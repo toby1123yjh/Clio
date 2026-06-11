@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+.output/
+.wxt/
+*.zip
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test / coverage
+coverage/
+.vitest-cache/
+test-results/
+playwright-report/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# POC artifacts (large)
+poc/**/output/
+poc/**/cache/

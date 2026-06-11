@@ -1,0 +1,42 @@
+{
+  "name": "clio-browser",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Clio — evidence-first, browser-only knowledge companion (pure Chrome Extension).",
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "dev": "pnpm -C apps/extension dev",
+    "build": "pnpm -C apps/extension build",
+    "zip": "pnpm -C apps/extension zip",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "test": "pnpm -r test",
+    "e2e:extension": "pnpm build && playwright test --config=playwright.config.ts",
+    "poc": "node poc/run-poc.mjs",
+    "poc:01-sqlite-wasm": "node poc/run-poc.mjs 01",
+    "poc:03-fts5": "node poc/run-poc.mjs 03",
+    "poc:chrome-smoke": "node poc/chrome-extension-smoke.mjs",
+    "poc:rail-click-smoke": "node poc/rail-click-smoke.mjs",
+    "poc:phase1a-acceptance": "node poc/phase1a-acceptance.mjs",
+    "poc:phase2a-ui": "node poc/phase2a-ui-visual-acceptance.mjs",
+    "poc:phase3a-agent-mock": "node poc/run-poc.mjs 31",
+    "poc:phase3b-gemini-smoke": "node poc/run-poc.mjs 32",
+    "poc:phase3c-sessions": "node poc/run-poc.mjs 33",
+    "poc:05-worker-cpu": "node poc/run-poc.mjs 05",
+    "poc:06-csp": "node poc/run-poc.mjs 06",
+    "poc:10-idb-fallback": "node poc/run-poc.mjs 10",
+    "poc:11-pdfjs": "node poc/run-poc.mjs 11"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@playwright/test": "^1.60.0",
+    "@sqlite.org/sqlite-wasm": "3.53.0-build1",
+    "fake-indexeddb": "^6.2.5",
+    "pdfjs-dist": "^5.7.284",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,9 @@
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+  background: hsl(var(--clio-background));
+}

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Clio Offscreen</title>
+  </head>
+  <body>
+    <!--
+      Offscreen Document host.
+
+      Phase 0:
+        - Serves as the long-lived environment for SQLite WASM + OPFS (POC-01, POC-02)
+          and Worker CPU tasks (POC-05).
+        - Background service worker creates this via chrome.offscreen.createDocument.
+        - Lifecycle decision: hybrid (lazy start + chrome.alarms heartbeat
+          + idle-release after 5 min). See design/plan/phase0/p0-decisions.md §2.
+
+      Phase 1+: hosts the Local Engine Worker; communicates with SW via MessageChannel.
+    -->
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
