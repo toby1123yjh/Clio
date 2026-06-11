@@ -88,7 +88,7 @@ The stateful work (storage, indexing, retrieval) lives in an **Offscreen Documen
 
 ### Option A — Install the prebuilt extension (recommended)
 
-1. Download `clio-chrome-mv3.zip` from the [latest release](https://github.com/toby1123yjh/Clio/releases/latest).
+1. Download `clio-chrome-mv3.zip` from the [Releases page](https://github.com/toby1123yjh/Clio/releases).
 2. Unzip it.
 3. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select the unzipped folder.
 4. Press `Alt+Shift+C` on any page to open the Rail.

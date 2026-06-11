@@ -88,7 +88,7 @@ Clio 不是云端助手,也不是网页问答引擎——它把**你自己的阅
 
 ### 方式 A —— 安装预构建扩展（推荐）
 
-1. 从 [最新 release](https://github.com/toby1123yjh/Clio/releases/latest) 下载 `clio-chrome-mv3.zip`。
+1. 从 [Releases 页面](https://github.com/toby1123yjh/Clio/releases) 下载 `clio-chrome-mv3.zip`。
 2. 解压。
 3. 打开 `chrome://extensions`,启用**开发者模式**,点击**加载已解压的扩展程序**,选择解压后的文件夹。
 4. 在任意页面按 `Alt+Shift+C` 打开 Rail。
