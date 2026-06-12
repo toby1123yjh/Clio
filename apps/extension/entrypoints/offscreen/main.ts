@@ -67,6 +67,10 @@ const webToolRuntime = new ClioWebToolRuntime({
     requestProvider({ kind: "ensureOpenAIHostPermission", baseUrl })
       .then(() => true)
       .catch(() => false),
+  ensureOpenAICompatibleHostPermission: (baseUrl) =>
+    requestProvider({ kind: "ensureOpenAICompatibleHostPermission", baseUrl })
+      .then(() => true)
+      .catch(() => false),
 });
 const imageGenerationRuntime = new ClioImageGenerationRuntime({
   loadImageGenerationSettings: () => requestProvider({ kind: "getImageGenerationSettings" }),

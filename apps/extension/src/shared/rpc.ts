@@ -4,7 +4,9 @@ import type {
 } from "@/src/agent-runtime/image-generation-settings";
 import type { ProviderId, ProviderSettings } from "@/src/agent-runtime/provider-settings";
 import type {
+  SearchOpenAICompatibleOverrideSettings,
   SearchOpenAIOverrideSettings,
+  SearchProviderId,
   SearchProviderSettings,
 } from "@/src/agent-runtime/search-provider-settings";
 import type {
@@ -593,8 +595,9 @@ export type ProviderRequest =
   | { kind: "getSearchProviderSettings" }
   | {
       kind: "saveSearchProviderSettings";
-      provider: "auto" | "openai";
+      provider: SearchProviderId;
       openai?: SearchOpenAIOverrideSettings;
+      openaiCompatible?: SearchOpenAICompatibleOverrideSettings;
     }
   | { kind: "getImageGenerationSettings" }
   | { kind: "saveImageGenerationSettings"; settings: SaveImageGenerationSettingsInput }
@@ -1324,8 +1327,10 @@ function isProviderRequest(value: unknown): value is ProviderRequest {
       return true;
     case "saveSearchProviderSettings":
       return (
-        (value.provider === "auto" || value.provider === "openai") &&
-        (value.openai === undefined || isSearchOpenAIOverrideSettings(value.openai))
+        isSearchProviderId(value.provider) &&
+        (value.openai === undefined || isSearchOpenAIOverrideSettings(value.openai)) &&
+        (value.openaiCompatible === undefined ||
+          isSearchOpenAICompatibleOverrideSettings(value.openaiCompatible))
       );
     case "getImageGenerationSettings":
       return true;
@@ -1651,6 +1656,21 @@ function isSearchOpenAIOverrideSettings(value: unknown): value is SearchOpenAIOv
     (value.model === undefined || typeof value.model === "string") &&
     (value.baseUrl === undefined || typeof value.baseUrl === "string")
   );
+}
+
+function isSearchOpenAICompatibleOverrideSettings(
+  value: unknown,
+): value is SearchOpenAICompatibleOverrideSettings {
+  return (
+    isRecord(value) &&
+    (value.apiKey === undefined || typeof value.apiKey === "string") &&
+    (value.model === undefined || typeof value.model === "string") &&
+    (value.baseUrl === undefined || typeof value.baseUrl === "string")
+  );
+}
+
+function isSearchProviderId(value: unknown): value is SearchProviderId {
+  return value === "auto" || value === "openai" || value === "openai-compatible";
 }
 
 function isSaveImageGenerationSettingsInput(

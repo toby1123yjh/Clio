@@ -1067,6 +1067,7 @@ function ClioContentApp() {
         kind: "saveSearchProviderSettings",
         provider: input.provider,
         openai: input.openai,
+        openaiCompatible: input.openaiCompatible,
       });
       setSearchProviderSettings(settings);
       setProviderMessage("Search provider saved.");

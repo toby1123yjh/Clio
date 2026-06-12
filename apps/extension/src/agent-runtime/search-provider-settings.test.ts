@@ -4,7 +4,7 @@ import type { ChromeStorageAreaLike, StoredProviderConfig } from "./provider-set
 import {
   defaultSearchProviderSettings,
   readSearchProviderSettings,
-  resolveOpenAIWebSearchConfig,
+  resolveWebSearchConfig,
   saveSearchProviderSettings,
   searchProviderStorageKey,
 } from "./search-provider-settings";
@@ -33,6 +33,15 @@ const mainOpenAIConfig: StoredProviderConfig = {
   updatedAt: "2026-06-08T00:00:00.000Z",
 };
 
+const mainOpenAICompatibleConfig: StoredProviderConfig = {
+  provider: "openai-compatible",
+  apiKey: "compatible-key",
+  model: "deepseek-chat",
+  baseUrl: "https://new-api.example.test/v1",
+  providerName: "custom",
+  updatedAt: "2026-06-08T00:00:00.000Z",
+};
+
 describe("Search provider settings", () => {
   it("defaults to Auto with blank OpenAI Search overrides", async () => {
     await expect(readSearchProviderSettings(fakeStorage())).resolves.toEqual(
@@ -57,9 +66,11 @@ describe("Search provider settings", () => {
 
     expect(settings.provider).toBe("auto");
     expect(settings.openai).toEqual({});
+    expect(settings.openaiCompatible).toEqual({});
     await expect(readSearchProviderSettings(storage)).resolves.toMatchObject({
       provider: "auto",
       openai: {},
+      openaiCompatible: {},
     });
   });
 
@@ -83,69 +94,144 @@ describe("Search provider settings", () => {
         model: "gpt-search",
         baseUrl: "https://api.openai.example.test/v1",
       },
+      openaiCompatible: {},
       updatedAt: "2026-06-08T00:00:00.000Z",
     });
   });
 
+  it("saves unrestricted OpenAI Compatible Search model overrides", async () => {
+    const storage = fakeStorage();
+
+    const settings = await saveSearchProviderSettings(
+      {
+        provider: "openai-compatible",
+        openaiCompatible: {
+          apiKey: " compatible-key ",
+          model: " any-provider-model-2026 ",
+          baseUrl: " https://new-api.example.test/v1/ ",
+        },
+      },
+      storage,
+    );
+
+    expect(settings).toMatchObject({
+      provider: "openai-compatible",
+      openai: {},
+      openaiCompatible: {
+        apiKey: "compatible-key",
+        model: "any-provider-model-2026",
+        baseUrl: "https://new-api.example.test/v1",
+      },
+    });
+  });
+
   it("uses filled Search overrides first and falls back per field to main OpenAI config", () => {
-    const resolved = resolveOpenAIWebSearchConfig(
+    const resolved = resolveWebSearchConfig(
       {
         provider: "auto",
         openai: {
           model: "gpt-search",
         },
+        openaiCompatible: {},
       },
       mainOpenAIConfig,
     );
 
     expect(resolved).toEqual({
       provider: "openai",
+      providerFamily: "openai",
+      providerLabel: "OpenAI Search",
       apiKey: "main-openai-key",
       model: "gpt-search",
       baseUrl: "https://api.openai.example.test/v1",
-      configuredBy: "search-override",
+      protocol: "openai-responses-web-search",
+      configuredBy: "search-openai-override",
     });
   });
 
   it("uses explicit OpenAI Search key without requiring a main OpenAI provider", () => {
-    const resolved = resolveOpenAIWebSearchConfig(
+    const resolved = resolveWebSearchConfig(
       {
         provider: "openai",
         openai: {
           apiKey: "search-key",
           model: "gpt-search",
         },
+        openaiCompatible: {},
       },
       undefined,
     );
 
     expect(resolved).toMatchObject({
       provider: "openai",
+      providerFamily: "openai",
       apiKey: "search-key",
       model: "gpt-search",
       baseUrl: defaultOpenAIBaseUrl,
-      configuredBy: "search-override",
+      protocol: "openai-responses-web-search",
+      configuredBy: "search-openai-override",
+    });
+  });
+
+  it("selects Chat Completions protocol for OpenAI dedicated search models", () => {
+    const resolved = resolveWebSearchConfig(
+      {
+        provider: "openai",
+        openai: {
+          apiKey: "search-key",
+          model: "gpt-5-search-api",
+        },
+        openaiCompatible: {},
+      },
+      undefined,
+    );
+
+    expect(resolved).toMatchObject({
+      provider: "openai",
+      model: "gpt-5-search-api",
+      protocol: "openai-chat-completions-search",
+    });
+  });
+
+  it("auto-runs with the active OpenAI Compatible provider through Responses web_search", () => {
+    const resolved = resolveWebSearchConfig(
+      {
+        provider: "auto",
+        openai: {},
+        openaiCompatible: {},
+      },
+      mainOpenAICompatibleConfig,
+    );
+
+    expect(resolved).toEqual({
+      provider: "openai-compatible",
+      providerFamily: "openai-compatible",
+      providerLabel: "OpenAI Compatible Search",
+      apiKey: "compatible-key",
+      model: "deepseek-chat",
+      baseUrl: "https://new-api.example.test/v1",
+      protocol: "openai-responses-web-search",
+      configuredBy: "main-openai-compatible",
     });
   });
 
   it("reports setup required at search runtime when no source-returning config exists", () => {
-    const compatibleOnly: StoredProviderConfig = {
-      provider: "openai-compatible",
-      apiKey: "compatible-key",
-      model: "gpt-5.5",
-      baseUrl: "https://new-api.example.test/v1",
-      providerName: "custom",
+    const geminiOnly: StoredProviderConfig = {
+      provider: "gemini",
+      apiKey: "gemini-key",
+      model: "gemini-2.5-flash",
       updatedAt: "2026-06-08T00:00:00.000Z",
     };
 
     expect(() =>
-      resolveOpenAIWebSearchConfig(
+      resolveWebSearchConfig(
         {
           provider: "auto",
           openai: {},
+          openaiCompatible: {},
         },
-        compatibleOnly,
+        geminiOnly,
       ),
-    ).toThrow("Configure OpenAI Search or an OpenAI model");
+    ).toThrow("Configure Search or a search-capable model");
   });
 });

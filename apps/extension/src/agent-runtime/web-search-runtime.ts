@@ -8,14 +8,16 @@ import { EngineRpcError } from "../shared/rpc";
 import { classifyProviderError } from "./provider-errors";
 import type { StoredProviderConfig } from "./provider-settings";
 import {
+  type ResolvedWebSearchConfig,
   type SearchProviderSettings,
-  resolveOpenAIWebSearchConfig,
+  resolveWebSearchConfig,
 } from "./search-provider-settings";
 
 export interface ClioWebToolRuntimeOptions {
   loadSearchProviderSettings: () => Promise<SearchProviderSettings>;
   loadActiveProviderConfig: () => Promise<StoredProviderConfig | undefined>;
   ensureOpenAIHostPermission: (baseUrl: string) => Promise<boolean>;
+  ensureOpenAICompatibleHostPermission: (baseUrl: string) => Promise<boolean>;
   fetchFn?: typeof fetch;
 }
 
@@ -23,12 +25,14 @@ export class ClioWebToolRuntime {
   private readonly loadSearchProviderSettings: () => Promise<SearchProviderSettings>;
   private readonly loadActiveProviderConfig: () => Promise<StoredProviderConfig | undefined>;
   private readonly ensureOpenAIHostPermission: (baseUrl: string) => Promise<boolean>;
+  private readonly ensureOpenAICompatibleHostPermission: (baseUrl: string) => Promise<boolean>;
   private readonly fetchFn: typeof fetch;
 
   constructor(options: ClioWebToolRuntimeOptions) {
     this.loadSearchProviderSettings = options.loadSearchProviderSettings;
     this.loadActiveProviderConfig = options.loadActiveProviderConfig;
     this.ensureOpenAIHostPermission = options.ensureOpenAIHostPermission;
+    this.ensureOpenAICompatibleHostPermission = options.ensureOpenAICompatibleHostPermission;
     this.fetchFn = options.fetchFn ?? fetch;
   }
 
@@ -48,11 +52,11 @@ export class ClioWebToolRuntime {
     try {
       const searchSettings = await this.loadSearchProviderSettings();
       const activeConfig = await this.loadActiveProviderConfig();
-      const config = resolveOpenAIWebSearchConfig(searchSettings, activeConfig);
-      if (!(await this.ensureOpenAIHostPermission(config.baseUrl))) {
+      const config = resolveWebSearchConfig(searchSettings, activeConfig);
+      if (!(await this.hasSearchHostPermission(config))) {
         throw new EngineRpcError(
           "PROVIDER_PERMISSION_REQUIRED",
-          "OpenAI host access is unavailable in this extension build.",
+          `${config.providerLabel} host access is unavailable in this extension build.`,
         );
       }
 
@@ -60,26 +64,45 @@ export class ClioWebToolRuntime {
         type: "started",
         runId: request.runId,
         query,
-        provider: "OpenAI Search",
+        provider: config.providerLabel,
         createdAt: request.createdAt,
       };
 
-      yield* streamOpenAIWebSearch(request, config, this.fetchFn, options.signal);
+      yield* streamWithAdapter(request, config, this.fetchFn, options.signal);
     } catch (error) {
       yield failedEvent(request.runId, error);
     }
   }
+
+  private hasSearchHostPermission(config: ResolvedWebSearchConfig) {
+    if (config.providerFamily === "openai-compatible") {
+      return this.ensureOpenAICompatibleHostPermission(config.baseUrl);
+    }
+    return this.ensureOpenAIHostPermission(config.baseUrl);
+  }
 }
 
-interface OpenAIWebSearchConfig {
-  apiKey: string;
-  model: string;
-  baseUrl: string;
-}
-
-async function* streamOpenAIWebSearch(
+async function* streamWithAdapter(
   request: ClioWebSearchRequest,
-  config: OpenAIWebSearchConfig,
+  config: ResolvedWebSearchConfig,
+  fetchFn: typeof fetch,
+  signal?: AbortSignal,
+): AsyncIterable<ClioWebSearchEvent> {
+  switch (config.protocol) {
+    case "openai-responses-web-search":
+      yield* streamOpenAIResponsesWebSearch(request, config, fetchFn, signal);
+      return;
+    case "openai-chat-completions-search":
+      yield* streamOpenAIChatCompletionsSearch(request, config, fetchFn, signal);
+      return;
+    default:
+      return assertNever(config.protocol);
+  }
+}
+
+async function* streamOpenAIResponsesWebSearch(
+  request: ClioWebSearchRequest,
+  config: ResolvedWebSearchConfig,
   fetchFn: typeof fetch,
   signal?: AbortSignal,
 ): AsyncIterable<ClioWebSearchEvent> {
@@ -103,12 +126,12 @@ async function* streamOpenAIWebSearch(
   if (!response.ok) {
     throw new EngineRpcError(
       response.status === 401 || response.status === 403 ? "PROVIDER_AUTH_ERROR" : "PROVIDER_ERROR",
-      `OpenAI Search failed with HTTP ${response.status}.`,
+      `${config.providerLabel} failed with HTTP ${response.status}.`,
       await safeReadText(response),
     );
   }
 
-  const collector = createResponseCollector(request);
+  const collector = createSearchCollector(request, config.providerLabel);
   if (response.body === null) {
     const parsed = parseOpenAIResponseJson(await safeReadText(response));
     collector.applyFinalResponse(parsed);
@@ -129,7 +152,66 @@ async function* streamOpenAIWebSearch(
   yield completedEvent(collector);
 }
 
-function createResponseCollector(request: ClioWebSearchRequest) {
+async function* streamOpenAIChatCompletionsSearch(
+  request: ClioWebSearchRequest,
+  config: ResolvedWebSearchConfig,
+  fetchFn: typeof fetch,
+  signal?: AbortSignal,
+): AsyncIterable<ClioWebSearchEvent> {
+  const response = await fetchFn(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: config.model,
+      messages: [{ role: "user", content: request.query }],
+      web_search_options: {},
+      stream: true,
+    }),
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new EngineRpcError(
+      response.status === 401 || response.status === 403 ? "PROVIDER_AUTH_ERROR" : "PROVIDER_ERROR",
+      `${config.providerLabel} failed with HTTP ${response.status}.`,
+      await safeReadText(response),
+    );
+  }
+
+  const collector = createSearchCollector(request, config.providerLabel);
+  if (response.body === null) {
+    const parsed = safeJsonParse(await safeReadText(response));
+    collector.applyFinalText(extractChatCompletionText(parsed));
+    collector.addSources(extractSources(parsed));
+    yield completedEvent(collector);
+    return;
+  }
+
+  for await (const event of parseSseStream(response.body)) {
+    if (event === "[DONE]") continue;
+    const parsed = safeJsonParse(event);
+    if (!isRecord(parsed)) continue;
+    const delta = extractChatCompletionDelta(parsed);
+    if (delta.length > 0) {
+      yield { type: "answer_delta", runId: request.runId, delta: collector.addDelta(delta) };
+    }
+    collector.addSources(extractSources(parsed));
+    if (isChatCompletionErrorEvent(parsed)) {
+      throw new EngineRpcError(
+        "PROVIDER_ERROR",
+        `${config.providerLabel} could not complete the search.`,
+        stringifyUnknown(parsed.error ?? parsed),
+      );
+    }
+  }
+
+  yield completedEvent(collector);
+}
+
+function createSearchCollector(request: ClioWebSearchRequest, providerLabel: string) {
   let answer = "";
   const sources = new Map<string, ClioWebSource>();
 
@@ -145,6 +227,8 @@ function createResponseCollector(request: ClioWebSearchRequest) {
   }
 
   return {
+    addDelta,
+    addSources,
     applyEvent(event: Record<string, unknown>) {
       const deltas: string[] = [];
       const type = typeof event.type === "string" ? event.type : "";
@@ -160,11 +244,14 @@ function createResponseCollector(request: ClioWebSearchRequest) {
       if (type === "response.failed" || type === "error") {
         throw new EngineRpcError(
           "PROVIDER_ERROR",
-          "OpenAI Search could not complete the search.",
+          `${providerLabel} could not complete the search.`,
           stringifyUnknown(event.error ?? event),
         );
       }
       return deltas;
+    },
+    applyFinalText(text: string) {
+      if (text.length > answer.length) answer = text;
     },
     applyFinalResponse(response: unknown) {
       const finalText = extractOutputText(response);
@@ -178,7 +265,7 @@ function createResponseCollector(request: ClioWebSearchRequest) {
         query: request.query.trim(),
         answer: answer.trim(),
         sources: Array.from(sources.values()),
-        provider: "OpenAI Search",
+        provider: providerLabel,
         createdAt: request.createdAt,
         completedAt: new Date().toISOString(),
       };
@@ -186,11 +273,12 @@ function createResponseCollector(request: ClioWebSearchRequest) {
   };
 }
 
-function completedEvent(collector: ReturnType<typeof createResponseCollector>): ClioWebSearchEvent {
+function completedEvent(collector: ReturnType<typeof createSearchCollector>): ClioWebSearchEvent {
+  const result = collector.result();
   return {
     type: "completed",
-    runId: collector.result().runId,
-    result: collector.result(),
+    runId: result.runId,
+    result,
   };
 }
 
@@ -248,6 +336,40 @@ function extractOutputText(value: unknown): string {
     .join("");
 }
 
+function extractChatCompletionDelta(value: unknown): string {
+  if (!isRecord(value) || !Array.isArray(value.choices)) return "";
+  return value.choices
+    .flatMap((choice) => {
+      if (!isRecord(choice) || !isRecord(choice.delta)) return [];
+      const content = choice.delta.content;
+      if (typeof content === "string") return [content];
+      if (!Array.isArray(content)) return [];
+      return content.flatMap((part) =>
+        isRecord(part) && typeof part.text === "string" ? [part.text] : [],
+      );
+    })
+    .join("");
+}
+
+function extractChatCompletionText(value: unknown): string {
+  if (!isRecord(value) || !Array.isArray(value.choices)) return "";
+  return value.choices
+    .flatMap((choice) => {
+      if (!isRecord(choice) || !isRecord(choice.message)) return [];
+      const content = choice.message.content;
+      if (typeof content === "string") return [content];
+      if (!Array.isArray(content)) return [];
+      return content.flatMap((part) =>
+        isRecord(part) && typeof part.text === "string" ? [part.text] : [],
+      );
+    })
+    .join("");
+}
+
+function isChatCompletionErrorEvent(value: Record<string, unknown>) {
+  return value.type === "error" || isRecord(value.error);
+}
+
 function extractSources(value: unknown): ClioWebSource[] {
   const sourceCandidates = [...collectAnnotations(value), ...collectSourceObjects(value)];
   return sourceCandidates.flatMap((candidate, index) => {
@@ -275,7 +397,7 @@ function collectAnnotations(value: unknown): Record<string, unknown>[] {
     if (!isRecord(item)) return;
     if (Array.isArray(item.annotations)) visit(item.annotations);
     if (item.type === "url_citation" || isRecord(item.url_citation)) annotations.push(item);
-    for (const key of ["action", "content", "message", "output", "response"]) {
+    for (const key of ["action", "choices", "content", "delta", "message", "output", "response"]) {
       if (key in item) visit(item[key]);
     }
   };
@@ -293,7 +415,7 @@ function collectSourceObjects(value: unknown): Record<string, unknown>[] {
     if (!isRecord(item)) return;
     if (Array.isArray(item.sources)) visit(item.sources);
     if (typeof item.url === "string") sources.push(item);
-    for (const key of ["action", "content", "message", "output", "response"]) {
+    for (const key of ["action", "choices", "content", "delta", "message", "output", "response"]) {
       if (key in item) visit(item[key]);
     }
   };
@@ -390,4 +512,8 @@ function hashSourceUrl(value: string) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled web search protocol: ${JSON.stringify(value)}`);
 }

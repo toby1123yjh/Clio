@@ -400,6 +400,26 @@ describe("session engine RPC guards", () => {
             model: "gpt-search",
             baseUrl: "https://api.openai.example.test/v1",
           },
+          openaiCompatible: {
+            apiKey: "",
+            model: "compatible-search-model",
+            baseUrl: "https://new-api.example.test/v1",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "saveSearchProviderSettings",
+          provider: "openai-compatible",
+          openaiCompatible: {
+            apiKey: "sk-test",
+            model: "any-compatible-model",
+            baseUrl: "https://new-api.example.test/v1",
+          },
         },
       }),
     ).toBe(true);

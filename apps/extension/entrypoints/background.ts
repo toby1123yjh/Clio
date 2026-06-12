@@ -767,6 +767,7 @@ async function routeProviderRequest(request: ProviderRequest) {
       return saveSearchProviderSettings({
         provider: request.provider,
         openai: request.openai,
+        openaiCompatible: request.openaiCompatible,
       });
     case "getImageGenerationSettings":
       return readImageGenerationSettings();

@@ -2533,6 +2533,9 @@ function SettingsPanel(props: RailShellProps) {
   const [searchOpenAIApiKey, setSearchOpenAIApiKey] = React.useState("");
   const [searchOpenAIModel, setSearchOpenAIModel] = React.useState("");
   const [searchOpenAIBaseUrl, setSearchOpenAIBaseUrl] = React.useState("");
+  const [searchOpenAICompatibleApiKey, setSearchOpenAICompatibleApiKey] = React.useState("");
+  const [searchOpenAICompatibleModel, setSearchOpenAICompatibleModel] = React.useState("");
+  const [searchOpenAICompatibleBaseUrl, setSearchOpenAICompatibleBaseUrl] = React.useState("");
   const [imageGenerationApiKey, setImageGenerationApiKey] = React.useState("");
   const [imageGenerationModel, setImageGenerationModel] = React.useState("");
   const [imageGenerationBaseUrl, setImageGenerationBaseUrl] = React.useState("");
@@ -2559,6 +2562,9 @@ function SettingsPanel(props: RailShellProps) {
     setSearchOpenAIApiKey(props.searchProviderSettings.openai.apiKey ?? "");
     setSearchOpenAIModel(props.searchProviderSettings.openai.model ?? "");
     setSearchOpenAIBaseUrl(props.searchProviderSettings.openai.baseUrl ?? "");
+    setSearchOpenAICompatibleApiKey(props.searchProviderSettings.openaiCompatible.apiKey ?? "");
+    setSearchOpenAICompatibleModel(props.searchProviderSettings.openaiCompatible.model ?? "");
+    setSearchOpenAICompatibleBaseUrl(props.searchProviderSettings.openaiCompatible.baseUrl ?? "");
   }, [props.searchProviderSettings]);
 
   React.useEffect(() => {
@@ -2619,10 +2625,16 @@ function SettingsPanel(props: RailShellProps) {
         <SearchProviderSettingsCard
           apiKey={searchOpenAIApiKey}
           baseUrl={searchOpenAIBaseUrl}
+          compatibleApiKey={searchOpenAICompatibleApiKey}
+          compatibleBaseUrl={searchOpenAICompatibleBaseUrl}
+          compatibleModel={searchOpenAICompatibleModel}
           loading={props.providerLoading}
           model={searchOpenAIModel}
           onApiKeyChange={setSearchOpenAIApiKey}
           onBaseUrlChange={setSearchOpenAIBaseUrl}
+          onCompatibleApiKeyChange={setSearchOpenAICompatibleApiKey}
+          onCompatibleBaseUrlChange={setSearchOpenAICompatibleBaseUrl}
+          onCompatibleModelChange={setSearchOpenAICompatibleModel}
           onModelChange={setSearchOpenAIModel}
           onProviderChange={setSearchProvider}
           onSave={() =>
@@ -2632,6 +2644,11 @@ function SettingsPanel(props: RailShellProps) {
                 apiKey: searchOpenAIApiKey,
                 model: searchOpenAIModel,
                 baseUrl: searchOpenAIBaseUrl,
+              },
+              openaiCompatible: {
+                apiKey: searchOpenAICompatibleApiKey,
+                model: searchOpenAICompatibleModel,
+                baseUrl: searchOpenAICompatibleBaseUrl,
               },
             })
           }
@@ -2982,20 +2999,46 @@ interface SearchProviderSettingsCardProps {
   apiKey: string;
   model: string;
   baseUrl: string;
+  compatibleApiKey: string;
+  compatibleModel: string;
+  compatibleBaseUrl: string;
   loading: boolean;
   onProviderChange: (provider: SearchProviderId) => void;
   onApiKeyChange: (value: string) => void;
   onModelChange: (value: string) => void;
   onBaseUrlChange: (value: string) => void;
+  onCompatibleApiKeyChange: (value: string) => void;
+  onCompatibleModelChange: (value: string) => void;
+  onCompatibleBaseUrlChange: (value: string) => void;
   onSave: () => Promise<boolean>;
 }
 
 function SearchProviderSettingsCard(props: SearchProviderSettingsCardProps) {
   const [apiKeyMasked, setApiKeyMasked] = React.useState(false);
   const disabled = props.loading || props.settings === null;
+  const showingCompatible = props.provider === "openai-compatible";
   const apiKeyToggleLabel = apiKeyMasked
-    ? "Show OpenAI Search API key"
-    : "Mask OpenAI Search API key";
+    ? `Show ${showingCompatible ? "OpenAI Compatible" : "OpenAI"} Search API key`
+    : `Mask ${showingCompatible ? "OpenAI Compatible" : "OpenAI"} Search API key`;
+  const fieldIds = showingCompatible
+    ? {
+        key: "clio-rail-search-openai-compatible-key",
+        model: "clio-rail-search-openai-compatible-model",
+        baseUrl: "clio-rail-search-openai-compatible-base-url",
+      }
+    : {
+        key: "clio-rail-search-openai-key",
+        model: "clio-rail-search-openai-model",
+        baseUrl: "clio-rail-search-openai-base-url",
+      };
+  const apiKey = showingCompatible ? props.compatibleApiKey : props.apiKey;
+  const model = showingCompatible ? props.compatibleModel : props.model;
+  const baseUrl = showingCompatible ? props.compatibleBaseUrl : props.baseUrl;
+  const onApiKeyChange = showingCompatible ? props.onCompatibleApiKeyChange : props.onApiKeyChange;
+  const onModelChange = showingCompatible ? props.onCompatibleModelChange : props.onModelChange;
+  const onBaseUrlChange = showingCompatible
+    ? props.onCompatibleBaseUrlChange
+    : props.onBaseUrlChange;
 
   return (
     <section
@@ -3031,7 +3074,8 @@ function SearchProviderSettingsCard(props: SearchProviderSettingsCardProps) {
           value={props.provider}
         >
           <option value="auto">Auto</option>
-          <option value="openai">OpenAI Search</option>
+          <option value="openai">OpenAI</option>
+          <option value="openai-compatible">OpenAI Compatible</option>
         </select>
       </div>
 
@@ -3041,16 +3085,20 @@ function SearchProviderSettingsCard(props: SearchProviderSettingsCardProps) {
             <Bot size={15} />
           </span>
           <div className="min-w-0 leading-tight">
-            <h5 className="truncate text-sm font-semibold">OpenAI Search override</h5>
+            <h5 className="truncate text-sm font-semibold">
+              {showingCompatible ? "OpenAI Compatible Search" : "OpenAI Search override"}
+            </h5>
             <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
-              Empty fields use the main OpenAI model search config when supported.
+              {showingCompatible
+                ? "Custom model names are allowed; unsupported endpoints fail when Search runs."
+                : "Empty fields use the main OpenAI model search config when supported."}
             </p>
           </div>
         </div>
 
         <div className="grid gap-3">
           <div className="grid gap-1.5 text-[12px]">
-            <label className="font-medium text-foreground" htmlFor="clio-rail-search-openai-key">
+            <label className="font-medium text-foreground" htmlFor={fieldIds.key}>
               API Key
             </label>
             <div className="flex gap-2">
@@ -3058,11 +3106,13 @@ function SearchProviderSettingsCard(props: SearchProviderSettingsCardProps) {
                 autoComplete="off"
                 className="h-10 min-w-0 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
                 disabled={disabled}
-                id="clio-rail-search-openai-key"
-                onChange={(event) => props.onApiKeyChange(event.target.value)}
-                placeholder="Use main OpenAI key"
+                id={fieldIds.key}
+                onChange={(event) => onApiKeyChange(event.target.value)}
+                placeholder={
+                  showingCompatible ? "Use main OpenAI Compatible key" : "Use main OpenAI key"
+                }
                 type={apiKeyMasked ? "password" : "text"}
-                value={props.apiKey}
+                value={apiKey}
               />
               <Button
                 aria-label={apiKeyToggleLabel}
@@ -3078,33 +3128,40 @@ function SearchProviderSettingsCard(props: SearchProviderSettingsCardProps) {
               </Button>
             </div>
           </div>
-          <label className="grid gap-1.5 text-[12px]" htmlFor="clio-rail-search-openai-model">
+          <label className="grid gap-1.5 text-[12px]" htmlFor={fieldIds.model}>
             <span className="font-medium text-foreground">Model</span>
             <Input
               className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
               disabled={disabled}
-              id="clio-rail-search-openai-model"
-              onChange={(event) => props.onModelChange(event.target.value)}
-              placeholder="Use main OpenAI model"
-              value={props.model}
+              id={fieldIds.model}
+              onChange={(event) => onModelChange(event.target.value)}
+              placeholder={
+                showingCompatible ? "Use main OpenAI Compatible model" : "Use main OpenAI model"
+              }
+              value={model}
             />
           </label>
-          <label className="grid gap-1.5 text-[12px]" htmlFor="clio-rail-search-openai-base-url">
+          <label className="grid gap-1.5 text-[12px]" htmlFor={fieldIds.baseUrl}>
             <span className="font-medium text-foreground">Base URL</span>
             <Input
               className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
               disabled={disabled}
-              id="clio-rail-search-openai-base-url"
-              onChange={(event) => props.onBaseUrlChange(event.target.value)}
-              placeholder="Use main OpenAI Base URL"
-              value={props.baseUrl}
+              id={fieldIds.baseUrl}
+              onChange={(event) => onBaseUrlChange(event.target.value)}
+              placeholder={
+                showingCompatible
+                  ? "Use main OpenAI Compatible Base URL"
+                  : "Use main OpenAI Base URL"
+              }
+              value={baseUrl}
             />
           </label>
         </div>
 
         <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
-          Auto uses filled OpenAI Search fields first. Blank fields are resolved only when a search
-          runs.
+          {showingCompatible
+            ? "OpenAI Compatible Search attempts the Responses web_search protocol and does not fall back to ordinary chat completion."
+            : "Auto uses filled OpenAI Search fields first. Blank fields are resolved only when a search runs."}
         </p>
 
         <div className="mt-3">
@@ -3339,7 +3396,8 @@ function providerLabel(provider: ProviderId) {
 }
 
 function searchProviderLabel(provider: SearchProviderId) {
-  if (provider === "openai") return "OpenAI Search";
+  if (provider === "openai") return "OpenAI";
+  if (provider === "openai-compatible") return "OpenAI Compatible";
   return "Auto";
 }
 
