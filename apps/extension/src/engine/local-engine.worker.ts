@@ -15,7 +15,10 @@ import {
   type CompactionRecord,
   type CreateChatSessionPayload,
   type CreateCompactionPayload,
+  type CreateTopicPagePayload,
+  type CreateWikiCompileJobPayload,
   type DeleteMemoryResult,
+  type DeleteTopicPageResult,
   type EngineHealth,
   type EngineRequest,
   EngineRpcError,
@@ -34,9 +37,18 @@ import {
   type SessionEvidenceRecord,
   type SessionLeaseResult,
   type SourceKind,
+  type TopicGraphEdge,
+  type TopicGraphEdgeInput,
+  type TopicGraphEdgeKind,
+  type TopicPageDetail,
+  type TopicPageSourceRef,
   type UpdateChatMessagePayload,
+  type UpdateTopicPagePayload,
   type UpsertChatMessagePayload,
   type WebSearchHistoryRecord,
+  type WikiCompileJobStatus,
+  type WikiCompileJobSummary,
+  type WikiCompileResultPayload,
   engineErrorFromUnknown,
   isWorkerRequestMessage,
 } from "@/src/shared/rpc";
@@ -78,7 +90,7 @@ type SqliteInitModule = (config?: {
 }) => Promise<SqliteApi>;
 
 const databasePath = "/clio-browser-phase1.sqlite3";
-const schemaVersion = 7;
+const schemaVersion = 9;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
 const staleSessionLeaseMs = 30_000;
@@ -103,6 +115,35 @@ class LocalEngine {
         return await this.get(request.id);
       case "deleteMemory":
         return await this.delete(request.id);
+      case "listTopicPages":
+        return await this.listTopicPages(request.query, request.limit);
+      case "getTopicPage":
+        return await this.getTopicPage(request.id);
+      case "createTopicPage":
+        return await this.createTopicPage(request.payload);
+      case "updateTopicPage":
+        return await this.updateTopicPage(request.id, request.payload);
+      case "deleteTopicPage":
+        return await this.deleteTopicPage(request.id);
+      case "enqueueWikiCompile":
+        return await this.enqueueWikiCompile(request.payload);
+      case "listWikiCompileJobs":
+        return await this.listWikiCompileJobs(request.status, request.limit);
+      case "getWikiCompileJob":
+        return await this.getWikiCompileJob(request.id);
+      case "claimNextWikiCompileJob":
+        return await this.claimNextWikiCompileJob(request.id, request.now);
+      case "completeWikiCompileJob":
+        return await this.completeWikiCompileJob(request.id, request.result);
+      case "failWikiCompileJob":
+        return await this.failWikiCompileJob(
+          request.id,
+          request.error,
+          request.retryAfter,
+          request.now,
+        );
+      case "listTopicGraphEdges":
+        return await this.listTopicGraphEdges(request.topicId, request.edgeKind);
       case "repair":
         return await this.repair(request.action);
       case "getJobStatus":
@@ -438,6 +479,326 @@ class LocalEngine {
       deleted: db.selectValue("SELECT changes()") !== 0,
       id,
     };
+  }
+
+  private async listTopicPages(query: string | undefined, limit = 30) {
+    const db = await this.ensureReady();
+    const normalizedQuery = normalizeText(query ?? "");
+    const clampedLimit = clampLimit(limit, 100);
+    const rows =
+      normalizedQuery.length === 0
+        ? db.selectObjects(
+            `SELECT *
+             FROM topic_pages
+             ORDER BY updated_at DESC
+             LIMIT ?`,
+            [clampedLimit],
+          )
+        : db.selectObjects(
+            `SELECT *
+             FROM topic_pages
+             WHERE title LIKE ? ESCAPE '\\'
+                OR summary LIKE ? ESCAPE '\\'
+                OR content LIKE ? ESCAPE '\\'
+             ORDER BY updated_at DESC
+             LIMIT ?`,
+            [
+              `%${escapeLikePattern(normalizedQuery)}%`,
+              `%${escapeLikePattern(normalizedQuery)}%`,
+              `%${escapeLikePattern(normalizedQuery)}%`,
+              clampedLimit,
+            ],
+          );
+    return {
+      items: rows.map(topicPageSummaryFromRow),
+      ...(normalizedQuery.length === 0 ? {} : { query: normalizedQuery }),
+    };
+  }
+
+  private async getTopicPage(id: string): Promise<TopicPageDetail | null> {
+    const db = await this.ensureReady();
+    const row = db.selectObject("SELECT * FROM topic_pages WHERE id = ? LIMIT 1", [id]);
+    return row === undefined ? null : topicPageDetailFromRow(row);
+  }
+
+  private async createTopicPage(payload: CreateTopicPagePayload): Promise<TopicPageDetail> {
+    const db = await this.ensureReady();
+    const row = transaction(db, () => createTopicPageRow(db, payload));
+    return topicPageDetailFromRow(row);
+  }
+
+  private async updateTopicPage(
+    id: string,
+    payload: UpdateTopicPagePayload,
+  ): Promise<TopicPageDetail | null> {
+    const db = await this.ensureReady();
+    const row = transaction(db, () => updateTopicPageRow(db, id, payload));
+    return row === undefined ? null : topicPageDetailFromRow(row);
+  }
+
+  private async deleteTopicPage(id: string): Promise<DeleteTopicPageResult> {
+    const db = await this.ensureReady();
+    transaction(db, () => {
+      db.exec({
+        sql: "DELETE FROM topic_graph_edges WHERE from_topic_id = ? OR to_topic_id = ?",
+        bind: [id, id],
+      });
+      db.exec({
+        sql: `UPDATE wiki_compile_jobs
+              SET topic_id = CASE WHEN topic_id = ? THEN NULL ELSE topic_id END,
+                  result_topic_id = CASE WHEN result_topic_id = ? THEN NULL ELSE result_topic_id END
+              WHERE topic_id = ? OR result_topic_id = ?`,
+        bind: [id, id, id, id],
+      });
+      db.exec({ sql: "DELETE FROM topic_pages WHERE id = ?", bind: [id] });
+    });
+    return {
+      deleted: db.selectValue("SELECT changes()") !== 0,
+      id,
+    };
+  }
+
+  private async enqueueWikiCompile(
+    payload: CreateWikiCompileJobPayload,
+  ): Promise<WikiCompileJobSummary> {
+    const db = await this.ensureReady();
+    const now = normalizeOptionalIso(payload.createdAt) ?? new Date().toISOString();
+    const id = payload.id ?? createId("wiki_job");
+    const query = normalizeWikiCompileQuery(payload.query);
+    const instructions = normalizeTopicText(payload.instructions ?? "", 4_000);
+    const sourceMemoryIds = normalizeWikiSourceMemoryIds(payload.sourceMemoryIds ?? []);
+    const maxAttempts = normalizeWikiMaxAttempts(payload.maxAttempts);
+    const runAfter = normalizeOptionalIso(payload.runAfter);
+
+    transaction(db, () => {
+      db.exec({
+        sql: `INSERT INTO wiki_compile_jobs (
+          id,
+          status,
+          topic_id,
+          query,
+          instructions,
+          source_memory_ids_json,
+          attempts,
+          max_attempts,
+          run_after,
+          created_at,
+          updated_at
+        ) VALUES (?, 'queued', ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+        bind: [
+          id,
+          payload.topicId ?? null,
+          query,
+          instructions,
+          JSON.stringify(sourceMemoryIds),
+          maxAttempts,
+          runAfter ?? null,
+          now,
+          now,
+        ],
+      });
+    });
+
+    const row = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
+    if (row === undefined) {
+      throw new EngineRpcError("WIKI_JOB_CREATE_FAILED", "Wiki compile job was not saved.");
+    }
+    return wikiCompileJobFromRow(row);
+  }
+
+  private async listWikiCompileJobs(
+    status?: WikiCompileJobStatus,
+    limit = 30,
+  ): Promise<{ jobs: WikiCompileJobSummary[] }> {
+    const db = await this.ensureReady();
+    const clampedLimit = clampLimit(limit, 100);
+    const rows =
+      status === undefined
+        ? db.selectObjects(
+            `SELECT *
+             FROM wiki_compile_jobs
+             ORDER BY created_at DESC
+             LIMIT ?`,
+            [clampedLimit],
+          )
+        : db.selectObjects(
+            `SELECT *
+             FROM wiki_compile_jobs
+             WHERE status = ?
+             ORDER BY created_at DESC
+             LIMIT ?`,
+            [status, clampedLimit],
+          );
+    return { jobs: rows.map(wikiCompileJobFromRow) };
+  }
+
+  private async getWikiCompileJob(id: string): Promise<WikiCompileJobSummary | null> {
+    const db = await this.ensureReady();
+    const row = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
+    return row === undefined ? null : wikiCompileJobFromRow(row);
+  }
+
+  private async claimNextWikiCompileJob(
+    id?: string,
+    nowInput?: string,
+  ): Promise<WikiCompileJobSummary | null> {
+    const db = await this.ensureReady();
+    const now = normalizeOptionalIso(nowInput) ?? new Date().toISOString();
+    let jobId: string | undefined;
+    transaction(db, () => {
+      const row =
+        id === undefined
+          ? db.selectObject(
+              `SELECT *
+               FROM wiki_compile_jobs
+               WHERE status = 'queued'
+                 AND (run_after IS NULL OR run_after <= ?)
+               ORDER BY created_at ASC
+               LIMIT 1`,
+              [now],
+            )
+          : db.selectObject(
+              `SELECT *
+               FROM wiki_compile_jobs
+               WHERE id = ?
+                 AND status = 'queued'
+                 AND (run_after IS NULL OR run_after <= ?)
+               LIMIT 1`,
+              [id, now],
+            );
+      if (row === undefined) return;
+      jobId = stringField(row, "id");
+      db.exec({
+        sql: `UPDATE wiki_compile_jobs
+              SET status = 'running',
+                  attempts = attempts + 1,
+                  claimed_at = ?,
+                  updated_at = ?,
+                  last_error = NULL
+              WHERE id = ?`,
+        bind: [now, now, jobId],
+      });
+    });
+    if (jobId === undefined) return null;
+    const row = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [jobId]);
+    return row === undefined ? null : wikiCompileJobFromRow(row);
+  }
+
+  private async completeWikiCompileJob(id: string, result: WikiCompileResultPayload) {
+    const db = await this.ensureReady();
+    const completedAt = normalizeOptionalIso(result.completedAt) ?? new Date().toISOString();
+    let topicRow: SqlRow | undefined;
+    let jobRow: SqlRow | undefined;
+
+    transaction(db, () => {
+      const job = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
+      if (job === undefined) {
+        throw new EngineRpcError("WIKI_JOB_NOT_FOUND", `Wiki compile job not found: ${id}`);
+      }
+
+      const existingTopicId = optionalString(job, "topic_id");
+      const existingTopic =
+        existingTopicId === undefined
+          ? undefined
+          : db.selectObject("SELECT * FROM topic_pages WHERE id = ? LIMIT 1", [existingTopicId]);
+      const sourceRefs = compileSourceRefs(result);
+      if (existingTopic !== undefined && existingTopicId !== undefined) {
+        topicRow =
+          updateTopicPageRow(db, existingTopicId, {
+            ...compileTopicUpdatePayload(result),
+            sourceRefs,
+            updatedAt: completedAt,
+          }) ?? undefined;
+      }
+      if (topicRow === undefined) {
+        topicRow = createTopicPageRow(
+          db,
+          compileTopicCreatePayload(job, result, sourceRefs, completedAt),
+        );
+      }
+
+      const topicId = stringField(topicRow, "id");
+      refreshTopicGraphEdges(db, topicId, sourceRefs, result.edges ?? [], completedAt);
+      db.exec({
+        sql: `UPDATE wiki_compile_jobs
+              SET status = 'done',
+                  finished_at = ?,
+                  updated_at = ?,
+                  last_error = NULL,
+                  result_topic_id = ?
+              WHERE id = ?`,
+        bind: [completedAt, completedAt, topicId, id],
+      });
+      jobRow = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
+    });
+
+    if (topicRow === undefined || jobRow === undefined) {
+      throw new EngineRpcError("WIKI_JOB_COMPLETE_FAILED", "Wiki compile job was not completed.");
+    }
+    return {
+      job: wikiCompileJobFromRow(jobRow),
+      topic: topicPageDetailFromRow(topicRow),
+    };
+  }
+
+  private async failWikiCompileJob(
+    id: string,
+    error: string,
+    retryAfter?: string,
+    nowInput?: string,
+  ): Promise<WikiCompileJobSummary | null> {
+    const db = await this.ensureReady();
+    const row = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
+    if (row === undefined) return null;
+
+    const now = normalizeOptionalIso(nowInput) ?? new Date().toISOString();
+    const retryAt = normalizeOptionalIso(retryAfter);
+    const attempts = numberField(row, "attempts");
+    const maxAttempts = numberField(row, "max_attempts");
+    const willRetry = retryAt !== undefined && attempts < maxAttempts;
+    db.exec({
+      sql: `UPDATE wiki_compile_jobs
+            SET status = ?,
+                run_after = ?,
+                claimed_at = NULL,
+                finished_at = ?,
+                last_error = ?,
+                updated_at = ?
+            WHERE id = ?`,
+      bind: [
+        willRetry ? "queued" : "failed",
+        willRetry ? retryAt : null,
+        willRetry ? null : now,
+        normalizeTopicText(error, 2_000),
+        now,
+        id,
+      ],
+    });
+
+    const updated = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
+    return updated === undefined ? null : wikiCompileJobFromRow(updated);
+  }
+
+  private async listTopicGraphEdges(topicId: string, kind?: TopicGraphEdgeKind) {
+    const db = await this.ensureReady();
+    const rows =
+      kind === undefined
+        ? db.selectObjects(
+            `SELECT *
+             FROM topic_graph_edges
+             WHERE from_topic_id = ? OR to_topic_id = ?
+             ORDER BY kind ASC, weight DESC, created_at DESC`,
+            [topicId, topicId],
+          )
+        : db.selectObjects(
+            `SELECT *
+             FROM topic_graph_edges
+             WHERE (from_topic_id = ? OR to_topic_id = ?)
+               AND kind = ?
+             ORDER BY weight DESC, created_at DESC`,
+            [topicId, topicId, kind],
+          );
+    return { edges: rows.map(topicGraphEdgeFromRow) };
   }
 
   private async repair(action: RepairAction): Promise<RepairResult> {
@@ -1245,6 +1606,9 @@ class LocalEngine {
     const db = await this.ensureReady();
     transaction(db, () => {
       db.exec("DELETE FROM jobs");
+      db.exec("DELETE FROM topic_graph_edges");
+      db.exec("DELETE FROM wiki_compile_jobs");
+      db.exec("DELETE FROM topic_pages");
       db.exec("DELETE FROM anchors");
       db.exec("DELETE FROM memory_fts");
       db.exec("DELETE FROM chunks");
@@ -1526,6 +1890,50 @@ function migrate(db: SqliteDb) {
       created_at TEXT NOT NULL
     )
   `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS topic_pages (
+      id TEXT PRIMARY KEY,
+      slug TEXT NOT NULL UNIQUE,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL DEFAULT '',
+      source_refs_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wiki_compile_jobs (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'done', 'failed')),
+      topic_id TEXT REFERENCES topic_pages(id) ON DELETE SET NULL,
+      query TEXT NOT NULL DEFAULT '',
+      instructions TEXT NOT NULL DEFAULT '',
+      source_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      run_after TEXT,
+      claimed_at TEXT,
+      finished_at TEXT,
+      last_error TEXT,
+      result_topic_id TEXT REFERENCES topic_pages(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS topic_graph_edges (
+      id TEXT PRIMARY KEY,
+      from_topic_id TEXT NOT NULL REFERENCES topic_pages(id) ON DELETE CASCADE,
+      to_topic_id TEXT REFERENCES topic_pages(id) ON DELETE CASCADE,
+      memory_id TEXT REFERENCES memories(id) ON DELETE CASCADE,
+      chunk_id TEXT REFERENCES chunks(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('source', 'related', 'mentions')),
+      weight REAL NOT NULL DEFAULT 1,
+      label TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    )
+  `);
   ensureAgentScopeCheckConstraints(db);
 
   db.exec("CREATE INDEX IF NOT EXISTS idx_memories_captured_at ON memories(captured_at DESC)");
@@ -1556,6 +1964,21 @@ function migrate(db: SqliteDb) {
   );
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_image_generation_history_created ON image_generation_history(created_at DESC)",
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_topic_pages_updated ON topic_pages(updated_at DESC)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_topic_pages_slug ON topic_pages(slug)");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_wiki_compile_jobs_status ON wiki_compile_jobs(status, run_after)",
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_wiki_compile_jobs_topic ON wiki_compile_jobs(topic_id)");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_topic_graph_edges_from ON topic_graph_edges(from_topic_id, kind)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_topic_graph_edges_to ON topic_graph_edges(to_topic_id, kind)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_topic_graph_edges_memory ON topic_graph_edges(memory_id, kind)",
   );
   db.exec(`
     UPDATE memories
@@ -1984,6 +2407,70 @@ function memorySummaryFromRow(row: SqlRow): MemorySummary {
   };
 }
 
+function topicPageSummaryFromRow(row: SqlRow): Omit<TopicPageDetail, "content" | "sourceRefs"> {
+  const sourceRefs = parseTopicSourceRefs(stringField(row, "source_refs_json"));
+  return {
+    id: stringField(row, "id"),
+    slug: stringField(row, "slug"),
+    title: stringField(row, "title"),
+    summary: stringField(row, "summary"),
+    createdAt: stringField(row, "created_at"),
+    updatedAt: stringField(row, "updated_at"),
+    sourceCount: sourceRefs.length,
+  };
+}
+
+function topicPageDetailFromRow(row: SqlRow): TopicPageDetail {
+  return {
+    ...topicPageSummaryFromRow(row),
+    content: stringField(row, "content"),
+    sourceRefs: parseTopicSourceRefs(stringField(row, "source_refs_json")),
+  };
+}
+
+function wikiCompileJobFromRow(row: SqlRow): WikiCompileJobSummary {
+  const topicId = optionalString(row, "topic_id");
+  const runAfter = optionalString(row, "run_after");
+  const claimedAt = optionalString(row, "claimed_at");
+  const finishedAt = optionalString(row, "finished_at");
+  const lastError = optionalString(row, "last_error");
+  const resultTopicId = optionalString(row, "result_topic_id");
+  return {
+    id: stringField(row, "id"),
+    status: wikiCompileJobStatusField(row, "status"),
+    ...(topicId === undefined ? {} : { topicId }),
+    query: stringField(row, "query"),
+    instructions: stringField(row, "instructions"),
+    sourceMemoryIds: parseStringArray(stringField(row, "source_memory_ids_json")),
+    attempts: numberField(row, "attempts"),
+    maxAttempts: numberField(row, "max_attempts"),
+    createdAt: stringField(row, "created_at"),
+    updatedAt: stringField(row, "updated_at"),
+    ...(runAfter === undefined ? {} : { runAfter }),
+    ...(claimedAt === undefined ? {} : { claimedAt }),
+    ...(finishedAt === undefined ? {} : { finishedAt }),
+    ...(lastError === undefined ? {} : { lastError }),
+    ...(resultTopicId === undefined ? {} : { resultTopicId }),
+  };
+}
+
+function topicGraphEdgeFromRow(row: SqlRow): TopicGraphEdge {
+  const toTopicId = optionalString(row, "to_topic_id");
+  const memoryId = optionalString(row, "memory_id");
+  const chunkId = optionalString(row, "chunk_id");
+  return {
+    id: stringField(row, "id"),
+    fromTopicId: stringField(row, "from_topic_id"),
+    ...(toTopicId === undefined ? {} : { toTopicId }),
+    ...(memoryId === undefined ? {} : { memoryId }),
+    ...(chunkId === undefined ? {} : { chunkId }),
+    kind: topicGraphEdgeKindField(row, "kind"),
+    weight: realField(row, "weight"),
+    label: stringField(row, "label"),
+    createdAt: stringField(row, "created_at"),
+  };
+}
+
 function anchorFromRow(row: SqlRow): AnchorInfo {
   const xpath = optionalString(row, "xpath");
   const textFragment = optionalString(row, "text_fragment");
@@ -2247,6 +2734,23 @@ function parseStringArray(input: string): string[] {
   return parseJsonArray(input).flatMap((item) => (typeof item === "string" ? [item] : []));
 }
 
+function parseTopicSourceRefs(input: string): TopicPageSourceRef[] {
+  return normalizeTopicSourceRefs(
+    parseJsonArray(input).flatMap((item) => {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) return [];
+      const record = item as Record<string, unknown>;
+      if (typeof record.memoryId !== "string") return [];
+      return [
+        {
+          memoryId: record.memoryId,
+          ...(typeof record.chunkId === "string" ? { chunkId: record.chunkId } : {}),
+          ...(typeof record.quote === "string" ? { quote: record.quote } : {}),
+        },
+      ];
+    }),
+  );
+}
+
 function parseCoveredEvidence(input: string) {
   return parseJsonArray(input).flatMap((item) => {
     if (typeof item !== "object" || item === null || Array.isArray(item)) return [];
@@ -2324,6 +2828,14 @@ function numberField(row: SqlRow, key: string) {
   return 0;
 }
 
+function realField(row: SqlRow, key: string) {
+  const value = row[key];
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "string") return Number.parseFloat(value) || 0;
+  return 0;
+}
+
 function sourceKindField(row: SqlRow, key: string): SourceKind {
   return stringField(row, key) === "selection" ? "selection" : "page";
 }
@@ -2336,6 +2848,18 @@ function jobStatusField(row: SqlRow, key: string): JobStatus {
   const value = stringField(row, key);
   if (value === "running" || value === "done" || value === "failed") return value;
   return "queued";
+}
+
+function wikiCompileJobStatusField(row: SqlRow, key: string): WikiCompileJobStatus {
+  const value = stringField(row, key);
+  if (value === "running" || value === "done" || value === "failed") return value;
+  return "queued";
+}
+
+function topicGraphEdgeKindField(row: SqlRow, key: string): TopicGraphEdgeKind {
+  const value = stringField(row, key);
+  if (value === "related" || value === "mentions") return value;
+  return "source";
 }
 
 function jobTypeField(row: SqlRow, key: string): JobType {
@@ -2373,6 +2897,320 @@ function agentScopeField(row: SqlRow, key: string): ChatMessageRecord["scope"] {
 function clampLimit(limit: number, max: number) {
   if (!Number.isFinite(limit)) return max;
   return Math.max(1, Math.min(Math.floor(limit), max));
+}
+
+function normalizeTopicTitle(value: string) {
+  const title = normalizeText(value).slice(0, 120);
+  if (title.length === 0) {
+    throw new EngineRpcError("EMPTY_TOPIC_TITLE", "Topic title is required.");
+  }
+  return title;
+}
+
+function normalizeTopicText(value: string, maxLength: number) {
+  return normalizeText(value).slice(0, maxLength);
+}
+
+function createTopicPageRow(db: SqliteDb, payload: CreateTopicPagePayload): SqlRow {
+  const title = normalizeTopicTitle(payload.title);
+  const now = new Date().toISOString();
+  const createdAt = normalizeOptionalIso(payload.createdAt) ?? now;
+  const updatedAt = normalizeOptionalIso(payload.updatedAt) ?? createdAt;
+  const id = payload.id ?? createId("topic");
+  const slug = uniqueTopicSlug(db, payload.slug ?? title, id);
+  const summary = normalizeTopicText(payload.summary ?? "", 800);
+  const content = normalizeTopicText(payload.content ?? "", 100_000);
+  const sourceRefs = normalizeTopicSourceRefs(payload.sourceRefs ?? []);
+
+  db.exec({
+    sql: `INSERT INTO topic_pages (
+      id,
+      slug,
+      title,
+      summary,
+      content,
+      source_refs_json,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    bind: [id, slug, title, summary, content, JSON.stringify(sourceRefs), createdAt, updatedAt],
+  });
+
+  const row = db.selectObject("SELECT * FROM topic_pages WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) {
+    throw new EngineRpcError("TOPIC_CREATE_FAILED", "Topic page was not saved.");
+  }
+  return row;
+}
+
+function updateTopicPageRow(
+  db: SqliteDb,
+  id: string,
+  payload: UpdateTopicPagePayload,
+): SqlRow | undefined {
+  const existing = db.selectObject("SELECT * FROM topic_pages WHERE id = ? LIMIT 1", [id]);
+  if (existing === undefined) return undefined;
+
+  const title =
+    payload.title === undefined
+      ? stringField(existing, "title")
+      : normalizeTopicTitle(payload.title);
+  const slug =
+    payload.slug === undefined
+      ? stringField(existing, "slug")
+      : uniqueTopicSlug(db, payload.slug, id);
+  const summary =
+    payload.summary === undefined
+      ? stringField(existing, "summary")
+      : normalizeTopicText(payload.summary, 800);
+  const content =
+    payload.content === undefined
+      ? stringField(existing, "content")
+      : normalizeTopicText(payload.content, 100_000);
+  const sourceRefs =
+    payload.sourceRefs === undefined
+      ? parseTopicSourceRefs(stringField(existing, "source_refs_json"))
+      : normalizeTopicSourceRefs(payload.sourceRefs);
+  const updatedAt = normalizeOptionalIso(payload.updatedAt) ?? new Date().toISOString();
+
+  db.exec({
+    sql: `UPDATE topic_pages
+          SET slug = ?,
+              title = ?,
+              summary = ?,
+              content = ?,
+              source_refs_json = ?,
+              updated_at = ?
+          WHERE id = ?`,
+    bind: [slug, title, summary, content, JSON.stringify(sourceRefs), updatedAt, id],
+  });
+
+  return db.selectObject("SELECT * FROM topic_pages WHERE id = ? LIMIT 1", [id]);
+}
+
+function compileTopicCreatePayload(
+  job: SqlRow,
+  result: WikiCompileResultPayload,
+  sourceRefs: TopicPageSourceRef[],
+  completedAt: string,
+): CreateTopicPagePayload {
+  const topic = result.topic ?? {};
+  const title =
+    typeof topic.title === "string" && normalizeText(topic.title).length > 0
+      ? topic.title
+      : stringField(job, "query");
+  const topicId = "id" in topic && typeof topic.id === "string" ? topic.id : undefined;
+  return {
+    ...(topicId === undefined ? {} : { id: topicId }),
+    ...(typeof topic.slug === "string" ? { slug: topic.slug } : {}),
+    title,
+    summary: typeof topic.summary === "string" ? topic.summary : "",
+    content: typeof topic.content === "string" ? topic.content : "",
+    sourceRefs,
+    createdAt: completedAt,
+    updatedAt: completedAt,
+  };
+}
+
+function compileTopicUpdatePayload(result: WikiCompileResultPayload): UpdateTopicPagePayload {
+  const topic = result.topic ?? {};
+  return {
+    ...(typeof topic.slug === "string" ? { slug: topic.slug } : {}),
+    ...(typeof topic.title === "string" ? { title: topic.title } : {}),
+    ...(typeof topic.summary === "string" ? { summary: topic.summary } : {}),
+    ...(typeof topic.content === "string" ? { content: topic.content } : {}),
+  };
+}
+
+function compileSourceRefs(result: WikiCompileResultPayload): TopicPageSourceRef[] {
+  const topicSourceRefs =
+    result.topic !== undefined &&
+    "sourceRefs" in result.topic &&
+    result.topic.sourceRefs !== undefined
+      ? result.topic.sourceRefs
+      : [];
+  return normalizeTopicSourceRefs([...(result.sourceRefs ?? []), ...topicSourceRefs]);
+}
+
+function refreshTopicGraphEdges(
+  db: SqliteDb,
+  topicId: string,
+  sourceRefs: TopicPageSourceRef[],
+  edgeInputs: TopicGraphEdgeInput[],
+  createdAt: string,
+) {
+  db.exec({
+    sql: "DELETE FROM topic_graph_edges WHERE from_topic_id = ?",
+    bind: [topicId],
+  });
+
+  const edges = normalizeTopicGraphEdges(topicId, sourceRefs, edgeInputs, createdAt);
+  for (const edge of edges) {
+    db.exec({
+      sql: `INSERT INTO topic_graph_edges (
+        id,
+        from_topic_id,
+        to_topic_id,
+        memory_id,
+        chunk_id,
+        kind,
+        weight,
+        label,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      bind: [
+        edge.id,
+        edge.fromTopicId,
+        edge.toTopicId ?? null,
+        edge.memoryId ?? null,
+        edge.chunkId ?? null,
+        edge.kind,
+        edge.weight,
+        edge.label,
+        edge.createdAt,
+      ],
+    });
+  }
+}
+
+function normalizeTopicSourceRefs(refs: TopicPageSourceRef[]): TopicPageSourceRef[] {
+  const seen = new Set<string>();
+  return refs.slice(0, 100).flatMap((ref) => {
+    const memoryId = normalizeText(ref.memoryId);
+    if (memoryId.length === 0) return [];
+    const chunkId = ref.chunkId === undefined ? undefined : normalizeText(ref.chunkId);
+    const quote = ref.quote === undefined ? undefined : normalizeTopicText(ref.quote, 500);
+    const key = `${memoryId}:${chunkId ?? ""}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [
+      {
+        memoryId,
+        ...(chunkId === undefined || chunkId.length === 0 ? {} : { chunkId }),
+        ...(quote === undefined || quote.length === 0 ? {} : { quote }),
+      },
+    ];
+  });
+}
+
+function normalizeTopicGraphEdges(
+  topicId: string,
+  sourceRefs: TopicPageSourceRef[],
+  edgeInputs: TopicGraphEdgeInput[],
+  createdAt: string,
+): TopicGraphEdge[] {
+  const seen = new Set<string>();
+  const sourceEdges: TopicGraphEdgeInput[] = sourceRefs.map((ref) => ({
+    kind: "source" as const,
+    memoryId: ref.memoryId,
+    chunkId: ref.chunkId,
+    label: ref.quote,
+    weight: 1,
+  }));
+  return [...sourceEdges, ...edgeInputs].slice(0, 200).flatMap((input) => {
+    const kind = normalizeTopicGraphEdgeKind(input.kind);
+    const fromTopicId = topicId;
+    const toTopicId =
+      input.toTopicId === undefined ? undefined : normalizeText(input.toTopicId).slice(0, 200);
+    const memoryId =
+      input.memoryId === undefined ? undefined : normalizeText(input.memoryId).slice(0, 200);
+    const chunkId =
+      input.chunkId === undefined ? undefined : normalizeText(input.chunkId).slice(0, 200);
+    if (
+      (toTopicId === undefined || toTopicId.length === 0) &&
+      (memoryId === undefined || memoryId.length === 0)
+    ) {
+      return [];
+    }
+    const key = `${fromTopicId}:${kind}:${toTopicId ?? ""}:${memoryId ?? ""}:${chunkId ?? ""}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [
+      {
+        id: input.id ?? createId("topic_edge"),
+        fromTopicId,
+        ...(toTopicId === undefined || toTopicId.length === 0 ? {} : { toTopicId }),
+        ...(memoryId === undefined || memoryId.length === 0 ? {} : { memoryId }),
+        ...(chunkId === undefined || chunkId.length === 0 ? {} : { chunkId }),
+        kind,
+        weight: normalizeTopicGraphWeight(input.weight),
+        label: normalizeTopicText(input.label ?? "", 200),
+        createdAt: normalizeOptionalIso(input.createdAt) ?? createdAt,
+      },
+    ];
+  });
+}
+
+function normalizeTopicGraphEdgeKind(value: TopicGraphEdgeKind): TopicGraphEdgeKind {
+  if (value === "related" || value === "mentions") return value;
+  return "source";
+}
+
+function normalizeTopicGraphWeight(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value)) return 1;
+  return Math.max(0, Math.min(1, value));
+}
+
+function normalizeWikiCompileQuery(value: string) {
+  const query = normalizeTopicText(value, 500);
+  if (query.length === 0) {
+    throw new EngineRpcError("EMPTY_WIKI_QUERY", "Wiki compile query is required.");
+  }
+  return query;
+}
+
+function normalizeWikiSourceMemoryIds(values: string[]) {
+  const seen = new Set<string>();
+  return values.slice(0, 50).flatMap((value) => {
+    const id = normalizeText(value);
+    if (id.length === 0 || seen.has(id)) return [];
+    seen.add(id);
+    return [id];
+  });
+}
+
+function normalizeWikiMaxAttempts(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value)) return defaultJobMaxAttempts;
+  return Math.max(1, Math.min(10, Math.floor(value)));
+}
+
+function normalizeTopicSlug(value: string) {
+  const ascii = normalizeText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  if (ascii.length > 0) return ascii;
+  const fallback = Array.from(normalizeText(value))
+    .map((char) => char.codePointAt(0)?.toString(36) ?? "")
+    .filter((part) => part.length > 0)
+    .join("-")
+    .slice(0, 80)
+    .replace(/^-+|-+$/g, "");
+  return fallback.length > 0 ? fallback : "topic";
+}
+
+function uniqueTopicSlug(db: SqliteDb, value: string, id: string) {
+  const base = normalizeTopicSlug(value);
+  let slug = base;
+  let suffix = 2;
+  while (true) {
+    const row = db.selectObject("SELECT id FROM topic_pages WHERE slug = ? LIMIT 1", [slug]);
+    if (row === undefined || stringField(row, "id") === id) return slug;
+    const suffixText = `-${suffix}`;
+    slug = `${base.slice(0, Math.max(1, 80 - suffixText.length))}${suffixText}`;
+    suffix += 1;
+  }
+}
+
+function normalizeOptionalIso(value: string | undefined) {
+  if (value === undefined) return undefined;
+  const normalized = normalizeText(value);
+  return normalized.length === 0 ? undefined : normalized;
+}
+
+function escapeLikePattern(value: string) {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
 }
 
 function createId(prefix: string) {

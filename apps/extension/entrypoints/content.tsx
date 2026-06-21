@@ -42,6 +42,19 @@ import {
   stopInterruptedAssistant,
 } from "@/src/rail/api/chat-session";
 import { toSearchItem } from "@/src/rail/api/local-memory";
+import {
+  type TopicPageFormState,
+  type WikiCompileFormState,
+  buildWikiCompileQuestion,
+  buildWikiCompileResult,
+  createTopicPayloadFromForm,
+  createWikiCompilePayloadFromForm,
+  emptyTopicPageForm,
+  emptyWikiCompileForm,
+  topicDetailToForm,
+  topicDetailToWikiCompileForm,
+  updateTopicPayloadFromForm,
+} from "@/src/rail/api/local-topic";
 import { type RailCommand, createRailCommands } from "@/src/rail/app/command-registry";
 import { type ToastState, errorToast } from "@/src/rail/app/feedback";
 import type { MarkdownSource } from "@/src/rail/app/markdown-sources";
@@ -130,7 +143,11 @@ import {
   type ImageGenerationHistoryRecord,
   type MemoryDetail,
   type SearchMemoryItem,
+  type TopicGraphEdge,
+  type TopicPageDetail,
+  type TopicPageSummary,
   type WebSearchHistoryRecord,
+  type WikiCompileJobSummary,
   isContentCommandMessage,
 } from "@/src/shared/rpc";
 import { excerpt, hashText, normalizeText } from "@/src/shared/text";
@@ -389,6 +406,30 @@ function evidenceRecordToAgentEvidence(record: {
   };
 }
 
+function memoryDetailToAgentEvidence(memory: MemoryDetail): EvidenceItem {
+  return {
+    id: memory.id,
+    sourceKind: memory.sourceKind,
+    sourceUrl: memory.sourceUrl,
+    sourceTitle: memory.sourceTitle,
+    text: memory.normalizedText,
+    excerpt: memory.excerpt,
+    ...(memory.anchor === undefined
+      ? {}
+      : {
+          anchor: {
+            selectedText: memory.anchor.selectedText,
+            contextBefore: memory.anchor.contextBefore,
+            contextAfter: memory.anchor.contextAfter,
+            ...(memory.anchor.xpath === undefined ? {} : { xpath: memory.anchor.xpath }),
+            ...(memory.anchor.textFragment === undefined
+              ? {}
+              : { textFragment: memory.anchor.textFragment }),
+          },
+        }),
+  };
+}
+
 function buildAttachedEvidence(
   kind: ComposerContextAttachmentKind | undefined,
   pageContext: { url: string; title: string },
@@ -581,6 +622,15 @@ function ClioContentApp() {
   );
   const [selection, setSelection] = React.useState<SelectionState | null>(null);
   const [items, setItems] = React.useState<SearchMemoryItem[]>([]);
+  const [topicPages, setTopicPages] = React.useState<TopicPageSummary[]>([]);
+  const [topicDetail, setTopicDetail] = React.useState<TopicPageDetail | null>(null);
+  const [topicForm, setTopicForm] = React.useState<TopicPageFormState>(emptyTopicPageForm);
+  const [topicFormOpen, setTopicFormOpen] = React.useState(false);
+  const [wikiCompileForm, setWikiCompileForm] =
+    React.useState<WikiCompileFormState>(emptyWikiCompileForm);
+  const [wikiCompileJobs, setWikiCompileJobs] = React.useState<WikiCompileJobSummary[]>([]);
+  const [topicGraphEdges, setTopicGraphEdges] = React.useState<TopicGraphEdge[]>([]);
+  const [wikiCompileRunning, setWikiCompileRunning] = React.useState(false);
   const [relatedItems, setRelatedItems] = React.useState<SearchMemoryItem[]>([]);
   const [chatSessions, setChatSessions] = React.useState<ChatSessionSummary[]>([]);
   const [detail, setDetail] = React.useState<MemoryDetail | null>(null);
@@ -614,6 +664,7 @@ function ClioContentApp() {
   const railWidthRef = React.useRef(railWidth);
   const collapsedLauncherPositionRef = React.useRef(collapsedLauncherPosition);
   const activeAgentStreamRef = React.useRef<AgentStreamController | null>(null);
+  const activeWikiCompileStreamRef = React.useRef<AgentStreamController | null>(null);
   const activeWebSearchStreamRef = React.useRef<WebSearchStreamController | null>(null);
   const activeImageGenerationStreamRef = React.useRef<ImageGenerationStreamController | null>(null);
   const ownerIdRef = React.useRef<string | null>(null);
@@ -630,6 +681,7 @@ function ClioContentApp() {
   React.useEffect(() => {
     return () => {
       activeAgentStreamRef.current?.close();
+      activeWikiCompileStreamRef.current?.close();
       activeWebSearchStreamRef.current?.close();
       activeImageGenerationStreamRef.current?.close();
     };
@@ -725,10 +777,21 @@ function ClioContentApp() {
     async (nextQuery = railState.query) => {
       dispatch({ type: "SET_LOADING", loading: true });
       try {
+        const topicResult = await requestEngine({
+          kind: "listTopicPages",
+          query: nextQuery.trim().length > 0 ? nextQuery : undefined,
+          limit: 40,
+        });
+        const wikiJobsResult = await requestEngine({
+          kind: "listWikiCompileJobs",
+          limit: 8,
+        });
         const result =
           nextQuery.trim().length > 0
             ? await requestEngine({ kind: "searchMemory", query: nextQuery, limit: 40 })
             : await requestEngine({ kind: "listMemories", limit: 40 });
+        setTopicPages(topicResult.items);
+        setWikiCompileJobs(wikiJobsResult.jobs);
         setItems(result.items.map(toSearchItem));
       } catch (error) {
         showToast(errorToast(error));
@@ -1356,6 +1419,109 @@ function ClioContentApp() {
     [showToast],
   );
 
+  const openTopicDetail = React.useCallback(
+    async (id: string) => {
+      dispatch({ type: "SET_LOADING", loading: true });
+      try {
+        const next = await requestEngine({ kind: "getTopicPage", id });
+        if (next === null) {
+          showToast({ tone: "warning", message: "Topic page was not found." });
+          await loadLibrary(railState.query);
+          return;
+        }
+        const edges = await requestEngine({
+          kind: "listTopicGraphEdges",
+          topicId: id,
+        });
+        setTopicDetail(next);
+        setTopicForm(topicDetailToForm(next));
+        setWikiCompileForm(topicDetailToWikiCompileForm(next));
+        setTopicGraphEdges(edges.edges);
+        setTopicFormOpen(false);
+      } catch (error) {
+        showToast(errorToast(error));
+      } finally {
+        dispatch({ type: "SET_LOADING", loading: false });
+      }
+    },
+    [loadLibrary, railState.query, showToast],
+  );
+
+  const createTopicPage = React.useCallback(async () => {
+    setTopicDetail(null);
+    setTopicForm(emptyTopicPageForm);
+    setWikiCompileForm(emptyWikiCompileForm);
+    setTopicGraphEdges([]);
+    setTopicFormOpen(true);
+  }, []);
+
+  const editTopicPage = React.useCallback((page: TopicPageDetail) => {
+    setTopicDetail(page);
+    setTopicForm(topicDetailToForm(page));
+    setTopicFormOpen(true);
+  }, []);
+
+  const saveTopicPage = React.useCallback(
+    async (form: TopicPageFormState, id?: string) => {
+      dispatch({ type: "SET_LOADING", loading: true });
+      try {
+        const next =
+          id === undefined
+            ? await requestEngine({
+                kind: "createTopicPage",
+                payload: createTopicPayloadFromForm(form),
+              })
+            : await requestEngine({
+                kind: "updateTopicPage",
+                id,
+                payload: updateTopicPayloadFromForm(form),
+              });
+        if (next === null) {
+          showToast({ tone: "warning", message: "Topic page was not found." });
+          return;
+        }
+        setTopicDetail(next);
+        setTopicForm(topicDetailToForm(next));
+        setWikiCompileForm(topicDetailToWikiCompileForm(next));
+        const edges = await requestEngine({
+          kind: "listTopicGraphEdges",
+          topicId: next.id,
+        });
+        setTopicGraphEdges(edges.edges);
+        setTopicFormOpen(false);
+        await loadLibrary(railState.query);
+        showToast({ tone: "success", message: "Topic page saved." });
+      } catch (error) {
+        showToast(errorToast(error));
+      } finally {
+        dispatch({ type: "SET_LOADING", loading: false });
+      }
+    },
+    [loadLibrary, railState.query, showToast],
+  );
+
+  const deleteTopicPage = React.useCallback(
+    async (id: string) => {
+      if (!window.confirm("Delete this Clio topic page? Source memories are kept.")) return;
+      dispatch({ type: "SET_LOADING", loading: true });
+      try {
+        await requestEngine({ kind: "deleteTopicPage", id });
+        setTopicDetail(null);
+        setTopicForm(emptyTopicPageForm);
+        setWikiCompileForm(emptyWikiCompileForm);
+        setTopicGraphEdges([]);
+        setTopicFormOpen(false);
+        await loadLibrary(railState.query);
+        showToast({ tone: "success", message: "Topic page deleted." });
+      } catch (error) {
+        showToast(errorToast(error));
+      } finally {
+        dispatch({ type: "SET_LOADING", loading: false });
+      }
+    },
+    [loadLibrary, railState.query, showToast],
+  );
+
   const deleteMemory = React.useCallback(
     async (id: string) => {
       if (!window.confirm("Delete this local Clio memory? This cannot be undone.")) return;
@@ -1414,6 +1580,209 @@ function ClioContentApp() {
       }
     },
     [showToast],
+  );
+
+  const openTopicSource = React.useCallback(
+    async (memoryId: string) => {
+      try {
+        const memory = await requestEngine({ kind: "getMemory", id: memoryId });
+        if (memory === null) {
+          showToast({ tone: "warning", message: "Source memory was not found." });
+          return;
+        }
+        await openSource(memory);
+      } catch (error) {
+        showToast(errorToast(error));
+      }
+    },
+    [openSource, showToast],
+  );
+
+  const compileTopicWithAI = React.useCallback(
+    async (form: WikiCompileFormState, topicId?: string) => {
+      const query = normalizeText(form.query);
+      if (query.length === 0) {
+        showToast({ tone: "warning", message: "Enter a topic query before compiling." });
+        return;
+      }
+      if (activeWikiCompileStreamRef.current !== null || wikiCompileRunning) {
+        showToast({ tone: "warning", message: "Wait for the current Wiki compile to finish." });
+        return;
+      }
+
+      setWikiCompileRunning(true);
+      dispatch({ type: "SET_LOADING", loading: true });
+      let job: WikiCompileJobSummary | null = null;
+      try {
+        const candidates =
+          topicId !== undefined && topicDetail?.sourceRefs.length
+            ? topicDetail.sourceRefs.map((ref) => ref.memoryId)
+            : [];
+        job = await requestEngine({
+          kind: "enqueueWikiCompile",
+          payload: createWikiCompilePayloadFromForm(form, topicId, candidates),
+        });
+        setWikiCompileJobs((jobs) => [job as WikiCompileJobSummary, ...jobs].slice(0, 8));
+        const claimed = await requestEngine({ kind: "claimNextWikiCompileJob", id: job.id });
+        if (claimed === null || claimed.id !== job.id) {
+          showToast({ tone: "warning", message: "Wiki compile was queued." });
+          await loadLibrary(railState.query);
+          setWikiCompileRunning(false);
+          dispatch({ type: "SET_LOADING", loading: false });
+          return;
+        }
+        job = claimed;
+        setWikiCompileJobs((jobs) => [claimed, ...jobs.filter((item) => item.id !== claimed.id)]);
+
+        const sourceMemoryIds =
+          claimed.sourceMemoryIds.length > 0
+            ? claimed.sourceMemoryIds
+            : (await requestEngine({ kind: "searchMemory", query, limit: 8 })).items.map(
+                (item) => item.id,
+              );
+        const evidenceDetails = await Promise.all(
+          sourceMemoryIds.slice(0, 8).map((id) => requestEngine({ kind: "getMemory", id })),
+        );
+        const evidence = evidenceDetails
+          .flatMap((memory) => (memory === null ? [] : [memoryDetailToAgentEvidence(memory)]))
+          .slice(0, 8);
+        if (evidence.length === 0) {
+          await requestEngine({
+            kind: "failWikiCompileJob",
+            id: claimed.id,
+            error: "No saved memories matched this topic.",
+          });
+          await loadLibrary(railState.query);
+          showToast({ tone: "warning", message: "Save or search matching memories first." });
+          setWikiCompileRunning(false);
+          dispatch({ type: "SET_LOADING", loading: false });
+          return;
+        }
+
+        const runId = `wiki-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+        const createdAt = new Date().toISOString();
+        const output: string[] = [];
+        const citations: Parameters<typeof buildWikiCompileResult>[0]["citations"] = [];
+        const pageContext = railState.activePageContext;
+        const request: AgentChatRequest = {
+          runId,
+          question: buildWikiCompileQuestion({
+            query: claimed.query,
+            instructions: claimed.instructions,
+            evidence,
+          }),
+          scope: "current-page",
+          pageUrl: pageContext.url,
+          pageTitle: pageContext.title,
+          evidence,
+          createdAt,
+        };
+
+        activeWikiCompileStreamRef.current = openAgentStream(request, {
+          onEvent: (event) => {
+            if (event.type === "text_delta") {
+              output.push(event.delta);
+              return;
+            }
+            if (event.type === "citation") {
+              citations.push(event.citation);
+              return;
+            }
+            if (event.type === "run_completed") {
+              activeWikiCompileStreamRef.current = null;
+              void requestEngine({
+                kind: "completeWikiCompileJob",
+                id: claimed.id,
+                result: buildWikiCompileResult({
+                  job: claimed,
+                  text: output.join(""),
+                  evidence,
+                  citations,
+                }),
+              })
+                .then(async ({ job: completedJob, topic }) => {
+                  setTopicDetail(topic);
+                  setTopicForm(topicDetailToForm(topic));
+                  setWikiCompileForm(topicDetailToWikiCompileForm(topic));
+                  const edges = await requestEngine({
+                    kind: "listTopicGraphEdges",
+                    topicId: topic.id,
+                  });
+                  setTopicGraphEdges(edges.edges);
+                  setWikiCompileJobs((jobs) => [
+                    completedJob,
+                    ...jobs.filter((item) => item.id !== completedJob.id),
+                  ]);
+                  await loadLibrary(railState.query);
+                  showToast({ tone: "success", message: "Wiki topic compiled." });
+                })
+                .catch((error) => showToast(errorToast(error)))
+                .finally(() => {
+                  setWikiCompileRunning(false);
+                  dispatch({ type: "SET_LOADING", loading: false });
+                });
+              return;
+            }
+            if (event.type === "run_failed" || event.type === "run_cancelled") {
+              activeWikiCompileStreamRef.current = null;
+              const message =
+                event.type === "run_failed"
+                  ? event.error.message
+                  : (event.reason ?? "Wiki compile cancelled.");
+              void requestEngine({
+                kind: "failWikiCompileJob",
+                id: claimed.id,
+                error: message,
+              })
+                .then((failedJob) => {
+                  if (failedJob !== null) {
+                    setWikiCompileJobs((jobs) => [
+                      failedJob,
+                      ...jobs.filter((item) => item.id !== failedJob.id),
+                    ]);
+                  }
+                  showToast({ tone: "warning", message });
+                })
+                .catch((error) => showToast(errorToast(error)))
+                .finally(() => {
+                  setWikiCompileRunning(false);
+                  dispatch({ type: "SET_LOADING", loading: false });
+                });
+            }
+          },
+          onTransportError: (error) => {
+            activeWikiCompileStreamRef.current = null;
+            void requestEngine({
+              kind: "failWikiCompileJob",
+              id: claimed.id,
+              error: error.message,
+            }).catch(() => undefined);
+            setWikiCompileRunning(false);
+            dispatch({ type: "SET_LOADING", loading: false });
+            showToast(errorToast(error));
+          },
+        });
+      } catch (error) {
+        if (job !== null) {
+          await requestEngine({
+            kind: "failWikiCompileJob",
+            id: job.id,
+            error: error instanceof Error ? error.message : String(error),
+          }).catch(() => undefined);
+        }
+        setWikiCompileRunning(false);
+        dispatch({ type: "SET_LOADING", loading: false });
+        showToast(errorToast(error));
+      }
+    },
+    [
+      loadLibrary,
+      railState.activePageContext,
+      railState.query,
+      showToast,
+      topicDetail,
+      wikiCompileRunning,
+    ],
   );
 
   const handleSubmitWebSearch = React.useCallback(
@@ -2581,6 +2950,14 @@ function ClioContentApp() {
         imageGenerationSettings={imageGenerationSettings}
         imageGenerationState={imageGenerationState}
         items={items}
+        topicDetail={topicDetail}
+        topicForm={topicForm}
+        topicFormOpen={topicFormOpen}
+        topicGraphEdges={topicGraphEdges}
+        topicPages={topicPages}
+        wikiCompileForm={wikiCompileForm}
+        wikiCompileJobs={wikiCompileJobs}
+        wikiCompileRunning={wikiCompileRunning}
         onAcceptPageChange={handleAcceptPageChange}
         onBackToHome={() => {
           setDetail(null);
@@ -2603,6 +2980,7 @@ function ClioContentApp() {
         onComposerPrefillConsumed={handleComposerPrefillConsumed}
         onClearComposerSkillMode={() => dispatch({ type: "CLEAR_COMPOSER_SKILL_MODE" })}
         onDelete={(id) => void deleteMemory(id)}
+        onDeleteTopicPage={(id) => void deleteTopicPage(id)}
         onDeleteImageGenerationHistory={(id) => void handleDeleteImageGenerationHistory(id)}
         onCloseCommandPalette={() => dispatch({ type: "CLOSE_COMMAND_PALETTE" })}
         onComposerInputChange={handleComposerInputChange}
@@ -2624,6 +3002,15 @@ function ClioContentApp() {
         onOpenSettings={openSettings}
         onImagePromptPrefillConsumed={() => dispatch({ type: "CLEAR_IMAGE_PROMPT_PREFILL" })}
         onOpenSource={(memory) => void openSource(memory)}
+        onOpenTopicPage={(id) => void openTopicDetail(id)}
+        onCreateTopicPage={() => void createTopicPage()}
+        onCancelTopicForm={() => setTopicFormOpen(false)}
+        onEditTopicPage={(page) => editTopicPage(page)}
+        onSaveTopicPage={(form, id) => void saveTopicPage(form, id)}
+        onTopicFormChange={setTopicForm}
+        onWikiCompileFormChange={setWikiCompileForm}
+        onCompileTopicWithAI={(form, topicId) => void compileTopicWithAI(form, topicId)}
+        onOpenTopicSource={(memoryId) => void openTopicSource(memoryId)}
         onQueryChange={(query) => dispatch({ type: "SET_QUERY", query })}
         onRefresh={() => void loadLibrary(railState.query)}
         onRefreshProvider={refreshSettingsProviders}

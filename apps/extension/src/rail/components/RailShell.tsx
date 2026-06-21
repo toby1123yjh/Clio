@@ -33,6 +33,15 @@ import type { AgentToolTrace } from "@/src/agent-runtime/types";
 import type { ComposerContextAttachmentKind } from "@/src/rail/api/chat-session";
 import { formatDate } from "@/src/rail/api/local-memory";
 import {
+  type TopicFormMode,
+  type TopicPageFormState,
+  type WikiCompileFormState,
+  emptyTopicPageForm,
+  topicGraphEdgeLabel,
+  topicSummaryLabel,
+  wikiJobStatusLabel,
+} from "@/src/rail/api/local-topic";
+import {
   buildAgentActivitySnapshot,
   formatExplicitToolTraceMeta,
   formatToolTraceStatus,
@@ -90,7 +99,11 @@ import type {
   ImageGenerationHistoryRecord,
   MemoryDetail,
   SearchMemoryItem,
+  TopicGraphEdge,
+  TopicPageDetail,
+  TopicPageSummary,
   WebSearchHistoryRecord,
+  WikiCompileJobSummary,
 } from "@/src/shared/rpc";
 import type { ReplyActionSuggestion } from "@/src/suggestions/suggestion-types";
 import {
@@ -128,8 +141,10 @@ import {
   Moon,
   PanelRightClose,
   Paperclip,
+  Pencil,
   Plus,
   RefreshCw,
+  Save,
   Search,
   Settings,
   ShieldAlert,
@@ -149,12 +164,17 @@ export interface RailShellProps {
   state: RailState;
   health: EngineHealth | null;
   items: SearchMemoryItem[];
+  topicPages: TopicPageSummary[];
   relatedItems: SearchMemoryItem[];
   chatSessions: ChatSessionSummary[];
   railCommands: RailCommand[];
   slashCommands: SlashCommand[];
   slashContext: SlashCommandContext;
   detail: MemoryDetail | null;
+  topicDetail: TopicPageDetail | null;
+  topicForm: TopicPageFormState;
+  topicFormOpen: boolean;
+  topicGraphEdges: TopicGraphEdge[];
   railWidth: number;
   collapsedDragPoint: CollapsedLauncherDragPoint | null;
   collapsedSide: CollapsedLauncherSide;
@@ -166,6 +186,9 @@ export interface RailShellProps {
   imageGenerationState: ImageGenerationDisplayState;
   webSearchHistory: WebSearchHistoryRecord[];
   webSearchState: WebSearchDisplayState;
+  wikiCompileForm: WikiCompileFormState;
+  wikiCompileJobs: WikiCompileJobSummary[];
+  wikiCompileRunning: boolean;
   providerLoading: boolean;
   providerMessage: string | null;
   railTheme: RailTheme;
@@ -182,12 +205,22 @@ export interface RailShellProps {
   onCancelDialogue: () => void;
   onClearDialogue: () => void;
   onDelete: (id: string) => void;
+  onDeleteTopicPage: (id: string) => void;
   onExecuteCommand: (command: RailCommand) => void;
   onKeepPreviousPage: () => void;
   onOpenChatHistory: () => void;
   onOpenChatSession: (sessionId: string) => void;
   onOpenDetail: (id: string) => void;
   onOpenKnowledgeBase: () => void;
+  onOpenTopicPage: (id: string) => void;
+  onCreateTopicPage: () => void;
+  onCancelTopicForm: () => void;
+  onEditTopicPage: (page: TopicPageDetail) => void;
+  onSaveTopicPage: (form: TopicPageFormState, id?: string) => void;
+  onTopicFormChange: (form: TopicPageFormState) => void;
+  onWikiCompileFormChange: (form: WikiCompileFormState) => void;
+  onCompileTopicWithAI: (form: WikiCompileFormState, topicId?: string) => void;
+  onOpenTopicSource: (memoryId: string) => void;
   onOpenMarkdownPreview: (messageId: string) => void;
   onReplySuggestion: (suggestion: ReplyActionSuggestion) => void;
   onCloseMarkdownPreview: () => void;
@@ -3402,6 +3435,11 @@ function searchProviderLabel(provider: SearchProviderId) {
 }
 
 function KnowledgeBasePanel(props: RailShellProps) {
+  const [section, setSection] = React.useState<"memories" | "topics">("memories");
+  const topicCountLabel =
+    props.topicPages.length === 0 ? "No topic pages" : `${props.topicPages.length} topic pages`;
+  const memoryCountLabel =
+    props.items.length === 0 ? "Local memory" : `${props.items.length} local items`;
   return (
     <div className="relative z-10 flex min-h-0 flex-1 flex-col" data-clio-panel="knowledge-base">
       <div className="flex h-[62px] shrink-0 items-center justify-between border-b border-border px-5">
@@ -3412,7 +3450,7 @@ function KnowledgeBasePanel(props: RailShellProps) {
           <div className="min-w-0 leading-tight">
             <h3 className="truncate text-[20px] font-semibold leading-7">Knowledge Base</h3>
             <p className="truncate text-[11px] text-muted-foreground">
-              {props.items.length === 0 ? "Local memory" : `${props.items.length} local items`}
+              {section === "topics" ? topicCountLabel : memoryCountLabel}
             </p>
           </div>
         </div>
@@ -3433,6 +3471,36 @@ function KnowledgeBasePanel(props: RailShellProps) {
       <div className="clio-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden px-6 py-4">
         {renderRoutePrompt(props)}
         <InlineHealthBanner health={props.health} onOpenSettings={props.onOpenSettings} />
+        <div className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-surface p-1">
+          <button
+            aria-pressed={section === "memories"}
+            className={[
+              "flex h-9 items-center justify-center gap-1.5 rounded-md text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary",
+              section === "memories"
+                ? "bg-background text-foreground shadow-[0_1px_2px_rgba(15,15,15,0.08)]"
+                : "text-muted-foreground hover:bg-muted hover:text-foreground",
+            ].join(" ")}
+            onClick={() => setSection("memories")}
+            type="button"
+          >
+            <FileText size={14} />
+            Memories
+          </button>
+          <button
+            aria-pressed={section === "topics"}
+            className={[
+              "flex h-9 items-center justify-center gap-1.5 rounded-md text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary",
+              section === "topics"
+                ? "bg-background text-foreground shadow-[0_1px_2px_rgba(15,15,15,0.08)]"
+                : "text-muted-foreground hover:bg-muted hover:text-foreground",
+            ].join(" ")}
+            onClick={() => setSection("topics")}
+            type="button"
+          >
+            <BookOpen size={14} />
+            Topics
+          </button>
+        </div>
         <div className="grid grid-cols-2 gap-2">
           <Button
             className="border border-border bg-surface text-foreground hover:bg-muted"
@@ -3453,6 +3521,17 @@ function KnowledgeBasePanel(props: RailShellProps) {
             Save selection
           </Button>
         </div>
+        {section === "topics" ? (
+          <Button
+            className="border border-border bg-surface text-foreground hover:bg-muted"
+            disabled={props.state.loading}
+            onClick={props.onCreateTopicPage}
+            variant="subtle"
+          >
+            <Plus size={15} />
+            New topic
+          </Button>
+        ) : null}
         <div className="relative">
           <Search
             className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
@@ -3466,14 +3545,481 @@ function KnowledgeBasePanel(props: RailShellProps) {
             value={props.state.query}
           />
         </div>
-        <MemoryList
-          highlightedId={props.state.highlightedMemoryId}
-          items={props.items}
-          loading={props.state.loading}
-          onOpenDetail={props.onOpenDetail}
-        />
+        {section === "topics" ? (
+          <TopicKnowledgePanel
+            detail={props.topicDetail}
+            form={props.topicForm}
+            formOpen={props.topicFormOpen}
+            graphEdges={props.topicGraphEdges}
+            items={props.topicPages}
+            loading={props.state.loading}
+            wikiCompileForm={props.wikiCompileForm}
+            wikiCompileJobs={props.wikiCompileJobs}
+            wikiCompileRunning={props.wikiCompileRunning}
+            onCancelForm={props.onCancelTopicForm}
+            onChangeForm={props.onTopicFormChange}
+            onChangeWikiCompileForm={props.onWikiCompileFormChange}
+            onCompileWithAI={props.onCompileTopicWithAI}
+            onCreate={props.onCreateTopicPage}
+            onDelete={props.onDeleteTopicPage}
+            onEdit={props.onEditTopicPage}
+            onOpen={props.onOpenTopicPage}
+            onOpenSource={props.onOpenTopicSource}
+            onSave={props.onSaveTopicPage}
+          />
+        ) : (
+          <MemoryList
+            highlightedId={props.state.highlightedMemoryId}
+            items={props.items}
+            loading={props.state.loading}
+            onOpenDetail={props.onOpenDetail}
+          />
+        )}
       </div>
     </div>
+  );
+}
+
+function TopicKnowledgePanel({
+  detail,
+  form,
+  formOpen,
+  graphEdges,
+  items,
+  loading,
+  wikiCompileForm,
+  wikiCompileJobs,
+  wikiCompileRunning,
+  onCancelForm,
+  onChangeForm,
+  onChangeWikiCompileForm,
+  onCompileWithAI,
+  onCreate,
+  onDelete,
+  onEdit,
+  onOpen,
+  onOpenSource,
+  onSave,
+}: {
+  detail: TopicPageDetail | null;
+  form: TopicPageFormState;
+  formOpen: boolean;
+  graphEdges: TopicGraphEdge[];
+  items: TopicPageSummary[];
+  loading: boolean;
+  wikiCompileForm: WikiCompileFormState;
+  wikiCompileJobs: WikiCompileJobSummary[];
+  wikiCompileRunning: boolean;
+  onCancelForm: () => void;
+  onChangeForm: (form: TopicPageFormState) => void;
+  onChangeWikiCompileForm: (form: WikiCompileFormState) => void;
+  onCompileWithAI: (form: WikiCompileFormState, topicId?: string) => void;
+  onCreate: () => void;
+  onDelete: (id: string) => void;
+  onEdit: (page: TopicPageDetail) => void;
+  onOpen: (id: string) => void;
+  onOpenSource: (memoryId: string) => void;
+  onSave: (form: TopicPageFormState, id?: string) => void;
+}) {
+  if (formOpen) {
+    return (
+      <TopicPageForm
+        form={form}
+        loading={loading}
+        mode={detail === null ? "create" : "edit"}
+        onCancel={onCancelForm}
+        onChange={onChangeForm}
+        onSave={() => onSave(form, detail?.id)}
+      />
+    );
+  }
+
+  return (
+    <div className="grid gap-3">
+      {detail === null ? null : (
+        <TopicPageDetailCard
+          detail={detail}
+          graphEdges={graphEdges}
+          loading={loading}
+          onDelete={onDelete}
+          onEdit={onEdit}
+          onOpenSource={onOpenSource}
+        />
+      )}
+      <WikiCompileCard
+        detail={detail}
+        form={wikiCompileForm}
+        jobs={wikiCompileJobs}
+        loading={loading || wikiCompileRunning}
+        onChange={onChangeWikiCompileForm}
+        onCompile={onCompileWithAI}
+      />
+      <TopicPageList
+        activeId={detail?.id}
+        items={items}
+        loading={loading}
+        onCreate={onCreate}
+        onOpen={onOpen}
+      />
+    </div>
+  );
+}
+
+function TopicPageList({
+  activeId,
+  items,
+  loading,
+  onCreate,
+  onOpen,
+}: {
+  activeId?: string;
+  items: TopicPageSummary[];
+  loading: boolean;
+  onCreate: () => void;
+  onOpen: (id: string) => void;
+}) {
+  if (loading) {
+    return (
+      <div className="flex h-28 items-center justify-center rounded-lg border border-border bg-surface text-sm text-muted-foreground">
+        <Loader2 className="mr-2 animate-spin" size={16} />
+        Loading topics
+      </div>
+    );
+  }
+  if (items.length === 0) {
+    return (
+      <div className="rounded-lg border border-border bg-surface px-4 py-8 text-center">
+        <p className="text-sm text-muted-foreground">No topic pages yet.</p>
+        <Button className="mt-3" onClick={onCreate} size="sm" variant="subtle">
+          <Plus size={14} />
+          New topic
+        </Button>
+      </div>
+    );
+  }
+  return (
+    <ul className="flex flex-col gap-2">
+      {items.map((item) => (
+        <li key={item.id}>
+          <button
+            className={[
+              "relative flex w-full flex-col gap-2 rounded-lg border bg-surface p-3.5 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
+              activeId === item.id ? "border-primary/70" : "border-border",
+            ].join(" ")}
+            onClick={() => onOpen(item.id)}
+            type="button"
+          >
+            {activeId === item.id ? (
+              <span className="absolute bottom-3 left-0 top-3 w-[2px] rounded-r bg-primary" />
+            ) : null}
+            <div className="flex items-start gap-2.5">
+              <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-surface-subtle text-primary">
+                <BookOpen size={15} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <h3 className="line-clamp-2 text-sm font-semibold leading-5">{item.title}</h3>
+                <p className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <span>{topicSummaryLabel(item)}</span>
+                  <span>{formatDate(item.updatedAt)}</span>
+                </p>
+              </div>
+              <Badge className="border-border bg-surface-subtle text-muted-foreground">topic</Badge>
+            </div>
+            <p className="line-clamp-3 pl-9 text-[12.5px] leading-5 text-muted-foreground">
+              {item.summary || "Derived page over local memories."}
+            </p>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function WikiCompileCard({
+  detail,
+  form,
+  jobs,
+  loading,
+  onChange,
+  onCompile,
+}: {
+  detail: TopicPageDetail | null;
+  form: WikiCompileFormState;
+  jobs: WikiCompileJobSummary[];
+  loading: boolean;
+  onChange: (form: WikiCompileFormState) => void;
+  onCompile: (form: WikiCompileFormState, topicId?: string) => void;
+}) {
+  const query = form.query.trim();
+  return (
+    <section className="rounded-lg border border-border bg-surface p-4">
+      <div className="mb-3 flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">AI compile</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Compile a derived topic from saved memories.
+          </p>
+        </div>
+        <Button
+          disabled={loading || query.length === 0}
+          onClick={() => onCompile(form, detail?.id)}
+          size="sm"
+          variant="subtle"
+        >
+          {loading ? <Loader2 className="animate-spin" size={14} /> : <Sparkles size={14} />}
+          Compile
+        </Button>
+      </div>
+      <div className="grid gap-2.5">
+        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-wiki-compile-query">
+          <span className="font-medium text-foreground">Topic query</span>
+          <Input
+            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+            id="clio-wiki-compile-query"
+            onChange={(event) => onChange({ ...form, query: event.target.value })}
+            placeholder="Customer onboarding"
+            value={form.query}
+          />
+        </label>
+        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-wiki-compile-instructions">
+          <span className="font-medium text-foreground">Instructions</span>
+          <textarea
+            className="min-h-[68px] resize-y rounded-lg border border-border bg-background px-3 py-2.5 text-[12px] leading-5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-primary"
+            id="clio-wiki-compile-instructions"
+            onChange={(event) => onChange({ ...form, instructions: event.target.value })}
+            placeholder="Optional focus, scope, or tone"
+            value={form.instructions}
+          />
+        </label>
+      </div>
+      {jobs.length === 0 ? null : (
+        <div className="mt-3 grid gap-1.5">
+          {jobs.slice(0, 3).map((job) => (
+            <div
+              className="flex items-center justify-between gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-[11px]"
+              key={job.id}
+            >
+              <span className="min-w-0 truncate text-muted-foreground">{job.query}</span>
+              <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+                {wikiJobStatusLabel(job)}
+              </Badge>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function TopicPageDetailCard({
+  detail,
+  graphEdges,
+  loading,
+  onDelete,
+  onEdit,
+  onOpenSource,
+}: {
+  detail: TopicPageDetail;
+  graphEdges: TopicGraphEdge[];
+  loading: boolean;
+  onDelete: (id: string) => void;
+  onEdit: (page: TopicPageDetail) => void;
+  onOpenSource: (memoryId: string) => void;
+}) {
+  return (
+    <article className="rounded-lg border border-border bg-surface p-4">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="mb-1 flex flex-wrap items-center gap-1.5">
+            <Badge className="border-border bg-surface-subtle text-muted-foreground">topic</Badge>
+            <span className="text-[11px] text-muted-foreground">
+              {formatDate(detail.updatedAt)}
+            </span>
+          </div>
+          <h3 className="line-clamp-2 text-base font-semibold leading-6">{detail.title}</h3>
+        </div>
+        <div className="flex shrink-0 gap-1.5">
+          <Button disabled={loading} onClick={() => onEdit(detail)} size="sm" variant="ghost">
+            <Pencil size={14} />
+            Edit
+          </Button>
+          <Button disabled={loading} onClick={() => onDelete(detail.id)} size="sm" variant="ghost">
+            <Trash2 size={14} />
+            Delete
+          </Button>
+        </div>
+      </div>
+      {detail.summary.length > 0 ? (
+        <p className="mb-3 text-[12.5px] leading-5 text-muted-foreground">{detail.summary}</p>
+      ) : null}
+      {detail.content.length > 0 ? (
+        <div className="mb-4 whitespace-pre-wrap rounded-lg border border-border bg-background p-3 text-sm leading-6 text-foreground">
+          {detail.content}
+        </div>
+      ) : (
+        <div className="mb-4 rounded-lg border border-dashed border-border bg-background px-3 py-6 text-center text-sm text-muted-foreground">
+          Empty topic page.
+        </div>
+      )}
+      <div className="grid gap-2">
+        <h4 className="text-[12px] font-semibold text-foreground">Sources</h4>
+        {detail.sourceRefs.length === 0 ? (
+          <p className="rounded-lg border border-border bg-background px-3 py-3 text-[12px] text-muted-foreground">
+            No source memories linked.
+          </p>
+        ) : (
+          detail.sourceRefs.map((ref) => (
+            <button
+              className="flex w-full flex-col gap-1 rounded-lg border border-border bg-background px-3 py-2.5 text-left text-[12px] outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
+              key={`${ref.memoryId}:${ref.chunkId ?? ""}`}
+              onClick={() => onOpenSource(ref.memoryId)}
+              type="button"
+            >
+              <span className="flex items-center gap-1.5 font-medium text-foreground">
+                <ExternalLink size={13} />
+                {ref.memoryId}
+              </span>
+              {ref.quote === undefined ? null : (
+                <span className="line-clamp-2 text-muted-foreground">{ref.quote}</span>
+              )}
+            </button>
+          ))
+        )}
+      </div>
+      <TopicGraphEdgesList edges={graphEdges} onOpenSource={onOpenSource} />
+    </article>
+  );
+}
+
+function TopicGraphEdgesList({
+  edges,
+  onOpenSource,
+}: {
+  edges: TopicGraphEdge[];
+  onOpenSource: (memoryId: string) => void;
+}) {
+  if (edges.length === 0) return null;
+  return (
+    <div className="mt-4 grid gap-2 border-t border-border pt-3">
+      <h4 className="text-[12px] font-semibold text-foreground">Graph links</h4>
+      <div className="grid gap-1.5">
+        {edges.slice(0, 8).map((edge) => {
+          const canOpenSource = edge.memoryId !== undefined;
+          return (
+            <button
+              className="flex w-full items-center justify-between gap-2 rounded-md border border-border bg-background px-3 py-2 text-left text-[12px] outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:hover:bg-background"
+              disabled={!canOpenSource}
+              key={edge.id}
+              onClick={() => {
+                if (edge.memoryId !== undefined) onOpenSource(edge.memoryId);
+              }}
+              type="button"
+            >
+              <span className="min-w-0 truncate text-foreground">{topicGraphEdgeLabel(edge)}</span>
+              <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+                {edge.kind}
+              </Badge>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function TopicPageForm({
+  form,
+  loading,
+  mode,
+  onCancel,
+  onChange,
+  onSave,
+}: {
+  form: TopicPageFormState;
+  loading: boolean;
+  mode: TopicFormMode;
+  onCancel: () => void;
+  onChange: (form: TopicPageFormState) => void;
+  onSave: () => void;
+}) {
+  const title = form.title.trim();
+  return (
+    <section className="rounded-lg border border-border bg-surface p-4">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="truncate text-sm font-semibold">
+            {mode === "create" ? "New topic page" : "Edit topic page"}
+          </h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Derived notes stay linked to source memories.
+          </p>
+        </div>
+        <Button
+          disabled={loading || title.length === 0}
+          onClick={onSave}
+          size="sm"
+          variant="subtle"
+        >
+          {loading ? <Loader2 className="animate-spin" size={14} /> : <Save size={14} />}
+          Save
+        </Button>
+      </div>
+      <div className="grid gap-3">
+        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-topic-title">
+          <span className="font-medium text-foreground">Title</span>
+          <Input
+            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+            id="clio-topic-title"
+            onChange={(event) => onChange({ ...form, title: event.target.value })}
+            placeholder="Customer onboarding"
+            value={form.title}
+          />
+        </label>
+        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-topic-summary">
+          <span className="font-medium text-foreground">Summary</span>
+          <Input
+            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+            id="clio-topic-summary"
+            onChange={(event) => onChange({ ...form, summary: event.target.value })}
+            placeholder="Short user-facing summary"
+            value={form.summary}
+          />
+        </label>
+        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-topic-content">
+          <span className="font-medium text-foreground">Content</span>
+          <textarea
+            className="min-h-[180px] resize-y rounded-lg border border-border bg-background px-3 py-2.5 text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-primary"
+            id="clio-topic-content"
+            onChange={(event) => onChange({ ...form, content: event.target.value })}
+            placeholder="Compile what matters from local memories."
+            value={form.content}
+          />
+        </label>
+        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-topic-sources">
+          <span className="font-medium text-foreground">Source refs</span>
+          <textarea
+            className="min-h-[84px] resize-y rounded-lg border border-border bg-background px-3 py-2.5 font-mono text-[11.5px] leading-5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-primary"
+            id="clio-topic-sources"
+            onChange={(event) => onChange({ ...form, sourceRefsText: event.target.value })}
+            placeholder="mem_abc|chunk_xyz|optional quote"
+            value={form.sourceRefsText}
+          />
+        </label>
+      </div>
+      <div className="mt-3 flex justify-end gap-2">
+        <Button
+          disabled={loading}
+          onClick={() => {
+            onChange(emptyTopicPageForm);
+            onCancel();
+          }}
+          size="sm"
+          variant="ghost"
+        >
+          Cancel
+        </Button>
+      </div>
+    </section>
   );
 }
 
