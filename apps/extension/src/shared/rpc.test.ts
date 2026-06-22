@@ -142,6 +142,29 @@ describe("session engine RPC guards", () => {
     expect(
       isEngineRequestMessage({
         type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendWikiCompileJobEvent",
+          payload: {
+            jobId: "wiki-job-1",
+            kind: "sources_selected",
+            level: "info",
+            message: "2 source memories selected.",
+            detail: { sourceMemoryCount: 2 },
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listWikiCompileJobEvents", jobId: "wiki-job-1", limit: 20 },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
         request: { kind: "claimNextWikiCompileJob", now: "2026-06-21T00:00:00.000Z" },
       }),
     ).toBe(true);
@@ -218,6 +241,36 @@ describe("session engine RPC guards", () => {
           id: "wiki-job-1",
           result: {
             edges: [{ kind: "invalid", memoryId: "mem-1" }],
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects invalid wiki compile event payloads", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendWikiCompileJobEvent",
+          payload: {
+            jobId: "wiki-job-1",
+            kind: "provider_started",
+            level: "verbose",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendWikiCompileJobEvent",
+          payload: {
+            jobId: "wiki-job-1",
+            kind: "provider_started",
+            detail: "not an object",
           },
         },
       }),

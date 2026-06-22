@@ -16,6 +16,7 @@ import {
   type CreateChatSessionPayload,
   type CreateCompactionPayload,
   type CreateTopicPagePayload,
+  type CreateWikiCompileJobEventPayload,
   type CreateWikiCompileJobPayload,
   type DeleteMemoryResult,
   type DeleteTopicPageResult,
@@ -46,6 +47,9 @@ import {
   type UpdateTopicPagePayload,
   type UpsertChatMessagePayload,
   type WebSearchHistoryRecord,
+  type WikiCompileEventKind,
+  type WikiCompileEventLevel,
+  type WikiCompileJobEvent,
   type WikiCompileJobStatus,
   type WikiCompileJobSummary,
   type WikiCompileResultPayload,
@@ -90,7 +94,7 @@ type SqliteInitModule = (config?: {
 }) => Promise<SqliteApi>;
 
 const databasePath = "/clio-browser-phase1.sqlite3";
-const schemaVersion = 9;
+const schemaVersion = 10;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
 const staleSessionLeaseMs = 30_000;
@@ -131,6 +135,10 @@ class LocalEngine {
         return await this.listWikiCompileJobs(request.status, request.limit);
       case "getWikiCompileJob":
         return await this.getWikiCompileJob(request.id);
+      case "appendWikiCompileJobEvent":
+        return await this.appendWikiCompileJobEvent(request.payload);
+      case "listWikiCompileJobEvents":
+        return await this.listWikiCompileJobEvents(request.jobId, request.limit);
       case "claimNextWikiCompileJob":
         return await this.claimNextWikiCompileJob(request.id, request.now);
       case "completeWikiCompileJob":
@@ -597,6 +605,18 @@ class LocalEngine {
           now,
         ],
       });
+      insertWikiCompileJobEvent(db, {
+        jobId: id,
+        kind: "queued",
+        level: "info",
+        message: "Compile queued.",
+        detail: {
+          query,
+          sourceMemoryCount: sourceMemoryIds.length,
+          hasTopic: payload.topicId !== undefined,
+        },
+        createdAt: now,
+      });
     });
 
     const row = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
@@ -636,6 +656,26 @@ class LocalEngine {
     const db = await this.ensureReady();
     const row = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
     return row === undefined ? null : wikiCompileJobFromRow(row);
+  }
+
+  private async appendWikiCompileJobEvent(
+    payload: CreateWikiCompileJobEventPayload,
+  ): Promise<WikiCompileJobEvent> {
+    const db = await this.ensureReady();
+    return insertWikiCompileJobEvent(db, payload);
+  }
+
+  private async listWikiCompileJobEvents(jobId: string, limit = 40) {
+    const db = await this.ensureReady();
+    const rows = db.selectObjects(
+      `SELECT *
+       FROM wiki_compile_job_events
+       WHERE job_id = ?
+       ORDER BY created_at ASC, id ASC
+       LIMIT ?`,
+      [jobId, clampLimit(limit, 100)],
+    );
+    return { events: rows.map(wikiCompileJobEventFromRow) };
   }
 
   private async claimNextWikiCompileJob(
@@ -678,6 +718,13 @@ class LocalEngine {
               WHERE id = ?`,
         bind: [now, now, jobId],
       });
+      insertWikiCompileJobEvent(db, {
+        jobId,
+        kind: "claimed",
+        level: "info",
+        message: "Compile started.",
+        createdAt: now,
+      });
     });
     if (jobId === undefined) return null;
     const row = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [jobId]);
@@ -718,7 +765,13 @@ class LocalEngine {
       }
 
       const topicId = stringField(topicRow, "id");
-      refreshTopicGraphEdges(db, topicId, sourceRefs, result.edges ?? [], completedAt);
+      const edgeCount = refreshTopicGraphEdges(
+        db,
+        topicId,
+        sourceRefs,
+        result.edges ?? [],
+        completedAt,
+      );
       db.exec({
         sql: `UPDATE wiki_compile_jobs
               SET status = 'done',
@@ -728,6 +781,18 @@ class LocalEngine {
                   result_topic_id = ?
               WHERE id = ?`,
         bind: [completedAt, completedAt, topicId, id],
+      });
+      insertWikiCompileJobEvent(db, {
+        jobId: id,
+        kind: "completed",
+        level: "info",
+        message: "Topic page saved.",
+        detail: {
+          topicId,
+          sourceCount: sourceRefs.length,
+          edgeCount,
+        },
+        createdAt: completedAt,
       });
       jobRow = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
     });
@@ -756,23 +821,39 @@ class LocalEngine {
     const attempts = numberField(row, "attempts");
     const maxAttempts = numberField(row, "max_attempts");
     const willRetry = retryAt !== undefined && attempts < maxAttempts;
-    db.exec({
-      sql: `UPDATE wiki_compile_jobs
-            SET status = ?,
-                run_after = ?,
-                claimed_at = NULL,
-                finished_at = ?,
-                last_error = ?,
-                updated_at = ?
-            WHERE id = ?`,
-      bind: [
-        willRetry ? "queued" : "failed",
-        willRetry ? retryAt : null,
-        willRetry ? null : now,
-        normalizeTopicText(error, 2_000),
-        now,
-        id,
-      ],
+    const message = normalizeTopicText(error, 2_000);
+    transaction(db, () => {
+      db.exec({
+        sql: `UPDATE wiki_compile_jobs
+              SET status = ?,
+                  run_after = ?,
+                  claimed_at = NULL,
+                  finished_at = ?,
+                  last_error = ?,
+                  updated_at = ?
+              WHERE id = ?`,
+        bind: [
+          willRetry ? "queued" : "failed",
+          willRetry ? retryAt : null,
+          willRetry ? null : now,
+          message,
+          now,
+          id,
+        ],
+      });
+      insertWikiCompileJobEvent(db, {
+        jobId: id,
+        kind: "failed",
+        level: willRetry ? "warning" : "error",
+        message,
+        detail: {
+          willRetry,
+          attempts,
+          maxAttempts,
+          ...(retryAt === undefined ? {} : { retryAfter: retryAt }),
+        },
+        createdAt: now,
+      });
     });
 
     const updated = db.selectObject("SELECT * FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [id]);
@@ -1607,6 +1688,7 @@ class LocalEngine {
     transaction(db, () => {
       db.exec("DELETE FROM jobs");
       db.exec("DELETE FROM topic_graph_edges");
+      db.exec("DELETE FROM wiki_compile_job_events");
       db.exec("DELETE FROM wiki_compile_jobs");
       db.exec("DELETE FROM topic_pages");
       db.exec("DELETE FROM anchors");
@@ -1922,6 +2004,27 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS wiki_compile_job_events (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL REFERENCES wiki_compile_jobs(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (
+        kind IN (
+          'queued',
+          'claimed',
+          'sources_selected',
+          'provider_started',
+          'provider_delta',
+          'completed',
+          'failed'
+        )
+      ),
+      level TEXT NOT NULL CHECK (level IN ('info', 'warning', 'error')),
+      message TEXT NOT NULL DEFAULT '',
+      detail_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS topic_graph_edges (
       id TEXT PRIMARY KEY,
       from_topic_id TEXT NOT NULL REFERENCES topic_pages(id) ON DELETE CASCADE,
@@ -1971,6 +2074,9 @@ function migrate(db: SqliteDb) {
     "CREATE INDEX IF NOT EXISTS idx_wiki_compile_jobs_status ON wiki_compile_jobs(status, run_after)",
   );
   db.exec("CREATE INDEX IF NOT EXISTS idx_wiki_compile_jobs_topic ON wiki_compile_jobs(topic_id)");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_wiki_compile_events_job ON wiki_compile_job_events(job_id, created_at)",
+  );
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_topic_graph_edges_from ON topic_graph_edges(from_topic_id, kind)",
   );
@@ -2454,6 +2560,18 @@ function wikiCompileJobFromRow(row: SqlRow): WikiCompileJobSummary {
   };
 }
 
+function wikiCompileJobEventFromRow(row: SqlRow): WikiCompileJobEvent {
+  return {
+    id: stringField(row, "id"),
+    jobId: stringField(row, "job_id"),
+    kind: wikiCompileEventKindField(row, "kind"),
+    level: wikiCompileEventLevelField(row, "level"),
+    message: stringField(row, "message"),
+    detail: parseMetadata(stringField(row, "detail_json")),
+    createdAt: stringField(row, "created_at"),
+  };
+}
+
 function topicGraphEdgeFromRow(row: SqlRow): TopicGraphEdge {
   const toTopicId = optionalString(row, "to_topic_id");
   const memoryId = optionalString(row, "memory_id");
@@ -2856,6 +2974,27 @@ function wikiCompileJobStatusField(row: SqlRow, key: string): WikiCompileJobStat
   return "queued";
 }
 
+function wikiCompileEventKindField(row: SqlRow, key: string): WikiCompileEventKind {
+  const value = stringField(row, key);
+  if (
+    value === "claimed" ||
+    value === "sources_selected" ||
+    value === "provider_started" ||
+    value === "provider_delta" ||
+    value === "completed" ||
+    value === "failed"
+  ) {
+    return value;
+  }
+  return "queued";
+}
+
+function wikiCompileEventLevelField(row: SqlRow, key: string): WikiCompileEventLevel {
+  const value = stringField(row, key);
+  if (value === "warning" || value === "error") return value;
+  return "info";
+}
+
 function topicGraphEdgeKindField(row: SqlRow, key: string): TopicGraphEdgeKind {
   const value = stringField(row, key);
   if (value === "related" || value === "mentions") return value;
@@ -3032,6 +3171,41 @@ function compileSourceRefs(result: WikiCompileResultPayload): TopicPageSourceRef
   return normalizeTopicSourceRefs([...(result.sourceRefs ?? []), ...topicSourceRefs]);
 }
 
+function insertWikiCompileJobEvent(
+  db: SqliteDb,
+  payload: CreateWikiCompileJobEventPayload,
+): WikiCompileJobEvent {
+  const jobExists =
+    db.selectObject("SELECT id FROM wiki_compile_jobs WHERE id = ? LIMIT 1", [payload.jobId]) !==
+    undefined;
+  if (!jobExists) {
+    throw new EngineRpcError("WIKI_JOB_NOT_FOUND", `Wiki compile job not found: ${payload.jobId}`);
+  }
+
+  const id = payload.id ?? createId("wiki_event");
+  const createdAt = normalizeOptionalIso(payload.createdAt) ?? new Date().toISOString();
+  const level = normalizeWikiCompileEventLevel(payload.level);
+  const message = normalizeTopicText(payload.message ?? "", 1_000);
+  const detail = normalizeWikiCompileEventDetail(payload.detail ?? {});
+  db.exec({
+    sql: `INSERT INTO wiki_compile_job_events (
+      id,
+      job_id,
+      kind,
+      level,
+      message,
+      detail_json,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    bind: [id, payload.jobId, payload.kind, level, message, JSON.stringify(detail), createdAt],
+  });
+  const row = db.selectObject("SELECT * FROM wiki_compile_job_events WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) {
+    throw new EngineRpcError("WIKI_JOB_EVENT_CREATE_FAILED", "Wiki compile event was not saved.");
+  }
+  return wikiCompileJobEventFromRow(row);
+}
+
 function refreshTopicGraphEdges(
   db: SqliteDb,
   topicId: string,
@@ -3071,6 +3245,7 @@ function refreshTopicGraphEdges(
       ],
     });
   }
+  return edges.length;
 }
 
 function normalizeTopicSourceRefs(refs: TopicPageSourceRef[]): TopicPageSourceRef[] {
@@ -3149,6 +3324,41 @@ function normalizeTopicGraphEdgeKind(value: TopicGraphEdgeKind): TopicGraphEdgeK
 function normalizeTopicGraphWeight(value: number | undefined) {
   if (value === undefined || !Number.isFinite(value)) return 1;
   return Math.max(0, Math.min(1, value));
+}
+
+function normalizeWikiCompileEventLevel(
+  value: WikiCompileEventLevel | undefined,
+): WikiCompileEventLevel {
+  if (value === "warning" || value === "error") return value;
+  return "info";
+}
+
+function normalizeWikiCompileEventDetail(value: Record<string, unknown>) {
+  const normalized: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value).slice(0, 20)) {
+    if (entry === undefined) continue;
+    if (
+      entry === null ||
+      typeof entry === "string" ||
+      typeof entry === "number" ||
+      typeof entry === "boolean"
+    ) {
+      normalized[key] = entry;
+      continue;
+    }
+    if (Array.isArray(entry)) {
+      normalized[key] = entry
+        .slice(0, 20)
+        .filter(
+          (item) =>
+            item === null ||
+            typeof item === "string" ||
+            typeof item === "number" ||
+            typeof item === "boolean",
+        );
+    }
+  }
+  return normalized;
 }
 
 function normalizeWikiCompileQuery(value: string) {

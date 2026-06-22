@@ -139,6 +139,7 @@ import {
   type ClioWebSearchEvent,
   type ClioWebSearchResult,
   type ContentCommand,
+  type CreateWikiCompileJobEventPayload,
   type EngineHealth,
   type ImageGenerationHistoryRecord,
   type MemoryDetail,
@@ -147,6 +148,7 @@ import {
   type TopicPageDetail,
   type TopicPageSummary,
   type WebSearchHistoryRecord,
+  type WikiCompileJobEvent,
   type WikiCompileJobSummary,
   isContentCommandMessage,
 } from "@/src/shared/rpc";
@@ -629,6 +631,7 @@ function ClioContentApp() {
   const [wikiCompileForm, setWikiCompileForm] =
     React.useState<WikiCompileFormState>(emptyWikiCompileForm);
   const [wikiCompileJobs, setWikiCompileJobs] = React.useState<WikiCompileJobSummary[]>([]);
+  const [wikiCompileJobEvents, setWikiCompileJobEvents] = React.useState<WikiCompileJobEvent[]>([]);
   const [topicGraphEdges, setTopicGraphEdges] = React.useState<TopicGraphEdge[]>([]);
   const [wikiCompileRunning, setWikiCompileRunning] = React.useState(false);
   const [relatedItems, setRelatedItems] = React.useState<SearchMemoryItem[]>([]);
@@ -773,6 +776,46 @@ function ClioContentApp() {
     }
   }, [showToast]);
 
+  const loadWikiCompileJobEvents = React.useCallback(
+    async (jobId?: string) => {
+      if (jobId === undefined) {
+        setWikiCompileJobEvents([]);
+        return;
+      }
+      try {
+        const result = await requestEngine({ kind: "listWikiCompileJobEvents", jobId, limit: 40 });
+        setWikiCompileJobEvents(result.events);
+      } catch (error) {
+        showToast(errorToast(error));
+      }
+    },
+    [showToast],
+  );
+
+  const appendWikiCompileEvent = React.useCallback(
+    async (
+      jobId: string,
+      event: Omit<CreateWikiCompileJobEventPayload, "jobId" | "id" | "createdAt">,
+    ) => {
+      try {
+        await requestEngine({
+          kind: "appendWikiCompileJobEvent",
+          payload: {
+            jobId,
+            kind: event.kind,
+            level: event.level,
+            message: event.message,
+            detail: event.detail,
+          },
+        });
+        await loadWikiCompileJobEvents(jobId);
+      } catch {
+        // Progress events are diagnostic; the compile flow should continue.
+      }
+    },
+    [loadWikiCompileJobEvents],
+  );
+
   const loadLibrary = React.useCallback(
     async (nextQuery = railState.query) => {
       dispatch({ type: "SET_LOADING", loading: true });
@@ -792,6 +835,11 @@ function ClioContentApp() {
             : await requestEngine({ kind: "listMemories", limit: 40 });
         setTopicPages(topicResult.items);
         setWikiCompileJobs(wikiJobsResult.jobs);
+        if (wikiJobsResult.jobs[0] !== undefined) {
+          await loadWikiCompileJobEvents(wikiJobsResult.jobs[0].id);
+        } else {
+          setWikiCompileJobEvents([]);
+        }
         setItems(result.items.map(toSearchItem));
       } catch (error) {
         showToast(errorToast(error));
@@ -799,7 +847,7 @@ function ClioContentApp() {
         dispatch({ type: "SET_LOADING", loading: false });
       }
     },
-    [railState.query, showToast],
+    [loadWikiCompileJobEvents, railState.query, showToast],
   );
 
   const loadChatHistory = React.useCallback(async () => {
@@ -1623,8 +1671,10 @@ function ClioContentApp() {
           payload: createWikiCompilePayloadFromForm(form, topicId, candidates),
         });
         setWikiCompileJobs((jobs) => [job as WikiCompileJobSummary, ...jobs].slice(0, 8));
+        await loadWikiCompileJobEvents(job.id);
         const claimed = await requestEngine({ kind: "claimNextWikiCompileJob", id: job.id });
         if (claimed === null || claimed.id !== job.id) {
+          await loadWikiCompileJobEvents(job.id);
           showToast({ tone: "warning", message: "Wiki compile was queued." });
           await loadLibrary(railState.query);
           setWikiCompileRunning(false);
@@ -1633,6 +1683,7 @@ function ClioContentApp() {
         }
         job = claimed;
         setWikiCompileJobs((jobs) => [claimed, ...jobs.filter((item) => item.id !== claimed.id)]);
+        await loadWikiCompileJobEvents(claimed.id);
 
         const sourceMemoryIds =
           claimed.sourceMemoryIds.length > 0
@@ -1646,6 +1697,18 @@ function ClioContentApp() {
         const evidence = evidenceDetails
           .flatMap((memory) => (memory === null ? [] : [memoryDetailToAgentEvidence(memory)]))
           .slice(0, 8);
+        await appendWikiCompileEvent(claimed.id, {
+          kind: "sources_selected",
+          level: evidence.length === 0 ? "warning" : "info",
+          message:
+            evidence.length === 0
+              ? "No matching source memories found."
+              : `${evidence.length} source memories selected.`,
+          detail: {
+            sourceMemoryCount: evidence.length,
+            memoryIds: evidence.map((item) => item.id),
+          },
+        });
         if (evidence.length === 0) {
           await requestEngine({
             kind: "failWikiCompileJob",
@@ -1663,6 +1726,8 @@ function ClioContentApp() {
         const createdAt = new Date().toISOString();
         const output: string[] = [];
         const citations: Parameters<typeof buildWikiCompileResult>[0]["citations"] = [];
+        let streamedCharacterCount = 0;
+        let lastDeltaEventAt = 0;
         const pageContext = railState.activePageContext;
         const request: AgentChatRequest = {
           runId,
@@ -1678,10 +1743,28 @@ function ClioContentApp() {
           createdAt,
         };
 
+        await appendWikiCompileEvent(claimed.id, {
+          kind: "provider_started",
+          message: "Provider generation started.",
+          detail: {
+            runId,
+            sourceMemoryCount: evidence.length,
+          },
+        });
         activeWikiCompileStreamRef.current = openAgentStream(request, {
           onEvent: (event) => {
             if (event.type === "text_delta") {
               output.push(event.delta);
+              streamedCharacterCount += event.delta.length;
+              const now = Date.now();
+              if (streamedCharacterCount >= 400 && now - lastDeltaEventAt > 1200) {
+                lastDeltaEventAt = now;
+                void appendWikiCompileEvent(claimed.id, {
+                  kind: "provider_delta",
+                  message: `${streamedCharacterCount} characters generated.`,
+                  detail: { characterCount: streamedCharacterCount },
+                });
+              }
               return;
             }
             if (event.type === "citation") {
@@ -1713,6 +1796,7 @@ function ClioContentApp() {
                     completedJob,
                     ...jobs.filter((item) => item.id !== completedJob.id),
                   ]);
+                  await loadWikiCompileJobEvents(completedJob.id);
                   await loadLibrary(railState.query);
                   showToast({ tone: "success", message: "Wiki topic compiled." });
                 })
@@ -1740,6 +1824,7 @@ function ClioContentApp() {
                       failedJob,
                       ...jobs.filter((item) => item.id !== failedJob.id),
                     ]);
+                    void loadWikiCompileJobEvents(failedJob.id);
                   }
                   showToast({ tone: "warning", message });
                 })
@@ -1756,7 +1841,11 @@ function ClioContentApp() {
               kind: "failWikiCompileJob",
               id: claimed.id,
               error: error.message,
-            }).catch(() => undefined);
+            })
+              .then((failedJob) => {
+                if (failedJob !== null) void loadWikiCompileJobEvents(failedJob.id);
+              })
+              .catch(() => undefined);
             setWikiCompileRunning(false);
             dispatch({ type: "SET_LOADING", loading: false });
             showToast(errorToast(error));
@@ -1769,6 +1858,7 @@ function ClioContentApp() {
             id: job.id,
             error: error instanceof Error ? error.message : String(error),
           }).catch(() => undefined);
+          await loadWikiCompileJobEvents(job.id);
         }
         setWikiCompileRunning(false);
         dispatch({ type: "SET_LOADING", loading: false });
@@ -1776,7 +1866,9 @@ function ClioContentApp() {
       }
     },
     [
+      appendWikiCompileEvent,
       loadLibrary,
+      loadWikiCompileJobEvents,
       railState.activePageContext,
       railState.query,
       showToast,
@@ -2956,6 +3048,7 @@ function ClioContentApp() {
         topicGraphEdges={topicGraphEdges}
         topicPages={topicPages}
         wikiCompileForm={wikiCompileForm}
+        wikiCompileJobEvents={wikiCompileJobEvents}
         wikiCompileJobs={wikiCompileJobs}
         wikiCompileRunning={wikiCompileRunning}
         onAcceptPageChange={handleAcceptPageChange}

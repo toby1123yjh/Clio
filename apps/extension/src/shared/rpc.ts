@@ -52,6 +52,15 @@ export type RepairAction = "retry_init" | "rebuild_fts" | "reset_library";
 export type JobStatus = "queued" | "running" | "done" | "failed";
 export type JobType = "reindex_fts" | "resolve_anchor" | "post_capture_hardening";
 export type WikiCompileJobStatus = "queued" | "running" | "done" | "failed";
+export type WikiCompileEventLevel = "info" | "warning" | "error";
+export type WikiCompileEventKind =
+  | "queued"
+  | "claimed"
+  | "sources_selected"
+  | "provider_started"
+  | "provider_delta"
+  | "completed"
+  | "failed";
 export type TopicGraphEdgeKind = "source" | "related" | "mentions";
 export type ReindexScope = "fts";
 export type ChatMessageRole = "user" | "assistant" | "evidence";
@@ -181,6 +190,30 @@ export interface WikiCompileJobSummary {
 
 export interface ListWikiCompileJobsResult {
   jobs: WikiCompileJobSummary[];
+}
+
+export interface CreateWikiCompileJobEventPayload {
+  id?: string;
+  jobId: string;
+  kind: WikiCompileEventKind;
+  level?: WikiCompileEventLevel;
+  message?: string;
+  detail?: Record<string, unknown>;
+  createdAt?: string;
+}
+
+export interface WikiCompileJobEvent {
+  id: string;
+  jobId: string;
+  kind: WikiCompileEventKind;
+  level: WikiCompileEventLevel;
+  message: string;
+  detail: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface ListWikiCompileJobEventsResult {
+  events: WikiCompileJobEvent[];
 }
 
 export interface WikiCompileResultPayload {
@@ -595,6 +628,8 @@ export type EngineRequest =
   | { kind: "enqueueWikiCompile"; payload: CreateWikiCompileJobPayload }
   | { kind: "listWikiCompileJobs"; status?: WikiCompileJobStatus; limit?: number }
   | { kind: "getWikiCompileJob"; id: string }
+  | { kind: "appendWikiCompileJobEvent"; payload: CreateWikiCompileJobEventPayload }
+  | { kind: "listWikiCompileJobEvents"; jobId: string; limit?: number }
   | { kind: "claimNextWikiCompileJob"; id?: string; now?: string }
   | { kind: "completeWikiCompileJob"; id: string; result: WikiCompileResultPayload }
   | { kind: "failWikiCompileJob"; id: string; error: string; retryAfter?: string; now?: string }
@@ -650,88 +685,98 @@ export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health
                       ? WikiCompileJobSummary
                       : T extends { kind: "listWikiCompileJobs" }
                         ? ListWikiCompileJobsResult
-                        : T extends { kind: "getWikiCompileJob" | "claimNextWikiCompileJob" }
-                          ? WikiCompileJobSummary | null
-                          : T extends { kind: "completeWikiCompileJob" }
-                            ? { job: WikiCompileJobSummary; topic: TopicPageDetail }
-                            : T extends { kind: "failWikiCompileJob" }
+                        : T extends { kind: "appendWikiCompileJobEvent" }
+                          ? WikiCompileJobEvent
+                          : T extends { kind: "listWikiCompileJobEvents" }
+                            ? ListWikiCompileJobEventsResult
+                            : T extends { kind: "getWikiCompileJob" | "claimNextWikiCompileJob" }
                               ? WikiCompileJobSummary | null
-                              : T extends { kind: "listTopicGraphEdges" }
-                                ? ListTopicGraphEdgesResult
-                                : T extends { kind: "repair" }
-                                  ? RepairResult
-                                  : T extends { kind: "getJobStatus" }
-                                    ? GetJobStatusResult
-                                    : T extends { kind: "reindex" }
-                                      ? ReindexResult
-                                      : T extends { kind: "resolveAnchor" }
-                                        ? AnchorResolveResult
-                                        : T extends { kind: "createChatSession" }
-                                          ? ChatSessionSummary
-                                          : T extends { kind: "listChatSessions" }
-                                            ? ListChatSessionsResult
-                                            : T extends {
-                                                  kind:
-                                                    | "loadChatSession"
-                                                    | "recoverInterruptedChatSession";
-                                                }
-                                              ? ChatSessionDetail | null
-                                              : T extends {
-                                                    kind:
-                                                      | "claimChatSession"
-                                                      | "heartbeatChatSession"
-                                                      | "releaseChatSession";
-                                                  }
-                                                ? SessionLeaseResult
-                                                : T extends { kind: "appendSessionEvidence" }
-                                                  ? SessionEvidenceRecord
-                                                  : T extends { kind: "appendCompaction" }
-                                                    ? CompactionRecord
-                                                    : T extends { kind: "listCompactions" }
-                                                      ? { items: CompactionRecord[] }
-                                                      : T extends { kind: "getLatestCompaction" }
-                                                        ? CompactionRecord | null
-                                                        : T extends {
-                                                              kind:
-                                                                | "upsertChatMessage"
-                                                                | "updateChatMessage";
-                                                            }
-                                                          ? ChatMessageRecord
-                                                          : T extends { kind: "deleteChatMessage" }
-                                                            ? { deleted: boolean }
+                              : T extends { kind: "completeWikiCompileJob" }
+                                ? { job: WikiCompileJobSummary; topic: TopicPageDetail }
+                                : T extends { kind: "failWikiCompileJob" }
+                                  ? WikiCompileJobSummary | null
+                                  : T extends { kind: "listTopicGraphEdges" }
+                                    ? ListTopicGraphEdgesResult
+                                    : T extends { kind: "repair" }
+                                      ? RepairResult
+                                      : T extends { kind: "getJobStatus" }
+                                        ? GetJobStatusResult
+                                        : T extends { kind: "reindex" }
+                                          ? ReindexResult
+                                          : T extends { kind: "resolveAnchor" }
+                                            ? AnchorResolveResult
+                                            : T extends { kind: "createChatSession" }
+                                              ? ChatSessionSummary
+                                              : T extends { kind: "listChatSessions" }
+                                                ? ListChatSessionsResult
+                                                : T extends {
+                                                      kind:
+                                                        | "loadChatSession"
+                                                        | "recoverInterruptedChatSession";
+                                                    }
+                                                  ? ChatSessionDetail | null
+                                                  : T extends {
+                                                        kind:
+                                                          | "claimChatSession"
+                                                          | "heartbeatChatSession"
+                                                          | "releaseChatSession";
+                                                      }
+                                                    ? SessionLeaseResult
+                                                    : T extends { kind: "appendSessionEvidence" }
+                                                      ? SessionEvidenceRecord
+                                                      : T extends { kind: "appendCompaction" }
+                                                        ? CompactionRecord
+                                                        : T extends { kind: "listCompactions" }
+                                                          ? { items: CompactionRecord[] }
+                                                          : T extends {
+                                                                kind: "getLatestCompaction";
+                                                              }
+                                                            ? CompactionRecord | null
                                                             : T extends {
-                                                                  kind: "clearQueuedChatMessages";
+                                                                  kind:
+                                                                    | "upsertChatMessage"
+                                                                    | "updateChatMessage";
                                                                 }
-                                                              ? { cleared: number }
+                                                              ? ChatMessageRecord
                                                               : T extends {
-                                                                    kind: "listWebSearchHistory";
+                                                                    kind: "deleteChatMessage";
                                                                   }
-                                                                ? ListWebSearchHistoryResult
+                                                                ? { deleted: boolean }
                                                                 : T extends {
-                                                                      kind: "appendWebSearchHistory";
+                                                                      kind: "clearQueuedChatMessages";
                                                                     }
-                                                                  ? WebSearchHistoryRecord
+                                                                  ? { cleared: number }
                                                                   : T extends {
-                                                                        kind: "deleteWebSearchHistory";
+                                                                        kind: "listWebSearchHistory";
                                                                       }
-                                                                    ? { deleted: boolean }
+                                                                    ? ListWebSearchHistoryResult
                                                                     : T extends {
-                                                                          kind: "clearWebSearchHistory";
+                                                                          kind: "appendWebSearchHistory";
                                                                         }
-                                                                      ? { cleared: number }
+                                                                      ? WebSearchHistoryRecord
                                                                       : T extends {
-                                                                            kind: "listImageGenerationHistory";
+                                                                            kind: "deleteWebSearchHistory";
                                                                           }
-                                                                        ? ListImageGenerationHistoryResult
+                                                                        ? { deleted: boolean }
                                                                         : T extends {
-                                                                              kind: "appendImageGenerationHistory";
+                                                                              kind: "clearWebSearchHistory";
                                                                             }
-                                                                          ? ImageGenerationHistoryRecord
+                                                                          ? { cleared: number }
                                                                           : T extends {
-                                                                                kind: "deleteImageGenerationHistory";
+                                                                                kind: "listImageGenerationHistory";
                                                                               }
-                                                                            ? { deleted: boolean }
-                                                                            : never;
+                                                                            ? ListImageGenerationHistoryResult
+                                                                            : T extends {
+                                                                                  kind: "appendImageGenerationHistory";
+                                                                                }
+                                                                              ? ImageGenerationHistoryRecord
+                                                                              : T extends {
+                                                                                    kind: "deleteImageGenerationHistory";
+                                                                                  }
+                                                                                ? {
+                                                                                    deleted: boolean;
+                                                                                  }
+                                                                                : never;
 
 export type EngineResponse<T = unknown> =
   | { ok: true; value: T }
@@ -1239,6 +1284,13 @@ function isEngineRequest(value: unknown): value is EngineRequest {
         (value.status === undefined || isWikiCompileJobStatus(value.status)) &&
         (value.limit === undefined || typeof value.limit === "number")
       );
+    case "appendWikiCompileJobEvent":
+      return isCreateWikiCompileJobEventPayload(value.payload);
+    case "listWikiCompileJobEvents":
+      return (
+        typeof value.jobId === "string" &&
+        (value.limit === undefined || typeof value.limit === "number")
+      );
     case "getWikiCompileJob":
     case "claimNextWikiCompileJob":
       return value.kind === "claimNextWikiCompileJob"
@@ -1403,6 +1455,21 @@ function isWikiCompileResultPayload(value: unknown): value is WikiCompileResultP
   );
 }
 
+function isCreateWikiCompileJobEventPayload(
+  value: unknown,
+): value is CreateWikiCompileJobEventPayload {
+  return (
+    isRecord(value) &&
+    (value.id === undefined || typeof value.id === "string") &&
+    typeof value.jobId === "string" &&
+    isWikiCompileEventKind(value.kind) &&
+    (value.level === undefined || isWikiCompileEventLevel(value.level)) &&
+    (value.message === undefined || typeof value.message === "string") &&
+    (value.detail === undefined || isRecord(value.detail)) &&
+    (value.createdAt === undefined || typeof value.createdAt === "string")
+  );
+}
+
 function isTopicGraphEdgeInput(value: unknown): value is TopicGraphEdgeInput {
   return (
     isRecord(value) &&
@@ -1424,6 +1491,22 @@ function isJobStatus(value: unknown): value is JobStatus {
 
 function isWikiCompileJobStatus(value: unknown): value is WikiCompileJobStatus {
   return value === "queued" || value === "running" || value === "done" || value === "failed";
+}
+
+function isWikiCompileEventLevel(value: unknown): value is WikiCompileEventLevel {
+  return value === "info" || value === "warning" || value === "error";
+}
+
+function isWikiCompileEventKind(value: unknown): value is WikiCompileEventKind {
+  return (
+    value === "queued" ||
+    value === "claimed" ||
+    value === "sources_selected" ||
+    value === "provider_started" ||
+    value === "provider_delta" ||
+    value === "completed" ||
+    value === "failed"
+  );
 }
 
 function isTopicGraphEdgeKind(value: unknown): value is TopicGraphEdgeKind {
@@ -2034,5 +2117,5 @@ function isEngineResponse(value: unknown): value is EngineResponse {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

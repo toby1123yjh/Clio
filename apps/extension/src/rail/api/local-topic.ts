@@ -8,6 +8,7 @@ import type {
   TopicPageSourceRef,
   TopicPageSummary,
   UpdateTopicPagePayload,
+  WikiCompileJobEvent,
   WikiCompileJobSummary,
   WikiCompileResultPayload,
 } from "@/src/shared/rpc";
@@ -50,6 +51,32 @@ export function wikiJobStatusLabel(job: WikiCompileJobSummary) {
   if (job.status === "running") return "Running";
   if (job.status === "done") return "Done";
   return "Failed";
+}
+
+export function wikiCompileEventLabel(event: WikiCompileJobEvent) {
+  if (event.kind === "queued") return "Queued";
+  if (event.kind === "claimed") return "Started";
+  if (event.kind === "sources_selected") return "Sources";
+  if (event.kind === "provider_started") return "Provider";
+  if (event.kind === "provider_delta") return "Generating";
+  if (event.kind === "completed") return "Done";
+  return "Failed";
+}
+
+export function wikiCompileEventDetail(event: WikiCompileJobEvent) {
+  const sourceMemoryCount = numericDetail(event.detail.sourceMemoryCount);
+  if (event.kind === "sources_selected" && sourceMemoryCount !== undefined) {
+    return `${sourceMemoryCount} source${sourceMemoryCount === 1 ? "" : "s"}`;
+  }
+  const characterCount = numericDetail(event.detail.characterCount);
+  if (event.kind === "provider_delta" && characterCount !== undefined) {
+    return `${characterCount} chars`;
+  }
+  const edgeCount = numericDetail(event.detail.edgeCount);
+  if (event.kind === "completed" && edgeCount !== undefined) {
+    return `${edgeCount} links`;
+  }
+  return "";
 }
 
 export function topicGraphEdgeLabel(edge: TopicGraphEdge) {
@@ -245,4 +272,8 @@ function formatTopicSourceRefs(refs: TopicPageSourceRef[]) {
         .replace(/\|+$/g, ""),
     )
     .join("\n");
+}
+
+function numericDetail(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }

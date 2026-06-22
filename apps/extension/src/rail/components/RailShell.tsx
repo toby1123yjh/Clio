@@ -39,6 +39,8 @@ import {
   emptyTopicPageForm,
   topicGraphEdgeLabel,
   topicSummaryLabel,
+  wikiCompileEventDetail,
+  wikiCompileEventLabel,
   wikiJobStatusLabel,
 } from "@/src/rail/api/local-topic";
 import {
@@ -103,6 +105,7 @@ import type {
   TopicPageDetail,
   TopicPageSummary,
   WebSearchHistoryRecord,
+  WikiCompileJobEvent,
   WikiCompileJobSummary,
 } from "@/src/shared/rpc";
 import type { ReplyActionSuggestion } from "@/src/suggestions/suggestion-types";
@@ -175,6 +178,7 @@ export interface RailShellProps {
   topicForm: TopicPageFormState;
   topicFormOpen: boolean;
   topicGraphEdges: TopicGraphEdge[];
+  wikiCompileJobEvents: WikiCompileJobEvent[];
   railWidth: number;
   collapsedDragPoint: CollapsedLauncherDragPoint | null;
   collapsedSide: CollapsedLauncherSide;
@@ -3554,6 +3558,7 @@ function KnowledgeBasePanel(props: RailShellProps) {
             items={props.topicPages}
             loading={props.state.loading}
             wikiCompileForm={props.wikiCompileForm}
+            wikiCompileJobEvents={props.wikiCompileJobEvents}
             wikiCompileJobs={props.wikiCompileJobs}
             wikiCompileRunning={props.wikiCompileRunning}
             onCancelForm={props.onCancelTopicForm}
@@ -3588,6 +3593,7 @@ function TopicKnowledgePanel({
   items,
   loading,
   wikiCompileForm,
+  wikiCompileJobEvents,
   wikiCompileJobs,
   wikiCompileRunning,
   onCancelForm,
@@ -3608,6 +3614,7 @@ function TopicKnowledgePanel({
   items: TopicPageSummary[];
   loading: boolean;
   wikiCompileForm: WikiCompileFormState;
+  wikiCompileJobEvents: WikiCompileJobEvent[];
   wikiCompileJobs: WikiCompileJobSummary[];
   wikiCompileRunning: boolean;
   onCancelForm: () => void;
@@ -3649,6 +3656,7 @@ function TopicKnowledgePanel({
       <WikiCompileCard
         detail={detail}
         form={wikiCompileForm}
+        events={wikiCompileJobEvents}
         jobs={wikiCompileJobs}
         loading={loading || wikiCompileRunning}
         onChange={onChangeWikiCompileForm}
@@ -3737,6 +3745,7 @@ function TopicPageList({
 
 function WikiCompileCard({
   detail,
+  events,
   form,
   jobs,
   loading,
@@ -3744,6 +3753,7 @@ function WikiCompileCard({
   onCompile,
 }: {
   detail: TopicPageDetail | null;
+  events: WikiCompileJobEvent[];
   form: WikiCompileFormState;
   jobs: WikiCompileJobSummary[];
   loading: boolean;
@@ -3751,6 +3761,7 @@ function WikiCompileCard({
   onCompile: (form: WikiCompileFormState, topicId?: string) => void;
 }) {
   const query = form.query.trim();
+  const recentEvents = events.slice(-5).reverse();
   return (
     <section className="rounded-lg border border-border bg-surface p-4">
       <div className="mb-3 flex items-start justify-between gap-2">
@@ -3805,6 +3816,44 @@ function WikiCompileCard({
               </Badge>
             </div>
           ))}
+        </div>
+      )}
+      {recentEvents.length === 0 ? null : (
+        <div className="mt-3 grid gap-1.5 border-t border-border pt-3">
+          <div className="flex items-center justify-between gap-2">
+            <h4 className="text-[12px] font-semibold text-foreground">Compile log</h4>
+            <Badge className="border-border bg-surface-subtle text-muted-foreground">
+              {recentEvents.length}
+            </Badge>
+          </div>
+          <div className="grid gap-1.5">
+            {recentEvents.map((event) => {
+              const detailText = wikiCompileEventDetail(event);
+              return (
+                <div
+                  className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-[11px]"
+                  key={event.id}
+                >
+                  <span
+                    className={[
+                      "h-2 w-2 rounded-full",
+                      event.level === "error"
+                        ? "bg-destructive"
+                        : event.level === "warning"
+                          ? "bg-amber-500"
+                          : "bg-primary",
+                    ].join(" ")}
+                  />
+                  <span className="min-w-0 truncate text-foreground">
+                    {event.message || wikiCompileEventLabel(event)}
+                  </span>
+                  <span className="shrink-0 text-muted-foreground">
+                    {detailText || wikiCompileEventLabel(event)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
     </section>
@@ -3886,8 +3935,104 @@ function TopicPageDetailCard({
           ))
         )}
       </div>
+      <TopicGraphMap detail={detail} edges={graphEdges} onOpenSource={onOpenSource} />
       <TopicGraphEdgesList edges={graphEdges} onOpenSource={onOpenSource} />
     </article>
+  );
+}
+
+function TopicGraphMap({
+  detail,
+  edges,
+  onOpenSource,
+}: {
+  detail: TopicPageDetail;
+  edges: TopicGraphEdge[];
+  onOpenSource: (memoryId: string) => void;
+}) {
+  if (edges.length === 0) return null;
+  const sourceEdges = edges.filter((edge) => edge.memoryId !== undefined).slice(0, 4);
+  const topicEdges = edges.filter((edge) => edge.toTopicId !== undefined).slice(0, 4);
+  const sourceNodes = sourceEdges.map((edge, index) => ({
+    edge,
+    x: 18,
+    y: graphNodeY(index, sourceEdges.length),
+    label: edge.label || edge.memoryId || "Source",
+  }));
+  const topicNodes = topicEdges.map((edge, index) => ({
+    edge,
+    x: 82,
+    y: graphNodeY(index, topicEdges.length),
+    label: edge.label || edge.toTopicId || "Topic",
+  }));
+  const center = { x: 50, y: 50 };
+  return (
+    <div className="mt-4 grid gap-2 border-t border-border pt-3">
+      <h4 className="text-[12px] font-semibold text-foreground">Graph</h4>
+      <div className="relative h-56 overflow-hidden rounded-lg border border-border bg-background">
+        <svg
+          aria-hidden="true"
+          className="absolute inset-0 h-full w-full"
+          preserveAspectRatio="none"
+          viewBox="0 0 100 100"
+        >
+          <title>Topic graph</title>
+          {sourceNodes.map((node) => (
+            <line
+              className="stroke-primary/45"
+              key={`source-line-${node.edge.id}`}
+              strokeWidth="0.55"
+              x1={node.x + 8}
+              x2={center.x - 8}
+              y1={node.y}
+              y2={center.y}
+            />
+          ))}
+          {topicNodes.map((node) => (
+            <line
+              className="stroke-muted-foreground/40"
+              key={`topic-line-${node.edge.id}`}
+              strokeDasharray={node.edge.kind === "mentions" ? "2 2" : undefined}
+              strokeWidth="0.55"
+              x1={center.x + 8}
+              x2={node.x - 8}
+              y1={center.y}
+              y2={node.y}
+            />
+          ))}
+        </svg>
+        <div
+          className="absolute left-1/2 top-1/2 flex h-14 w-28 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-lg border border-primary/50 bg-surface px-2 text-center text-[11px] font-semibold leading-4 text-foreground shadow-sm"
+          title={detail.title}
+        >
+          <span className="line-clamp-2">{detail.title}</span>
+        </div>
+        {sourceNodes.map((node) => (
+          <button
+            className="absolute flex h-10 w-24 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-md border border-border bg-surface-subtle px-2 text-center text-[10px] leading-3 text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
+            key={`source-node-${node.edge.id}`}
+            onClick={() => {
+              if (node.edge.memoryId !== undefined) onOpenSource(node.edge.memoryId);
+            }}
+            style={{ left: `${node.x}%`, top: `${node.y}%` }}
+            title={node.label}
+            type="button"
+          >
+            <span className="line-clamp-2">{node.label}</span>
+          </button>
+        ))}
+        {topicNodes.map((node) => (
+          <div
+            className="absolute flex h-10 w-24 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-md border border-border bg-surface-subtle px-2 text-center text-[10px] leading-3 text-muted-foreground"
+            key={`topic-node-${node.edge.id}`}
+            style={{ left: `${node.x}%`, top: `${node.y}%` }}
+            title={node.label}
+          >
+            <span className="line-clamp-2">{node.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -3925,6 +4070,12 @@ function TopicGraphEdgesList({
       </div>
     </div>
   );
+}
+
+function graphNodeY(index: number, count: number) {
+  if (count <= 1) return 50;
+  const step = 60 / Math.max(1, count - 1);
+  return 20 + index * step;
 }
 
 function TopicPageForm({
