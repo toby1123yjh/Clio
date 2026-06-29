@@ -45,7 +45,16 @@ interface Candidate {
   memory: LocalRagMemory;
   chunkId?: string;
   text: string;
-  score: number;
+  rank: CandidateRank;
+}
+
+interface CandidateRank {
+  kind: "chunk" | "fallback";
+  coverage: number;
+  exactMatches: number;
+  substringMatches: number;
+  memoryIndex: number;
+  chunkOrd: number;
 }
 
 const defaultMaxItems = 6;
@@ -177,13 +186,16 @@ export function assembleLocalRagEvidencePack(input: LocalRagEvidencePackInput): 
   const queryTerms = queryTermSet(query);
   const retrievalPlan = planLocalRagRetrieval(query);
   const allowFallback = retrievalPlan.shouldRetrieve && retrievalPlan.reason === "local_intent";
-  const candidates = memories.flatMap((memory) =>
-    candidatesForMemory(memory, queryTerms, {
-      allowFallback,
-      contextChunksBefore,
-      contextChunksAfter,
-    }),
-  );
+  const candidates = memories
+    .flatMap((memory, memoryIndex) =>
+      candidatesForMemory(memory, queryTerms, {
+        allowFallback,
+        contextChunksBefore,
+        contextChunksAfter,
+        memoryIndex,
+      }),
+    )
+    .sort(compareCandidates);
   const pack: EvidenceItem[] = [];
   const seenIds = new Set<string>();
   let totalChars = 0;
@@ -219,24 +231,31 @@ export function assembleLocalRagEvidencePack(input: LocalRagEvidencePackInput): 
 function candidatesForMemory(
   memory: LocalRagMemory,
   queryTerms: Set<string>,
-  options: { allowFallback: boolean; contextChunksBefore: number; contextChunksAfter: number },
+  options: {
+    allowFallback: boolean;
+    contextChunksBefore: number;
+    contextChunksAfter: number;
+    memoryIndex: number;
+  },
 ): Candidate[] {
   const chunks = dedupeChunks(memory.chunks).sort(compareChunks);
   const scoredChunks = chunks
     .map((chunk, index) => ({
       chunk,
       index,
-      score: overlapScore(chunk.text, queryTerms),
+      match: matchDetails(chunk.text, queryTerms),
     }))
-    .filter((item) => item.score > 0)
+    .filter((item) => item.match.totalMatches > 0)
     .sort(
       (left, right) =>
-        right.score - left.score || left.chunk.ord - right.chunk.ord || left.index - right.index,
+        compareMatchDetails(right.match, left.match) ||
+        left.chunk.ord - right.chunk.ord ||
+        left.index - right.index,
     );
 
   if (scoredChunks.length > 0) {
     const acceptedWindows: Array<{ startIndex: number; endIndex: number }> = [];
-    return scoredChunks.flatMap(({ chunk, index, score }) => {
+    return scoredChunks.flatMap(({ chunk, index, match }) => {
       const startIndex = Math.max(0, index - options.contextChunksBefore);
       const endIndex = Math.min(chunks.length - 1, index + options.contextChunksAfter);
       if (acceptedWindows.some((window) => windowsOverlap(window, { startIndex, endIndex }))) {
@@ -252,7 +271,14 @@ function candidatesForMemory(
             .slice(startIndex, endIndex + 1)
             .map((windowChunk) => windowChunk.text)
             .join("\n\n"),
-          score,
+          rank: {
+            kind: "chunk",
+            coverage: match.coverage,
+            exactMatches: match.exactMatches,
+            substringMatches: match.substringMatches,
+            memoryIndex: options.memoryIndex,
+            chunkOrd: chunk.ord,
+          },
         },
       ];
     });
@@ -266,7 +292,14 @@ function candidatesForMemory(
       evidenceId: `memory:${memory.id}`,
       memory,
       text: fallbackText,
-      score: 0,
+      rank: {
+        kind: "fallback",
+        coverage: 0,
+        exactMatches: 0,
+        substringMatches: 0,
+        memoryIndex: options.memoryIndex,
+        chunkOrd: Number.MAX_SAFE_INTEGER,
+      },
     },
   ];
 }
@@ -298,6 +331,22 @@ function compareChunks(
   right: LocalRagMemory["chunks"][number],
 ) {
   return left.ord - right.ord || left.id.localeCompare(right.id);
+}
+
+function compareCandidates(left: Candidate, right: Candidate) {
+  return (
+    candidateKindRank(left.rank.kind) - candidateKindRank(right.rank.kind) ||
+    right.rank.coverage - left.rank.coverage ||
+    right.rank.exactMatches - left.rank.exactMatches ||
+    right.rank.substringMatches - left.rank.substringMatches ||
+    left.rank.memoryIndex - right.rank.memoryIndex ||
+    left.rank.chunkOrd - right.rank.chunkOrd ||
+    left.evidenceId.localeCompare(right.evidenceId)
+  );
+}
+
+function candidateKindRank(kind: CandidateRank["kind"]) {
+  return kind === "chunk" ? 0 : 1;
 }
 
 function queryTermSet(query: string) {
@@ -356,14 +405,39 @@ function isWordChar(value: string | undefined) {
   return value !== undefined && /[\p{L}\p{N}_]/u.test(value);
 }
 
-function overlapScore(text: string, queryTerms: Set<string>) {
-  if (queryTerms.size === 0) return 0;
-  const textTerms = new Set(Array.from(text.toLowerCase().match(queryTokenPattern) ?? []));
-  let score = 0;
-  for (const term of queryTerms) {
-    if (textTerms.has(term) || text.toLowerCase().includes(term)) score += 1;
+function matchDetails(text: string, queryTerms: Set<string>) {
+  if (queryTerms.size === 0) {
+    return { coverage: 0, exactMatches: 0, substringMatches: 0, totalMatches: 0 };
   }
-  return score;
+  const lowerText = text.toLowerCase();
+  const textTerms = new Set(Array.from(text.toLowerCase().match(queryTokenPattern) ?? []));
+  let exactMatches = 0;
+  let substringMatches = 0;
+  for (const term of queryTerms) {
+    if (textTerms.has(term)) {
+      exactMatches += 1;
+    } else if (lowerText.includes(term)) {
+      substringMatches += 1;
+    }
+  }
+  const totalMatches = exactMatches + substringMatches;
+  return {
+    coverage: totalMatches / queryTerms.size,
+    exactMatches,
+    substringMatches,
+    totalMatches,
+  };
+}
+
+function compareMatchDetails(
+  left: ReturnType<typeof matchDetails>,
+  right: ReturnType<typeof matchDetails>,
+) {
+  return (
+    left.coverage - right.coverage ||
+    left.exactMatches - right.exactMatches ||
+    left.substringMatches - right.substringMatches
+  );
 }
 
 function positiveLimit(value: number | undefined, fallback: number) {

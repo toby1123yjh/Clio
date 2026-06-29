@@ -112,6 +112,101 @@ describe("assembleLocalRagEvidencePack", () => {
     expect(pack[0]?.text).toBe("Alpha launch notes. Beta launch notes.");
   });
 
+  it("ranks stronger later-memory chunk matches before weaker earlier matches", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "alpha beta gamma",
+      memories: [
+        memory({
+          id: "mem-1",
+          chunks: [{ id: "chunk-1", ord: 0, text: "Alpha only.", tokenCount: 2 }],
+        }),
+        memory({
+          id: "mem-2",
+          chunks: [{ id: "chunk-2", ord: 0, text: "Alpha beta gamma full match.", tokenCount: 5 }],
+        }),
+      ],
+      contextChunksBefore: 0,
+      contextChunksAfter: 0,
+    });
+
+    expect(pack.map((item) => item.id)).toEqual([
+      "memory:mem-2:chunk:chunk-2",
+      "memory:mem-1:chunk:chunk-1",
+    ]);
+  });
+
+  it("ranks exact token matches before substring-only matches", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "cat",
+      memories: [
+        memory({
+          id: "mem-1",
+          chunks: [{ id: "chunk-1", ord: 0, text: "Concatenate category catalog.", tokenCount: 3 }],
+        }),
+        memory({
+          id: "mem-2",
+          chunks: [{ id: "chunk-2", ord: 0, text: "The cat sits here.", tokenCount: 4 }],
+        }),
+      ],
+      contextChunksBefore: 0,
+      contextChunksAfter: 0,
+    });
+
+    expect(pack.map((item) => item.id)).toEqual([
+      "memory:mem-2:chunk:chunk-2",
+      "memory:mem-1:chunk:chunk-1",
+    ]);
+  });
+
+  it("keeps explicit local fallback evidence behind chunk matches", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "what did I save about alpha archive",
+      memories: [
+        memory({
+          id: "mem-1",
+          excerpt: "Saved archive fallback text.",
+          normalizedText: "Saved archive fallback text.",
+          chunks: [{ id: "chunk-1", ord: 0, text: "Unmatched fallback body.", tokenCount: 3 }],
+        }),
+        memory({
+          id: "mem-2",
+          chunks: [{ id: "chunk-2", ord: 0, text: "Alpha archive details.", tokenCount: 3 }],
+        }),
+      ],
+      contextChunksBefore: 0,
+      contextChunksAfter: 0,
+    });
+
+    expect(pack.map((item) => item.id)).toEqual(["memory:mem-2:chunk:chunk-2", "memory:mem-1"]);
+  });
+
+  it("uses memory order and chunk order as deterministic tie breakers", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "alpha",
+      memories: [
+        memory({
+          id: "mem-1",
+          chunks: [
+            { id: "chunk-2", ord: 1, text: "Alpha later chunk.", tokenCount: 3 },
+            { id: "chunk-1", ord: 0, text: "Alpha earlier chunk.", tokenCount: 3 },
+          ],
+        }),
+        memory({
+          id: "mem-2",
+          chunks: [{ id: "chunk-3", ord: 0, text: "Alpha second memory.", tokenCount: 3 }],
+        }),
+      ],
+      contextChunksBefore: 0,
+      contextChunksAfter: 0,
+    });
+
+    expect(pack.map((item) => item.id)).toEqual([
+      "memory:mem-1:chunk:chunk-1",
+      "memory:mem-1:chunk:chunk-2",
+      "memory:mem-2:chunk:chunk-3",
+    ]);
+  });
+
   it("truncates expanded windows under item budgets", () => {
     const pack = assembleLocalRagEvidencePack({
       query: "needle",
