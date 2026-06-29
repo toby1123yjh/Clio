@@ -1,4 +1,4 @@
-import type { AgentStreamEvent, EvidenceItem, LocalCitation } from "./types";
+import type { AgentStreamEvent, EvidenceItem, EvidenceSourceKind, LocalCitation } from "./types";
 
 const citationMarkerStart = "[[cite:";
 const citationMarkerEnd = "]]";
@@ -62,13 +62,26 @@ export class CitationMarkerParser {
     return {
       id: `${runId}:citation:${evidence.id}`,
       evidenceId: evidence.id,
-      label: evidence.sourceKind === "selection" ? "Selection" : "Page",
+      label: citationLabel(evidence.sourceKind),
       sourceKind: evidence.sourceKind,
       sourceUrl: evidence.sourceUrl,
       sourceTitle: evidence.sourceTitle,
       excerpt: evidence.excerpt,
       ...(evidence.anchor === undefined ? {} : { anchor: evidence.anchor }),
     };
+  }
+}
+
+export function citationLabel(sourceKind: EvidenceSourceKind) {
+  switch (sourceKind) {
+    case "selection":
+      return "Selection";
+    case "memory":
+      return "Memory";
+    case "page":
+      return "Page";
+    default:
+      return sourceKind satisfies never;
   }
 }
 

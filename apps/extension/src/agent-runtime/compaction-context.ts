@@ -191,13 +191,14 @@ export function buildRequestWithProviderContext(input: {
   });
   if (input.request.scope === "general") {
     const { evidenceSummary: _evidenceSummary, ...generalProviderContext } = providerContext;
+    const memoryEvidence = input.request.evidence.filter((item) => item.sourceKind === "memory");
     return {
       ...input.request,
-      evidence: [],
+      evidence: memoryEvidence,
       currentTurnEvidenceRefs: [],
       providerContext: {
         ...generalProviderContext,
-        evidence: [],
+        evidence: memoryEvidence,
       },
     };
   }

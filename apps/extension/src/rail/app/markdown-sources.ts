@@ -1,4 +1,4 @@
-import type { EvidenceAnchor, LocalCitation } from "../../agent-runtime/types";
+import type { EvidenceAnchor, EvidenceSourceKind, LocalCitation } from "../../agent-runtime/types";
 import { excerpt, normalizeText } from "../../shared/text";
 import type { PageContext, RailDialogueMessage } from "./rail-state";
 
@@ -111,10 +111,18 @@ function citationToSource(citation: LocalCitation): MarkdownSource {
   };
 }
 
-function sourceLabel(kind: "page" | "selection", title: string | undefined, fallback: string) {
+function sourceLabel(kind: EvidenceSourceKind, title: string | undefined, fallback: string) {
   if (kind === "selection") {
     const compact = excerpt(fallback, 44);
     return compact.length === 0 ? "Selection" : `Selection: ${compact}`;
+  }
+  if (kind === "memory") {
+    const compactTitle = normalizeText(title ?? "");
+    if (compactTitle.length > 0 && !isGenericSourceLabel(compactTitle)) {
+      return excerpt(compactTitle, 52);
+    }
+    const compact = excerpt(fallback, 44);
+    return compact.length === 0 ? "Memory" : `Memory: ${compact}`;
   }
   const compactTitle = normalizeText(title ?? "");
   if (compactTitle.length > 0 && !isGenericSourceLabel(compactTitle)) {
@@ -125,7 +133,7 @@ function sourceLabel(kind: "page" | "selection", title: string | undefined, fall
 
 function isGenericSourceLabel(value: string) {
   const normalized = value.trim().toLowerCase();
-  return normalized === "page" || normalized === "selection";
+  return normalized === "page" || normalized === "selection" || normalized === "memory";
 }
 
 function sourceHost(url: string) {

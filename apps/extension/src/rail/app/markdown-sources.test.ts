@@ -64,6 +64,31 @@ describe("markdown source helpers", () => {
     expect(sources[0]?.label).toBe("Selection: A selected passage that should identify the...");
   });
 
+  it("projects memory citations as memory sources", () => {
+    const sources = buildMarkdownSources({
+      ...assistant,
+      citations: [
+        {
+          id: "cite-memory-1",
+          evidenceId: "memory:mem-1:chunk:chunk-1",
+          label: "Memory",
+          sourceKind: "memory",
+          sourceUrl: "https://example.com/memory-source",
+          sourceTitle: "Saved Memory",
+          excerpt: "A durable local memory excerpt",
+        },
+      ],
+    });
+
+    expect(sources[0]).toMatchObject({
+      id: "cite-memory-1",
+      kind: "memory",
+      label: "Saved Memory",
+      url: "https://example.com/memory-source",
+      excerpt: "A durable local memory excerpt",
+    });
+  });
+
   it("hides legacy cite markers from visible markdown", () => {
     expect(stripLegacyCitationMarkers("Grounded [[cite:page:0]] answer.")).toBe("Grounded answer.");
   });

@@ -15,6 +15,7 @@ import type {
   AgentScope,
   AgentStreamEvent,
   EvidenceItem,
+  EvidenceSourceKind,
   LocalCitation,
 } from "@/src/agent-runtime/types";
 
@@ -552,7 +553,7 @@ export interface CreateChatSessionPayload {
 export interface AppendSessionEvidencePayload {
   id?: string;
   sessionId: string;
-  evidence: EvidenceItem;
+  evidence: EvidenceItem & { sourceKind: SourceKind };
   createdAt?: string;
   metadata?: Record<string, unknown>;
 }
@@ -1532,7 +1533,7 @@ function isAppendSessionEvidencePayload(value: unknown): value is AppendSessionE
     isRecord(value) &&
     (value.id === undefined || typeof value.id === "string") &&
     typeof value.sessionId === "string" &&
-    isEvidenceItem(value.evidence) &&
+    isSessionEvidenceItem(value.evidence) &&
     (value.createdAt === undefined || typeof value.createdAt === "string") &&
     (value.metadata === undefined || isRecord(value.metadata))
   );
@@ -1835,16 +1836,28 @@ function isProviderContextMessage(value: unknown) {
   );
 }
 
-function isEvidenceItem(value: unknown) {
+function isEvidenceItem(value: unknown): value is EvidenceItem {
   if (!isRecord(value)) return false;
   return (
     typeof value.id === "string" &&
-    (value.sourceKind === "page" || value.sourceKind === "selection") &&
+    isEvidenceSourceKind(value.sourceKind) &&
     typeof value.sourceUrl === "string" &&
     typeof value.sourceTitle === "string" &&
     typeof value.text === "string" &&
     typeof value.excerpt === "string"
   );
+}
+
+function isSessionEvidenceItem(value: unknown): value is EvidenceItem & { sourceKind: SourceKind } {
+  return isEvidenceItem(value) && isSourceKind(value.sourceKind);
+}
+
+function isEvidenceSourceKind(value: unknown): value is EvidenceSourceKind {
+  return value === "page" || value === "selection" || value === "memory";
+}
+
+function isSourceKind(value: unknown): value is SourceKind {
+  return value === "page" || value === "selection";
 }
 
 function isAgentStreamEvent(value: unknown): value is AgentStreamEvent {
@@ -2086,7 +2099,7 @@ function isLocalCitation(value: unknown): value is LocalCitation {
     typeof value.id === "string" &&
     typeof value.evidenceId === "string" &&
     typeof value.label === "string" &&
-    (value.sourceKind === "page" || value.sourceKind === "selection") &&
+    isEvidenceSourceKind(value.sourceKind) &&
     typeof value.sourceUrl === "string" &&
     typeof value.sourceTitle === "string" &&
     typeof value.excerpt === "string"

@@ -457,6 +457,49 @@ describe("session engine RPC guards", () => {
     ).toBe(true);
   });
 
+  it("accepts memory evidence for agent runs but not session evidence writes", () => {
+    const memoryEvidence = {
+      id: "memory:mem-1:chunk:chunk-1",
+      sourceKind: "memory",
+      sourceUrl: "https://example.com/memory",
+      sourceTitle: "Saved Memory",
+      text: "Bounded memory evidence text",
+      excerpt: "Bounded memory evidence text",
+    };
+
+    expect(
+      isAgentRunRequestMessage({
+        type: CLIO_AGENT_RUN_REQUEST,
+        request: {
+          kind: "start",
+          request: {
+            runId: "run-memory-1",
+            question: "What do I know about billing?",
+            scope: "general",
+            pageUrl: "https://example.com/a",
+            pageTitle: "Example",
+            evidence: [memoryEvidence],
+            currentTurnEvidenceRefs: [memoryEvidence.id],
+            createdAt: "2026-06-29T00:00:00.000Z",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSessionEvidence",
+          payload: {
+            sessionId: "session-1",
+            evidence: memoryEvidence,
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts typed agent thinking and tool trace stream events", () => {
     expect(
       isAgentStreamEventMessage({

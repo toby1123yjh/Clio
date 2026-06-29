@@ -1,6 +1,6 @@
 export type AgentScope = "general" | "current-page" | "selection";
 
-export type EvidenceSourceKind = "page" | "selection";
+export type EvidenceSourceKind = "page" | "selection" | "memory";
 
 export interface EvidenceAnchor {
   selectedText: string;

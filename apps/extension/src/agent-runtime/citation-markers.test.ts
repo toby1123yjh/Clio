@@ -56,6 +56,27 @@ describe("CitationMarkerParser", () => {
 
     expect(textFrom(events)).toBe("Answer ");
   });
+
+  it("labels local memory evidence as memory citations", () => {
+    const events = collect(
+      new CitationMarkerParser([
+        {
+          ...evidence,
+          id: "memory:mem-1:chunk:chunk-1",
+          sourceKind: "memory",
+        },
+      ]),
+      ["Grounded [[cite:memory:mem-1:chunk:chunk-1]]."],
+    );
+
+    expect(events.find((event) => event.type === "citation")).toMatchObject({
+      citation: {
+        evidenceId: "memory:mem-1:chunk:chunk-1",
+        label: "Memory",
+        sourceKind: "memory",
+      },
+    });
+  });
 });
 
 function textFrom(events: AgentStreamEvent[]) {

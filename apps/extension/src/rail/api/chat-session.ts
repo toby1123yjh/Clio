@@ -1,7 +1,12 @@
 import type { AgentChatRequest, AgentScope, EvidenceItem } from "@/src/agent-runtime/types";
 import type { PageContext, RailSkillRequestDisplay } from "@/src/rail/app/rail-state";
 import { requestEngine } from "@/src/shared/chrome-client";
-import type { ChatMessageRecord, ChatSessionDetail, SessionEvidenceRecord } from "@/src/shared/rpc";
+import type {
+  ChatMessageRecord,
+  ChatSessionDetail,
+  SessionEvidenceRecord,
+  SourceKind,
+} from "@/src/shared/rpc";
 import { excerpt, normalizeSourceUrl, normalizeText } from "@/src/shared/text";
 
 const activeSessionPrefix = "clio:active-session:";
@@ -489,11 +494,12 @@ async function appendEvidenceTranscript(input: {
   pageContext: PageContext;
 }) {
   if (input.attachedEvidence === undefined) return undefined;
+  const attachedEvidence = sessionEvidenceForAppend(input.attachedEvidence);
   const evidenceRecord = await requestEngine({
     kind: "appendSessionEvidence",
     payload: {
       sessionId: input.sessionId,
-      evidence: input.attachedEvidence,
+      evidence: attachedEvidence,
       createdAt: input.createdAt,
     },
   });
@@ -514,6 +520,21 @@ async function appendEvidenceTranscript(input: {
     },
   });
   return evidenceRecord;
+}
+
+function sessionEvidenceForAppend(
+  evidence: EvidenceItem,
+): EvidenceItem & { sourceKind: SourceKind } {
+  switch (evidence.sourceKind) {
+    case "page":
+      return { ...evidence, sourceKind: "page" };
+    case "selection":
+      return { ...evidence, sourceKind: "selection" };
+    case "memory":
+      throw new Error("Memory evidence cannot be persisted as session evidence.");
+    default:
+      return evidence.sourceKind satisfies never;
+  }
 }
 
 function sessionEvidenceToAgentEvidence(record: SessionEvidenceRecord): EvidenceItem {

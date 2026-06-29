@@ -1,3 +1,4 @@
+import { citationLabel } from "./citation-markers";
 import type { AgentChatRequest, AgentStreamEvent, IAgentRuntime, LocalCitation } from "./types";
 
 const mockDelayMs = 18;
@@ -28,7 +29,7 @@ export class MockAgentRuntime implements IAgentRuntime {
     const citation: LocalCitation = {
       id: `${request.runId}:citation:${firstEvidence.id}`,
       evidenceId: firstEvidence.id,
-      label: firstEvidence.sourceKind === "selection" ? "Selection" : "Page",
+      label: citationLabel(firstEvidence.sourceKind),
       sourceKind: firstEvidence.sourceKind,
       sourceUrl: firstEvidence.sourceUrl,
       sourceTitle: firstEvidence.sourceTitle,

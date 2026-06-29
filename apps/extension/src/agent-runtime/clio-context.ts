@@ -1,7 +1,7 @@
 import type { AgentChatRequest } from "./types";
 
 export const clioAgentSystemPrompt =
-  "You are Clio, a browser assistant. If the user attached page evidence, use it first. " +
+  "You are Clio, a browser assistant. If attached evidence is provided, use it first. " +
   "Do not emit raw citation ids or machine citation markers. " +
   "When a response should visibly indicate attached source usage, write [source] and Clio will render the real source link. " +
   "If no evidence is attached, answer as a general assistant without source markers.";
@@ -12,29 +12,22 @@ export function buildClioUserPrompt(request: AgentChatRequest): string {
   }
 
   if (request.scope === "general") {
-    return [
+    return buildPromptBlocks([
       `Question: ${request.question}`,
       "Scope: general",
-      "No page or selection context is attached.",
-    ].join("\n\n");
+      ...evidencePromptBlock(
+        request.evidence,
+        "No page, selection, or memory evidence is attached.",
+      ),
+    ]);
   }
 
-  const evidenceBlock =
-    request.evidence.length === 0
-      ? ["Evidence: none attached by the user."]
-      : [
-          "Evidence:",
-          ...request.evidence.map(
-            (item, index) =>
-              `${index + 1}. id=${item.id}\nsource=${item.sourceTitle} (${item.sourceUrl})\n${item.text}`,
-          ),
-        ];
-  return [
+  return buildPromptBlocks([
     `Question: ${request.question}`,
     `Scope: ${request.scope}`,
     `Page: ${request.pageTitle} (${request.pageUrl})`,
-    ...evidenceBlock,
-  ].join("\n\n");
+    ...evidencePromptBlock(request.evidence, "Evidence: none attached by the user."),
+  ]);
 }
 
 function buildCompactedContextPrompt(request: AgentChatRequest): string {
@@ -59,8 +52,12 @@ function buildCompactedContextPrompt(request: AgentChatRequest): string {
         ];
   const scopeBlock =
     request.scope === "general"
-      ? ["Scope: general", "No page or selection context is attached."]
+      ? ["Scope: general"]
       : [`Scope: ${request.scope}`, `Page: ${request.pageTitle} (${request.pageUrl})`];
+  const concreteEvidence =
+    request.scope === "general"
+      ? context.evidence.filter((item) => item.sourceKind === "memory")
+      : context.evidence;
   const evidenceSummaryBlock =
     request.scope === "general"
       ? []
@@ -71,25 +68,38 @@ function buildCompactedContextPrompt(request: AgentChatRequest): string {
             context.evidenceSummary,
             "Do not expose summarized-only evidence as [source]. Use [source] only for concrete evidence listed below.",
           ];
-  const evidenceBlock =
-    request.scope === "general"
-      ? []
-      : context.evidence.length === 0
-        ? ["Concrete source evidence: none attached by the user."]
-        : [
-            "Concrete source evidence:",
-            ...context.evidence.map(
-              (item, index) =>
-                `${index + 1}. id=${item.id}\nsource=${item.sourceTitle} (${item.sourceUrl})\n${item.text}`,
-            ),
-          ];
 
-  return [
+  return buildPromptBlocks([
     `Question: ${request.question}`,
     ...scopeBlock,
     ...summaryBlock,
     ...messageBlock,
     ...evidenceSummaryBlock,
-    ...evidenceBlock,
-  ].join("\n\n");
+    ...evidencePromptBlock(
+      concreteEvidence,
+      "Concrete source evidence: none attached by the user.",
+      {
+        heading: "Concrete source evidence:",
+      },
+    ),
+  ]);
+}
+
+function evidencePromptBlock(
+  evidence: AgentChatRequest["evidence"],
+  emptyLine: string,
+  options: { heading?: string } = {},
+) {
+  if (evidence.length === 0) return [emptyLine];
+  return [
+    options.heading ?? "Evidence:",
+    ...evidence.map(
+      (item, index) =>
+        `${index + 1}. id=${item.id}\nkind=${item.sourceKind}\nsource=${item.sourceTitle} (${item.sourceUrl})\n${item.text}`,
+    ),
+  ];
+}
+
+function buildPromptBlocks(lines: string[]) {
+  return lines.join("\n\n");
 }

@@ -34,17 +34,41 @@ describe("Clio user prompt", () => {
     const prompt = buildClioUserPrompt(
       request({
         scope: "general",
-        evidence: [pageEvidence],
+        evidence: [],
       }),
     );
 
     expect(prompt).toContain("Question: Hi");
     expect(prompt).toContain("Scope: general");
-    expect(prompt).toContain("No page or selection context is attached.");
+    expect(prompt).toContain("No page, selection, or memory evidence is attached.");
     expect(prompt).not.toContain("Page:");
     expect(prompt).not.toContain("Private Page");
     expect(prompt).not.toContain("https://example.com/private-page");
     expect(prompt).not.toContain("Private page evidence text");
+  });
+
+  it("includes local memory evidence for general RAG turns without page context", () => {
+    const prompt = buildClioUserPrompt(
+      request({
+        scope: "general",
+        evidence: [
+          {
+            id: "memory:mem-1:chunk:chunk-1",
+            sourceKind: "memory",
+            sourceUrl: "https://example.com/memory",
+            sourceTitle: "Saved Memory",
+            text: "Bounded memory evidence text",
+            excerpt: "Bounded memory evidence text",
+          },
+        ],
+      }),
+    );
+
+    expect(prompt).toContain("Scope: general");
+    expect(prompt).toContain("kind=memory");
+    expect(prompt).toContain("Saved Memory");
+    expect(prompt).toContain("Bounded memory evidence text");
+    expect(prompt).not.toContain("Page: Private Page");
   });
 
   it("keeps compacted general chat free of retained evidence", () => {
@@ -71,7 +95,7 @@ describe("Clio user prompt", () => {
     expect(prompt).toContain("Earlier pure chat");
     expect(prompt).not.toContain("Page:");
     expect(prompt).not.toContain("Old evidence summary");
-    expect(prompt).not.toContain("Concrete source evidence");
+    expect(prompt).toContain("Concrete source evidence: none attached by the user.");
     expect(prompt).not.toContain("Private page evidence text");
   });
 

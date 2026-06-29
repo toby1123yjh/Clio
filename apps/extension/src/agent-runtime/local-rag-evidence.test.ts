@@ -1,0 +1,107 @@
+import { describe, expect, it } from "vitest";
+import { type LocalRagMemory, assembleLocalRagEvidencePack } from "./local-rag-evidence";
+
+function memory(overrides: Partial<LocalRagMemory> = {}): LocalRagMemory {
+  return {
+    id: "mem-1",
+    sourceUrl: "https://example.com/a",
+    sourceTitle: "Example Memory",
+    normalizedText:
+      "The durable memory text talks about onboarding, billing, and enterprise support.",
+    excerpt: "The durable memory text talks about onboarding.",
+    chunks: [
+      {
+        id: "chunk-1",
+        ord: 0,
+        text: "Product onboarding notes for the support team.",
+        tokenCount: 8,
+      },
+      {
+        id: "chunk-2",
+        ord: 1,
+        text: "Billing operations and renewal policy details.",
+        tokenCount: 7,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+describe("assembleLocalRagEvidencePack", () => {
+  it("returns no evidence for empty query or memory input", () => {
+    expect(assembleLocalRagEvidencePack({ query: "", memories: [memory()] })).toEqual([]);
+    expect(assembleLocalRagEvidencePack({ query: "billing", memories: [] })).toEqual([]);
+  });
+
+  it("prefers matching chunks and emits memory evidence ids", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "billing renewal",
+      memories: [memory()],
+      maxItems: 2,
+    });
+
+    expect(pack).toHaveLength(1);
+    expect(pack[0]).toMatchObject({
+      id: "memory:mem-1:chunk:chunk-2",
+      sourceKind: "memory",
+      sourceTitle: "Example Memory",
+      text: "Billing operations and renewal policy details.",
+    });
+  });
+
+  it("falls back to memory excerpt when no chunk overlaps query terms", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "unmatched",
+      memories: [memory()],
+    });
+
+    expect(pack).toHaveLength(1);
+    expect(pack[0]).toMatchObject({
+      id: "memory:mem-1",
+      sourceKind: "memory",
+      text: "The durable memory text talks about onboarding.",
+    });
+  });
+
+  it("enforces per-item and total character budgets", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "alpha beta",
+      memories: [
+        memory({
+          id: "mem-1",
+          chunks: [{ id: "chunk-1", ord: 0, text: "alpha ".repeat(20), tokenCount: 20 }],
+        }),
+        memory({
+          id: "mem-2",
+          chunks: [{ id: "chunk-2", ord: 0, text: "beta ".repeat(20), tokenCount: 20 }],
+        }),
+      ],
+      maxItems: 4,
+      maxCharsPerItem: 20,
+      maxTotalChars: 30,
+    });
+
+    expect(pack).toHaveLength(2);
+    expect(pack[0]?.text.length).toBeLessThanOrEqual(20);
+    expect(pack[1]?.text.length).toBeLessThanOrEqual(10);
+    expect(pack.reduce((sum, item) => sum + item.text.length, 0)).toBeLessThanOrEqual(30);
+  });
+
+  it("deduplicates repeated memory and chunk records deterministically", () => {
+    const repeated = memory({
+      chunks: [
+        { id: "chunk-1", ord: 0, text: "billing first", tokenCount: 2 },
+        { id: "chunk-1", ord: 1, text: "billing duplicate", tokenCount: 2 },
+      ],
+    });
+
+    const pack = assembleLocalRagEvidencePack({
+      query: "billing",
+      memories: [repeated, repeated],
+      maxItems: 4,
+    });
+
+    expect(pack.map((item) => item.id)).toEqual(["memory:mem-1:chunk:chunk-1"]);
+    expect(pack[0]?.text).toBe("billing first");
+  });
+});

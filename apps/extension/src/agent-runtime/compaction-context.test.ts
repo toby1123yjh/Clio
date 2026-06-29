@@ -183,14 +183,23 @@ describe("compaction provider context", () => {
     ]);
   });
 
-  it("drops retained evidence when building a general chat provider request", () => {
+  it("drops retained page evidence but preserves current memory pack for general chat", () => {
     const request = {
       runId: "run-1",
       question: "Hi",
       scope: "general" as const,
       pageUrl: "https://example.com/page",
       pageTitle: "Example",
-      evidence: [],
+      evidence: [
+        {
+          id: "memory:mem-1:chunk:chunk-1",
+          sourceKind: "memory" as const,
+          sourceUrl: "https://example.com/memory",
+          sourceTitle: "Saved Memory",
+          text: "Current memory evidence",
+          excerpt: "Current memory evidence",
+        },
+      ],
       createdAt: at,
     };
     const next = buildRequestWithProviderContext({
@@ -224,10 +233,12 @@ describe("compaction provider context", () => {
       },
     });
 
-    expect(next.evidence).toEqual([]);
+    expect(next.evidence.map((item) => item.id)).toEqual(["memory:mem-1:chunk:chunk-1"]);
     expect(next.currentTurnEvidenceRefs).toEqual([]);
     expect(next.providerContext?.messages.map((item) => item.content)).toEqual(["Earlier chat"]);
-    expect(next.providerContext?.evidence).toEqual([]);
+    expect(next.providerContext?.evidence.map((item) => item.id)).toEqual([
+      "memory:mem-1:chunk:chunk-1",
+    ]);
     expect(next.providerContext?.evidenceSummary).toBeUndefined();
   });
 });

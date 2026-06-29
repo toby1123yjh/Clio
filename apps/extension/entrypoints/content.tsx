@@ -6,6 +6,7 @@ import {
   type ImageGenerationStreamController,
   openImageGenerationStream,
 } from "@/src/agent-runtime/image-generation-stream-client";
+import { assembleLocalRagEvidencePack } from "@/src/agent-runtime/local-rag-evidence";
 import type {
   ProviderId,
   ProviderSettings,
@@ -411,7 +412,7 @@ function evidenceRecordToAgentEvidence(record: {
 function memoryDetailToAgentEvidence(memory: MemoryDetail): EvidenceItem {
   return {
     id: memory.id,
-    sourceKind: memory.sourceKind,
+    sourceKind: "memory",
     sourceUrl: memory.sourceUrl,
     sourceTitle: memory.sourceTitle,
     text: memory.normalizedText,
@@ -430,6 +431,28 @@ function memoryDetailToAgentEvidence(memory: MemoryDetail): EvidenceItem {
           },
         }),
   };
+}
+
+async function loadLocalRagEvidencePack(query: string): Promise<EvidenceItem[]> {
+  const normalizedQuery = normalizeText(query);
+  if (normalizedQuery.length === 0) return [];
+  try {
+    const search = await requestEngine({ kind: "searchMemory", query: normalizedQuery, limit: 8 });
+    const memoryIds = search.items.map((item) => item.id).slice(0, 8);
+    if (memoryIds.length === 0) return [];
+    const memories = await Promise.all(
+      memoryIds.map((id) => requestEngine({ kind: "getMemory", id })),
+    );
+    return assembleLocalRagEvidencePack({
+      query: normalizedQuery,
+      memories: memories.flatMap((memory) => (memory === null ? [] : [memory])),
+      maxItems: 6,
+      maxCharsPerItem: 1_200,
+      maxTotalChars: 4_800,
+    });
+  } catch {
+    return [];
+  }
 }
 
 function buildAttachedEvidence(
@@ -2607,9 +2630,11 @@ function ClioContentApp() {
       }
       const targetSessionId = existingSession === null ? undefined : sessionId;
       const previousEvidence = existingSession?.evidence.map(evidenceRecordToAgentEvidence) ?? [];
+      const localRagEvidence =
+        scope === "general" ? await loadLocalRagEvidencePack(providerQuestion) : [];
       const evidence =
         scope === "general"
-          ? []
+          ? localRagEvidence
           : attachedEvidence === undefined
             ? previousEvidence
             : [...previousEvidence, attachedEvidence];
