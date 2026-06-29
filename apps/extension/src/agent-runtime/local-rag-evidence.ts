@@ -28,6 +28,8 @@ export interface LocalRagEvidencePackInput {
   maxItems?: number;
   maxCharsPerItem?: number;
   maxTotalChars?: number;
+  contextChunksBefore?: number;
+  contextChunksAfter?: number;
 }
 
 export type LocalRagRetrievalSkipReason = "empty" | "too_short" | "smalltalk" | "creative";
@@ -49,6 +51,8 @@ interface Candidate {
 const defaultMaxItems = 6;
 const defaultMaxCharsPerItem = 1_200;
 const defaultMaxTotalChars = 4_800;
+const defaultContextChunksBefore = 1;
+const defaultContextChunksAfter = 1;
 const maxQueryTerms = 16;
 const minQuestionLength = 8;
 const minEvidenceTextLength = 8;
@@ -155,6 +159,11 @@ export function assembleLocalRagEvidencePack(input: LocalRagEvidencePackInput): 
   const maxItems = positiveLimit(input.maxItems, defaultMaxItems);
   const maxCharsPerItem = positiveLimit(input.maxCharsPerItem, defaultMaxCharsPerItem);
   const maxTotalChars = positiveLimit(input.maxTotalChars, defaultMaxTotalChars);
+  const contextChunksBefore = contextChunkLimit(
+    input.contextChunksBefore,
+    defaultContextChunksBefore,
+  );
+  const contextChunksAfter = contextChunkLimit(input.contextChunksAfter, defaultContextChunksAfter);
   if (
     query.length === 0 ||
     memories.length === 0 ||
@@ -169,7 +178,11 @@ export function assembleLocalRagEvidencePack(input: LocalRagEvidencePackInput): 
   const retrievalPlan = planLocalRagRetrieval(query);
   const allowFallback = retrievalPlan.shouldRetrieve && retrievalPlan.reason === "local_intent";
   const candidates = memories.flatMap((memory) =>
-    candidatesForMemory(memory, queryTerms, { allowFallback }),
+    candidatesForMemory(memory, queryTerms, {
+      allowFallback,
+      contextChunksBefore,
+      contextChunksAfter,
+    }),
   );
   const pack: EvidenceItem[] = [];
   const seenIds = new Set<string>();
@@ -206,26 +219,43 @@ export function assembleLocalRagEvidencePack(input: LocalRagEvidencePackInput): 
 function candidatesForMemory(
   memory: LocalRagMemory,
   queryTerms: Set<string>,
-  options: { allowFallback: boolean },
+  options: { allowFallback: boolean; contextChunksBefore: number; contextChunksAfter: number },
 ): Candidate[] {
-  const chunks = dedupeChunks(memory.chunks);
+  const chunks = dedupeChunks(memory.chunks).sort(compareChunks);
   const scoredChunks = chunks
-    .map((chunk) => ({
+    .map((chunk, index) => ({
       chunk,
+      index,
       score: overlapScore(chunk.text, queryTerms),
     }))
     .filter((item) => item.score > 0)
-    .sort((left, right) => right.score - left.score || left.chunk.ord - right.chunk.ord);
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.chunk.ord - right.chunk.ord || left.index - right.index,
+    );
 
   if (scoredChunks.length > 0) {
-    return scoredChunks.map(({ chunk, score }) => ({
-      evidenceId: `memory:${memory.id}:chunk:${chunk.id}`,
-      memory,
-      chunkId: chunk.id,
-      text: chunk.text,
-      score,
-      source: "chunk_match" as const,
-    }));
+    const acceptedWindows: Array<{ startIndex: number; endIndex: number }> = [];
+    return scoredChunks.flatMap(({ chunk, index, score }) => {
+      const startIndex = Math.max(0, index - options.contextChunksBefore);
+      const endIndex = Math.min(chunks.length - 1, index + options.contextChunksAfter);
+      if (acceptedWindows.some((window) => windowsOverlap(window, { startIndex, endIndex }))) {
+        return [];
+      }
+      acceptedWindows.push({ startIndex, endIndex });
+      return [
+        {
+          evidenceId: `memory:${memory.id}:chunk:${chunk.id}`,
+          memory,
+          chunkId: chunk.id,
+          text: chunks
+            .slice(startIndex, endIndex + 1)
+            .map((windowChunk) => windowChunk.text)
+            .join("\n\n"),
+          score,
+        },
+      ];
+    });
   }
 
   if (!options.allowFallback) return [];
@@ -261,6 +291,13 @@ function dedupeChunks(chunks: LocalRagMemory["chunks"]) {
     seen.add(key);
     return [{ ...chunk, text }];
   });
+}
+
+function compareChunks(
+  left: LocalRagMemory["chunks"][number],
+  right: LocalRagMemory["chunks"][number],
+) {
+  return left.ord - right.ord || left.id.localeCompare(right.id);
 }
 
 function queryTermSet(query: string) {
@@ -333,6 +370,19 @@ function positiveLimit(value: number | undefined, fallback: number) {
   if (value === undefined) return fallback;
   if (!Number.isFinite(value)) return fallback;
   return Math.max(0, Math.floor(value));
+}
+
+function contextChunkLimit(value: number | undefined, fallback: number) {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.floor(value));
+}
+
+function windowsOverlap(
+  left: { startIndex: number; endIndex: number },
+  right: { startIndex: number; endIndex: number },
+) {
+  return left.startIndex <= right.endIndex && right.startIndex <= left.endIndex;
 }
 
 function evidenceAnchor(memory: LocalRagMemory): EvidenceAnchor | undefined {

@@ -49,8 +49,87 @@ describe("assembleLocalRagEvidencePack", () => {
       id: "memory:mem-1:chunk:chunk-2",
       sourceKind: "memory",
       sourceTitle: "Example Memory",
+      text: [
+        "Product onboarding notes for the support team.",
+        "Billing operations and renewal policy details.",
+      ].join(" "),
+    });
+  });
+
+  it("can disable adjacent chunk context for callers that need anchor-only evidence", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "billing renewal",
+      memories: [memory()],
+      contextChunksBefore: 0,
+      contextChunksAfter: 0,
+    });
+
+    expect(pack).toHaveLength(1);
+    expect(pack[0]).toMatchObject({
+      id: "memory:mem-1:chunk:chunk-2",
       text: "Billing operations and renewal policy details.",
     });
+  });
+
+  it("keeps adjacent context scoped to the matched memory", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "billing",
+      memories: [
+        memory({
+          chunks: [
+            { id: "chunk-1", ord: 0, text: "Same memory setup context.", tokenCount: 4 },
+            { id: "chunk-2", ord: 1, text: "Billing operations details.", tokenCount: 3 },
+          ],
+        }),
+        memory({
+          id: "mem-2",
+          chunks: [{ id: "chunk-3", ord: 0, text: "Other memory lead-in context.", tokenCount: 4 }],
+        }),
+      ],
+    });
+
+    expect(pack).toHaveLength(1);
+    expect(pack[0]?.text).toContain("Same memory setup context.");
+    expect(pack[0]?.text).not.toContain("Other memory lead-in context.");
+  });
+
+  it("deduplicates overlapping windows by keeping the higher-priority anchor", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "alpha beta",
+      memories: [
+        memory({
+          chunks: [
+            { id: "chunk-1", ord: 0, text: "Alpha launch notes.", tokenCount: 3 },
+            { id: "chunk-2", ord: 1, text: "Beta launch notes.", tokenCount: 3 },
+            { id: "chunk-3", ord: 2, text: "Gamma launch notes.", tokenCount: 3 },
+          ],
+        }),
+      ],
+      maxItems: 4,
+    });
+
+    expect(pack.map((item) => item.id)).toEqual(["memory:mem-1:chunk:chunk-1"]);
+    expect(pack[0]?.text).toBe("Alpha launch notes. Beta launch notes.");
+  });
+
+  it("truncates expanded windows under item budgets", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "needle",
+      memories: [
+        memory({
+          chunks: [
+            { id: "chunk-1", ord: 0, text: "Short setup.", tokenCount: 2 },
+            { id: "chunk-2", ord: 1, text: "Needle match with details.", tokenCount: 4 },
+            { id: "chunk-3", ord: 2, text: "Follow-up context continues.", tokenCount: 4 },
+          ],
+        }),
+      ],
+      maxCharsPerItem: 38,
+    });
+
+    expect(pack).toHaveLength(1);
+    expect(pack[0]?.text.length).toBeLessThanOrEqual(38);
+    expect(pack[0]?.text).toBe("Short setup. Needle match with deta...");
   });
 
   it("does not inject weak fallback evidence for ordinary questions", () => {
