@@ -6,7 +6,10 @@ import {
   type ImageGenerationStreamController,
   openImageGenerationStream,
 } from "@/src/agent-runtime/image-generation-stream-client";
-import { assembleLocalRagEvidencePack } from "@/src/agent-runtime/local-rag-evidence";
+import {
+  assembleLocalRagEvidencePack,
+  planLocalRagRetrieval,
+} from "@/src/agent-runtime/local-rag-evidence";
 import type {
   ProviderId,
   ProviderSettings,
@@ -436,6 +439,7 @@ function memoryDetailToAgentEvidence(memory: MemoryDetail): EvidenceItem {
 async function loadLocalRagEvidencePack(query: string): Promise<EvidenceItem[]> {
   const normalizedQuery = normalizeText(query);
   if (normalizedQuery.length === 0) return [];
+  if (!planLocalRagRetrieval(normalizedQuery).shouldRetrieve) return [];
   try {
     const search = await requestEngine({ kind: "searchMemory", query: normalizedQuery, limit: 8 });
     const memoryIds = search.items.map((item) => item.id).slice(0, 8);

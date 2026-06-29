@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { type LocalRagMemory, assembleLocalRagEvidencePack } from "./local-rag-evidence";
+import {
+  type LocalRagMemory,
+  assembleLocalRagEvidencePack,
+  planLocalRagRetrieval,
+} from "./local-rag-evidence";
 
 function memory(overrides: Partial<LocalRagMemory> = {}): LocalRagMemory {
   return {
@@ -49,9 +53,18 @@ describe("assembleLocalRagEvidencePack", () => {
     });
   });
 
-  it("falls back to memory excerpt when no chunk overlaps query terms", () => {
+  it("does not inject weak fallback evidence for ordinary questions", () => {
     const pack = assembleLocalRagEvidencePack({
-      query: "unmatched",
+      query: "what should we prioritize next quarter",
+      memories: [memory()],
+    });
+
+    expect(pack).toEqual([]);
+  });
+
+  it("falls back to memory excerpt when local intent is explicit", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "check my saved archive about unmatched",
       memories: [memory()],
     });
 
@@ -103,5 +116,60 @@ describe("assembleLocalRagEvidencePack", () => {
 
     expect(pack.map((item) => item.id)).toEqual(["memory:mem-1:chunk:chunk-1"]);
     expect(pack[0]?.text).toBe("billing first");
+  });
+});
+
+describe("planLocalRagRetrieval", () => {
+  it("skips empty input, short smalltalk, and short non-local queries", () => {
+    expect(planLocalRagRetrieval("")).toEqual({ shouldRetrieve: false, reason: "empty" });
+    expect(planLocalRagRetrieval("hi")).toEqual({
+      shouldRetrieve: false,
+      reason: "smalltalk",
+    });
+    expect(planLocalRagRetrieval("你好")).toEqual({
+      shouldRetrieve: false,
+      reason: "smalltalk",
+    });
+    expect(planLocalRagRetrieval("ok?")).toEqual({
+      shouldRetrieve: false,
+      reason: "smalltalk",
+    });
+    expect(planLocalRagRetrieval("why")).toEqual({
+      shouldRetrieve: false,
+      reason: "too_short",
+    });
+  });
+
+  it("skips pure creative requests without local context intent", () => {
+    expect(planLocalRagRetrieval("write a concise announcement")).toEqual({
+      shouldRetrieve: false,
+      reason: "creative",
+    });
+    expect(planLocalRagRetrieval("润色这句话")).toEqual({
+      shouldRetrieve: false,
+      reason: "creative",
+    });
+  });
+
+  it("retrieves when local memory or project/document intent is explicit", () => {
+    expect(planLocalRagRetrieval("what did I save about billing?")).toEqual({
+      shouldRetrieve: true,
+      reason: "local_intent",
+    });
+    expect(planLocalRagRetrieval("查一下知识库里面 LightRAG 的笔记")).toEqual({
+      shouldRetrieve: true,
+      reason: "local_intent",
+    });
+    expect(planLocalRagRetrieval("继续分析这个项目的 commit")).toEqual({
+      shouldRetrieve: true,
+      reason: "local_intent",
+    });
+  });
+
+  it("retrieves ordinary longer questions and lets the evidence gate filter weak results", () => {
+    expect(planLocalRagRetrieval("how should the retrieval pipeline handle evidence?")).toEqual({
+      shouldRetrieve: true,
+      reason: "question",
+    });
   });
 });
