@@ -7,6 +7,7 @@ import {
   openImageGenerationStream,
 } from "@/src/agent-runtime/image-generation-stream-client";
 import {
+  type LocalRagMemory,
   assembleLocalRagEvidencePack,
   planLocalRagRetrieval,
 } from "@/src/agent-runtime/local-rag-evidence";
@@ -147,6 +148,7 @@ import {
   type EngineHealth,
   type ImageGenerationHistoryRecord,
   type MemoryDetail,
+  type MemoryEvidenceWindow,
   type SearchMemoryItem,
   type TopicGraphEdge,
   type TopicPageDetail,
@@ -412,28 +414,57 @@ function evidenceRecordToAgentEvidence(record: {
   };
 }
 
-function memoryDetailToAgentEvidence(memory: MemoryDetail): EvidenceItem {
+function evidenceWindowToAgentEvidence(window: MemoryEvidenceWindow): EvidenceItem {
+  const text = normalizeText(window.chunks.map((chunk) => chunk.text).join("\n\n"));
   return {
-    id: memory.id,
+    id: `memory:${window.memoryId}:chunk:${window.chunkId}`,
     sourceKind: "memory",
-    sourceUrl: memory.sourceUrl,
-    sourceTitle: memory.sourceTitle,
-    text: memory.normalizedText,
-    excerpt: memory.excerpt,
-    ...(memory.anchor === undefined
+    sourceUrl: window.sourceUrl,
+    sourceTitle: window.sourceTitle,
+    text,
+    excerpt: excerpt(text || window.excerpt),
+    ...(window.anchor === undefined
       ? {}
       : {
           anchor: {
-            selectedText: memory.anchor.selectedText,
-            contextBefore: memory.anchor.contextBefore,
-            contextAfter: memory.anchor.contextAfter,
-            ...(memory.anchor.xpath === undefined ? {} : { xpath: memory.anchor.xpath }),
-            ...(memory.anchor.textFragment === undefined
+            selectedText: window.anchor.selectedText,
+            contextBefore: window.anchor.contextBefore,
+            contextAfter: window.anchor.contextAfter,
+            ...(window.anchor.xpath === undefined ? {} : { xpath: window.anchor.xpath }),
+            ...(window.anchor.textFragment === undefined
               ? {}
-              : { textFragment: memory.anchor.textFragment }),
+              : { textFragment: window.anchor.textFragment }),
           },
         }),
   };
+}
+
+function evidenceWindowsToLocalRagMemories(windows: MemoryEvidenceWindow[]): LocalRagMemory[] {
+  const memories = new Map<string, LocalRagMemory>();
+  for (const window of windows) {
+    const text = normalizeText(window.chunks.map((chunk) => chunk.text).join("\n\n"));
+    if (text.length === 0) continue;
+    const existing = memories.get(window.memoryId);
+    const memory =
+      existing ??
+      ({
+        id: window.memoryId,
+        sourceUrl: window.sourceUrl,
+        sourceTitle: window.sourceTitle,
+        normalizedText: "",
+        excerpt: window.excerpt,
+        anchor: window.anchor,
+        chunks: [],
+      } satisfies LocalRagMemory);
+    memory.chunks.push({
+      id: window.chunkId,
+      ord: memory.chunks.length,
+      text,
+      tokenCount: window.chunks.reduce((total, chunk) => total + chunk.tokenCount, 0),
+    });
+    memories.set(window.memoryId, memory);
+  }
+  return Array.from(memories.values());
 }
 
 async function loadLocalRagEvidencePack(query: string): Promise<EvidenceItem[]> {
@@ -441,18 +472,24 @@ async function loadLocalRagEvidencePack(query: string): Promise<EvidenceItem[]> 
   if (normalizedQuery.length === 0) return [];
   if (!planLocalRagRetrieval(normalizedQuery).shouldRetrieve) return [];
   try {
-    const search = await requestEngine({ kind: "searchMemory", query: normalizedQuery, limit: 8 });
-    const memoryIds = search.items.map((item) => item.id).slice(0, 8);
-    if (memoryIds.length === 0) return [];
-    const memories = await Promise.all(
-      memoryIds.map((id) => requestEngine({ kind: "getMemory", id })),
-    );
+    const windows = await requestEngine({
+      kind: "getMemoryEvidenceWindows",
+      payload: {
+        query: normalizedQuery,
+        limit: 12,
+        maxWindowsPerMemory: 2,
+        contextChunksBefore: 1,
+        contextChunksAfter: 1,
+      },
+    });
     return assembleLocalRagEvidencePack({
       query: normalizedQuery,
-      memories: memories.flatMap((memory) => (memory === null ? [] : [memory])),
+      memories: evidenceWindowsToLocalRagMemories(windows.items),
       maxItems: 6,
       maxCharsPerItem: 1_200,
       maxTotalChars: 4_800,
+      contextChunksBefore: 0,
+      contextChunksAfter: 0,
     });
   } catch {
     return [];
@@ -1718,12 +1755,18 @@ function ClioContentApp() {
             : (await requestEngine({ kind: "searchMemory", query, limit: 8 })).items.map(
                 (item) => item.id,
               );
-        const evidenceDetails = await Promise.all(
-          sourceMemoryIds.slice(0, 8).map((id) => requestEngine({ kind: "getMemory", id })),
-        );
-        const evidence = evidenceDetails
-          .flatMap((memory) => (memory === null ? [] : [memoryDetailToAgentEvidence(memory)]))
-          .slice(0, 8);
+        const evidenceWindows = await requestEngine({
+          kind: "getMemoryEvidenceWindows",
+          payload: {
+            query,
+            memoryIds: sourceMemoryIds.slice(0, 8),
+            limit: 8,
+            maxWindowsPerMemory: 1,
+            contextChunksBefore: 1,
+            contextChunksAfter: 1,
+          },
+        });
+        const evidence = evidenceWindows.items.map(evidenceWindowToAgentEvidence).slice(0, 8);
         await appendWikiCompileEvent(claimed.id, {
           kind: "sources_selected",
           level: evidence.length === 0 ? "warning" : "info",
@@ -1733,7 +1776,7 @@ function ClioContentApp() {
               : `${evidence.length} source memories selected.`,
           detail: {
             sourceMemoryCount: evidence.length,
-            memoryIds: evidence.map((item) => item.id),
+            memoryIds: evidenceWindows.items.map((item) => item.memoryId),
           },
         });
         if (evidence.length === 0) {

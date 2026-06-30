@@ -24,12 +24,15 @@ import {
   type EngineRequest,
   EngineRpcError,
   type GetJobStatusResult,
+  type GetMemoryEvidenceWindowsPayload,
+  type GetMemoryEvidenceWindowsResult,
   type ImageGenerationHistoryRecord,
   type JobStatus,
   type JobSummary,
   type JobType,
   type ListMemoriesResult,
   type MemoryDetail,
+  type MemoryEvidenceWindow,
   type MemorySummary,
   type ReindexResult,
   type RepairAction,
@@ -138,6 +141,8 @@ class LocalEngine {
         return await this.list(request.limit);
       case "getMemory":
         return await this.get(request.id);
+      case "getMemoryEvidenceWindows":
+        return await this.getMemoryEvidenceWindows(request.payload);
       case "deleteMemory":
         return await this.delete(request.id);
       case "listTopicPages":
@@ -512,6 +517,95 @@ class LocalEngine {
         text: stringField(chunk, "text"),
         tokenCount: numberField(chunk, "token_count"),
       })),
+    };
+  }
+
+  private async getMemoryEvidenceWindows(
+    payload: GetMemoryEvidenceWindowsPayload,
+  ): Promise<GetMemoryEvidenceWindowsResult> {
+    const db = await this.ensureReady();
+    const query = normalizeText(payload.query ?? "");
+    const ftsQuery = buildFtsQuery(query);
+    const sourceIds = boundedUniqueStrings(payload.memoryIds, 40);
+    const limit = clampOptionalLimit(payload.limit, 8, 20);
+    const maxWindowsPerMemory = clampOptionalLimit(payload.maxWindowsPerMemory, 2, 4);
+    const contextChunksBefore = clampOptionalCount(payload.contextChunksBefore, 1, 3);
+    const contextChunksAfter = clampOptionalCount(payload.contextChunksAfter, 1, 3);
+    const anchorRows = loadAnchorsBySourceId(db, sourceIds);
+    const windows: MemoryEvidenceWindow[] = [];
+    const seenWindows = new Set<string>();
+    const windowsBySource = new Map<string, number>();
+
+    const addWindow = (sourceId: string, anchorOrd: number) => {
+      if (windows.length >= limit) return;
+      const sourceCount = windowsBySource.get(sourceId) ?? 0;
+      if (sourceCount >= maxWindowsPerMemory) return;
+      const window = loadSourceEvidenceWindow(db, {
+        sourceId,
+        anchorOrd,
+        contextChunksBefore,
+        contextChunksAfter,
+        anchor: anchorRows.get(sourceId),
+      });
+      if (window === undefined) return;
+      const key = `${window.memoryId}:${window.chunkId}`;
+      if (seenWindows.has(key)) return;
+      seenWindows.add(key);
+      windowsBySource.set(sourceId, sourceCount + 1);
+      windows.push(window);
+    };
+
+    if (ftsQuery.length > 0) {
+      const bindings: unknown[] = [ftsQuery];
+      const sourceFilter =
+        sourceIds.length === 0 ? "" : ` AND s.id IN (${sourceIds.map(() => "?").join(", ")})`;
+      bindings.push(...sourceIds, Math.max(limit * 4, limit + sourceIds.length));
+      const rows = db.selectObjects(
+        `SELECT
+          s.id AS source_id,
+          c.ord AS chunk_ord
+         FROM source_fts
+         JOIN sources s ON s.id = source_fts.source_id
+         JOIN source_chunks c ON c.id = source_fts.chunk_id
+         WHERE source_fts MATCH ?
+           AND s.lifecycle_status <> 'deleted'
+           ${sourceFilter}
+         ORDER BY bm25(source_fts) ASC
+         LIMIT ?`,
+        bindings,
+      );
+      for (const row of rows) {
+        addWindow(stringField(row, "source_id"), numberField(row, "chunk_ord"));
+      }
+    }
+
+    if (windows.length < limit && sourceIds.length > 0) {
+      const fallbackRows = db.selectObjects(
+        `SELECT
+          s.id AS source_id,
+          MIN(c.ord) AS chunk_ord
+         FROM sources s
+         JOIN source_chunks c ON c.source_id = s.id
+         WHERE s.lifecycle_status <> 'deleted'
+           AND s.id IN (${sourceIds.map(() => "?").join(", ")})
+         GROUP BY s.id
+         ORDER BY s.captured_at DESC
+         LIMIT ?`,
+        [...sourceIds, sourceIds.length],
+      );
+      const fallbackOrdBySource = new Map(
+        fallbackRows.map((row) => [stringField(row, "source_id"), numberField(row, "chunk_ord")]),
+      );
+      for (const sourceId of sourceIds) {
+        const anchorOrd = fallbackOrdBySource.get(sourceId);
+        if (anchorOrd === undefined) continue;
+        addWindow(sourceId, anchorOrd);
+      }
+    }
+
+    return {
+      items: windows,
+      ...(query.length === 0 ? {} : { query }),
     };
   }
 
@@ -3080,6 +3174,85 @@ function anchorFromRow(row: SqlRow): AnchorInfo {
   };
 }
 
+function loadAnchorsBySourceId(db: SqliteDb, sourceIds: string[]) {
+  if (sourceIds.length === 0) return new Map<string, AnchorInfo>();
+  const rows = db.selectObjects(
+    `SELECT *
+     FROM anchors
+     WHERE memory_id IN (${sourceIds.map(() => "?").join(", ")})`,
+    sourceIds,
+  );
+  return new Map(rows.map((row) => [stringField(row, "memory_id"), anchorFromRow(row)]));
+}
+
+function loadSourceEvidenceWindow(
+  db: SqliteDb,
+  input: {
+    sourceId: string;
+    anchorOrd: number;
+    contextChunksBefore: number;
+    contextChunksAfter: number;
+    anchor?: AnchorInfo;
+  },
+): MemoryEvidenceWindow | undefined {
+  const source = db.selectObject(
+    `SELECT
+      id,
+      source_kind,
+      source_url,
+      source_title
+     FROM sources
+     WHERE id = ?
+       AND lifecycle_status <> 'deleted'
+     LIMIT 1`,
+    [input.sourceId],
+  );
+  if (source === undefined) return undefined;
+
+  const startOrd = Math.max(0, input.anchorOrd - input.contextChunksBefore);
+  const endOrd = input.anchorOrd + input.contextChunksAfter;
+  const rows = db.selectObjects(
+    `SELECT id, ord, text, token_count
+     FROM source_chunks
+     WHERE source_id = ?
+       AND ord BETWEEN ? AND ?
+     ORDER BY ord ASC`,
+    [input.sourceId, startOrd, endOrd],
+  );
+  if (rows.length === 0) return undefined;
+
+  const chunks = rows.map((row) => ({
+    id: stringField(row, "id"),
+    ord: numberField(row, "ord"),
+    text: stringField(row, "text"),
+    tokenCount: numberField(row, "token_count"),
+  }));
+  const anchorChunk =
+    chunks.find((chunk) => chunk.ord === input.anchorOrd) ?? chunks[Math.floor(chunks.length / 2)];
+  if (anchorChunk === undefined) return undefined;
+  const anchor =
+    input.anchor ??
+    optionalAnchorFromRow(
+      db.selectObject("SELECT * FROM anchors WHERE memory_id = ? LIMIT 1", [input.sourceId]),
+    );
+  const text = chunks.map((chunk) => chunk.text).join("\n\n");
+
+  return {
+    memoryId: stringField(source, "id"),
+    chunkId: anchorChunk.id,
+    sourceKind: sourceKindField(source, "source_kind"),
+    sourceUrl: stringField(source, "source_url"),
+    sourceTitle: stringField(source, "source_title"),
+    excerpt: excerpt(text),
+    ...(anchor === undefined ? {} : { anchor }),
+    chunks,
+  };
+}
+
+function optionalAnchorFromRow(row: SqlRow | undefined) {
+  return row === undefined ? undefined : anchorFromRow(row);
+}
+
 function jobSummaryFromRow(row: SqlRow): JobSummary {
   const lastError = optionalString(row, "last_error");
   const startedAt = optionalString(row, "started_at");
@@ -3523,6 +3696,27 @@ function agentScopeField(row: SqlRow, key: string): ChatMessageRecord["scope"] {
 function clampLimit(limit: number, max: number) {
   if (!Number.isFinite(limit)) return max;
   return Math.max(1, Math.min(Math.floor(limit), max));
+}
+
+function clampOptionalLimit(value: number | undefined, fallback: number, max: number) {
+  return clampLimit(value ?? fallback, max);
+}
+
+function clampOptionalCount(value: number | undefined, fallback: number, max: number) {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(Math.floor(value), max));
+}
+
+function boundedUniqueStrings(values: string[] | undefined, max: number) {
+  if (values === undefined) return [];
+  const seen = new Set<string>();
+  return values.flatMap((value) => {
+    const normalized = normalizeText(value);
+    if (normalized.length === 0 || seen.has(normalized) || seen.size >= max) return [];
+    seen.add(normalized);
+    return [normalized];
+  });
 }
 
 function normalizeTopicTitle(value: string) {

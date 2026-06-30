@@ -500,6 +500,50 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts bounded memory evidence window requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "getMemoryEvidenceWindows",
+          payload: {
+            query: "billing notes",
+            memoryIds: ["mem-1", "mem-2"],
+            limit: 8,
+            maxWindowsPerMemory: 2,
+            contextChunksBefore: 1,
+            contextChunksAfter: 1,
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "getMemoryEvidenceWindows",
+          payload: {
+            memoryIds: [42],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "getMemoryEvidenceWindows",
+          payload: {
+            query: "billing notes",
+            contextChunksBefore: "wide",
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts typed agent thinking and tool trace stream events", () => {
     expect(
       isAgentStreamEventMessage({

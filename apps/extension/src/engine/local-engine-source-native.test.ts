@@ -48,4 +48,25 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).not.toContain('"ingest_chunk_meta"');
     expect(workerSource).not.toContain('"ingest_graph"');
   });
+
+  it("loads prompt evidence through bounded source chunk windows", () => {
+    expect(workerSource).toContain('case "getMemoryEvidenceWindows"');
+    expect(workerSource).toContain("private async getMemoryEvidenceWindows");
+    expect(workerSource).toContain("FROM source_fts");
+    expect(workerSource).toContain("JOIN source_chunks c ON c.id = source_fts.chunk_id");
+    expect(workerSource).toContain("function loadSourceEvidenceWindow");
+    expect(workerSource).toContain("FROM source_chunks");
+    expect(workerSource).toContain("ord BETWEEN ? AND ?");
+
+    const evidenceWindowSection = workerSource.slice(
+      workerSource.indexOf("private async getMemoryEvidenceWindows"),
+      workerSource.indexOf("private async delete"),
+    );
+    expect(evidenceWindowSection).not.toContain("normalized_text");
+    const loaderSection = workerSource.slice(
+      workerSource.indexOf("function loadSourceEvidenceWindow"),
+      workerSource.indexOf("function optionalAnchorFromRow"),
+    );
+    expect(loaderSection).not.toContain("normalized_text");
+  });
 });

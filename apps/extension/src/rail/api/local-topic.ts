@@ -228,9 +228,10 @@ function sourceRefsFromCompileOutput(
   const citationRefs = citations.flatMap((citation) => {
     const item = evidence.find((candidate) => candidate.id === citation.evidenceId);
     if (item === undefined) return [];
+    const ref = sourceRefFromEvidence(item);
     return [
       {
-        memoryId: item.id,
+        ...ref,
         quote: citation.excerpt,
       },
     ];
@@ -238,10 +239,25 @@ function sourceRefsFromCompileOutput(
   if (citationRefs.length > 0) return dedupeSourceRefs(citationRefs);
   return dedupeSourceRefs(
     evidence.slice(0, 8).map((item) => ({
-      memoryId: item.id,
+      ...sourceRefFromEvidence(item),
       quote: excerpt(item.text || item.excerpt || content, 180),
     })),
   );
+}
+
+function sourceRefFromEvidence(
+  item: EvidenceItem,
+): Pick<TopicPageSourceRef, "memoryId" | "chunkId"> {
+  const match = /^memory:(.+):chunk:(.+)$/u.exec(item.id);
+  const memoryId = match?.[1];
+  const chunkId = match?.[2];
+  if (memoryId !== undefined && chunkId !== undefined) {
+    return {
+      memoryId,
+      chunkId,
+    };
+  }
+  return { memoryId: item.id };
 }
 
 function dedupeSourceRefs(refs: TopicPageSourceRef[]) {
