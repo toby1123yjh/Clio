@@ -37,6 +37,12 @@ import {
   type ReindexResult,
   type RepairAction,
   type RepairResult,
+  type RetrieveSourceHitChunk,
+  type RetrieveSourceItem,
+  type RetrieveSourcesPayload,
+  type RetrieveSourcesResult,
+  type RetrieveSourcesTraceTrack,
+  type RetrieveTrackName,
   type SearchMemoryResult,
   type SessionEvidenceRecord,
   type SessionLeaseResult,
@@ -102,6 +108,7 @@ const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
 const staleSessionLeaseMs = 30_000;
+const defaultRrfK = 60;
 
 type SourceLifecycleStatus = "fresh" | "stale" | "archived" | "deleted";
 type SourceAnalysisLevel = "saved" | "analyzed";
@@ -110,6 +117,13 @@ type SourceAuditAction =
   | "source.superseded"
   | "source.deleted"
   | "source.stage_queued";
+
+interface SourceRetrievalHit {
+  track: "fts_chunks";
+  rank: number;
+  source: SqlRow;
+  chunk: RetrieveSourceHitChunk;
+}
 
 interface DocumentDraft {
   kind: SourceKind;
@@ -135,6 +149,8 @@ class LocalEngine {
         return await this.capture("page", request.payload);
       case "captureSelection":
         return await this.capture("selection", request.payload);
+      case "retrieveSources":
+        return await this.retrieveSources(request.payload);
       case "searchMemory":
         return await this.search(request.query, request.limit);
       case "listMemories":
@@ -411,6 +427,94 @@ class LocalEngine {
               },
             }
           : memorySummaryFromRow(saved),
+    };
+  }
+
+  private async retrieveSources(payload: RetrieveSourcesPayload): Promise<RetrieveSourcesResult> {
+    const db = await this.ensureReady();
+    const query = normalizeText(payload.query);
+    const limit = clampOptionalLimit(payload.limit, 20, 50);
+    const includeChunks = clampOptionalLimit(payload.includeChunks, 3, 8);
+    const traceTracks: RetrieveSourcesTraceTrack[] = [];
+
+    if (buildFtsQuery(query).length === 0) {
+      const rows = db.selectObjects(
+        `SELECT
+          id,
+          source_kind,
+          source_url,
+          normalized_source_url,
+          source_title,
+          captured_at,
+          content_hash,
+          version_group_key,
+          version_no,
+          supersedes_source_id,
+          superseded_by_source_id,
+          is_current
+         FROM sources
+         WHERE lifecycle_status <> 'deleted'
+         ORDER BY captured_at DESC
+         LIMIT ?`,
+        [limit],
+      );
+      traceTracks.push({
+        name: "recent_sources",
+        status: "used",
+        itemCount: rows.length,
+        reason: "empty_query",
+      });
+      traceTracks.push({
+        name: "fts_chunks",
+        status: "skipped",
+        itemCount: 0,
+        reason: "empty_query",
+      });
+      traceTracks.push(vectorUnavailableTrace());
+      return {
+        query,
+        items: rows.map((row, index) => ({
+          ...memorySummaryFromRetrievalRow(
+            row,
+            stringField(row, "source_title") || stringField(row, "source_url"),
+          ),
+          score: reciprocalRankFusionScore(index + 1),
+          tracks: ["recent_sources"],
+          hitChunks: [],
+        })),
+        trace: {
+          strategy: "rrf",
+          rrfK: defaultRrfK,
+          tracks: traceTracks,
+        },
+      };
+    }
+
+    const ftsHits = loadFtsChunkRetrievalHits(db, {
+      query,
+      limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
+    });
+    const items = fuseSourceRetrievalHits(ftsHits, {
+      limit,
+      includeChunks,
+      rrfK: defaultRrfK,
+    });
+    traceTracks.push({
+      name: "fts_chunks",
+      status: ftsHits.length > 0 ? "used" : "skipped",
+      itemCount: ftsHits.length,
+      ...(ftsHits.length === 0 ? { reason: "no_matches" } : {}),
+    });
+    traceTracks.push(vectorUnavailableTrace());
+
+    return {
+      query,
+      items,
+      trace: {
+        strategy: "rrf",
+        rrfK: defaultRrfK,
+        tracks: traceTracks,
+      },
     };
   }
 
@@ -3082,6 +3186,32 @@ function memorySummaryFromRow(row: SqlRow): MemorySummary {
   };
 }
 
+function memorySummaryFromRetrievalRow(row: SqlRow, fallbackExcerpt: string): MemorySummary {
+  const sourceKind = sourceKindField(row, "source_kind");
+  const normalizedSourceUrl =
+    stringField(row, "normalized_source_url") || normalizeSourceUrl(stringField(row, "source_url"));
+  const groupKey =
+    stringField(row, "version_group_key") ||
+    buildMemoryVersionGroupKey(sourceKind, normalizedSourceUrl, stringField(row, "content_hash"));
+  const supersedesMemoryId = optionalString(row, "supersedes_source_id");
+  const supersededByMemoryId = optionalString(row, "superseded_by_source_id");
+  return {
+    id: stringField(row, "id"),
+    sourceKind,
+    sourceUrl: stringField(row, "source_url"),
+    sourceTitle: stringField(row, "source_title"),
+    capturedAt: stringField(row, "captured_at"),
+    excerpt: excerpt(fallbackExcerpt),
+    version: {
+      groupKey,
+      versionNo: Math.max(1, numberField(row, "version_no")),
+      isCurrent: numberField(row, "is_current") !== 0,
+      ...(supersedesMemoryId === undefined ? {} : { supersedesMemoryId }),
+      ...(supersededByMemoryId === undefined ? {} : { supersededByMemoryId }),
+    },
+  };
+}
+
 function topicPageSummaryFromRow(row: SqlRow): Omit<TopicPageDetail, "content" | "sourceRefs"> {
   const sourceRefs = parseTopicSourceRefs(stringField(row, "source_refs_json"));
   return {
@@ -3251,6 +3381,131 @@ function loadSourceEvidenceWindow(
 
 function optionalAnchorFromRow(row: SqlRow | undefined) {
   return row === undefined ? undefined : anchorFromRow(row);
+}
+
+function loadFtsChunkRetrievalHits(
+  db: SqliteDb,
+  input: { query: string; limit: number },
+): SourceRetrievalHit[] {
+  const ftsQuery = buildFtsQuery(input.query);
+  if (ftsQuery.length === 0) return [];
+  const rows = db.selectObjects(
+    `SELECT
+      s.id,
+      s.source_kind,
+      s.source_url,
+      s.normalized_source_url,
+      s.source_title,
+      s.captured_at,
+      s.content_hash,
+      s.version_group_key,
+      s.version_no,
+      s.supersedes_source_id,
+      s.superseded_by_source_id,
+      s.is_current,
+      c.id AS chunk_id,
+      c.ord AS chunk_ord,
+      c.text AS chunk_text,
+      bm25(source_fts) AS score
+     FROM source_fts
+     JOIN sources s ON s.id = source_fts.source_id
+     JOIN source_chunks c ON c.id = source_fts.chunk_id
+     WHERE source_fts MATCH ?
+       AND s.lifecycle_status <> 'deleted'
+     ORDER BY score ASC
+     LIMIT ?`,
+    [ftsQuery, clampLimit(input.limit, 400)],
+  );
+  return rows.map((row, index) => ({
+    track: "fts_chunks",
+    rank: index + 1,
+    source: row,
+    chunk: {
+      chunkId: stringField(row, "chunk_id"),
+      ord: numberField(row, "chunk_ord"),
+      snippet: excerpt(stringField(row, "chunk_text")),
+      score: realField(row, "score"),
+      track: "fts_chunks",
+    },
+  }));
+}
+
+function fuseSourceRetrievalHits(
+  hits: SourceRetrievalHit[],
+  input: { limit: number; includeChunks: number; rrfK: number },
+): RetrieveSourceItem[] {
+  const grouped = new Map<
+    string,
+    {
+      source: SqlRow;
+      score: number;
+      bestRank: number;
+      tracks: Set<RetrieveTrackName>;
+      chunks: RetrieveSourceHitChunk[];
+      seenChunks: Set<string>;
+    }
+  >();
+
+  for (const hit of hits) {
+    const sourceId = stringField(hit.source, "id");
+    if (sourceId.length === 0) continue;
+    const existing = grouped.get(sourceId) ?? {
+      source: hit.source,
+      score: 0,
+      bestRank: Number.MAX_SAFE_INTEGER,
+      tracks: new Set<RetrieveTrackName>(),
+      chunks: [],
+      seenChunks: new Set<string>(),
+    };
+    existing.score += reciprocalRankFusionScore(hit.rank, input.rrfK);
+    existing.bestRank = Math.min(existing.bestRank, hit.rank);
+    existing.tracks.add(hit.track);
+    if (
+      existing.chunks.length < input.includeChunks &&
+      hit.chunk.chunkId.length > 0 &&
+      !existing.seenChunks.has(hit.chunk.chunkId)
+    ) {
+      existing.seenChunks.add(hit.chunk.chunkId);
+      existing.chunks.push(hit.chunk);
+    }
+    grouped.set(sourceId, existing);
+  }
+
+  return Array.from(grouped.values())
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        left.bestRank - right.bestRank ||
+        stringField(right.source, "captured_at").localeCompare(
+          stringField(left.source, "captured_at"),
+        ) ||
+        stringField(left.source, "source_title").localeCompare(
+          stringField(right.source, "source_title"),
+        ),
+    )
+    .slice(0, input.limit)
+    .map((item) => ({
+      ...memorySummaryFromRetrievalRow(
+        item.source,
+        item.chunks[0]?.snippet || stringField(item.source, "source_title"),
+      ),
+      score: item.score,
+      tracks: Array.from(item.tracks),
+      hitChunks: item.chunks,
+    }));
+}
+
+function reciprocalRankFusionScore(rank: number, rrfK = defaultRrfK) {
+  return 1 / (rrfK + Math.max(1, Math.floor(rank)));
+}
+
+function vectorUnavailableTrace(): RetrieveSourcesTraceTrack {
+  return {
+    name: "vector_chunks",
+    status: "unavailable",
+    itemCount: 0,
+    reason: "embedding_index_not_available",
+  };
 }
 
 function jobSummaryFromRow(row: SqlRow): JobSummary {

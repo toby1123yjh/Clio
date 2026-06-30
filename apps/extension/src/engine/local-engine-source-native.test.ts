@@ -69,4 +69,30 @@ describe("local engine source-native storage foundation", () => {
     );
     expect(loaderSection).not.toContain("normalized_text");
   });
+
+  it("exposes source-native retrieval with RRF fusion and truthful vector trace", () => {
+    expect(workerSource).toContain('case "retrieveSources"');
+    expect(workerSource).toContain("private async retrieveSources");
+    expect(workerSource).toContain("function loadFtsChunkRetrievalHits");
+    expect(workerSource).toContain("function fuseSourceRetrievalHits");
+    expect(workerSource).toContain("function reciprocalRankFusionScore");
+    expect(workerSource).toContain("const defaultRrfK = 60");
+    expect(workerSource).toContain("FROM source_fts");
+    expect(workerSource).toContain("JOIN sources s ON s.id = source_fts.source_id");
+    expect(workerSource).toContain("JOIN source_chunks c ON c.id = source_fts.chunk_id");
+    expect(workerSource).toContain('name: "vector_chunks"');
+    expect(workerSource).toContain('status: "unavailable"');
+    expect(workerSource).toContain("embedding_index_not_available");
+
+    const retrieveSection = workerSource.slice(
+      workerSource.indexOf("private async retrieveSources"),
+      workerSource.indexOf("private async search"),
+    );
+    expect(retrieveSection).not.toContain("normalized_text");
+    const ftsRetrievalSection = workerSource.slice(
+      workerSource.indexOf("function loadFtsChunkRetrievalHits"),
+      workerSource.indexOf("function fuseSourceRetrievalHits"),
+    );
+    expect(ftsRetrievalSection).not.toContain("normalized_text");
+  });
 });

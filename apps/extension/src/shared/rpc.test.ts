@@ -544,6 +544,48 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts source retrieval requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "retrieveSources",
+          payload: {
+            query: "context window retrieval",
+            limit: 20,
+            scope: "all",
+            includeChunks: 3,
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "retrieveSources",
+          payload: {
+            query: "context window retrieval",
+            scope: "current_page",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "retrieveSources",
+          payload: {
+            limit: 20,
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts typed agent thinking and tool trace stream events", () => {
     expect(
       isAgentStreamEventMessage({
