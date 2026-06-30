@@ -103,12 +103,19 @@ type SqliteInitModule = (config?: {
 }) => Promise<SqliteApi>;
 
 const databasePath = "/clio-browser-phase1.sqlite3";
-const schemaVersion = 12;
+const schemaVersion = 13;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
 const staleSessionLeaseMs = 30_000;
 const defaultRrfK = 60;
+const defaultEmbeddingProvider = {
+  modelId: "clio-local-hash-v1",
+  provider: "local-deterministic",
+  label: "Clio local deterministic hash v1",
+  dimension: 64,
+  metric: "cosine",
+} as const;
 
 type SourceLifecycleStatus = "fresh" | "stale" | "archived" | "deleted";
 type SourceAnalysisLevel = "saved" | "analyzed";
@@ -119,10 +126,17 @@ type SourceAuditAction =
   | "source.stage_queued";
 
 interface SourceRetrievalHit {
-  track: "fts_chunks";
+  track: "fts_chunks" | "vector_chunks";
   rank: number;
   source: SqlRow;
   chunk: RetrieveSourceHitChunk;
+}
+
+interface EmbeddingProvider {
+  readonly modelId: string;
+  readonly provider: string;
+  readonly dimension: number;
+  embed(input: string): number[];
 }
 
 interface DocumentDraft {
@@ -198,6 +212,8 @@ class LocalEngine {
         return await this.repair(request.action);
       case "getJobStatus":
         return await this.getJobStatus(request.status, request.limit);
+      case "runJob":
+        return await this.runQueuedJob(request.id);
       case "reindex":
         return await this.reindex(request.scope);
       case "resolveAnchor":
@@ -470,7 +486,7 @@ class LocalEngine {
         itemCount: 0,
         reason: "empty_query",
       });
-      traceTracks.push(vectorUnavailableTrace());
+      traceTracks.push(vectorSkippedTrace("empty_query"));
       return {
         query,
         items: rows.map((row, index) => ({
@@ -494,7 +510,11 @@ class LocalEngine {
       query,
       limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
     });
-    const items = fuseSourceRetrievalHits(ftsHits, {
+    const vectorResult = loadVectorChunkRetrievalHits(db, {
+      query,
+      limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
+    });
+    const items = fuseSourceRetrievalHits([...ftsHits, ...vectorResult.hits], {
       limit,
       includeChunks,
       rrfK: defaultRrfK,
@@ -505,7 +525,7 @@ class LocalEngine {
       itemCount: ftsHits.length,
       ...(ftsHits.length === 0 ? { reason: "no_matches" } : {}),
     });
-    traceTracks.push(vectorUnavailableTrace());
+    traceTracks.push(vectorResult.trace);
 
     return {
       query,
@@ -737,6 +757,7 @@ class LocalEngine {
       });
       db.exec({ sql: "DELETE FROM anchors WHERE memory_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM topic_graph_edges WHERE memory_id = ?", bind: [id] });
+      db.exec({ sql: "DELETE FROM source_embeddings WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_fts WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_chunks WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_metadata WHERE source_id = ?", bind: [id] });
@@ -1187,6 +1208,11 @@ class LocalEngine {
     return {
       jobs: rows.map(jobSummaryFromRow),
     };
+  }
+
+  private async runQueuedJob(id: string): Promise<JobSummary> {
+    const db = await this.ensureReady();
+    return runJob(db, id);
   }
 
   private async reindex(scope: "fts"): Promise<ReindexResult> {
@@ -1962,6 +1988,7 @@ class LocalEngine {
       db.exec("DELETE FROM wiki_compile_jobs");
       db.exec("DELETE FROM topic_pages");
       db.exec("DELETE FROM anchors");
+      db.exec("DELETE FROM source_embeddings");
       db.exec("DELETE FROM source_fts");
       db.exec("DELETE FROM source_chunks");
       db.exec("DELETE FROM sources");
@@ -2133,6 +2160,31 @@ function migrate(db: SqliteDb) {
       title,
       body,
       tokenize = 'unicode61 remove_diacritics 2'
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS embedding_models (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      label TEXT NOT NULL,
+      dimension INTEGER NOT NULL,
+      metric TEXT NOT NULL CHECK (metric IN ('cosine')),
+      status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS source_embeddings (
+      model_id TEXT NOT NULL REFERENCES embedding_models(id) ON DELETE CASCADE,
+      target_kind TEXT NOT NULL CHECK (target_kind IN ('chunk', 'meta')),
+      target_id TEXT NOT NULL,
+      source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+      vector_json TEXT NOT NULL,
+      text_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (model_id, target_kind, target_id)
     )
   `);
   db.exec(`
@@ -2368,6 +2420,13 @@ function migrate(db: SqliteDb) {
   );
   db.exec("CREATE INDEX IF NOT EXISTS idx_source_chunks_parent ON source_chunks(parent_chunk_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_source_metadata_source ON source_metadata(source_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_embedding_models_status ON embedding_models(status)");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_source_embeddings_source ON source_embeddings(source_id)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_source_embeddings_target ON source_embeddings(target_kind, target_id)",
+  );
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_source_lifecycle_source ON source_lifecycle_events(source_id, created_at)",
   );
@@ -2420,6 +2479,7 @@ function migrate(db: SqliteDb) {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_topic_graph_edges_memory ON topic_graph_edges(memory_id, kind)",
   );
+  ensureDefaultEmbeddingModel(db);
   db.exec(`PRAGMA user_version = ${schemaVersion}`);
 }
 
@@ -2429,6 +2489,8 @@ function dropPreSourceNativeTables(db: SqliteDb) {
   db.exec("DROP TABLE IF EXISTS wiki_compile_jobs");
   db.exec("DROP TABLE IF EXISTS topic_pages");
   db.exec("DROP TABLE IF EXISTS anchors");
+  db.exec("DROP TABLE IF EXISTS source_embeddings");
+  db.exec("DROP TABLE IF EXISTS embedding_models");
   db.exec("DROP TABLE IF EXISTS source_fts");
   db.exec("DROP TABLE IF EXISTS source_chunks");
   db.exec("DROP TABLE IF EXISTS source_audit_log");
@@ -2956,6 +3018,67 @@ function recoverStaleJobs(db: SqliteDb) {
   });
 }
 
+function ensureDefaultEmbeddingModel(db: SqliteDb) {
+  const now = new Date().toISOString();
+  db.exec({
+    sql: `INSERT INTO embedding_models (
+      id,
+      provider,
+      label,
+      dimension,
+      metric,
+      status,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      provider = excluded.provider,
+      label = excluded.label,
+      dimension = excluded.dimension,
+      metric = excluded.metric,
+      status = CASE
+        WHEN embedding_models.status = 'disabled' THEN 'disabled'
+        ELSE excluded.status
+      END,
+      updated_at = excluded.updated_at`,
+    bind: [
+      defaultEmbeddingProvider.modelId,
+      defaultEmbeddingProvider.provider,
+      defaultEmbeddingProvider.label,
+      defaultEmbeddingProvider.dimension,
+      defaultEmbeddingProvider.metric,
+      now,
+      now,
+    ],
+  });
+}
+
+function getActiveEmbeddingProvider(db: SqliteDb): EmbeddingProvider | null {
+  const row = db.selectObject(
+    `SELECT *
+     FROM embedding_models
+     WHERE id = ?
+       AND provider = ?
+       AND status = 'active'
+       AND metric = 'cosine'
+     LIMIT 1`,
+    [defaultEmbeddingProvider.modelId, defaultEmbeddingProvider.provider],
+  );
+  if (row === undefined) return null;
+  const dimension = numberField(row, "dimension");
+  if (dimension !== defaultEmbeddingProvider.dimension) return null;
+  return localDeterministicEmbeddingProvider;
+}
+
+const localDeterministicEmbeddingProvider: EmbeddingProvider = {
+  modelId: defaultEmbeddingProvider.modelId,
+  provider: defaultEmbeddingProvider.provider,
+  dimension: defaultEmbeddingProvider.dimension,
+  embed(input: string) {
+    return embedLocalDeterministic(input, defaultEmbeddingProvider.dimension);
+  },
+};
+
 function enqueueJob(db: SqliteDb, type: JobType, payload: Record<string, unknown>) {
   const now = new Date().toISOString();
   const jobId = createId("job");
@@ -2997,10 +3120,13 @@ function runJob(db: SqliteDb, jobId: string): JobSummary {
 
   try {
     const type = jobTypeField(job, "type");
+    let result: Record<string, unknown> = { ok: true };
     if (type === "reindex_fts") {
       rebuildFtsData(db);
-    } else if (type === "resolve_anchor" || type === "post_capture_hardening") {
-      // Reserved job types are intentionally no-op until their async work expands.
+    } else if (type === "post_capture_hardening") {
+      result = runPostCaptureHardeningJob(db, stringField(job, "payload_json"));
+    } else if (type === "resolve_anchor") {
+      result = { ok: true, reserved: "resolve_anchor" };
     } else {
       throw new EngineRpcError("UNKNOWN_JOB_TYPE", `Unknown job type: ${stringField(job, "type")}`);
     }
@@ -3012,7 +3138,7 @@ function runJob(db: SqliteDb, jobId: string): JobSummary {
                 finished_at = ?,
                 result_json = ?
             WHERE id = ?`,
-      bind: [finishedAt, finishedAt, JSON.stringify({ ok: true }), jobId],
+      bind: [finishedAt, finishedAt, JSON.stringify(result), jobId],
     });
   } catch (error) {
     const engineError = engineErrorFromUnknown(error);
@@ -3067,6 +3193,114 @@ function rebuildFtsData(db: SqliteDb) {
         text: stringField(row, "text"),
       });
     }
+  });
+}
+
+function runPostCaptureHardeningJob(db: SqliteDb, payloadJson: string): Record<string, unknown> {
+  const payload = parsePostCaptureHardeningPayload(payloadJson);
+  if (payload.sourceId.length === 0) {
+    throw new EngineRpcError("INVALID_JOB_PAYLOAD", "Post-capture job is missing sourceId.");
+  }
+  const shouldRunEmbedding = payload.stages.length === 0 || payload.stages.includes("embedding");
+  if (!shouldRunEmbedding) {
+    return { ok: true, embedding: { skipped: true, reason: "stage_not_requested" } };
+  }
+  return runEmbeddingStageForSource(db, payload.sourceId);
+}
+
+function parsePostCaptureHardeningPayload(payloadJson: string) {
+  const payload = parseMetadata(payloadJson);
+  const sourceId = typeof payload.sourceId === "string" ? normalizeText(payload.sourceId) : "";
+  const stages = Array.isArray(payload.stages)
+    ? payload.stages.flatMap((stage) => (typeof stage === "string" ? [stage] : []))
+    : [];
+  return { sourceId, stages };
+}
+
+function runEmbeddingStageForSource(db: SqliteDb, sourceId: string): Record<string, unknown> {
+  const source = db.selectObject("SELECT id FROM sources WHERE id = ? LIMIT 1", [sourceId]);
+  if (source === undefined) {
+    throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
+  }
+  const deleted = db.selectObject(
+    "SELECT id FROM sources WHERE id = ? AND lifecycle_status = 'deleted' LIMIT 1",
+    [sourceId],
+  );
+  if (deleted !== undefined) {
+    return {
+      ok: true,
+      embedding: {
+        modelId: defaultEmbeddingProvider.modelId,
+        chunkCount: 0,
+        skipped: true,
+        reason: "source_deleted",
+      },
+    };
+  }
+  const provider = getActiveEmbeddingProvider(db);
+  if (provider === null) {
+    throw new EngineRpcError(
+      "EMBEDDING_MODEL_UNAVAILABLE",
+      "Active embedding model is unavailable.",
+    );
+  }
+  const chunks = db.selectObjects(
+    `SELECT id, source_id, text, hash
+     FROM source_chunks
+     WHERE source_id = ?
+     ORDER BY ord ASC`,
+    [sourceId],
+  );
+  const now = new Date().toISOString();
+  for (const chunk of chunks) {
+    upsertSourceChunkEmbedding(db, provider, chunk, now);
+  }
+  return {
+    ok: true,
+    embedding: {
+      modelId: provider.modelId,
+      provider: provider.provider,
+      targetKind: "chunk",
+      chunkCount: chunks.length,
+    },
+  };
+}
+
+function upsertSourceChunkEmbedding(
+  db: SqliteDb,
+  provider: EmbeddingProvider,
+  chunk: SqlRow,
+  now: string,
+) {
+  const vector = provider.embed(stringField(chunk, "text"));
+  if (vector.length !== provider.dimension) {
+    throw new EngineRpcError("EMBEDDING_DIMENSION_MISMATCH", "Embedding dimension mismatch.");
+  }
+  db.exec({
+    sql: `INSERT INTO source_embeddings (
+      model_id,
+      target_kind,
+      target_id,
+      source_id,
+      vector_json,
+      text_hash,
+      created_at,
+      updated_at
+    ) VALUES (?, 'chunk', ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(model_id, target_kind, target_id) DO UPDATE SET
+      source_id = excluded.source_id,
+      vector_json = excluded.vector_json,
+      text_hash = excluded.text_hash,
+      updated_at = excluded.updated_at`,
+    bind: [
+      provider.modelId,
+      stringField(chunk, "id"),
+      stringField(chunk, "source_id"),
+      JSON.stringify(vector),
+      stringField(chunk, "hash") || hashText(stringField(chunk, "text")),
+      now,
+      now,
+    ],
   });
 }
 
@@ -3430,6 +3664,106 @@ function loadFtsChunkRetrievalHits(
   }));
 }
 
+function loadVectorChunkRetrievalHits(
+  db: SqliteDb,
+  input: { query: string; limit: number },
+): { hits: SourceRetrievalHit[]; trace: RetrieveSourcesTraceTrack } {
+  const provider = getActiveEmbeddingProvider(db);
+  if (provider === null) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_chunks",
+        status: "unavailable",
+        itemCount: 0,
+        reason: "embedding_model_unavailable",
+      },
+    };
+  }
+  const queryVector = provider.embed(input.query);
+  const rows = db.selectObjects(
+    `SELECT
+      s.id,
+      s.source_kind,
+      s.source_url,
+      s.normalized_source_url,
+      s.source_title,
+      s.captured_at,
+      s.content_hash,
+      s.version_group_key,
+      s.version_no,
+      s.supersedes_source_id,
+      s.superseded_by_source_id,
+      s.is_current,
+      c.id AS chunk_id,
+      c.ord AS chunk_ord,
+      c.text AS chunk_text,
+      se.vector_json,
+      se.text_hash
+     FROM source_embeddings se
+     JOIN source_chunks c ON c.id = se.target_id
+     JOIN sources s ON s.id = se.source_id
+     WHERE se.model_id = ?
+       AND se.target_kind = 'chunk'
+       AND s.lifecycle_status <> 'deleted'`,
+    [provider.modelId],
+  );
+  if (rows.length === 0) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_chunks",
+        status: "skipped",
+        itemCount: 0,
+        reason: "no_embeddings",
+      },
+    };
+  }
+  const ranked = rows
+    .flatMap((row) => {
+      const vector = parseEmbeddingVector(stringField(row, "vector_json"), provider.dimension);
+      if (vector === null) return [];
+      return [
+        {
+          row,
+          score: cosineSimilarity(queryVector, vector),
+        },
+      ];
+    })
+    .sort((left, right) => right.score - left.score)
+    .slice(0, clampLimit(input.limit, 400));
+  if (ranked.length === 0) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_chunks",
+        status: "skipped",
+        itemCount: 0,
+        reason: "invalid_embeddings",
+      },
+    };
+  }
+  return {
+    hits: ranked.map(({ row, score }, index) => ({
+      track: "vector_chunks",
+      rank: index + 1,
+      source: row,
+      chunk: {
+        chunkId: stringField(row, "chunk_id"),
+        ord: numberField(row, "chunk_ord"),
+        snippet: excerpt(stringField(row, "chunk_text")),
+        score,
+        track: "vector_chunks",
+      },
+    })),
+    trace: {
+      name: "vector_chunks",
+      status: "used",
+      itemCount: ranked.length,
+    },
+  };
+}
+
 function fuseSourceRetrievalHits(
   hits: SourceRetrievalHit[],
   input: { limit: number; includeChunks: number; rrfK: number },
@@ -3499,13 +3833,65 @@ function reciprocalRankFusionScore(rank: number, rrfK = defaultRrfK) {
   return 1 / (rrfK + Math.max(1, Math.floor(rank)));
 }
 
-function vectorUnavailableTrace(): RetrieveSourcesTraceTrack {
+function vectorSkippedTrace(reason: string): RetrieveSourcesTraceTrack {
   return {
     name: "vector_chunks",
-    status: "unavailable",
+    status: "skipped",
     itemCount: 0,
-    reason: "embedding_index_not_available",
+    reason,
   };
+}
+
+function embedLocalDeterministic(input: string, dimension: number) {
+  const vector = Array.from({ length: dimension }, () => 0);
+  const tokens =
+    normalizeText(input)
+      .toLowerCase()
+      .match(/[\p{L}\p{N}_]+/gu) ?? [];
+  for (const token of tokens.length === 0 ? [normalizeText(input).toLowerCase()] : tokens) {
+    if (token.length === 0) continue;
+    const hash = stableHashNumber(token);
+    const index = hash % dimension;
+    const sign = (hash & 1) === 0 ? 1 : -1;
+    vector[index] = (vector[index] ?? 0) + sign;
+  }
+  return normalizeVector(vector);
+}
+
+function stableHashNumber(input: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function normalizeVector(vector: number[]) {
+  const magnitude = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
+  if (magnitude === 0) return vector.map(() => 0);
+  return vector.map((value) => Number((value / magnitude).toFixed(8)));
+}
+
+function cosineSimilarity(left: number[], right: number[]) {
+  const length = Math.min(left.length, right.length);
+  let score = 0;
+  for (let index = 0; index < length; index += 1) {
+    score += (left[index] ?? 0) * (right[index] ?? 0);
+  }
+  return score;
+}
+
+function parseEmbeddingVector(input: string, dimension: number): number[] | null {
+  try {
+    const parsed = JSON.parse(input) as unknown;
+    if (!Array.isArray(parsed) || parsed.length !== dimension) return null;
+    const vector = parsed.map((value) => (typeof value === "number" ? value : Number.NaN));
+    if (vector.some((value) => !Number.isFinite(value))) return null;
+    return vector;
+  } catch {
+    return null;
+  }
 }
 
 function jobSummaryFromRow(row: SqlRow): JobSummary {

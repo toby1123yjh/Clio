@@ -586,6 +586,22 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts explicit queued job run requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "runJob", id: "job-1" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "runJob", id: 42 },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts typed agent thinking and tool trace stream events", () => {
     expect(
       isAgentStreamEventMessage({
