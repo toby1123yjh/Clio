@@ -94,10 +94,31 @@ type SqliteInitModule = (config?: {
 }) => Promise<SqliteApi>;
 
 const databasePath = "/clio-browser-phase1.sqlite3";
-const schemaVersion = 10;
+const schemaVersion = 12;
+const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
 const staleSessionLeaseMs = 30_000;
+
+type SourceLifecycleStatus = "fresh" | "stale" | "archived" | "deleted";
+type SourceAnalysisLevel = "saved" | "analyzed";
+type SourceAuditAction =
+  | "source.created"
+  | "source.superseded"
+  | "source.deleted"
+  | "source.stage_queued";
+
+interface DocumentDraft {
+  kind: SourceKind;
+  sourceUrl: string;
+  normalizedSourceUrl: string;
+  sourceTitle: string;
+  normalizedText: string;
+  textHash: string;
+  capturedAt: string;
+  metadataJson: string;
+  versionGroupKey: string;
+}
 
 class LocalEngine {
   private db: SqliteDb | null = null;
@@ -222,21 +243,16 @@ class LocalEngine {
 
   private async capture(kind: SourceKind, payload: CaptureBasePayload): Promise<CaptureResult> {
     const db = await this.ensureReady();
-    const normalizedText = normalizeText(payload.normalizedText);
-    if (normalizedText.length === 0) {
-      throw new EngineRpcError("EMPTY_CAPTURE", "Nothing readable was found to save.");
-    }
-
-    const sourceUrl = payload.sourceUrl.trim();
-    const normalizedSourceUrl = normalizeSourceUrl(sourceUrl);
-    const sourceTitle = payload.sourceTitle.trim() || fallbackTitle(sourceUrl);
-    const textHash = hashText(normalizedText);
+    const draft = buildDocumentDraft(kind, payload);
     const existing = db.selectObject(
       `SELECT *
-       FROM memories
-       WHERE source_kind = ? AND normalized_source_url = ? AND text_hash = ?
+       FROM sources
+       WHERE source_kind = ?
+         AND normalized_source_url = ?
+         AND content_hash = ?
+         AND lifecycle_status <> 'deleted'
        LIMIT 1`,
-      [kind, normalizedSourceUrl, textHash],
+      [draft.kind, draft.normalizedSourceUrl, draft.textHash],
     );
     if (existing !== undefined) {
       return {
@@ -245,84 +261,87 @@ class LocalEngine {
       };
     }
 
-    const chunks = chunkText(normalizedText);
+    const chunks = chunkText(draft.normalizedText);
     if (chunks.length === 0) {
       throw new EngineRpcError("EMPTY_CAPTURE", "Nothing readable was found to save.");
     }
 
-    const memoryId = createId("mem");
-    const capturedAt = payload.capturedAt ?? new Date().toISOString();
-    const metadataJson = JSON.stringify(payload.metadata ?? {});
-    const versionGroupKey = buildMemoryVersionGroupKey(kind, normalizedSourceUrl, textHash);
+    const sourceId = createId("src");
     const previousVersion =
-      kind === "page" ? findCurrentPageVersion(db, versionGroupKey) : undefined;
+      draft.kind === "page" ? findCurrentPageVersion(db, draft.versionGroupKey) : undefined;
     const versionNo =
       previousVersion === undefined
         ? 1
         : Math.max(1, numberField(previousVersion, "version_no")) + 1;
-    const supersedesMemoryId =
+    const supersedesSourceId =
       previousVersion === undefined ? undefined : stringField(previousVersion, "id");
 
     transaction(db, () => {
-      if (kind === "page" && supersedesMemoryId !== undefined) {
-        db.exec({
-          sql: `UPDATE memories
-                SET is_current = 0,
-                    superseded_by_memory_id = ?
-                WHERE id = ?`,
-          bind: [memoryId, supersedesMemoryId],
+      if (draft.kind === "page" && supersedesSourceId !== undefined) {
+        markSourceSuperseded(db, {
+          sourceId: supersedesSourceId,
+          supersededBySourceId: sourceId,
+          at: draft.capturedAt,
         });
       }
 
-      db.exec({
-        sql: `INSERT INTO memories (
-          id,
-          source_kind,
-          source_url,
-          normalized_source_url,
-          source_title,
-          captured_at,
-          normalized_text,
-          text_hash,
-          metadata_json,
-          version_group_key,
-          version_no,
-          supersedes_memory_id,
-          superseded_by_memory_id,
-          is_current,
-          simhash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, NULL)`,
-        bind: [
-          memoryId,
-          kind,
-          sourceUrl,
-          normalizedSourceUrl,
-          sourceTitle,
-          capturedAt,
-          normalizedText,
-          textHash,
-          metadataJson,
-          versionGroupKey,
+      insertSourceRow(db, {
+        id: sourceId,
+        kind: draft.kind,
+        sourceUrl: draft.sourceUrl,
+        normalizedSourceUrl: draft.normalizedSourceUrl,
+        sourceTitle: draft.sourceTitle,
+        capturedAt: draft.capturedAt,
+        normalizedText: draft.normalizedText,
+        contentHash: draft.textHash,
+        metadataJson: draft.metadataJson,
+        versionGroupKey: draft.versionGroupKey,
+        versionNo,
+        supersedesSourceId,
+      });
+      insertSourceLifecycleEvent(db, {
+        sourceId,
+        fromStatus: null,
+        toStatus: "fresh",
+        reason: "capture",
+        createdAt: draft.capturedAt,
+        payload: { sourceKind: draft.kind, versionNo },
+      });
+      insertSourceAuditLog(db, {
+        action: "source.created",
+        sourceId,
+        targetKind: "source",
+        targetId: sourceId,
+        reason: "capture",
+        createdAt: draft.capturedAt,
+        payload: {
+          sourceKind: draft.kind,
           versionNo,
-          supersedesMemoryId ?? null,
-        ],
+          supersedesSourceId: supersedesSourceId ?? null,
+        },
       });
 
       for (const chunk of chunks) {
-        const chunkId = `${memoryId}:${chunk.ord}`;
+        const chunkId = `${sourceId}:${chunk.ord}`;
         db.exec({
-          sql: `INSERT INTO chunks (
+          sql: `INSERT INTO source_chunks (
             id,
-            memory_id,
+            source_id,
             ord,
             text,
             token_count,
             hash,
-            fts_text
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            fts_text,
+            role,
+            parent_chunk_id,
+            section_path,
+            char_start,
+            char_end,
+            meta_head_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'child', NULL, NULL, NULL, NULL, NULL)`,
           bind: [
             chunkId,
-            memoryId,
+            sourceId,
             chunk.ord,
             chunk.text,
             chunk.tokenCount,
@@ -330,37 +349,60 @@ class LocalEngine {
             expandChineseBigrams(chunk.text),
           ],
         });
-        insertFtsRow(db, {
-          memoryId,
+        insertSourceFtsRow(db, {
+          sourceId,
           chunkId,
-          sourceKind: kind,
-          title: sourceTitle,
+          sourceKind: draft.kind,
+          title: draft.sourceTitle,
           text: chunk.text,
         });
       }
 
-      if (kind === "selection") {
-        insertAnchor(db, memoryId, payload as CaptureSelectionPayload, normalizedText, capturedAt);
+      if (draft.kind === "selection") {
+        insertAnchor(
+          db,
+          sourceId,
+          payload as CaptureSelectionPayload,
+          draft.normalizedText,
+          draft.capturedAt,
+        );
       }
+
+      const jobId = enqueueJob(db, "post_capture_hardening", {
+        sourceId,
+        stages: ["embedding", "chunk_meta", "graph"],
+      });
+      insertSourceAuditLog(db, {
+        action: "source.stage_queued",
+        sourceId,
+        targetKind: "job",
+        targetId: jobId,
+        reason: "post_capture_hardening",
+        createdAt: draft.capturedAt,
+        payload: {
+          jobType: "post_capture_hardening",
+          stages: ["embedding", "chunk_meta", "graph"],
+        },
+      });
     });
 
-    const saved = db.selectObject("SELECT * FROM memories WHERE id = ? LIMIT 1", [memoryId]);
+    const saved = db.selectObject("SELECT * FROM sources WHERE id = ? LIMIT 1", [sourceId]);
     return {
       status: "saved",
       memory:
         saved === undefined
           ? {
-              id: memoryId,
-              sourceKind: kind,
-              sourceUrl,
-              sourceTitle,
-              capturedAt,
-              excerpt: excerpt(normalizedText),
+              id: sourceId,
+              sourceKind: draft.kind,
+              sourceUrl: draft.sourceUrl,
+              sourceTitle: draft.sourceTitle,
+              capturedAt: draft.capturedAt,
+              excerpt: excerpt(draft.normalizedText),
               version: {
-                groupKey: versionGroupKey,
+                groupKey: draft.versionGroupKey,
                 versionNo,
                 isCurrent: true,
-                supersedesMemoryId,
+                supersedesMemoryId: supersedesSourceId,
               },
             }
           : memorySummaryFromRow(saved),
@@ -380,24 +422,26 @@ class LocalEngine {
 
     const rows = db.selectObjects(
       `SELECT
-        m.id,
-        m.source_kind,
-        m.source_url,
-        m.normalized_source_url,
-        m.source_title,
-        m.captured_at,
-        m.normalized_text,
-        m.version_group_key,
-        m.version_no,
-        m.supersedes_memory_id,
-        m.superseded_by_memory_id,
-        m.is_current,
+        s.id,
+        s.source_kind,
+        s.source_url,
+        s.normalized_source_url,
+        s.source_title,
+        s.captured_at,
+        s.normalized_text,
+        s.content_hash,
+        s.version_group_key,
+        s.version_no,
+        s.supersedes_source_id,
+        s.superseded_by_source_id,
+        s.is_current,
         c.text AS chunk_text,
-        bm25(memory_fts) AS score
-       FROM memory_fts
-       JOIN memories m ON m.id = memory_fts.memory_id
-       JOIN chunks c ON c.id = memory_fts.chunk_id
-       WHERE memory_fts MATCH ?
+        bm25(source_fts) AS score
+       FROM source_fts
+       JOIN sources s ON s.id = source_fts.source_id
+       JOIN source_chunks c ON c.id = source_fts.chunk_id
+       WHERE source_fts MATCH ?
+         AND s.lifecycle_status <> 'deleted'
        ORDER BY score ASC
        LIMIT ?`,
       [ftsQuery, clampLimit(limit, 80)],
@@ -426,7 +470,8 @@ class LocalEngine {
     const db = await this.ensureReady();
     const rows = db.selectObjects(
       `SELECT *
-       FROM memories
+       FROM sources
+       WHERE lifecycle_status <> 'deleted'
        ORDER BY captured_at DESC
        LIMIT ?`,
       [clampLimit(limit, 100)],
@@ -438,21 +483,28 @@ class LocalEngine {
 
   private async get(id: string): Promise<MemoryDetail | null> {
     const db = await this.ensureReady();
-    const row = db.selectObject("SELECT * FROM memories WHERE id = ? LIMIT 1", [id]);
+    const row = db.selectObject(
+      "SELECT * FROM sources WHERE id = ? AND lifecycle_status <> 'deleted' LIMIT 1",
+      [id],
+    );
     if (row === undefined) return null;
     const chunkRows = db.selectObjects(
       `SELECT id, ord, text, token_count
-       FROM chunks
-       WHERE memory_id = ?
+       FROM source_chunks
+       WHERE source_id = ?
        ORDER BY ord ASC`,
       [id],
     );
     const anchor = db.selectObject("SELECT * FROM anchors WHERE memory_id = ? LIMIT 1", [id]);
+    const metadata = db.selectObject(
+      "SELECT metadata_json FROM source_metadata WHERE source_id = ? LIMIT 1",
+      [id],
+    );
 
     return {
       ...memorySummaryFromRow(row),
       normalizedText: stringField(row, "normalized_text"),
-      metadata: parseMetadata(stringField(row, "metadata_json")),
+      metadata: parseMetadata(stringField(metadata ?? {}, "metadata_json")),
       anchor: anchor === undefined ? undefined : anchorFromRow(anchor),
       chunks: chunkRows.map((chunk) => ({
         id: stringField(chunk, "id"),
@@ -465,26 +517,40 @@ class LocalEngine {
 
   private async delete(id: string): Promise<DeleteMemoryResult> {
     const db = await this.ensureReady();
+    let deleted = false;
     transaction(db, () => {
+      const source = db.selectObject(
+        "SELECT * FROM sources WHERE id = ? AND lifecycle_status <> 'deleted' LIMIT 1",
+        [id],
+      );
+      if (source === undefined) return;
+      const deletedAt = new Date().toISOString();
       db.exec({
-        sql: `UPDATE memories
-              SET superseded_by_memory_id = NULL
-              WHERE superseded_by_memory_id = ?`,
+        sql: `UPDATE sources
+              SET superseded_by_source_id = NULL
+              WHERE superseded_by_source_id = ?`,
         bind: [id],
       });
       db.exec({
-        sql: `UPDATE memories
-              SET supersedes_memory_id = NULL
-              WHERE supersedes_memory_id = ?`,
+        sql: `UPDATE sources
+              SET supersedes_source_id = NULL
+              WHERE supersedes_source_id = ?`,
         bind: [id],
       });
       db.exec({ sql: "DELETE FROM anchors WHERE memory_id = ?", bind: [id] });
-      db.exec({ sql: "DELETE FROM memory_fts WHERE memory_id = ?", bind: [id] });
-      db.exec({ sql: "DELETE FROM chunks WHERE memory_id = ?", bind: [id] });
-      db.exec({ sql: "DELETE FROM memories WHERE id = ?", bind: [id] });
+      db.exec({ sql: "DELETE FROM topic_graph_edges WHERE memory_id = ?", bind: [id] });
+      db.exec({ sql: "DELETE FROM source_fts WHERE source_id = ?", bind: [id] });
+      db.exec({ sql: "DELETE FROM source_chunks WHERE source_id = ?", bind: [id] });
+      db.exec({ sql: "DELETE FROM source_metadata WHERE source_id = ?", bind: [id] });
+      markSourceDeleted(db, {
+        sourceId: id,
+        deletedAt,
+        reason: "delete_memory",
+      });
+      deleted = true;
     });
     return {
-      deleted: db.selectValue("SELECT changes()") !== 0,
+      deleted,
       id,
     };
   }
@@ -940,8 +1006,11 @@ class LocalEngine {
 
   private async resolveAnchor(memoryId: string): Promise<AnchorResolveResult> {
     const db = await this.ensureReady();
-    const memory = db.selectObject("SELECT * FROM memories WHERE id = ? LIMIT 1", [memoryId]);
-    if (memory === undefined) {
+    const source = db.selectObject(
+      "SELECT * FROM sources WHERE id = ? AND lifecycle_status <> 'deleted' LIMIT 1",
+      [memoryId],
+    );
+    if (source === undefined) {
       return { status: "missing_memory", memoryId };
     }
     const anchor = db.selectObject("SELECT * FROM anchors WHERE memory_id = ? LIMIT 1", [memoryId]);
@@ -949,9 +1018,9 @@ class LocalEngine {
       return {
         status: "missing_anchor",
         memoryId,
-        sourceUrl: stringField(memory, "source_url"),
-        sourceTitle: stringField(memory, "source_title"),
-        sourceKind: sourceKindField(memory, "source_kind"),
+        sourceUrl: stringField(source, "source_url"),
+        sourceTitle: stringField(source, "source_title"),
+        sourceKind: sourceKindField(source, "source_kind"),
       };
     }
 
@@ -967,9 +1036,9 @@ class LocalEngine {
     return {
       status: "resolved",
       memoryId,
-      sourceUrl: stringField(memory, "source_url"),
-      sourceTitle: stringField(memory, "source_title"),
-      sourceKind: sourceKindField(memory, "source_kind"),
+      sourceUrl: stringField(source, "source_url"),
+      sourceTitle: stringField(source, "source_title"),
+      sourceKind: sourceKindField(source, "source_kind"),
       anchor: {
         ...anchorFromRow(anchor),
         lastResolutionStatus: "returned",
@@ -1687,14 +1756,17 @@ class LocalEngine {
     const db = await this.ensureReady();
     transaction(db, () => {
       db.exec("DELETE FROM jobs");
+      db.exec("DELETE FROM source_audit_log");
+      db.exec("DELETE FROM source_lifecycle_events");
+      db.exec("DELETE FROM source_metadata");
       db.exec("DELETE FROM topic_graph_edges");
       db.exec("DELETE FROM wiki_compile_job_events");
       db.exec("DELETE FROM wiki_compile_jobs");
       db.exec("DELETE FROM topic_pages");
       db.exec("DELETE FROM anchors");
-      db.exec("DELETE FROM memory_fts");
-      db.exec("DELETE FROM chunks");
-      db.exec("DELETE FROM memories");
+      db.exec("DELETE FROM source_fts");
+      db.exec("DELETE FROM source_chunks");
+      db.exec("DELETE FROM sources");
     });
     this.healthState = readyHealth(this.healthState.sqliteVersion);
   }
@@ -1794,48 +1866,70 @@ self.addEventListener("message", (event: MessageEvent<unknown>) => {
 function migrate(db: SqliteDb) {
   db.exec("PRAGMA foreign_keys = ON");
   db.exec("PRAGMA journal_mode = WAL");
+  const currentVersion = Number(db.selectValue("PRAGMA user_version") ?? 0);
+  if (currentVersion < sourceNativeSchemaVersion) {
+    dropPreSourceNativeTables(db);
+  }
   db.exec(`
-    CREATE TABLE IF NOT EXISTS memories (
+    CREATE TABLE IF NOT EXISTS sources (
       id TEXT PRIMARY KEY,
       source_kind TEXT NOT NULL CHECK (source_kind IN ('page', 'selection')),
+      source_type TEXT NOT NULL,
       source_url TEXT NOT NULL,
       normalized_source_url TEXT NOT NULL,
       source_title TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
       captured_at TEXT NOT NULL,
       normalized_text TEXT NOT NULL,
-      text_hash TEXT NOT NULL,
-      metadata_json TEXT NOT NULL DEFAULT '{}',
+      lifecycle_status TEXT NOT NULL CHECK (
+        lifecycle_status IN ('fresh', 'stale', 'archived', 'deleted')
+      ),
+      analysis_level TEXT NOT NULL CHECK (analysis_level IN ('saved', 'analyzed')),
       version_group_key TEXT,
       version_no INTEGER NOT NULL DEFAULT 1,
-      supersedes_memory_id TEXT,
-      superseded_by_memory_id TEXT,
+      supersedes_source_id TEXT REFERENCES sources(id) ON DELETE SET NULL,
+      superseded_by_source_id TEXT REFERENCES sources(id) ON DELETE SET NULL,
       is_current INTEGER NOT NULL DEFAULT 1,
-      simhash TEXT,
-      UNIQUE (source_kind, normalized_source_url, text_hash)
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     )
   `);
-  ensureColumn(db, "memories", "version_group_key", "version_group_key TEXT");
-  ensureColumn(db, "memories", "version_no", "version_no INTEGER NOT NULL DEFAULT 1");
-  ensureColumn(db, "memories", "supersedes_memory_id", "supersedes_memory_id TEXT");
-  ensureColumn(db, "memories", "superseded_by_memory_id", "superseded_by_memory_id TEXT");
-  ensureColumn(db, "memories", "is_current", "is_current INTEGER NOT NULL DEFAULT 1");
-  ensureColumn(db, "memories", "simhash", "simhash TEXT");
-
   db.exec(`
-    CREATE TABLE IF NOT EXISTS chunks (
+    CREATE TABLE IF NOT EXISTS source_metadata (
+      source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+      title TEXT NOT NULL DEFAULT '',
+      url TEXT NOT NULL DEFAULT '',
+      source_type TEXT NOT NULL DEFAULT '',
+      content_hash TEXT NOT NULL DEFAULT '',
+      captured_at TEXT NOT NULL DEFAULT '',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      section_outline_json TEXT NOT NULL DEFAULT '[]',
+      abstract TEXT,
+      authors_json TEXT NOT NULL DEFAULT '[]',
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS source_chunks (
       id TEXT PRIMARY KEY,
-      memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+      source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
       ord INTEGER NOT NULL,
       text TEXT NOT NULL,
       token_count INTEGER NOT NULL,
       hash TEXT NOT NULL,
       fts_text TEXT NOT NULL,
-      UNIQUE (memory_id, ord)
+      role TEXT NOT NULL DEFAULT 'child' CHECK (role IN ('parent', 'child')),
+      parent_chunk_id TEXT REFERENCES source_chunks(id) ON DELETE SET NULL,
+      section_path TEXT,
+      char_start INTEGER,
+      char_end INTEGER,
+      meta_head_json TEXT,
+      UNIQUE (source_id, ord)
     )
   `);
   db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-      memory_id UNINDEXED,
+    CREATE VIRTUAL TABLE IF NOT EXISTS source_fts USING fts5(
+      source_id UNINDEXED,
       chunk_id UNINDEXED,
       source_kind UNINDEXED,
       title,
@@ -1844,9 +1938,34 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS source_lifecycle_events (
+      id TEXT PRIMARY KEY,
+      source_id TEXT REFERENCES sources(id) ON DELETE SET NULL,
+      from_status TEXT CHECK (
+        from_status IS NULL OR from_status IN ('fresh', 'stale', 'archived', 'deleted')
+      ),
+      to_status TEXT NOT NULL CHECK (to_status IN ('fresh', 'stale', 'archived', 'deleted')),
+      reason TEXT NOT NULL DEFAULT '',
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS source_audit_log (
+      id TEXT PRIMARY KEY,
+      action TEXT NOT NULL,
+      source_id TEXT REFERENCES sources(id) ON DELETE SET NULL,
+      target_kind TEXT NOT NULL DEFAULT '',
+      target_id TEXT,
+      reason TEXT NOT NULL DEFAULT '',
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS anchors (
       id TEXT PRIMARY KEY,
-      memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+      memory_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
       kind TEXT NOT NULL CHECK (kind IN ('dom')),
       selected_text TEXT NOT NULL,
       context_before TEXT NOT NULL,
@@ -2029,8 +2148,8 @@ function migrate(db: SqliteDb) {
       id TEXT PRIMARY KEY,
       from_topic_id TEXT NOT NULL REFERENCES topic_pages(id) ON DELETE CASCADE,
       to_topic_id TEXT REFERENCES topic_pages(id) ON DELETE CASCADE,
-      memory_id TEXT REFERENCES memories(id) ON DELETE CASCADE,
-      chunk_id TEXT REFERENCES chunks(id) ON DELETE CASCADE,
+      memory_id TEXT REFERENCES sources(id) ON DELETE CASCADE,
+      chunk_id TEXT REFERENCES source_chunks(id) ON DELETE CASCADE,
       kind TEXT NOT NULL CHECK (kind IN ('source', 'related', 'mentions')),
       weight REAL NOT NULL DEFAULT 1,
       label TEXT NOT NULL DEFAULT '',
@@ -2039,10 +2158,27 @@ function migrate(db: SqliteDb) {
   `);
   ensureAgentScopeCheckConstraints(db);
 
-  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_captured_at ON memories(captured_at DESC)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_version_group ON memories(version_group_key)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_current ON memories(is_current)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_chunks_memory_ord ON chunks(memory_id, ord)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_sources_captured_at ON sources(captured_at DESC)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_sources_version_group ON sources(version_group_key)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_sources_current ON sources(is_current)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_sources_status ON sources(lifecycle_status)");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_sources_identity ON sources(source_kind, normalized_source_url, content_hash)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_source_chunks_source_ord ON source_chunks(source_id, ord)",
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_source_chunks_parent ON source_chunks(parent_chunk_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_source_metadata_source ON source_metadata(source_id)");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_source_lifecycle_source ON source_lifecycle_events(source_id, created_at)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_source_audit_source ON source_audit_log(source_id, created_at)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_source_audit_target ON source_audit_log(target_kind, target_id)",
+  );
   db.exec("CREATE INDEX IF NOT EXISTS idx_anchors_memory ON anchors(memory_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, run_after)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC)");
@@ -2086,24 +2222,24 @@ function migrate(db: SqliteDb) {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_topic_graph_edges_memory ON topic_graph_edges(memory_id, kind)",
   );
-  db.exec(`
-    UPDATE memories
-    SET version_group_key = CASE
-      WHEN source_kind = 'selection'
-        THEN source_kind || ':' || normalized_source_url || ':' || text_hash
-      ELSE source_kind || ':' || normalized_source_url
-    END
-    WHERE version_group_key IS NULL OR version_group_key = ''
-  `);
-  db.exec("UPDATE memories SET version_no = 1 WHERE version_no IS NULL OR version_no < 1");
-  db.exec("UPDATE memories SET is_current = 1 WHERE is_current IS NULL");
   db.exec(`PRAGMA user_version = ${schemaVersion}`);
 }
 
-function ensureColumn(db: SqliteDb, table: string, column: string, declaration: string) {
-  const columns = db.selectObjects(`PRAGMA table_info(${table})`);
-  const exists = columns.some((row) => stringField(row, "name") === column);
-  if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${declaration}`);
+function dropPreSourceNativeTables(db: SqliteDb) {
+  db.exec("DROP TABLE IF EXISTS topic_graph_edges");
+  db.exec("DROP TABLE IF EXISTS wiki_compile_job_events");
+  db.exec("DROP TABLE IF EXISTS wiki_compile_jobs");
+  db.exec("DROP TABLE IF EXISTS topic_pages");
+  db.exec("DROP TABLE IF EXISTS anchors");
+  db.exec("DROP TABLE IF EXISTS source_fts");
+  db.exec("DROP TABLE IF EXISTS source_chunks");
+  db.exec("DROP TABLE IF EXISTS source_audit_log");
+  db.exec("DROP TABLE IF EXISTS source_lifecycle_events");
+  db.exec("DROP TABLE IF EXISTS source_metadata");
+  db.exec("DROP TABLE IF EXISTS sources");
+  db.exec("DROP TABLE IF EXISTS memory_fts");
+  db.exec("DROP TABLE IF EXISTS chunks");
+  db.exec("DROP TABLE IF EXISTS memories");
 }
 
 function ensureAgentScopeCheckConstraints(db: SqliteDb) {
@@ -2127,6 +2263,343 @@ function tableCreateSql(db: SqliteDb, table: string) {
     table,
   ]);
   return stringField(row ?? {}, "sql");
+}
+
+function buildDocumentDraft(kind: SourceKind, payload: CaptureBasePayload): DocumentDraft {
+  const normalizedText = normalizeText(payload.normalizedText);
+  if (normalizedText.length === 0) {
+    throw new EngineRpcError("EMPTY_CAPTURE", "Nothing readable was found to save.");
+  }
+
+  const sourceUrl = payload.sourceUrl.trim();
+  const normalizedSourceUrl = normalizeSourceUrl(sourceUrl);
+  const sourceTitle = payload.sourceTitle.trim() || fallbackTitle(sourceUrl);
+  const textHash = hashText(normalizedText);
+  return {
+    kind,
+    sourceUrl,
+    normalizedSourceUrl,
+    sourceTitle,
+    normalizedText,
+    textHash,
+    capturedAt: payload.capturedAt ?? new Date().toISOString(),
+    metadataJson: JSON.stringify(payload.metadata ?? {}),
+    versionGroupKey: buildMemoryVersionGroupKey(kind, normalizedSourceUrl, textHash),
+  };
+}
+
+function insertSourceRow(
+  db: SqliteDb,
+  input: {
+    id: string;
+    kind: SourceKind;
+    sourceUrl: string;
+    normalizedSourceUrl: string;
+    sourceTitle: string;
+    capturedAt: string;
+    normalizedText: string;
+    contentHash: string;
+    metadataJson: string;
+    versionGroupKey: string;
+    versionNo: number;
+    supersedesSourceId?: string;
+  },
+) {
+  const analysisLevel: SourceAnalysisLevel = "saved";
+  db.exec({
+    sql: `INSERT INTO sources (
+      id,
+      source_kind,
+      source_type,
+      source_url,
+      normalized_source_url,
+      source_title,
+      content_hash,
+      captured_at,
+      normalized_text,
+      lifecycle_status,
+      analysis_level,
+      version_group_key,
+      version_no,
+      supersedes_source_id,
+      superseded_by_source_id,
+      is_current,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'fresh', ?, ?, ?, ?, NULL, 1, ?, ?)`,
+    bind: [
+      input.id,
+      input.kind,
+      input.kind,
+      input.sourceUrl,
+      input.normalizedSourceUrl,
+      input.sourceTitle,
+      input.contentHash,
+      input.capturedAt,
+      input.normalizedText,
+      analysisLevel,
+      input.versionGroupKey,
+      input.versionNo,
+      input.supersedesSourceId ?? null,
+      input.capturedAt,
+      input.capturedAt,
+    ],
+  });
+  upsertSourceMetadata(db, {
+    sourceId: input.id,
+    sourceTitle: input.sourceTitle,
+    sourceUrl: input.sourceUrl,
+    sourceType: input.kind,
+    contentHash: input.contentHash,
+    capturedAt: input.capturedAt,
+    metadataJson: safeJsonObjectString(input.metadataJson),
+    updatedAt: input.capturedAt,
+  });
+}
+
+function upsertSourceMetadata(
+  db: SqliteDb,
+  input: {
+    sourceId: string;
+    sourceTitle: string;
+    sourceUrl: string;
+    sourceType: string;
+    contentHash: string;
+    capturedAt: string;
+    metadataJson: string;
+    updatedAt: string;
+  },
+) {
+  const metadata = parseMetadata(input.metadataJson);
+  const abstract = stringMetadataField(metadata, "abstract");
+  const authorsJson = JSON.stringify(stringArrayMetadataField(metadata, "authors"));
+  const sectionOutlineJson = JSON.stringify(
+    Array.isArray(metadata.sectionOutline) ? metadata.sectionOutline.slice(0, 200) : [],
+  );
+  db.exec({
+    sql: `INSERT INTO source_metadata (
+      source_id,
+      title,
+      url,
+      source_type,
+      content_hash,
+      captured_at,
+      metadata_json,
+      section_outline_json,
+      abstract,
+      authors_json,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(source_id) DO UPDATE SET
+      title = excluded.title,
+      url = excluded.url,
+      source_type = excluded.source_type,
+      content_hash = excluded.content_hash,
+      captured_at = excluded.captured_at,
+      metadata_json = excluded.metadata_json,
+      section_outline_json = excluded.section_outline_json,
+      abstract = excluded.abstract,
+      authors_json = excluded.authors_json,
+      updated_at = excluded.updated_at`,
+    bind: [
+      input.sourceId,
+      input.sourceTitle,
+      input.sourceUrl,
+      input.sourceType,
+      input.contentHash,
+      input.capturedAt,
+      safeJsonObjectString(input.metadataJson),
+      sectionOutlineJson,
+      abstract,
+      authorsJson,
+      input.updatedAt,
+    ],
+  });
+}
+
+function markSourceSuperseded(
+  db: SqliteDb,
+  input: {
+    sourceId: string;
+    supersededBySourceId: string;
+    at: string;
+  },
+) {
+  db.exec({
+    sql: `UPDATE sources
+          SET lifecycle_status = 'stale',
+              superseded_by_source_id = ?,
+              is_current = 0,
+              updated_at = ?
+          WHERE id = ?`,
+    bind: [input.supersededBySourceId, input.at, input.sourceId],
+  });
+  insertSourceLifecycleEvent(db, {
+    sourceId: input.sourceId,
+    fromStatus: "fresh",
+    toStatus: "stale",
+    reason: "superseded",
+    createdAt: input.at,
+    payload: {
+      supersededBySourceId: input.supersededBySourceId,
+    },
+  });
+  insertSourceAuditLog(db, {
+    action: "source.superseded",
+    sourceId: input.sourceId,
+    targetKind: "source",
+    targetId: input.supersededBySourceId,
+    reason: "superseded",
+    createdAt: input.at,
+    payload: {},
+  });
+}
+
+function markSourceDeleted(
+  db: SqliteDb,
+  input: { sourceId: string; deletedAt: string; reason: string },
+) {
+  const previous = db.selectObject("SELECT lifecycle_status FROM sources WHERE id = ? LIMIT 1", [
+    input.sourceId,
+  ]);
+  const fromStatus = sourceLifecycleStatusFromRow(previous, "lifecycle_status");
+  db.exec({
+    sql: `UPDATE sources
+          SET lifecycle_status = 'deleted',
+              is_current = 0,
+              updated_at = ?
+          WHERE id = ?`,
+    bind: [input.deletedAt, input.sourceId],
+  });
+  insertSourceLifecycleEvent(db, {
+    sourceId: input.sourceId,
+    fromStatus,
+    toStatus: "deleted",
+    reason: input.reason,
+    createdAt: input.deletedAt,
+    payload: {},
+  });
+  insertSourceAuditLog(db, {
+    action: "source.deleted",
+    sourceId: input.sourceId,
+    targetKind: "source",
+    targetId: input.sourceId,
+    reason: input.reason,
+    createdAt: input.deletedAt,
+    payload: {},
+  });
+}
+
+function insertSourceLifecycleEvent(
+  db: SqliteDb,
+  input: {
+    sourceId: string;
+    fromStatus: SourceLifecycleStatus | null;
+    toStatus: SourceLifecycleStatus;
+    reason: string;
+    payload: Record<string, unknown>;
+    createdAt: string;
+  },
+) {
+  db.exec({
+    sql: `INSERT INTO source_lifecycle_events (
+      id,
+      source_id,
+      from_status,
+      to_status,
+      reason,
+      payload_json,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    bind: [
+      createId("src_life"),
+      input.sourceId,
+      input.fromStatus,
+      input.toStatus,
+      input.reason,
+      JSON.stringify(boundAuditPayload(input.payload)),
+      input.createdAt,
+    ],
+  });
+}
+
+function insertSourceAuditLog(
+  db: SqliteDb,
+  input: {
+    action: SourceAuditAction;
+    sourceId: string;
+    targetKind: string;
+    targetId?: string;
+    reason: string;
+    payload: Record<string, unknown>;
+    createdAt: string;
+  },
+) {
+  db.exec({
+    sql: `INSERT INTO source_audit_log (
+      id,
+      action,
+      source_id,
+      target_kind,
+      target_id,
+      reason,
+      payload_json,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    bind: [
+      createId("src_audit"),
+      input.action,
+      input.sourceId,
+      input.targetKind,
+      input.targetId ?? null,
+      input.reason,
+      JSON.stringify(boundAuditPayload(input.payload)),
+      input.createdAt,
+    ],
+  });
+}
+
+function safeJsonObjectString(input: string) {
+  return JSON.stringify(parseMetadata(input));
+}
+
+function stringMetadataField(metadata: Record<string, unknown>, key: string) {
+  const value = metadata[key];
+  return typeof value === "string" ? normalizeText(value).slice(0, 4_000) : null;
+}
+
+function stringArrayMetadataField(metadata: Record<string, unknown>, key: string) {
+  const value = metadata[key];
+  return Array.isArray(value)
+    ? value.flatMap((item) => (typeof item === "string" ? [normalizeText(item)] : [])).slice(0, 50)
+    : [];
+}
+
+function boundAuditPayload(payload: Record<string, unknown>) {
+  const bounded: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload).slice(0, 20)) {
+    if (value === null || typeof value === "boolean" || typeof value === "number") {
+      bounded[key] = value;
+      continue;
+    }
+    if (typeof value === "string") {
+      bounded[key] = value.slice(0, 500);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      bounded[key] = value
+        .slice(0, 20)
+        .flatMap((item) =>
+          item === null ||
+          typeof item === "boolean" ||
+          typeof item === "number" ||
+          typeof item === "string"
+            ? [typeof item === "string" ? item.slice(0, 200) : item]
+            : [],
+        );
+    }
+  }
+  return bounded;
 }
 
 function rebuildSessionsTable(db: SqliteDb) {
@@ -2374,21 +2847,22 @@ function runJob(db: SqliteDb, jobId: string): JobSummary {
 
 function rebuildFtsData(db: SqliteDb) {
   transaction(db, () => {
-    db.exec("DELETE FROM memory_fts");
+    db.exec("DELETE FROM source_fts");
     const rows = db.selectObjects(
       `SELECT
-        m.id AS memory_id,
-        m.source_kind,
-        m.source_title,
+        s.id AS source_id,
+        s.source_kind,
+        s.source_title,
         c.id AS chunk_id,
         c.text
-       FROM chunks c
-       JOIN memories m ON m.id = c.memory_id
-       ORDER BY m.captured_at DESC, c.ord ASC`,
+       FROM source_chunks c
+       JOIN sources s ON s.id = c.source_id
+       WHERE s.lifecycle_status <> 'deleted'
+       ORDER BY s.captured_at DESC, c.ord ASC`,
     );
     for (const row of rows) {
-      insertFtsRow(db, {
-        memoryId: stringField(row, "memory_id"),
+      insertSourceFtsRow(db, {
+        sourceId: stringField(row, "source_id"),
         chunkId: stringField(row, "chunk_id"),
         sourceKind: sourceKindField(row, "source_kind"),
         title: stringField(row, "source_title"),
@@ -2398,10 +2872,10 @@ function rebuildFtsData(db: SqliteDb) {
   });
 }
 
-function insertFtsRow(
+function insertSourceFtsRow(
   db: SqliteDb,
   input: {
-    memoryId: string;
+    sourceId: string;
     chunkId: string;
     sourceKind: SourceKind;
     title: string;
@@ -2409,15 +2883,15 @@ function insertFtsRow(
   },
 ) {
   db.exec({
-    sql: `INSERT INTO memory_fts (
-      memory_id,
+    sql: `INSERT INTO source_fts (
+      source_id,
       chunk_id,
       source_kind,
       title,
       body
     ) VALUES (?, ?, ?, ?, ?)`,
     bind: [
-      input.memoryId,
+      input.sourceId,
       input.chunkId,
       input.sourceKind,
       input.title,
@@ -2461,10 +2935,11 @@ function insertAnchor(
 function findCurrentPageVersion(db: SqliteDb, versionGroupKey: string) {
   return db.selectObject(
     `SELECT *
-     FROM memories
+     FROM sources
      WHERE source_kind = 'page'
        AND version_group_key = ?
        AND is_current = 1
+       AND lifecycle_status <> 'deleted'
      ORDER BY captured_at DESC
      LIMIT 1`,
     [versionGroupKey],
@@ -2493,9 +2968,9 @@ function memorySummaryFromRow(row: SqlRow): MemorySummary {
     stringField(row, "normalized_source_url") || normalizeSourceUrl(stringField(row, "source_url"));
   const groupKey =
     stringField(row, "version_group_key") ||
-    buildMemoryVersionGroupKey(sourceKind, normalizedSourceUrl, stringField(row, "text_hash"));
-  const supersedesMemoryId = optionalString(row, "supersedes_memory_id");
-  const supersededByMemoryId = optionalString(row, "superseded_by_memory_id");
+    buildMemoryVersionGroupKey(sourceKind, normalizedSourceUrl, stringField(row, "content_hash"));
+  const supersedesMemoryId = optionalString(row, "supersedes_source_id");
+  const supersededByMemoryId = optionalString(row, "superseded_by_source_id");
   return {
     id: stringField(row, "id"),
     sourceKind,
@@ -2956,6 +3431,18 @@ function realField(row: SqlRow, key: string) {
 
 function sourceKindField(row: SqlRow, key: string): SourceKind {
   return stringField(row, key) === "selection" ? "selection" : "page";
+}
+
+function sourceLifecycleStatusFromRow(
+  row: SqlRow | undefined,
+  key: string,
+): SourceLifecycleStatus | null {
+  if (row === undefined) return null;
+  const value = stringField(row, key);
+  if (value === "fresh" || value === "stale" || value === "archived" || value === "deleted") {
+    return value;
+  }
+  return null;
 }
 
 function imageGenerationModeField(row: SqlRow, key: string): ImageGenerationHistoryRecord["mode"] {
