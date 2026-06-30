@@ -56,6 +56,33 @@ describe("assembleLocalRagEvidencePack", () => {
     });
   });
 
+  it("keeps chunk-window evidence bounded even when the memory has full source text", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "vector retrieval",
+      memories: [
+        memory({
+          normalizedText: "full source body ".repeat(400),
+          excerpt: "full source body preview",
+          chunks: [
+            {
+              id: "chunk-1",
+              ord: 0,
+              text: "Vector retrieval evidence window only.",
+              tokenCount: 5,
+            },
+          ],
+        }),
+      ],
+      contextChunksBefore: 0,
+      contextChunksAfter: 0,
+    });
+
+    expect(pack).toHaveLength(1);
+    expect(pack[0]?.id).toBe("memory:mem-1:chunk:chunk-1");
+    expect(pack[0]?.text).toBe("Vector retrieval evidence window only.");
+    expect(pack[0]?.text).not.toContain("full source body");
+  });
+
   it("can disable adjacent chunk context for callers that need anchor-only evidence", () => {
     const pack = assembleLocalRagEvidencePack({
       query: "billing renewal",
@@ -248,6 +275,23 @@ describe("assembleLocalRagEvidencePack", () => {
       sourceKind: "memory",
       text: "The durable memory text talks about onboarding.",
     });
+  });
+
+  it("prefers bounded excerpts over full source text for explicit local fallback", () => {
+    const pack = assembleLocalRagEvidencePack({
+      query: "saved archive unmatched",
+      memories: [
+        memory({
+          excerpt: "Short bounded source preview.",
+          normalizedText: "full source body ".repeat(500),
+          chunks: [{ id: "chunk-1", ord: 0, text: "Completely separate body.", tokenCount: 3 }],
+        }),
+      ],
+    });
+
+    expect(pack).toHaveLength(1);
+    expect(pack[0]?.text).toBe("Short bounded source preview.");
+    expect(pack[0]?.text).not.toContain("full source body");
   });
 
   it("enforces per-item and total character budgets", () => {

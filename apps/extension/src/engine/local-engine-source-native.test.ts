@@ -7,6 +7,14 @@ const workerSource = readFileSync(
   "utf8",
 );
 
+function sourceSection(start: string, end: string) {
+  const startIndex = workerSource.indexOf(start);
+  const endIndex = workerSource.indexOf(end, startIndex + start.length);
+  expect(startIndex).toBeGreaterThanOrEqual(0);
+  expect(endIndex).toBeGreaterThan(startIndex);
+  return workerSource.slice(startIndex, endIndex);
+}
+
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
     expect(workerSource).toContain("const schemaVersion = 13");
@@ -77,9 +85,57 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).not.toContain('"ingest_graph"');
   });
 
+  it("keeps capture source-native and defers embedding work outside the capture transaction", () => {
+    const captureSection = sourceSection("private async capture", "private async retrieveSources");
+
+    expect(captureSection).toContain("const chunks = chunkText(draft.normalizedText)");
+    expect(captureSection).toContain("transaction(db, () => {");
+    expect(captureSection).toContain("insertSourceRow(db");
+    expect(captureSection).toContain("insertSourceLifecycleEvent(db");
+    expect(captureSection).toContain("insertSourceAuditLog(db");
+    expect(captureSection).toContain("INSERT INTO source_chunks");
+    expect(captureSection).toContain("insertSourceFtsRow(db");
+    expect(captureSection).toContain("insertAnchor(");
+    expect(captureSection).toContain('enqueueJob(db, "post_capture_hardening"');
+    expect(captureSection).toContain('action: "source.stage_queued"');
+    expect(captureSection).not.toContain("runEmbeddingStageForSource");
+    expect(captureSection).not.toContain("upsertSourceChunkEmbedding");
+    expect(captureSection).not.toContain("embedLocalDeterministic");
+  });
+
   it("cleans up source embeddings on source delete and library reset", () => {
     expect(workerSource).toContain("DELETE FROM source_embeddings WHERE source_id = ?");
     expect(workerSource).toContain('db.exec("DELETE FROM source_embeddings")');
+
+    const deleteSection = sourceSection("private async delete", "private async listTopicPages");
+    expect(deleteSection).toContain("DELETE FROM anchors WHERE memory_id = ?");
+    expect(deleteSection).toContain("DELETE FROM topic_graph_edges WHERE memory_id = ?");
+    expect(deleteSection).toContain("DELETE FROM source_embeddings WHERE source_id = ?");
+    expect(deleteSection).toContain("DELETE FROM source_fts WHERE source_id = ?");
+    expect(deleteSection).toContain("DELETE FROM source_chunks WHERE source_id = ?");
+    expect(deleteSection).toContain("DELETE FROM source_metadata WHERE source_id = ?");
+    expect(deleteSection).toContain("markSourceDeleted(db");
+
+    const resetSection = sourceSection("private async resetLibrary", "private async ensureReady");
+    expect(resetSection).toContain('db.exec("DELETE FROM jobs")');
+    expect(resetSection).toContain('db.exec("DELETE FROM topic_graph_edges")');
+    expect(resetSection).toContain('db.exec("DELETE FROM source_embeddings")');
+    expect(resetSection).toContain('db.exec("DELETE FROM source_fts")');
+    expect(resetSection).toContain('db.exec("DELETE FROM source_chunks")');
+    expect(resetSection).toContain('db.exec("DELETE FROM sources")');
+  });
+
+  it("rebuilds FTS from source chunks without changing embedding rows", () => {
+    const rebuildSection = sourceSection(
+      "function rebuildFtsData",
+      "function runPostCaptureHardeningJob",
+    );
+    expect(rebuildSection).toContain("DELETE FROM source_fts");
+    expect(rebuildSection).toContain("FROM source_chunks c");
+    expect(rebuildSection).toContain("JOIN sources s ON s.id = c.source_id");
+    expect(rebuildSection).toContain("WHERE s.lifecycle_status <> 'deleted'");
+    expect(rebuildSection).toContain("insertSourceFtsRow(db");
+    expect(rebuildSection).not.toContain("source_embeddings");
   });
 
   it("loads prompt evidence through bounded source chunk windows", () => {
@@ -104,6 +160,27 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("function optionalAnchorFromRow"),
     );
     expect(loaderSection).not.toContain("normalized_text");
+  });
+
+  it("orders bounded evidence loading as anchors, then query hits, then requested-source fallback", () => {
+    const evidenceWindowSection = sourceSection(
+      "private async getMemoryEvidenceWindows",
+      "private async delete",
+    );
+    const explicitAnchorIndex = evidenceWindowSection.indexOf(
+      "for (const anchor of explicitAnchors)",
+    );
+    const ftsIndex = evidenceWindowSection.indexOf("if (ftsQuery.length > 0)");
+    const fallbackIndex = evidenceWindowSection.indexOf(
+      "if (windows.length < limit && sourceIds.length > 0)",
+    );
+
+    expect(explicitAnchorIndex).toBeGreaterThanOrEqual(0);
+    expect(ftsIndex).toBeGreaterThan(explicitAnchorIndex);
+    expect(fallbackIndex).toBeGreaterThan(ftsIndex);
+    expect(evidenceWindowSection).toContain("contextChunksBefore");
+    expect(evidenceWindowSection).toContain("contextChunksAfter");
+    expect(evidenceWindowSection).toContain("maxWindowsPerMemory");
   });
 
   it("exposes source-native retrieval with RRF fusion and truthful vector trace", () => {
@@ -146,5 +223,33 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("function fuseSourceRetrievalHits"),
     );
     expect(vectorRetrievalSection).not.toContain("normalized_text");
+  });
+
+  it("keeps embedding jobs idempotent and model-scoped", () => {
+    const jobSection = sourceSection("function runJob", "function rebuildFtsData");
+    expect(jobSection).toContain('type === "post_capture_hardening"');
+    expect(jobSection).toContain("runPostCaptureHardeningJob(db");
+    expect(jobSection).toContain("status = 'done'");
+    expect(jobSection).toContain("status = ?");
+
+    const embeddingStageSection = sourceSection(
+      "function runEmbeddingStageForSource",
+      "function upsertSourceChunkEmbedding",
+    );
+    expect(embeddingStageSection).toContain("SOURCE_NOT_FOUND");
+    expect(embeddingStageSection).toContain("lifecycle_status = 'deleted'");
+    expect(embeddingStageSection).toContain("source_deleted");
+    expect(embeddingStageSection).toContain("getActiveEmbeddingProvider(db)");
+    expect(embeddingStageSection).toContain("EMBEDDING_MODEL_UNAVAILABLE");
+    expect(embeddingStageSection).toContain("ORDER BY ord ASC");
+
+    const upsertSection = sourceSection(
+      "function upsertSourceChunkEmbedding",
+      "function insertSourceFtsRow",
+    );
+    expect(upsertSection).toContain("ON CONFLICT(model_id, target_kind, target_id) DO UPDATE");
+    expect(upsertSection).toContain("provider.modelId");
+    expect(upsertSection).toContain("'chunk'");
+    expect(upsertSection).toContain("EMBEDDING_DIMENSION_MISMATCH");
   });
 });
