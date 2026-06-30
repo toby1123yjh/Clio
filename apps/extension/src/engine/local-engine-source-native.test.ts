@@ -88,6 +88,9 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("FROM source_fts");
     expect(workerSource).toContain("JOIN source_chunks c ON c.id = source_fts.chunk_id");
     expect(workerSource).toContain("function loadSourceEvidenceWindow");
+    expect(workerSource).toContain("function boundedEvidenceWindowAnchors");
+    expect(workerSource).toContain("function resolveEvidenceWindowAnchorOrd");
+    expect(workerSource).toContain("const explicitAnchors = boundedEvidenceWindowAnchors");
     expect(workerSource).toContain("FROM source_chunks");
     expect(workerSource).toContain("ord BETWEEN ? AND ?");
 

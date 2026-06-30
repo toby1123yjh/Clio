@@ -146,9 +146,11 @@ import {
   type ContentCommand,
   type CreateWikiCompileJobEventPayload,
   type EngineHealth,
+  type GetMemoryEvidenceWindowAnchor,
   type ImageGenerationHistoryRecord,
   type MemoryDetail,
   type MemoryEvidenceWindow,
+  type RetrieveSourcesResult,
   type SearchMemoryItem,
   type TopicGraphEdge,
   type TopicPageDetail,
@@ -467,15 +469,50 @@ function evidenceWindowsToLocalRagMemories(windows: MemoryEvidenceWindow[]): Loc
   return Array.from(memories.values());
 }
 
+function retrievalEvidenceWindowAnchors(
+  result: RetrieveSourcesResult,
+): GetMemoryEvidenceWindowAnchor[] {
+  const seen = new Set<string>();
+  return result.items.flatMap((item) =>
+    item.hitChunks.flatMap((chunk) => {
+      const memoryId = normalizeText(item.id);
+      const chunkId = normalizeText(chunk.chunkId);
+      if (memoryId.length === 0 || chunkId.length === 0) return [];
+      const key = `${memoryId}:${chunkId}`;
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [
+        {
+          memoryId,
+          chunkId,
+          ord: chunk.ord,
+        },
+      ];
+    }),
+  );
+}
+
 async function loadLocalRagEvidencePack(query: string): Promise<EvidenceItem[]> {
   const normalizedQuery = normalizeText(query);
   if (normalizedQuery.length === 0) return [];
   if (!planLocalRagRetrieval(normalizedQuery).shouldRetrieve) return [];
   try {
+    const retrieval = await requestEngine({
+      kind: "retrieveSources",
+      payload: {
+        query: normalizedQuery,
+        limit: 8,
+        includeChunks: 2,
+      },
+    });
+    const memoryIds = retrieval.items.map((item) => item.id);
+    const anchors = retrievalEvidenceWindowAnchors(retrieval);
     const windows = await requestEngine({
       kind: "getMemoryEvidenceWindows",
       payload: {
         query: normalizedQuery,
+        memoryIds,
+        anchors,
         limit: 12,
         maxWindowsPerMemory: 2,
         contextChunksBefore: 1,

@@ -509,6 +509,10 @@ describe("session engine RPC guards", () => {
           payload: {
             query: "billing notes",
             memoryIds: ["mem-1", "mem-2"],
+            anchors: [
+              { memoryId: "mem-1", chunkId: "chunk-1" },
+              { memoryId: "mem-2", ord: 3 },
+            ],
             limit: 8,
             maxWindowsPerMemory: 2,
             contextChunksBefore: 1,
@@ -525,6 +529,30 @@ describe("session engine RPC guards", () => {
           kind: "getMemoryEvidenceWindows",
           payload: {
             memoryIds: [42],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "getMemoryEvidenceWindows",
+          payload: {
+            anchors: [{ memoryId: "mem-1" }],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "getMemoryEvidenceWindows",
+          payload: {
+            anchors: [{ memoryId: "mem-1", chunkId: 42 }],
           },
         },
       }),

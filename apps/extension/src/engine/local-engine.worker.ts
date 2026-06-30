@@ -24,6 +24,7 @@ import {
   type EngineRequest,
   EngineRpcError,
   type GetJobStatusResult,
+  type GetMemoryEvidenceWindowAnchor,
   type GetMemoryEvidenceWindowsPayload,
   type GetMemoryEvidenceWindowsResult,
   type ImageGenerationHistoryRecord,
@@ -651,11 +652,15 @@ class LocalEngine {
     const query = normalizeText(payload.query ?? "");
     const ftsQuery = buildFtsQuery(query);
     const sourceIds = boundedUniqueStrings(payload.memoryIds, 40);
+    const explicitAnchors = boundedEvidenceWindowAnchors(payload.anchors, 80);
     const limit = clampOptionalLimit(payload.limit, 8, 20);
     const maxWindowsPerMemory = clampOptionalLimit(payload.maxWindowsPerMemory, 2, 4);
     const contextChunksBefore = clampOptionalCount(payload.contextChunksBefore, 1, 3);
     const contextChunksAfter = clampOptionalCount(payload.contextChunksAfter, 1, 3);
-    const anchorRows = loadAnchorsBySourceId(db, sourceIds);
+    const anchorRows = loadAnchorsBySourceId(db, [
+      ...sourceIds,
+      ...explicitAnchors.map((anchor) => anchor.memoryId),
+    ]);
     const windows: MemoryEvidenceWindow[] = [];
     const seenWindows = new Set<string>();
     const windowsBySource = new Map<string, number>();
@@ -678,6 +683,12 @@ class LocalEngine {
       windowsBySource.set(sourceId, sourceCount + 1);
       windows.push(window);
     };
+
+    for (const anchor of explicitAnchors) {
+      const anchorOrd = resolveEvidenceWindowAnchorOrd(db, anchor);
+      if (anchorOrd === undefined) continue;
+      addWindow(anchor.memoryId, anchorOrd);
+    }
 
     if (ftsQuery.length > 0) {
       const bindings: unknown[] = [ftsQuery];
@@ -3539,14 +3550,61 @@ function anchorFromRow(row: SqlRow): AnchorInfo {
 }
 
 function loadAnchorsBySourceId(db: SqliteDb, sourceIds: string[]) {
-  if (sourceIds.length === 0) return new Map<string, AnchorInfo>();
+  const boundedSourceIds = boundedUniqueStrings(sourceIds, 80);
+  if (boundedSourceIds.length === 0) return new Map<string, AnchorInfo>();
   const rows = db.selectObjects(
     `SELECT *
      FROM anchors
-     WHERE memory_id IN (${sourceIds.map(() => "?").join(", ")})`,
-    sourceIds,
+     WHERE memory_id IN (${boundedSourceIds.map(() => "?").join(", ")})`,
+    boundedSourceIds,
   );
   return new Map(rows.map((row) => [stringField(row, "memory_id"), anchorFromRow(row)]));
+}
+
+function boundedEvidenceWindowAnchors(
+  anchors: GetMemoryEvidenceWindowAnchor[] | undefined,
+  max: number,
+) {
+  if (anchors === undefined) return [];
+  const seen = new Set<string>();
+  return anchors.flatMap((anchor) => {
+    const memoryId = normalizeText(anchor.memoryId);
+    const chunkId = normalizeText(anchor.chunkId ?? "");
+    const ord =
+      anchor.ord === undefined || !Number.isFinite(anchor.ord)
+        ? undefined
+        : Math.max(0, Math.floor(anchor.ord));
+    if (memoryId.length === 0 || (chunkId.length === 0 && ord === undefined)) return [];
+    const key = `${memoryId}:${chunkId || `ord:${ord}`}`;
+    if (seen.has(key) || seen.size >= max) return [];
+    seen.add(key);
+    return [
+      {
+        memoryId,
+        ...(chunkId.length === 0 ? {} : { chunkId }),
+        ...(ord === undefined ? {} : { ord }),
+      },
+    ];
+  });
+}
+
+function resolveEvidenceWindowAnchorOrd(
+  db: SqliteDb,
+  anchor: GetMemoryEvidenceWindowAnchor,
+): number | undefined {
+  if (anchor.chunkId !== undefined && anchor.chunkId.length > 0) {
+    const chunk = db.selectObject(
+      `SELECT ord
+       FROM source_chunks
+       WHERE source_id = ?
+         AND id = ?
+       LIMIT 1`,
+      [anchor.memoryId, anchor.chunkId],
+    );
+    if (chunk !== undefined) return numberField(chunk, "ord");
+  }
+  if (anchor.ord === undefined || !Number.isFinite(anchor.ord)) return undefined;
+  return Math.max(0, Math.floor(anchor.ord));
 }
 
 function loadSourceEvidenceWindow(

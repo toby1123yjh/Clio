@@ -105,9 +105,16 @@ export interface MemoryDetail extends MemorySummary {
   }>;
 }
 
+export interface GetMemoryEvidenceWindowAnchor {
+  memoryId: string;
+  chunkId?: string;
+  ord?: number;
+}
+
 export interface GetMemoryEvidenceWindowsPayload {
   query?: string;
   memoryIds?: string[];
+  anchors?: GetMemoryEvidenceWindowAnchor[];
   limit?: number;
   maxWindowsPerMemory?: number;
   contextChunksBefore?: number;
@@ -1491,10 +1498,23 @@ function isGetMemoryEvidenceWindowsPayload(
     (value.memoryIds === undefined ||
       (Array.isArray(value.memoryIds) &&
         value.memoryIds.every((item) => typeof item === "string"))) &&
+    (value.anchors === undefined ||
+      (Array.isArray(value.anchors) && value.anchors.every(isGetMemoryEvidenceWindowAnchor))) &&
     (value.limit === undefined || typeof value.limit === "number") &&
     (value.maxWindowsPerMemory === undefined || typeof value.maxWindowsPerMemory === "number") &&
     (value.contextChunksBefore === undefined || typeof value.contextChunksBefore === "number") &&
     (value.contextChunksAfter === undefined || typeof value.contextChunksAfter === "number")
+  );
+}
+
+function isGetMemoryEvidenceWindowAnchor(value: unknown): value is GetMemoryEvidenceWindowAnchor {
+  if (!isRecord(value) || typeof value.memoryId !== "string") return false;
+  const hasChunkId = value.chunkId !== undefined;
+  const hasOrd = value.ord !== undefined;
+  return (
+    (value.chunkId === undefined || typeof value.chunkId === "string") &&
+    (value.ord === undefined || (typeof value.ord === "number" && Number.isFinite(value.ord))) &&
+    (hasChunkId || hasOrd)
   );
 }
 
