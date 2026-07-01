@@ -19,6 +19,8 @@ import {
   CLIO_WEB_SEARCH_RUN_REQUEST,
   CLIO_WEB_SEARCH_STREAM_EVENT,
   CLIO_WEB_SEARCH_STREAM_REQUEST,
+  type RetrieveSourceHitChunk,
+  type RetrieveSourceItem,
   isAgentRunEventMessage,
   isAgentRunRequestMessage,
   isAgentStreamCompactMessage,
@@ -612,6 +614,35 @@ describe("session engine RPC guards", () => {
         },
       }),
     ).toBe(false);
+  });
+
+  it("types meta source hits as source-level tracks without widening chunk tracks", () => {
+    const item = {
+      id: "source-1",
+      sourceKind: "page",
+      sourceUrl: "https://example.test",
+      sourceTitle: "Example",
+      capturedAt: "2026-07-01T00:00:00.000Z",
+      excerpt: "Example metadata",
+      version: {
+        groupKey: "page:https://example.test/:hash",
+        versionNo: 1,
+        isCurrent: true,
+      },
+      score: 1,
+      tracks: ["meta_sources", "fts_chunks"],
+      hitChunks: [],
+    } satisfies RetrieveSourceItem;
+    const chunk = {
+      chunkId: "chunk-1",
+      ord: 0,
+      snippet: "chunk snippet",
+      score: 1,
+      track: "fts_chunks",
+    } satisfies RetrieveSourceHitChunk;
+
+    expect(item.tracks).toContain("meta_sources");
+    expect(chunk.track).toBe("fts_chunks");
   });
 
   it("accepts explicit queued job run requests", () => {

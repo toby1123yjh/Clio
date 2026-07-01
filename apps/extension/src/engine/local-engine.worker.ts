@@ -126,11 +126,14 @@ type SourceAuditAction =
   | "source.deleted"
   | "source.stage_queued";
 
+type SourceRetrievalTrack = "meta_sources" | "fts_chunks" | "vector_chunks";
+
 interface SourceRetrievalHit {
-  track: "fts_chunks" | "vector_chunks";
+  track: SourceRetrievalTrack;
   rank: number;
   source: SqlRow;
-  chunk: RetrieveSourceHitChunk;
+  chunk?: RetrieveSourceHitChunk;
+  fallbackExcerpt?: string;
 }
 
 interface EmbeddingProvider {
@@ -482,6 +485,12 @@ class LocalEngine {
         reason: "empty_query",
       });
       traceTracks.push({
+        name: "meta_sources",
+        status: "skipped",
+        itemCount: 0,
+        reason: "empty_query",
+      });
+      traceTracks.push({
         name: "fts_chunks",
         status: "skipped",
         itemCount: 0,
@@ -507,6 +516,7 @@ class LocalEngine {
       };
     }
 
+    const metaHits = loadMetaSourceRetrievalHits(db, { query, limit: Math.max(limit * 2, limit) });
     const ftsHits = loadFtsChunkRetrievalHits(db, {
       query,
       limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
@@ -515,10 +525,16 @@ class LocalEngine {
       query,
       limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
     });
-    const items = fuseSourceRetrievalHits([...ftsHits, ...vectorResult.hits], {
+    const items = fuseSourceRetrievalHits([...metaHits, ...ftsHits, ...vectorResult.hits], {
       limit,
       includeChunks,
       rrfK: defaultRrfK,
+    });
+    traceTracks.push({
+      name: "meta_sources",
+      status: metaHits.length > 0 ? "used" : "skipped",
+      itemCount: metaHits.length,
+      ...(metaHits.length === 0 ? { reason: "no_matches" } : {}),
     });
     traceTracks.push({
       name: "fts_chunks",
@@ -3675,6 +3691,73 @@ function optionalAnchorFromRow(row: SqlRow | undefined) {
   return row === undefined ? undefined : anchorFromRow(row);
 }
 
+function loadMetaSourceRetrievalHits(
+  db: SqliteDb,
+  input: { query: string; limit: number },
+): SourceRetrievalHit[] {
+  const terms = metaSourceQueryTerms(input.query);
+  if (terms.length === 0) return [];
+  const matchClauses = terms
+    .map(
+      () => `(
+        s.source_title LIKE ? ESCAPE '\\'
+        OR sm.title LIKE ? ESCAPE '\\'
+        OR sm.abstract LIKE ? ESCAPE '\\'
+        OR sm.source_type LIKE ? ESCAPE '\\'
+      )`,
+    )
+    .join(" OR ");
+  const bind = terms.flatMap((term) => {
+    const pattern = `%${escapeLikePattern(term)}%`;
+    return [pattern, pattern, pattern, pattern];
+  });
+  const outputLimit = clampLimit(input.limit, 100);
+  const rows = db.selectObjects(
+    `SELECT
+      s.id,
+      s.source_kind,
+      s.source_url,
+      s.normalized_source_url,
+      s.source_title,
+      s.captured_at,
+      s.content_hash,
+      s.version_group_key,
+      s.version_no,
+      s.supersedes_source_id,
+      s.superseded_by_source_id,
+      s.is_current,
+      sm.title AS meta_title,
+      sm.abstract AS meta_abstract,
+      sm.source_type AS meta_source_type
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.lifecycle_status <> 'deleted'
+       AND (${matchClauses})
+     ORDER BY s.captured_at DESC
+     LIMIT ?`,
+    [...bind, clampLimit(outputLimit * 4, 300)],
+  );
+  return rows
+    .map((row) => ({
+      row,
+      fallbackExcerpt: metaSourceFallbackExcerpt(row, input.query),
+      score: metaSourceMatchScore(row, input.query),
+    }))
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        stringField(right.row, "captured_at").localeCompare(stringField(left.row, "captured_at")) ||
+        stringField(left.row, "source_title").localeCompare(stringField(right.row, "source_title")),
+    )
+    .slice(0, outputLimit)
+    .map(({ row, fallbackExcerpt }, index) => ({
+      track: "meta_sources",
+      rank: index + 1,
+      source: row,
+      fallbackExcerpt,
+    }));
+}
+
 function loadFtsChunkRetrievalHits(
   db: SqliteDb,
   input: { query: string; limit: number },
@@ -3822,6 +3905,58 @@ function loadVectorChunkRetrievalHits(
   };
 }
 
+function metaSourceQueryTerms(input: string) {
+  const normalized = normalizeText(input);
+  if (normalized.length === 0) return [];
+  const expanded = expandChineseBigrams(normalized);
+  const seen = new Set<string>();
+  return [normalized, ...(expanded.match(/[\p{L}\p{N}_]+/gu) ?? [])].flatMap((term) => {
+    const value = normalizeText(term);
+    const key = value.toLocaleLowerCase();
+    if (value.length === 0 || seen.has(key) || seen.size >= 16) return [];
+    seen.add(key);
+    return [value];
+  });
+}
+
+function metaSourceMatchScore(row: SqlRow, query: string) {
+  const normalizedQuery = normalizeText(query).toLocaleLowerCase();
+  const terms = metaSourceQueryTerms(query).map((term) => term.toLocaleLowerCase());
+  const fields = [
+    { value: stringField(row, "source_title"), weight: 8 },
+    { value: stringField(row, "meta_title"), weight: 8 },
+    { value: stringField(row, "meta_source_type"), weight: 4 },
+    { value: stringField(row, "meta_abstract"), weight: 3 },
+  ];
+  let score = 0;
+  for (const field of fields) {
+    const value = normalizeText(field.value).toLocaleLowerCase();
+    if (value.length === 0) continue;
+    if (value === normalizedQuery) score += field.weight * 5;
+    else if (normalizedQuery.length > 0 && value.includes(normalizedQuery)) {
+      score += field.weight * 3;
+    }
+    for (const term of terms) {
+      if (value.includes(term)) score += field.weight;
+    }
+  }
+  return score;
+}
+
+function metaSourceFallbackExcerpt(row: SqlRow, query: string) {
+  const title = stringField(row, "meta_title") || stringField(row, "source_title");
+  const sourceType = stringField(row, "meta_source_type");
+  const abstractText = stringField(row, "meta_abstract");
+  const queryTerms = metaSourceQueryTerms(query).map((term) => term.toLocaleLowerCase());
+  const matchingAbstract =
+    abstractText.length > 0 &&
+    queryTerms.some((term) => abstractText.toLocaleLowerCase().includes(term));
+  const parts = [title, sourceType, matchingAbstract ? abstractText : ""].filter(
+    (part) => part.length > 0,
+  );
+  return parts.length > 0 ? excerpt(parts.join(" - ")) : stringField(row, "source_url");
+}
+
 function fuseSourceRetrievalHits(
   hits: SourceRetrievalHit[],
   input: { limit: number; includeChunks: number; rrfK: number },
@@ -3835,6 +3970,7 @@ function fuseSourceRetrievalHits(
       tracks: Set<RetrieveTrackName>;
       chunks: RetrieveSourceHitChunk[];
       seenChunks: Set<string>;
+      fallbackExcerpt: string;
     }
   >();
 
@@ -3848,11 +3984,16 @@ function fuseSourceRetrievalHits(
       tracks: new Set<RetrieveTrackName>(),
       chunks: [],
       seenChunks: new Set<string>(),
+      fallbackExcerpt:
+        hit.fallbackExcerpt ||
+        stringField(hit.source, "source_title") ||
+        stringField(hit.source, "source_url"),
     };
     existing.score += reciprocalRankFusionScore(hit.rank, input.rrfK);
     existing.bestRank = Math.min(existing.bestRank, hit.rank);
     existing.tracks.add(hit.track);
     if (
+      hit.chunk !== undefined &&
       existing.chunks.length < input.includeChunks &&
       hit.chunk.chunkId.length > 0 &&
       !existing.seenChunks.has(hit.chunk.chunkId)
@@ -3879,7 +4020,7 @@ function fuseSourceRetrievalHits(
     .map((item) => ({
       ...memorySummaryFromRetrievalRow(
         item.source,
-        item.chunks[0]?.snippet || stringField(item.source, "source_title"),
+        item.chunks[0]?.snippet || item.fallbackExcerpt,
       ),
       score: item.score,
       tracks: Array.from(item.tracks),

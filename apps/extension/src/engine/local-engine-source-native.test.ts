@@ -186,6 +186,7 @@ describe("local engine source-native storage foundation", () => {
   it("exposes source-native retrieval with RRF fusion and truthful vector trace", () => {
     expect(workerSource).toContain('case "retrieveSources"');
     expect(workerSource).toContain("private async retrieveSources");
+    expect(workerSource).toContain("function loadMetaSourceRetrievalHits");
     expect(workerSource).toContain("function loadFtsChunkRetrievalHits");
     expect(workerSource).toContain("function loadVectorChunkRetrievalHits");
     expect(workerSource).toContain("function fuseSourceRetrievalHits");
@@ -197,9 +198,15 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("FROM source_fts");
     expect(workerSource).toContain("JOIN sources s ON s.id = source_fts.source_id");
     expect(workerSource).toContain("JOIN source_chunks c ON c.id = source_fts.chunk_id");
+    expect(workerSource).toContain("LEFT JOIN source_metadata sm ON sm.source_id = s.id");
+    expect(workerSource).toContain("s.source_title LIKE ? ESCAPE");
+    expect(workerSource).toContain("sm.title LIKE ? ESCAPE");
+    expect(workerSource).toContain("sm.abstract LIKE ? ESCAPE");
+    expect(workerSource).toContain("sm.source_type LIKE ? ESCAPE");
     expect(workerSource).toContain("FROM source_embeddings se");
     expect(workerSource).toContain("JOIN source_chunks c ON c.id = se.target_id");
     expect(workerSource).toContain("cosineSimilarity(queryVector, vector)");
+    expect(workerSource).toContain('name: "meta_sources"');
     expect(workerSource).toContain('name: "vector_chunks"');
     expect(workerSource).toContain('status: "used"');
     expect(workerSource).toContain('status: "skipped"');
@@ -212,7 +219,14 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("private async retrieveSources"),
       workerSource.indexOf("private async search"),
     );
+    expect(retrieveSection).toContain("const metaHits = loadMetaSourceRetrievalHits");
+    expect(retrieveSection).toContain("[...metaHits, ...ftsHits, ...vectorResult.hits]");
     expect(retrieveSection).not.toContain("normalized_text");
+    const metaRetrievalSection = workerSource.slice(
+      workerSource.indexOf("function loadMetaSourceRetrievalHits"),
+      workerSource.indexOf("function loadFtsChunkRetrievalHits"),
+    );
+    expect(metaRetrievalSection).not.toContain("normalized_text");
     const ftsRetrievalSection = workerSource.slice(
       workerSource.indexOf("function loadFtsChunkRetrievalHits"),
       workerSource.indexOf("function fuseSourceRetrievalHits"),
@@ -223,6 +237,13 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("function fuseSourceRetrievalHits"),
     );
     expect(vectorRetrievalSection).not.toContain("normalized_text");
+    const fusionSection = workerSource.slice(
+      workerSource.indexOf("function fuseSourceRetrievalHits"),
+      workerSource.indexOf("function reciprocalRankFusionScore"),
+    );
+    expect(fusionSection).toContain("hit.chunk !== undefined");
+    expect(fusionSection).toContain("fallbackExcerpt");
+    expect(fusionSection).toContain("item.chunks[0]?.snippet || item.fallbackExcerpt");
   });
 
   it("keeps embedding jobs idempotent and model-scoped", () => {
