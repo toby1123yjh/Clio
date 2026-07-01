@@ -89,10 +89,16 @@ type SqliteDb = {
   selectObjects: (sql: string, bind?: unknown[]) => SqlRow[];
   close: () => void;
 };
-type SqliteApi = {
+export type LocalEngineSqliteDb = SqliteDb;
+type SqliteOpenOptions = {
+  filename?: string;
+  flags?: string;
+  vfs?: string;
+};
+export type LocalEngineSqliteApi = {
   oo1: {
-    DB: new (filename: string, flags?: string) => SqliteDb;
-    OpfsDb?: new (filename: string, flags?: string) => SqliteDb;
+    DB: new (filenameOrOptions?: string | SqliteOpenOptions, flags?: string) => SqliteDb;
+    OpfsDb?: new (filenameOrOptions?: string | SqliteOpenOptions, flags?: string) => SqliteDb;
   };
   version: {
     libVersion: string;
@@ -101,7 +107,16 @@ type SqliteApi = {
 };
 type SqliteInitModule = (config?: {
   locateFile?: (path: string) => string;
-}) => Promise<SqliteApi>;
+}) => Promise<LocalEngineSqliteApi>;
+type LocalEngineDatabaseOpenResult = {
+  db: SqliteDb;
+  sqliteVersion?: string;
+  opfs?: EngineHealth["opfs"];
+};
+type LocalEngineDatabaseOpener = () => Promise<LocalEngineDatabaseOpenResult>;
+export interface LocalEngineOptions {
+  openDatabase?: LocalEngineDatabaseOpener;
+}
 
 const databasePath = "/clio-browser-phase1.sqlite3";
 const schemaVersion = 13;
@@ -155,9 +170,14 @@ interface DocumentDraft {
   versionGroupKey: string;
 }
 
-class LocalEngine {
+export class LocalEngine {
   private db: SqliteDb | null = null;
   private healthState: EngineHealth = startingHealth();
+  private readonly openDatabase: LocalEngineDatabaseOpener;
+
+  constructor(options: LocalEngineOptions = {}) {
+    this.openDatabase = options.openDatabase ?? openProductionDatabase;
+  }
 
   async handle(request: EngineRequest) {
     switch (request.kind) {
@@ -318,14 +338,6 @@ class LocalEngine {
       previousVersion === undefined ? undefined : stringField(previousVersion, "id");
 
     transaction(db, () => {
-      if (draft.kind === "page" && supersedesSourceId !== undefined) {
-        markSourceSuperseded(db, {
-          sourceId: supersedesSourceId,
-          supersededBySourceId: sourceId,
-          at: draft.capturedAt,
-        });
-      }
-
       insertSourceRow(db, {
         id: sourceId,
         kind: draft.kind,
@@ -361,6 +373,13 @@ class LocalEngine {
           supersedesSourceId: supersedesSourceId ?? null,
         },
       });
+      if (draft.kind === "page" && supersedesSourceId !== undefined) {
+        markSourceSuperseded(db, {
+          sourceId: supersedesSourceId,
+          supersededBySourceId: sourceId,
+          at: draft.capturedAt,
+        });
+      }
 
       for (const chunk of chunks) {
         const chunkId = `${sourceId}:${chunk.ord}`;
@@ -2043,19 +2062,9 @@ class LocalEngine {
 
     this.healthState = startingHealth();
     try {
-      const sqliteInit = sqlite3InitModule as unknown as SqliteInitModule;
-      const sqlite3 = await sqliteInit({
-        locateFile: (path) =>
-          path === "sqlite3.wasm" ? new URL(sqliteWasmUrl, location.href).href : path,
-      });
-      if (sqlite3.oo1.OpfsDb === undefined) {
-        throw new EngineRpcError(
-          "OPFS_UNAVAILABLE",
-          "SQLite OPFS storage is unavailable in this browser context.",
-        );
-      }
-
-      const db = new sqlite3.oo1.OpfsDb(databasePath, "c");
+      const opened = await this.openDatabase();
+      const db = opened.db;
+      const opfs = opened.opfs ?? "available";
       this.db = db;
       migrate(db);
       recoverStaleJobs(db);
@@ -2065,14 +2074,14 @@ class LocalEngine {
           status: "degraded",
           message: "SQLite integrity check did not return ok.",
           detail: String(integrity),
-          sqliteVersion: sqlite3.version.libVersion,
-          opfs: "available",
+          sqliteVersion: opened.sqliteVersion,
+          opfs,
           checkedAt: new Date().toISOString(),
         };
         throw new EngineRpcError("SQLITE_INTEGRITY", "Local memory storage needs repair.");
       }
 
-      this.healthState = readyHealth(sqlite3.version.libVersion);
+      this.healthState = readyHealth(opened.sqliteVersion, opfs);
       return db;
     } catch (error) {
       if (error instanceof EngineRpcError && error.code === "SQLITE_INTEGRITY") {
@@ -2091,38 +2100,76 @@ class LocalEngine {
     }
   }
 
-  private close() {
+  close() {
     if (this.db === null) return;
     this.db.close();
     this.db = null;
   }
 }
 
-const engine = new LocalEngine();
+async function openProductionDatabase(): Promise<LocalEngineDatabaseOpenResult> {
+  const sqliteInit = sqlite3InitModule as unknown as SqliteInitModule;
+  const sqlite3 = await sqliteInit({
+    locateFile: (path) =>
+      path === "sqlite3.wasm" ? new URL(sqliteWasmUrl, location.href).href : path,
+  });
+  if (sqlite3.oo1.OpfsDb === undefined) {
+    throw new EngineRpcError(
+      "OPFS_UNAVAILABLE",
+      "SQLite OPFS storage is unavailable in this browser context.",
+    );
+  }
 
-self.addEventListener("message", (event: MessageEvent<unknown>) => {
-  if (!isWorkerRequestMessage(event.data)) return;
-  const { requestId, request } = event.data;
-  void engine
-    .handle(request)
-    .then((value) => {
-      self.postMessage({
-        type: CLIO_WORKER_RESPONSE,
-        requestId,
-        response: { ok: true, value },
+  return {
+    db: new sqlite3.oo1.OpfsDb(databasePath, "c"),
+    sqliteVersion: sqlite3.version.libVersion,
+    opfs: "available",
+  };
+}
+
+type LocalEngineWorkerGlobal = typeof globalThis & {
+  addEventListener: (type: "message", listener: (event: MessageEvent<unknown>) => void) => void;
+  postMessage: (message: unknown) => void;
+};
+
+function installWorkerMessageHandler(workerSelf: LocalEngineWorkerGlobal, engine: LocalEngine) {
+  workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (!isWorkerRequestMessage(event.data)) return;
+    const { requestId, request } = event.data;
+    void engine
+      .handle(request)
+      .then((value) => {
+        workerSelf.postMessage({
+          type: CLIO_WORKER_RESPONSE,
+          requestId,
+          response: { ok: true, value },
+        });
+      })
+      .catch((error) => {
+        workerSelf.postMessage({
+          type: CLIO_WORKER_RESPONSE,
+          requestId,
+          response: {
+            ok: false,
+            error: engineErrorFromUnknown(error),
+          },
+        });
       });
-    })
-    .catch((error) => {
-      self.postMessage({
-        type: CLIO_WORKER_RESPONSE,
-        requestId,
-        response: {
-          ok: false,
-          error: engineErrorFromUnknown(error),
-        },
-      });
-    });
-});
+  });
+}
+
+function currentWorkerGlobal(): LocalEngineWorkerGlobal | null {
+  const candidate = globalThis as Partial<LocalEngineWorkerGlobal>;
+  if (typeof window !== "undefined") return null;
+  if (typeof candidate.addEventListener !== "function") return null;
+  if (typeof candidate.postMessage !== "function") return null;
+  return candidate as LocalEngineWorkerGlobal;
+}
+
+const workerSelf = currentWorkerGlobal();
+if (workerSelf !== null) {
+  installWorkerMessageHandler(workerSelf, new LocalEngine());
+}
 
 function migrate(db: SqliteDb) {
   db.exec("PRAGMA foreign_keys = ON");
@@ -5160,12 +5207,15 @@ function startingHealth(): EngineHealth {
   };
 }
 
-function readyHealth(sqliteVersion?: string): EngineHealth {
+function readyHealth(
+  sqliteVersion?: string,
+  opfs: EngineHealth["opfs"] = "available",
+): EngineHealth {
   return {
     status: "ready",
     message: "Local memory engine is ready.",
     sqliteVersion,
-    opfs: "available",
+    opfs,
     checkedAt: new Date().toISOString(),
   };
 }
