@@ -54,6 +54,7 @@ describe("local engine behavior harness", () => {
     expect(job.status).toBe("done");
 
     expect(harness.count("source_embeddings", "source_id = ?", [sourceId])).toBeGreaterThan(1);
+    expect(harness.count("source_metadata_fts", "source_id = ?", [sourceId])).toBe(1);
     expect(
       harness.count("source_embeddings", "source_id = ? AND target_kind = 'meta'", [sourceId]),
     ).toBe(1);
@@ -137,6 +138,17 @@ describe("local engine behavior harness", () => {
     expect(previous?.version.isCurrent).toBe(false);
     expect(previous?.version.supersededByMemoryId).toBe(second.memory.id);
     expect(current?.version.isCurrent).toBe(true);
+
+    const staleOnly = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "version one body",
+        limit: 5,
+        filter: { lifecycleStatuses: ["stale"] },
+      },
+    });
+    expect(staleOnly.items.map((item) => item.id)).toContain(first.memory.id);
+    expect(staleOnly.items.map((item) => item.id)).not.toContain(second.memory.id);
   });
 
   it("cleans source-derived rows on delete and reset", async () => {
@@ -151,6 +163,7 @@ describe("local engine behavior harness", () => {
 
     expect(harness.count("source_chunks", "source_id = ?", [sourceId])).toBeGreaterThan(0);
     expect(harness.count("source_fts", "source_id = ?", [sourceId])).toBeGreaterThan(0);
+    expect(harness.count("source_metadata_fts", "source_id = ?", [sourceId])).toBe(1);
     expect(harness.count("source_embeddings", "source_id = ?", [sourceId])).toBeGreaterThan(0);
     expect(harness.count("source_metadata", "source_id = ?", [sourceId])).toBe(1);
     expect(harness.count("anchors", "memory_id = ?", [sourceId])).toBe(1);
@@ -159,6 +172,7 @@ describe("local engine behavior harness", () => {
     expect(deleted.deleted).toBe(true);
     expect(harness.count("source_chunks", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_fts", "source_id = ?", [sourceId])).toBe(0);
+    expect(harness.count("source_metadata_fts", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_embeddings", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_metadata", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("anchors", "memory_id = ?", [sourceId])).toBe(0);
@@ -183,6 +197,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("sources")).toBe(0);
     expect(harness.count("source_chunks")).toBe(0);
     expect(harness.count("source_fts")).toBe(0);
+    expect(harness.count("source_metadata_fts")).toBe(0);
     expect(harness.count("source_embeddings")).toBe(0);
     expect(harness.count("source_metadata")).toBe(0);
     expect(harness.count("anchors")).toBe(0);
@@ -197,6 +212,11 @@ describe("local engine behavior harness", () => {
         sourceUrl: "https://example.test/recent-a",
         normalizedText: ragText("recent first", 4),
         capturedAt: "2026-07-01T00:01:00.000Z",
+        metadata: {
+          title: "Recent Research Note",
+          abstract: "Recent source type filter research note.",
+          source_type: "research-note",
+        },
       }),
     });
     const second = await harness.request({
@@ -224,6 +244,73 @@ describe("local engine behavior harness", () => {
     expect(trackReason(retrieved, "fts_chunks")).toBe("empty_query");
     expect(trackStatus(retrieved, "vector_chunks")).toBe("skipped");
     expect(trackReason(retrieved, "vector_chunks")).toBe("empty_query");
+
+    const filtered = await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "", limit: 10, filter: { sourceTypes: ["webpage"] } },
+    });
+    expect(filtered.items.map((item) => item.id)).toEqual([second.memory.id]);
+  });
+
+  it("uses metadata FTS and applies source filters across retrieval tracks", async () => {
+    const harness = createHarness();
+    const research = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/filtered-research",
+        sourceTitle: "Filtered Research",
+        normalizedText: ragText("shared retrieval body", 40),
+        metadata: {
+          title: "Filtered Research",
+          abstract: "Neural atlas metadata exists only in the source abstract.",
+          source_type: "research-note",
+        },
+      }),
+    });
+    const webpage = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/filtered-web",
+        sourceTitle: "Filtered Web",
+        normalizedText: ragText("shared retrieval body", 40),
+        capturedAt: "2026-07-01T00:03:00.000Z",
+        metadata: {
+          title: "Filtered Web",
+          abstract: "General webpage metadata.",
+          source_type: "webpage",
+        },
+      }),
+    });
+
+    const queued = await harness.request({ kind: "getJobStatus", status: "queued", limit: 10 });
+    for (const job of queued.jobs) {
+      await harness.request({ kind: "runJob", id: job.id });
+    }
+
+    const metadataOnly = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "neural atlas",
+        limit: 5,
+        filter: { sourceTypes: ["research-note"] },
+      },
+    });
+    expect(metadataOnly.items.map((item) => item.id)).toEqual([research.memory.id]);
+    expect(trackStatus(metadataOnly, "meta_sources")).toBe("used");
+
+    const chunkFiltered = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "shared retrieval body",
+        limit: 10,
+        includeChunks: 2,
+        filter: { sourceTypes: ["webpage"] },
+      },
+    });
+    expect(chunkFiltered.items.map((item) => item.id)).toEqual([webpage.memory.id]);
+    expect(chunkFiltered.items[0]?.tracks).toEqual(
+      expect.arrayContaining(["fts_chunks", "vector_chunks"]),
+    );
   });
 });
 

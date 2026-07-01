@@ -151,12 +151,19 @@ export type RetrieveTrackName =
   | "recent_sources";
 export type RetrieveTrackStatus = "used" | "unavailable" | "skipped";
 export type RetrieveFusionStrategy = "rrf";
+export type RetrieveSourceLifecycleFilter = "fresh" | "stale" | "archived";
+
+export interface RetrieveSourcesFilter {
+  sourceTypes?: string[];
+  lifecycleStatuses?: RetrieveSourceLifecycleFilter[];
+}
 
 export interface RetrieveSourcesPayload {
   query: string;
   limit?: number;
   scope?: RetrieveSourcesScope;
   includeChunks?: number;
+  filter?: RetrieveSourcesFilter;
 }
 
 export interface RetrieveSourceHitChunk {
@@ -1529,8 +1536,25 @@ function isRetrieveSourcesPayload(value: unknown): value is RetrieveSourcesPaylo
     typeof value.query === "string" &&
     (value.limit === undefined || typeof value.limit === "number") &&
     (value.scope === undefined || value.scope === "all") &&
-    (value.includeChunks === undefined || typeof value.includeChunks === "number")
+    (value.includeChunks === undefined || typeof value.includeChunks === "number") &&
+    (value.filter === undefined || isRetrieveSourcesFilter(value.filter))
   );
+}
+
+function isRetrieveSourcesFilter(value: unknown): value is RetrieveSourcesFilter {
+  return (
+    isRecord(value) &&
+    (value.sourceTypes === undefined ||
+      (Array.isArray(value.sourceTypes) &&
+        value.sourceTypes.every((item) => typeof item === "string"))) &&
+    (value.lifecycleStatuses === undefined ||
+      (Array.isArray(value.lifecycleStatuses) &&
+        value.lifecycleStatuses.every(isRetrieveSourceLifecycleFilter)))
+  );
+}
+
+function isRetrieveSourceLifecycleFilter(value: unknown): value is RetrieveSourceLifecycleFilter {
+  return value === "fresh" || value === "stale" || value === "archived";
 }
 
 function isRepairAction(value: unknown): value is RepairAction {

@@ -40,6 +40,7 @@ import {
   type RepairResult,
   type RetrieveSourceHitChunk,
   type RetrieveSourceItem,
+  type RetrieveSourcesFilter,
   type RetrieveSourcesPayload,
   type RetrieveSourcesResult,
   type RetrieveSourcesTraceTrack,
@@ -119,7 +120,7 @@ export interface LocalEngineOptions {
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
-const schemaVersion = 13;
+const schemaVersion = 14;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -132,8 +133,10 @@ const defaultEmbeddingProvider = {
   dimension: 64,
   metric: "cosine",
 } as const;
+const searchableSourceLifecycleStatuses = ["fresh", "stale", "archived"] as const;
 
 type SourceLifecycleStatus = "fresh" | "stale" | "archived" | "deleted";
+type SearchableSourceLifecycleStatus = Exclude<SourceLifecycleStatus, "deleted">;
 type SourceAnalysisLevel = "saved" | "analyzed";
 type SourceAuditAction =
   | "source.created"
@@ -149,6 +152,18 @@ interface SourceRetrievalHit {
   source: SqlRow;
   chunk?: RetrieveSourceHitChunk;
   fallbackExcerpt?: string;
+}
+
+interface NormalizedRetrieveSourcesFilter {
+  sourceTypes: string[];
+  lifecycleStatuses: SearchableSourceLifecycleStatus[];
+  hasSourceTypeFilter: boolean;
+  hasImpossibleFilter: boolean;
+}
+
+interface SqlWhereClause {
+  sql: string;
+  bind: unknown[];
 }
 
 interface EmbeddingProvider {
@@ -474,28 +489,35 @@ export class LocalEngine {
     const query = normalizeText(payload.query);
     const limit = clampOptionalLimit(payload.limit, 20, 50);
     const includeChunks = clampOptionalLimit(payload.includeChunks, 3, 8);
+    const ftsQuery = buildFtsQuery(query);
+    const filters = normalizeRetrieveSourcesFilter(payload.filter);
     const traceTracks: RetrieveSourcesTraceTrack[] = [];
 
-    if (buildFtsQuery(query).length === 0) {
+    if (filters.hasImpossibleFilter) {
+      return emptyFilteredRetrieveSourcesResult(query, ftsQuery.length === 0);
+    }
+
+    if (ftsQuery.length === 0) {
+      const sourceFilter = sourceFilterWhereClause(filters);
       const rows = db.selectObjects(
         `SELECT
-          id,
-          source_kind,
-          source_url,
-          normalized_source_url,
-          source_title,
-          captured_at,
-          content_hash,
-          version_group_key,
-          version_no,
-          supersedes_source_id,
-          superseded_by_source_id,
-          is_current
-         FROM sources
-         WHERE lifecycle_status <> 'deleted'
-         ORDER BY captured_at DESC
+          s.id,
+          s.source_kind,
+          s.source_url,
+          s.normalized_source_url,
+          s.source_title,
+          s.captured_at,
+          s.content_hash,
+          s.version_group_key,
+          s.version_no,
+          s.supersedes_source_id,
+          s.superseded_by_source_id,
+          s.is_current
+         FROM sources s
+         WHERE ${sourceFilter.sql}
+         ORDER BY s.captured_at DESC
          LIMIT ?`,
-        [limit],
+        [...sourceFilter.bind, limit],
       );
       traceTracks.push({
         name: "recent_sources",
@@ -536,18 +558,25 @@ export class LocalEngine {
       };
     }
 
-    const metaHits = loadMetaSourceRetrievalHits(db, { query, limit: Math.max(limit * 2, limit) });
+    const metaHits = loadMetaSourceRetrievalHits(db, {
+      query,
+      limit: Math.max(limit * 2, limit),
+      filter: filters,
+    });
     const vectorMetaResult = loadVectorMetaRetrievalHits(db, {
       query,
       limit: Math.max(limit * 2, limit),
+      filter: filters,
     });
     const ftsHits = loadFtsChunkRetrievalHits(db, {
       query,
       limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
+      filter: filters,
     });
     const vectorResult = loadVectorChunkRetrievalHits(db, {
       query,
       limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
+      filter: filters,
     });
     const items = fuseSourceRetrievalHits(
       [...metaHits, ...vectorMetaResult.hits, ...ftsHits, ...vectorResult.hits],
@@ -813,6 +842,7 @@ export class LocalEngine {
       db.exec({ sql: "DELETE FROM anchors WHERE memory_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM topic_graph_edges WHERE memory_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_embeddings WHERE source_id = ?", bind: [id] });
+      db.exec({ sql: "DELETE FROM source_metadata_fts WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_fts WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_chunks WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_metadata WHERE source_id = ?", bind: [id] });
@@ -2044,6 +2074,7 @@ export class LocalEngine {
       db.exec("DELETE FROM topic_pages");
       db.exec("DELETE FROM anchors");
       db.exec("DELETE FROM source_embeddings");
+      db.exec("DELETE FROM source_metadata_fts");
       db.exec("DELETE FROM source_fts");
       db.exec("DELETE FROM source_chunks");
       db.exec("DELETE FROM sources");
@@ -2242,6 +2273,18 @@ function migrate(db: SqliteDb) {
       source_kind UNINDEXED,
       title,
       body,
+      tokenize = 'unicode61 remove_diacritics 2'
+    )
+  `);
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS source_metadata_fts USING fts5(
+      source_id UNINDEXED,
+      source_kind UNINDEXED,
+      lifecycle_status UNINDEXED,
+      title,
+      abstract,
+      source_type,
+      url,
       tokenize = 'unicode61 remove_diacritics 2'
     )
   `);
@@ -2574,6 +2617,7 @@ function dropPreSourceNativeTables(db: SqliteDb) {
   db.exec("DROP TABLE IF EXISTS anchors");
   db.exec("DROP TABLE IF EXISTS source_embeddings");
   db.exec("DROP TABLE IF EXISTS embedding_models");
+  db.exec("DROP TABLE IF EXISTS source_metadata_fts");
   db.exec("DROP TABLE IF EXISTS source_fts");
   db.exec("DROP TABLE IF EXISTS source_chunks");
   db.exec("DROP TABLE IF EXISTS source_audit_log");
@@ -2649,6 +2693,8 @@ function insertSourceRow(
   },
 ) {
   const analysisLevel: SourceAnalysisLevel = "saved";
+  const metadata = parseMetadata(input.metadataJson);
+  const sourceType = stringMetadataField(metadata, "source_type") || input.kind;
   db.exec({
     sql: `INSERT INTO sources (
       id,
@@ -2673,7 +2719,7 @@ function insertSourceRow(
     bind: [
       input.id,
       input.kind,
-      input.kind,
+      sourceType,
       input.sourceUrl,
       input.normalizedSourceUrl,
       input.sourceTitle,
@@ -2690,9 +2736,10 @@ function insertSourceRow(
   });
   upsertSourceMetadata(db, {
     sourceId: input.id,
+    sourceKind: input.kind,
     sourceTitle: input.sourceTitle,
     sourceUrl: input.sourceUrl,
-    sourceType: input.kind,
+    sourceType,
     contentHash: input.contentHash,
     capturedAt: input.capturedAt,
     metadataJson: safeJsonObjectString(input.metadataJson),
@@ -2704,6 +2751,7 @@ function upsertSourceMetadata(
   db: SqliteDb,
   input: {
     sourceId: string;
+    sourceKind: SourceKind;
     sourceTitle: string;
     sourceUrl: string;
     sourceType: string;
@@ -2757,6 +2805,15 @@ function upsertSourceMetadata(
       authorsJson,
       input.updatedAt,
     ],
+  });
+  insertSourceMetadataFtsRow(db, {
+    sourceId: input.sourceId,
+    sourceKind: input.sourceKind,
+    sourceType: input.sourceType,
+    lifecycleStatus: "fresh",
+    title: input.sourceTitle,
+    abstract: abstract ?? "",
+    url: input.sourceUrl,
   });
 }
 
@@ -3255,6 +3312,7 @@ function runJob(db: SqliteDb, jobId: string): JobSummary {
 function rebuildFtsData(db: SqliteDb) {
   transaction(db, () => {
     db.exec("DELETE FROM source_fts");
+    db.exec("DELETE FROM source_metadata_fts");
     const rows = db.selectObjects(
       `SELECT
         s.id AS source_id,
@@ -3274,6 +3332,35 @@ function rebuildFtsData(db: SqliteDb) {
         sourceKind: sourceKindField(row, "source_kind"),
         title: stringField(row, "source_title"),
         text: stringField(row, "text"),
+      });
+    }
+    const metadataRows = db.selectObjects(
+      `SELECT
+        s.id AS source_id,
+        s.source_kind,
+        s.source_type,
+        s.source_url,
+        s.source_title,
+        s.lifecycle_status,
+        sm.title AS meta_title,
+        sm.abstract AS meta_abstract,
+        sm.source_type AS meta_source_type
+       FROM sources s
+       LEFT JOIN source_metadata sm ON sm.source_id = s.id
+       WHERE s.lifecycle_status <> 'deleted'
+       ORDER BY s.captured_at DESC`,
+    );
+    for (const row of metadataRows) {
+      const lifecycleStatus = sourceLifecycleStatusFromRow(row, "lifecycle_status");
+      if (lifecycleStatus === null || lifecycleStatus === "deleted") continue;
+      insertSourceMetadataFtsRow(db, {
+        sourceId: stringField(row, "source_id"),
+        sourceKind: sourceKindField(row, "source_kind"),
+        sourceType: stringField(row, "meta_source_type") || stringField(row, "source_type"),
+        lifecycleStatus,
+        title: stringField(row, "meta_title") || stringField(row, "source_title"),
+        abstract: stringField(row, "meta_abstract"),
+        url: stringField(row, "source_url"),
       });
     }
   });
@@ -3492,6 +3579,41 @@ function insertSourceFtsRow(
       input.sourceKind,
       input.title,
       expandChineseBigrams(input.text),
+    ],
+  });
+}
+
+function insertSourceMetadataFtsRow(
+  db: SqliteDb,
+  input: {
+    sourceId: string;
+    sourceKind: SourceKind;
+    sourceType: string;
+    lifecycleStatus: SearchableSourceLifecycleStatus;
+    title: string;
+    abstract: string;
+    url: string;
+  },
+) {
+  db.exec({ sql: "DELETE FROM source_metadata_fts WHERE source_id = ?", bind: [input.sourceId] });
+  db.exec({
+    sql: `INSERT INTO source_metadata_fts (
+      source_id,
+      source_kind,
+      lifecycle_status,
+      title,
+      abstract,
+      source_type,
+      url
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    bind: [
+      input.sourceId,
+      input.sourceKind,
+      input.lifecycleStatus,
+      expandChineseBigrams(input.title),
+      expandChineseBigrams(input.abstract),
+      expandChineseBigrams(input.sourceType),
+      input.url,
     ],
   });
 }
@@ -3828,26 +3950,107 @@ function optionalAnchorFromRow(row: SqlRow | undefined) {
   return row === undefined ? undefined : anchorFromRow(row);
 }
 
+function normalizeRetrieveSourcesFilter(
+  filter: RetrieveSourcesFilter | undefined,
+): NormalizedRetrieveSourcesFilter {
+  const sourceTypes = normalizeSourceTypeFilters(filter?.sourceTypes);
+  const hasSourceTypeFilter = filter?.sourceTypes !== undefined;
+  const lifecycleStatuses =
+    filter?.lifecycleStatuses === undefined
+      ? [...searchableSourceLifecycleStatuses]
+      : normalizeSourceLifecycleFilters(filter.lifecycleStatuses);
+  return {
+    sourceTypes,
+    lifecycleStatuses,
+    hasSourceTypeFilter,
+    hasImpossibleFilter:
+      (hasSourceTypeFilter && sourceTypes.length === 0) ||
+      (filter?.lifecycleStatuses !== undefined && lifecycleStatuses.length === 0),
+  };
+}
+
+function normalizeSourceTypeFilters(values: string[] | undefined) {
+  if (values === undefined) return [];
+  const seen = new Set<string>();
+  return values.flatMap((value) => {
+    const normalized = normalizeText(value).toLocaleLowerCase();
+    if (normalized.length === 0 || seen.has(normalized) || seen.size >= 24) return [];
+    seen.add(normalized);
+    return [normalized];
+  });
+}
+
+function normalizeSourceLifecycleFilters(
+  values: SearchableSourceLifecycleStatus[],
+): SearchableSourceLifecycleStatus[] {
+  const seen = new Set<SearchableSourceLifecycleStatus>();
+  return values.flatMap((value) => {
+    if (!searchableSourceLifecycleStatuses.includes(value) || seen.has(value)) return [];
+    seen.add(value);
+    return [value];
+  });
+}
+
+function sourceFilterWhereClause(filter: NormalizedRetrieveSourcesFilter): SqlWhereClause {
+  if (filter.hasImpossibleFilter) return { sql: "1 = 0", bind: [] };
+  const clauses = [`s.lifecycle_status IN (${filter.lifecycleStatuses.map(() => "?").join(", ")})`];
+  const bind: unknown[] = [...filter.lifecycleStatuses];
+  if (filter.hasSourceTypeFilter) {
+    clauses.push(`s.source_type IN (${filter.sourceTypes.map(() => "?").join(", ")})`);
+    bind.push(...filter.sourceTypes);
+  }
+  return {
+    sql: clauses.join("\n       AND "),
+    bind,
+  };
+}
+
+function emptyFilteredRetrieveSourcesResult(
+  query: string,
+  includeRecentSourcesTrack: boolean,
+): RetrieveSourcesResult {
+  const tracks: RetrieveSourcesTraceTrack[] = [];
+  if (includeRecentSourcesTrack) {
+    tracks.push({
+      name: "recent_sources",
+      status: "skipped",
+      itemCount: 0,
+      reason: "filter_no_match",
+    });
+  }
+  tracks.push({
+    name: "meta_sources",
+    status: "skipped",
+    itemCount: 0,
+    reason: "filter_no_match",
+  });
+  tracks.push(vectorMetaSkippedTrace("filter_no_match"));
+  tracks.push({
+    name: "fts_chunks",
+    status: "skipped",
+    itemCount: 0,
+    reason: "filter_no_match",
+  });
+  tracks.push(vectorSkippedTrace("filter_no_match"));
+  return {
+    query,
+    items: [],
+    trace: {
+      strategy: "rrf",
+      rrfK: defaultRrfK,
+      tracks,
+    },
+  };
+}
+
 function loadMetaSourceRetrievalHits(
   db: SqliteDb,
-  input: { query: string; limit: number },
+  input: { query: string; limit: number; filter: NormalizedRetrieveSourcesFilter },
 ): SourceRetrievalHit[] {
-  const terms = metaSourceQueryTerms(input.query);
-  if (terms.length === 0) return [];
-  const matchClauses = terms
-    .map(
-      () => `(
-        s.source_title LIKE ? ESCAPE '\\'
-        OR sm.title LIKE ? ESCAPE '\\'
-        OR sm.abstract LIKE ? ESCAPE '\\'
-        OR sm.source_type LIKE ? ESCAPE '\\'
-      )`,
-    )
-    .join(" OR ");
-  const bind = terms.flatMap((term) => {
-    const pattern = `%${escapeLikePattern(term)}%`;
-    return [pattern, pattern, pattern, pattern];
-  });
+  if (input.filter.hasImpossibleFilter) return [];
+  const ftsQuery = buildFtsQuery(input.query);
+  if (ftsQuery.length === 0) return [];
+  const sourceFilter = sourceFilterWhereClause(input.filter);
   const outputLimit = clampLimit(input.limit, 100);
   const rows = db.selectObjects(
     `SELECT
@@ -3865,42 +4068,33 @@ function loadMetaSourceRetrievalHits(
       s.is_current,
       sm.title AS meta_title,
       sm.abstract AS meta_abstract,
-      sm.source_type AS meta_source_type
-     FROM sources s
+      sm.source_type AS meta_source_type,
+      bm25(source_metadata_fts) AS score
+     FROM source_metadata_fts
+     JOIN sources s ON s.id = source_metadata_fts.source_id
      LEFT JOIN source_metadata sm ON sm.source_id = s.id
-     WHERE s.lifecycle_status <> 'deleted'
-       AND (${matchClauses})
-     ORDER BY s.captured_at DESC
+     WHERE source_metadata_fts MATCH ?
+       AND ${sourceFilter.sql}
+     ORDER BY score ASC
      LIMIT ?`,
-    [...bind, clampLimit(outputLimit * 4, 300)],
+    [ftsQuery, ...sourceFilter.bind, outputLimit],
   );
-  return rows
-    .map((row) => ({
-      row,
-      fallbackExcerpt: metaSourceFallbackExcerpt(row, input.query),
-      score: metaSourceMatchScore(row, input.query),
-    }))
-    .sort(
-      (left, right) =>
-        right.score - left.score ||
-        stringField(right.row, "captured_at").localeCompare(stringField(left.row, "captured_at")) ||
-        stringField(left.row, "source_title").localeCompare(stringField(right.row, "source_title")),
-    )
-    .slice(0, outputLimit)
-    .map(({ row, fallbackExcerpt }, index) => ({
-      track: "meta_sources",
-      rank: index + 1,
-      source: row,
-      fallbackExcerpt,
-    }));
+  return rows.slice(0, outputLimit).map((row, index) => ({
+    track: "meta_sources",
+    rank: index + 1,
+    source: row,
+    fallbackExcerpt: metaSourceFallbackExcerpt(row, input.query),
+  }));
 }
 
 function loadFtsChunkRetrievalHits(
   db: SqliteDb,
-  input: { query: string; limit: number },
+  input: { query: string; limit: number; filter: NormalizedRetrieveSourcesFilter },
 ): SourceRetrievalHit[] {
+  if (input.filter.hasImpossibleFilter) return [];
   const ftsQuery = buildFtsQuery(input.query);
   if (ftsQuery.length === 0) return [];
+  const sourceFilter = sourceFilterWhereClause(input.filter);
   const rows = db.selectObjects(
     `SELECT
       s.id,
@@ -3923,10 +4117,10 @@ function loadFtsChunkRetrievalHits(
      JOIN sources s ON s.id = source_fts.source_id
      JOIN source_chunks c ON c.id = source_fts.chunk_id
      WHERE source_fts MATCH ?
-       AND s.lifecycle_status <> 'deleted'
+       AND ${sourceFilter.sql}
      ORDER BY score ASC
      LIMIT ?`,
-    [ftsQuery, clampLimit(input.limit, 400)],
+    [ftsQuery, ...sourceFilter.bind, clampLimit(input.limit, 400)],
   );
   return rows.map((row, index) => ({
     track: "fts_chunks",
@@ -3944,8 +4138,19 @@ function loadFtsChunkRetrievalHits(
 
 function loadVectorMetaRetrievalHits(
   db: SqliteDb,
-  input: { query: string; limit: number },
+  input: { query: string; limit: number; filter: NormalizedRetrieveSourcesFilter },
 ): { hits: SourceRetrievalHit[]; trace: RetrieveSourcesTraceTrack } {
+  if (input.filter.hasImpossibleFilter) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_meta",
+        status: "skipped",
+        itemCount: 0,
+        reason: "filter_no_match",
+      },
+    };
+  }
   const provider = getActiveEmbeddingProvider(db);
   if (provider === null) {
     return {
@@ -3959,6 +4164,7 @@ function loadVectorMetaRetrievalHits(
     };
   }
   const queryVector = provider.embed(input.query);
+  const sourceFilter = sourceFilterWhereClause(input.filter);
   const rows = db.selectObjects(
     `SELECT
       s.id,
@@ -3984,8 +4190,8 @@ function loadVectorMetaRetrievalHits(
      WHERE se.model_id = ?
        AND se.target_kind = 'meta'
        AND se.target_id = s.id
-       AND s.lifecycle_status <> 'deleted'`,
-    [provider.modelId],
+       AND ${sourceFilter.sql}`,
+    [provider.modelId, ...sourceFilter.bind],
   );
   if (rows.length === 0) {
     return {
@@ -4039,8 +4245,19 @@ function loadVectorMetaRetrievalHits(
 
 function loadVectorChunkRetrievalHits(
   db: SqliteDb,
-  input: { query: string; limit: number },
+  input: { query: string; limit: number; filter: NormalizedRetrieveSourcesFilter },
 ): { hits: SourceRetrievalHit[]; trace: RetrieveSourcesTraceTrack } {
+  if (input.filter.hasImpossibleFilter) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_chunks",
+        status: "skipped",
+        itemCount: 0,
+        reason: "filter_no_match",
+      },
+    };
+  }
   const provider = getActiveEmbeddingProvider(db);
   if (provider === null) {
     return {
@@ -4054,6 +4271,7 @@ function loadVectorChunkRetrievalHits(
     };
   }
   const queryVector = provider.embed(input.query);
+  const sourceFilter = sourceFilterWhereClause(input.filter);
   const rows = db.selectObjects(
     `SELECT
       s.id,
@@ -4078,8 +4296,8 @@ function loadVectorChunkRetrievalHits(
      JOIN sources s ON s.id = se.source_id
      WHERE se.model_id = ?
        AND se.target_kind = 'chunk'
-       AND s.lifecycle_status <> 'deleted'`,
-    [provider.modelId],
+       AND ${sourceFilter.sql}`,
+    [provider.modelId, ...sourceFilter.bind],
   );
   if (rows.length === 0) {
     return {
@@ -4149,30 +4367,6 @@ function metaSourceQueryTerms(input: string) {
     seen.add(key);
     return [value];
   });
-}
-
-function metaSourceMatchScore(row: SqlRow, query: string) {
-  const normalizedQuery = normalizeText(query).toLocaleLowerCase();
-  const terms = metaSourceQueryTerms(query).map((term) => term.toLocaleLowerCase());
-  const fields = [
-    { value: stringField(row, "source_title"), weight: 8 },
-    { value: stringField(row, "meta_title"), weight: 8 },
-    { value: stringField(row, "meta_source_type"), weight: 4 },
-    { value: stringField(row, "meta_abstract"), weight: 3 },
-  ];
-  let score = 0;
-  for (const field of fields) {
-    const value = normalizeText(field.value).toLocaleLowerCase();
-    if (value.length === 0) continue;
-    if (value === normalizedQuery) score += field.weight * 5;
-    else if (normalizedQuery.length > 0 && value.includes(normalizedQuery)) {
-      score += field.weight * 3;
-    }
-    for (const term of terms) {
-      if (value.includes(term)) score += field.weight;
-    }
-  }
-  return score;
 }
 
 function metaSourceFallbackExcerpt(row: SqlRow, query: string) {

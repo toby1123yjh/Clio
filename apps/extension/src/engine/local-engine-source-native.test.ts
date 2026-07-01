@@ -17,18 +17,20 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 13");
+    expect(workerSource).toContain("const schemaVersion = 14");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_chunks");
     expect(workerSource).toContain("CREATE VIRTUAL TABLE IF NOT EXISTS source_fts");
+    expect(workerSource).toContain("CREATE VIRTUAL TABLE IF NOT EXISTS source_metadata_fts");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_lifecycle_events");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_audit_log");
     expect(workerSource).toContain("function dropPreSourceNativeTables(db: SqliteDb)");
     expect(workerSource).toContain("currentVersion < sourceNativeSchemaVersion");
     expect(workerSource).toContain("DROP TABLE IF EXISTS topic_pages");
     expect(workerSource).toContain("DROP TABLE IF EXISTS wiki_compile_jobs");
+    expect(workerSource).toContain("DROP TABLE IF EXISTS source_metadata_fts");
     expect(workerSource).toContain("DROP TABLE IF EXISTS memory_fts");
     expect(workerSource).toContain("DROP TABLE IF EXISTS chunks");
     expect(workerSource).toContain("DROP TABLE IF EXISTS memories");
@@ -106,12 +108,15 @@ describe("local engine source-native storage foundation", () => {
 
   it("cleans up source embeddings on source delete and library reset", () => {
     expect(workerSource).toContain("DELETE FROM source_embeddings WHERE source_id = ?");
+    expect(workerSource).toContain("DELETE FROM source_metadata_fts WHERE source_id = ?");
     expect(workerSource).toContain('db.exec("DELETE FROM source_embeddings")');
+    expect(workerSource).toContain('db.exec("DELETE FROM source_metadata_fts")');
 
     const deleteSection = sourceSection("private async delete", "private async listTopicPages");
     expect(deleteSection).toContain("DELETE FROM anchors WHERE memory_id = ?");
     expect(deleteSection).toContain("DELETE FROM topic_graph_edges WHERE memory_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_embeddings WHERE source_id = ?");
+    expect(deleteSection).toContain("DELETE FROM source_metadata_fts WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_fts WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_chunks WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_metadata WHERE source_id = ?");
@@ -121,6 +126,7 @@ describe("local engine source-native storage foundation", () => {
     expect(resetSection).toContain('db.exec("DELETE FROM jobs")');
     expect(resetSection).toContain('db.exec("DELETE FROM topic_graph_edges")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_embeddings")');
+    expect(resetSection).toContain('db.exec("DELETE FROM source_metadata_fts")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_fts")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_chunks")');
     expect(resetSection).toContain('db.exec("DELETE FROM sources")');
@@ -132,10 +138,13 @@ describe("local engine source-native storage foundation", () => {
       "function runPostCaptureHardeningJob",
     );
     expect(rebuildSection).toContain("DELETE FROM source_fts");
+    expect(rebuildSection).toContain("DELETE FROM source_metadata_fts");
     expect(rebuildSection).toContain("FROM source_chunks c");
     expect(rebuildSection).toContain("JOIN sources s ON s.id = c.source_id");
     expect(rebuildSection).toContain("WHERE s.lifecycle_status <> 'deleted'");
     expect(rebuildSection).toContain("insertSourceFtsRow(db");
+    expect(rebuildSection).toContain("LEFT JOIN source_metadata sm ON sm.source_id = s.id");
+    expect(rebuildSection).toContain("insertSourceMetadataFtsRow(db");
     expect(rebuildSection).not.toContain("source_embeddings");
   });
 
@@ -191,6 +200,8 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("function loadVectorMetaRetrievalHits");
     expect(workerSource).toContain("function loadFtsChunkRetrievalHits");
     expect(workerSource).toContain("function loadVectorChunkRetrievalHits");
+    expect(workerSource).toContain("function normalizeRetrieveSourcesFilter");
+    expect(workerSource).toContain("function sourceFilterWhereClause");
     expect(workerSource).toContain("function fuseSourceRetrievalHits");
     expect(workerSource).toContain("function reciprocalRankFusionScore");
     expect(workerSource).toContain("function embedLocalDeterministic");
@@ -200,11 +211,12 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("FROM source_fts");
     expect(workerSource).toContain("JOIN sources s ON s.id = source_fts.source_id");
     expect(workerSource).toContain("JOIN source_chunks c ON c.id = source_fts.chunk_id");
+    expect(workerSource).toContain("FROM source_metadata_fts");
+    expect(workerSource).toContain("source_metadata_fts MATCH ?");
+    expect(workerSource).toContain("bm25(source_metadata_fts) AS score");
     expect(workerSource).toContain("LEFT JOIN source_metadata sm ON sm.source_id = s.id");
-    expect(workerSource).toContain("s.source_title LIKE ? ESCAPE");
-    expect(workerSource).toContain("sm.title LIKE ? ESCAPE");
-    expect(workerSource).toContain("sm.abstract LIKE ? ESCAPE");
-    expect(workerSource).toContain("sm.source_type LIKE ? ESCAPE");
+    expect(workerSource).toContain("s.lifecycle_status IN");
+    expect(workerSource).toContain("s.source_type IN");
     expect(workerSource).toContain("FROM source_embeddings se");
     expect(workerSource).toContain("se.target_kind = 'meta'");
     expect(workerSource).toContain("JOIN source_chunks c ON c.id = se.target_id");

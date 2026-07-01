@@ -585,6 +585,10 @@ describe("session engine RPC guards", () => {
             limit: 20,
             scope: "all",
             includeChunks: 3,
+            filter: {
+              sourceTypes: ["webpage", "research-note"],
+              lifecycleStatuses: ["fresh", "stale", "archived"],
+            },
           },
         },
       }),
@@ -610,6 +614,36 @@ describe("session engine RPC guards", () => {
           kind: "retrieveSources",
           payload: {
             limit: 20,
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "retrieveSources",
+          payload: {
+            query: "context window retrieval",
+            filter: {
+              lifecycleStatuses: ["deleted"],
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "retrieveSources",
+          payload: {
+            query: "context window retrieval",
+            filter: {
+              sourceTypes: "webpage",
+            },
           },
         },
       }),
