@@ -143,7 +143,12 @@ export interface GetMemoryEvidenceWindowsResult {
 }
 
 export type RetrieveSourcesScope = "all";
-export type RetrieveTrackName = "meta_sources" | "fts_chunks" | "vector_chunks" | "recent_sources";
+export type RetrieveTrackName =
+  | "meta_sources"
+  | "vector_meta"
+  | "fts_chunks"
+  | "vector_chunks"
+  | "recent_sources";
 export type RetrieveTrackStatus = "used" | "unavailable" | "skipped";
 export type RetrieveFusionStrategy = "rrf";
 

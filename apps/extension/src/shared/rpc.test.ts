@@ -630,7 +630,7 @@ describe("session engine RPC guards", () => {
         isCurrent: true,
       },
       score: 1,
-      tracks: ["meta_sources", "fts_chunks"],
+      tracks: ["meta_sources", "vector_meta", "fts_chunks"],
       hitChunks: [],
     } satisfies RetrieveSourceItem;
     const chunk = {
@@ -642,6 +642,7 @@ describe("session engine RPC guards", () => {
     } satisfies RetrieveSourceHitChunk;
 
     expect(item.tracks).toContain("meta_sources");
+    expect(item.tracks).toContain("vector_meta");
     expect(chunk.track).toBe("fts_chunks");
   });
 

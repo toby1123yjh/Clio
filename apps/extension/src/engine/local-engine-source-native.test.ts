@@ -77,6 +77,7 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain('case "runJob"');
     expect(workerSource).toContain("function parsePostCaptureHardeningPayload");
     expect(workerSource).toContain("function upsertSourceChunkEmbedding");
+    expect(workerSource).toContain("function upsertSourceMetaEmbedding");
     expect(workerSource).toContain("result = runPostCaptureHardeningJob");
     expect(workerSource).toContain('"EMBEDDING_MODEL_UNAVAILABLE"');
     expect(workerSource).not.toContain("Reserved job types are intentionally no-op");
@@ -187,6 +188,7 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain('case "retrieveSources"');
     expect(workerSource).toContain("private async retrieveSources");
     expect(workerSource).toContain("function loadMetaSourceRetrievalHits");
+    expect(workerSource).toContain("function loadVectorMetaRetrievalHits");
     expect(workerSource).toContain("function loadFtsChunkRetrievalHits");
     expect(workerSource).toContain("function loadVectorChunkRetrievalHits");
     expect(workerSource).toContain("function fuseSourceRetrievalHits");
@@ -204,9 +206,11 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("sm.abstract LIKE ? ESCAPE");
     expect(workerSource).toContain("sm.source_type LIKE ? ESCAPE");
     expect(workerSource).toContain("FROM source_embeddings se");
+    expect(workerSource).toContain("se.target_kind = 'meta'");
     expect(workerSource).toContain("JOIN source_chunks c ON c.id = se.target_id");
     expect(workerSource).toContain("cosineSimilarity(queryVector, vector)");
     expect(workerSource).toContain('name: "meta_sources"');
+    expect(workerSource).toContain('name: "vector_meta"');
     expect(workerSource).toContain('name: "vector_chunks"');
     expect(workerSource).toContain('status: "used"');
     expect(workerSource).toContain('status: "skipped"');
@@ -220,7 +224,10 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("private async search"),
     );
     expect(retrieveSection).toContain("const metaHits = loadMetaSourceRetrievalHits");
-    expect(retrieveSection).toContain("[...metaHits, ...ftsHits, ...vectorResult.hits]");
+    expect(retrieveSection).toContain("const vectorMetaResult = loadVectorMetaRetrievalHits");
+    expect(retrieveSection).toContain(
+      "[...metaHits, ...vectorMetaResult.hits, ...ftsHits, ...vectorResult.hits]",
+    );
     expect(retrieveSection).not.toContain("normalized_text");
     const metaRetrievalSection = workerSource.slice(
       workerSource.indexOf("function loadMetaSourceRetrievalHits"),
@@ -232,6 +239,14 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("function fuseSourceRetrievalHits"),
     );
     expect(ftsRetrievalSection).not.toContain("normalized_text");
+    const vectorMetaRetrievalSection = workerSource.slice(
+      workerSource.indexOf("function loadVectorMetaRetrievalHits"),
+      workerSource.indexOf("function loadVectorChunkRetrievalHits"),
+    );
+    expect(vectorMetaRetrievalSection).toContain("se.target_kind = 'meta'");
+    expect(vectorMetaRetrievalSection).toContain("se.target_id = s.id");
+    expect(vectorMetaRetrievalSection).not.toContain("JOIN source_chunks");
+    expect(vectorMetaRetrievalSection).not.toContain("normalized_text");
     const vectorRetrievalSection = workerSource.slice(
       workerSource.indexOf("function loadVectorChunkRetrievalHits"),
       workerSource.indexOf("function fuseSourceRetrievalHits"),
@@ -255,7 +270,7 @@ describe("local engine source-native storage foundation", () => {
 
     const embeddingStageSection = sourceSection(
       "function runEmbeddingStageForSource",
-      "function upsertSourceChunkEmbedding",
+      "function upsertSourceMetaEmbedding",
     );
     expect(embeddingStageSection).toContain("SOURCE_NOT_FOUND");
     expect(embeddingStageSection).toContain("lifecycle_status = 'deleted'");
@@ -263,6 +278,12 @@ describe("local engine source-native storage foundation", () => {
     expect(embeddingStageSection).toContain("getActiveEmbeddingProvider(db)");
     expect(embeddingStageSection).toContain("EMBEDDING_MODEL_UNAVAILABLE");
     expect(embeddingStageSection).toContain("ORDER BY ord ASC");
+    expect(embeddingStageSection).toContain("loadSourceMetaEmbeddingInput(db, sourceId)");
+    expect(embeddingStageSection).toContain("buildSourceMetaEmbeddingText(metaInput)");
+    expect(embeddingStageSection).toContain("upsertSourceMetaEmbedding");
+    expect(embeddingStageSection).toContain("deleteSourceMetaEmbedding");
+    expect(embeddingStageSection).toContain('targetKinds: ["chunk", "meta"]');
+    expect(embeddingStageSection).toContain("metaSkippedReason");
 
     const upsertSection = sourceSection(
       "function upsertSourceChunkEmbedding",
@@ -271,6 +292,8 @@ describe("local engine source-native storage foundation", () => {
     expect(upsertSection).toContain("ON CONFLICT(model_id, target_kind, target_id) DO UPDATE");
     expect(upsertSection).toContain("provider.modelId");
     expect(upsertSection).toContain("'chunk'");
+    expect(upsertSection).toContain("'meta'");
+    expect(upsertSection).toContain("hashText(input.text)");
     expect(upsertSection).toContain("EMBEDDING_DIMENSION_MISMATCH");
   });
 });

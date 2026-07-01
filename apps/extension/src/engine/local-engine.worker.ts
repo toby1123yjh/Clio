@@ -126,7 +126,7 @@ type SourceAuditAction =
   | "source.deleted"
   | "source.stage_queued";
 
-type SourceRetrievalTrack = "meta_sources" | "fts_chunks" | "vector_chunks";
+type SourceRetrievalTrack = "meta_sources" | "vector_meta" | "fts_chunks" | "vector_chunks";
 
 interface SourceRetrievalHit {
   track: SourceRetrievalTrack;
@@ -490,6 +490,7 @@ class LocalEngine {
         itemCount: 0,
         reason: "empty_query",
       });
+      traceTracks.push(vectorMetaSkippedTrace("empty_query"));
       traceTracks.push({
         name: "fts_chunks",
         status: "skipped",
@@ -517,6 +518,10 @@ class LocalEngine {
     }
 
     const metaHits = loadMetaSourceRetrievalHits(db, { query, limit: Math.max(limit * 2, limit) });
+    const vectorMetaResult = loadVectorMetaRetrievalHits(db, {
+      query,
+      limit: Math.max(limit * 2, limit),
+    });
     const ftsHits = loadFtsChunkRetrievalHits(db, {
       query,
       limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
@@ -525,17 +530,21 @@ class LocalEngine {
       query,
       limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
     });
-    const items = fuseSourceRetrievalHits([...metaHits, ...ftsHits, ...vectorResult.hits], {
-      limit,
-      includeChunks,
-      rrfK: defaultRrfK,
-    });
+    const items = fuseSourceRetrievalHits(
+      [...metaHits, ...vectorMetaResult.hits, ...ftsHits, ...vectorResult.hits],
+      {
+        limit,
+        includeChunks,
+        rrfK: defaultRrfK,
+      },
+    );
     traceTracks.push({
       name: "meta_sources",
       status: metaHits.length > 0 ? "used" : "skipped",
       itemCount: metaHits.length,
       ...(metaHits.length === 0 ? { reason: "no_matches" } : {}),
     });
+    traceTracks.push(vectorMetaResult.trace);
     traceTracks.push({
       name: "fts_chunks",
       status: ftsHits.length > 0 ? "used" : "skipped",
@@ -3282,15 +3291,58 @@ function runEmbeddingStageForSource(db: SqliteDb, sourceId: string): Record<stri
   for (const chunk of chunks) {
     upsertSourceChunkEmbedding(db, provider, chunk, now);
   }
+  const metaInput = loadSourceMetaEmbeddingInput(db, sourceId);
+  const metaText = metaInput === undefined ? "" : buildSourceMetaEmbeddingText(metaInput);
+  if (metaText.length > 0) {
+    upsertSourceMetaEmbedding(db, provider, { sourceId, text: metaText }, now);
+  } else {
+    deleteSourceMetaEmbedding(db, provider.modelId, sourceId);
+  }
   return {
     ok: true,
     embedding: {
       modelId: provider.modelId,
       provider: provider.provider,
-      targetKind: "chunk",
+      targetKinds: ["chunk", "meta"],
       chunkCount: chunks.length,
+      metaCount: metaText.length > 0 ? 1 : 0,
+      ...(metaText.length === 0 ? { metaSkippedReason: "empty_meta" } : {}),
     },
   };
+}
+
+function loadSourceMetaEmbeddingInput(db: SqliteDb, sourceId: string) {
+  return db.selectObject(
+    `SELECT
+      s.id AS source_id,
+      s.source_title,
+      sm.title AS meta_title,
+      sm.abstract AS meta_abstract,
+      sm.source_type AS meta_source_type
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.id = ?
+     LIMIT 1`,
+    [sourceId],
+  );
+}
+
+function buildSourceMetaEmbeddingText(row: SqlRow) {
+  return [
+    stringField(row, "meta_title") || stringField(row, "source_title"),
+    stringField(row, "meta_abstract"),
+    stringField(row, "meta_source_type"),
+  ]
+    .map((part) => normalizeText(part))
+    .filter((part) => part.length > 0)
+    .join("\n\n");
+}
+
+function deleteSourceMetaEmbedding(db: SqliteDb, modelId: string, sourceId: string) {
+  db.exec({
+    sql: "DELETE FROM source_embeddings WHERE model_id = ? AND target_kind = 'meta' AND target_id = ?",
+    bind: [modelId, sourceId],
+  });
 }
 
 function upsertSourceChunkEmbedding(
@@ -3325,6 +3377,44 @@ function upsertSourceChunkEmbedding(
       stringField(chunk, "source_id"),
       JSON.stringify(vector),
       stringField(chunk, "hash") || hashText(stringField(chunk, "text")),
+      now,
+      now,
+    ],
+  });
+}
+
+function upsertSourceMetaEmbedding(
+  db: SqliteDb,
+  provider: EmbeddingProvider,
+  input: { sourceId: string; text: string },
+  now: string,
+) {
+  const vector = provider.embed(input.text);
+  if (vector.length !== provider.dimension) {
+    throw new EngineRpcError("EMBEDDING_DIMENSION_MISMATCH", "Embedding dimension mismatch.");
+  }
+  db.exec({
+    sql: `INSERT INTO source_embeddings (
+      model_id,
+      target_kind,
+      target_id,
+      source_id,
+      vector_json,
+      text_hash,
+      created_at,
+      updated_at
+    ) VALUES (?, 'meta', ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(model_id, target_kind, target_id) DO UPDATE SET
+      source_id = excluded.source_id,
+      vector_json = excluded.vector_json,
+      text_hash = excluded.text_hash,
+      updated_at = excluded.updated_at`,
+    bind: [
+      provider.modelId,
+      input.sourceId,
+      input.sourceId,
+      JSON.stringify(vector),
+      hashText(input.text),
       now,
       now,
     ],
@@ -3805,6 +3895,101 @@ function loadFtsChunkRetrievalHits(
   }));
 }
 
+function loadVectorMetaRetrievalHits(
+  db: SqliteDb,
+  input: { query: string; limit: number },
+): { hits: SourceRetrievalHit[]; trace: RetrieveSourcesTraceTrack } {
+  const provider = getActiveEmbeddingProvider(db);
+  if (provider === null) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_meta",
+        status: "unavailable",
+        itemCount: 0,
+        reason: "embedding_model_unavailable",
+      },
+    };
+  }
+  const queryVector = provider.embed(input.query);
+  const rows = db.selectObjects(
+    `SELECT
+      s.id,
+      s.source_kind,
+      s.source_url,
+      s.normalized_source_url,
+      s.source_title,
+      s.captured_at,
+      s.content_hash,
+      s.version_group_key,
+      s.version_no,
+      s.supersedes_source_id,
+      s.superseded_by_source_id,
+      s.is_current,
+      sm.title AS meta_title,
+      sm.abstract AS meta_abstract,
+      sm.source_type AS meta_source_type,
+      se.vector_json,
+      se.text_hash
+     FROM source_embeddings se
+     JOIN sources s ON s.id = se.source_id
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE se.model_id = ?
+       AND se.target_kind = 'meta'
+       AND se.target_id = s.id
+       AND s.lifecycle_status <> 'deleted'`,
+    [provider.modelId],
+  );
+  if (rows.length === 0) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_meta",
+        status: "skipped",
+        itemCount: 0,
+        reason: "no_embeddings",
+      },
+    };
+  }
+  const ranked = rows
+    .flatMap((row) => {
+      const vector = parseEmbeddingVector(stringField(row, "vector_json"), provider.dimension);
+      if (vector === null) return [];
+      return [
+        {
+          row,
+          score: cosineSimilarity(queryVector, vector),
+        },
+      ];
+    })
+    .sort((left, right) => right.score - left.score)
+    .slice(0, clampLimit(input.limit, 200));
+  if (ranked.length === 0) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_meta",
+        status: "skipped",
+        itemCount: 0,
+        reason: "invalid_embeddings",
+      },
+    };
+  }
+  return {
+    hits: ranked.map(({ row }, index) => ({
+      track: "vector_meta",
+      rank: index + 1,
+      source: row,
+      fallbackExcerpt: metaSourceFallbackExcerpt(row, input.query),
+    })),
+    trace: {
+      name: "vector_meta",
+      status: "used",
+      itemCount: ranked.length,
+    },
+  };
+}
+
 function loadVectorChunkRetrievalHits(
   db: SqliteDb,
   input: { query: string; limit: number },
@@ -4035,6 +4220,15 @@ function reciprocalRankFusionScore(rank: number, rrfK = defaultRrfK) {
 function vectorSkippedTrace(reason: string): RetrieveSourcesTraceTrack {
   return {
     name: "vector_chunks",
+    status: "skipped",
+    itemCount: 0,
+    reason,
+  };
+}
+
+function vectorMetaSkippedTrace(reason: string): RetrieveSourcesTraceTrack {
+  return {
+    name: "vector_meta",
     status: "skipped",
     itemCount: 0,
     reason,
