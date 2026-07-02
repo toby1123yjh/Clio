@@ -96,9 +96,11 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("const defaultSourceAdapterRegistry");
     expect(workerSource).toContain("const webpageSourceAdapter");
     expect(workerSource).toContain("const markdownSourceAdapter");
+    expect(workerSource).toContain("const pdfSourceAdapter");
     expect(workerSource).toContain("const paperSourceAdapter");
     expect(workerSource).toContain('sourceTypes: ["webpage"]');
     expect(workerSource).toContain('sourceTypes: ["markdown"]');
+    expect(workerSource).toContain('sourceTypes: ["pdf"]');
     expect(workerSource).toContain('sourceTypes: ["paper"]');
     expect(workerSource).toContain("Duplicate source adapter id");
     expect(workerSource).toContain("Duplicate active source adapter for source_type");
@@ -131,6 +133,7 @@ describe("local engine source-native storage foundation", () => {
     expect(captureSection).not.toContain("upsertSourceChunkEmbedding");
     expect(captureSection).not.toContain("buildChunkEmbeddingInput");
     expect(captureSection).not.toContain("embedLocalDeterministic");
+    expect(captureSection).not.toContain("pdfjs");
   });
 
   it("cleans up source embeddings on source delete and library reset", () => {

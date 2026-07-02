@@ -2813,9 +2813,42 @@ const paperSourceAdapter: SourceAdapter = {
   },
 };
 
+const pdfSourceAdapter: SourceAdapter = {
+  id: "pdf",
+  sourceTypes: ["pdf"],
+  match: (input) => isPdfAdapterInput(input),
+  adapt: ({ kind, payload }) => {
+    const inputMetadata = payloadMetadata(payload);
+    const extraction = extractPaperMetadata(payload);
+    const sourceUrl = metadataDisplayString(inputMetadata, "source_url") ?? payload.sourceUrl;
+    const capturedAt = metadataDisplayString(inputMetadata, "captured_at") ?? payload.capturedAt;
+    const metadata: Record<string, unknown> = {
+      ...inputMetadata,
+      adapter: "pdf",
+      source_type: "pdf",
+    };
+
+    setMetadataIfMissing(metadata, "mime_type", "application/pdf");
+    setMetadataIfMissing(metadata, "parser", "pdfjs");
+    normalizePaperMetadata(metadata, inputMetadata, extraction);
+
+    const sourceTitle =
+      metadataDisplayString(metadata, "title") ?? extraction.title ?? payload.sourceTitle;
+    setMetadataIfMissing(metadata, "title", sourceTitle);
+
+    return buildDocumentDraft(kind, payload, {
+      sourceUrl,
+      sourceTitle,
+      capturedAt,
+      metadata,
+    });
+  },
+};
+
 const defaultSourceAdapterRegistry = createSourceAdapterRegistry([
   webpageSourceAdapter,
   markdownSourceAdapter,
+  pdfSourceAdapter,
   paperSourceAdapter,
 ]);
 
@@ -2974,11 +3007,7 @@ function isMarkdownAdapterInput(input: SourceAdapterInput) {
   const adapterHint = adapterHintFromMetadata(metadata);
   if (adapterHint === "markdown") return true;
   if (metadataString(metadata, "source_type") === "markdown") return true;
-  const mimeType =
-    metadataString(metadata, "mime_type") ??
-    metadataString(metadata, "mimeType") ??
-    metadataString(metadata, "content_type") ??
-    metadataString(metadata, "contentType");
+  const mimeType = metadataMimeType(metadata);
   if (mimeType === "text/markdown" || mimeType === "text/x-markdown" || mimeType === "text/md") {
     return true;
   }
@@ -3096,6 +3125,33 @@ interface PaperMetadataExtraction extends ArxivParseResult {
   doi?: string;
   categories: string[];
   sectionOutline: Array<{ level: number; text: string }>;
+}
+
+function isPdfAdapterInput(input: SourceAdapterInput) {
+  const metadata = payloadMetadata(input.payload);
+  const adapterHint = adapterHintFromMetadata(metadata);
+  if (adapterHint === "pdf") return true;
+  if (metadataString(metadata, "source_type") === "pdf") return true;
+  if (metadataMimeType(metadata) === "application/pdf") return true;
+  return pdfUrlPath(input.payload.sourceUrl);
+}
+
+function metadataMimeType(metadata: Record<string, unknown>) {
+  return (
+    metadataString(metadata, "mime_type") ??
+    metadataString(metadata, "mimeType") ??
+    metadataString(metadata, "content_type") ??
+    metadataString(metadata, "contentType")
+  );
+}
+
+function pdfUrlPath(sourceUrl: string) {
+  try {
+    const pathname = new URL(sourceUrl).pathname.toLowerCase();
+    return pathname.endsWith(".pdf");
+  } catch {
+    return sourceUrl.trim().toLowerCase().split(/[?#]/, 1)[0]?.endsWith(".pdf") ?? false;
+  }
 }
 
 function isPaperAdapterInput(input: SourceAdapterInput) {

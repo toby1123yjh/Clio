@@ -586,6 +586,140 @@ describe("local engine behavior harness", () => {
     expect(degradedDetail?.metadata.arxiv_id).toBeUndefined();
     expect(degraded.memory.sourceTitle).toBe("Malformed Arxiv Metadata");
   });
+
+  it("adapts ordinary PDF sources without classifying them as papers", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/manuals/product-guide.pdf",
+        sourceTitle: "Raw PDF Title",
+        normalizedText: [
+          "Product Guide",
+          "",
+          "This PDF explains local operating procedures and support workflows.",
+          "",
+          "1 Overview",
+          "Support teams use bounded PDF evidence instead of loading the full document.",
+        ].join("\n"),
+        metadata: {
+          mime_type: "application/pdf",
+          pdf_page_count: 3,
+          title: "Product Guide",
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+
+    expect(capture.status).toBe("saved");
+    expect(capture.memory.sourceTitle).toBe("Product Guide");
+    expect(harness.count("sources", "id = ? AND source_type = 'pdf'", [sourceId])).toBe(1);
+    expect(
+      harness.count("source_metadata", "source_id = ? AND source_type = 'pdf' AND title = ?", [
+        sourceId,
+        "Product Guide",
+      ]),
+    ).toBe(1);
+
+    const detail = await harness.request({ kind: "getMemory", id: sourceId });
+    expect(detail?.metadata.source_type).toBe("pdf");
+    expect(detail?.metadata.adapter).toBe("pdf");
+    expect(detail?.metadata.parser).toBe("pdfjs");
+    expect(detail?.metadata.mime_type).toBe("application/pdf");
+    expect(detail?.metadata.pdf_page_count).toBe(3);
+    expect(detail?.metadata.paper_source).toBeUndefined();
+
+    const retrieved = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "bounded PDF evidence",
+        limit: 5,
+        filter: { sourceTypes: ["pdf"] },
+      },
+    });
+    expect(retrieved.items.map((item) => item.id)).toEqual([sourceId]);
+
+    const excluded = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "bounded PDF evidence",
+        limit: 5,
+        filter: { sourceTypes: ["paper"] },
+      },
+    });
+    expect(excluded.items.map((item) => item.id)).not.toContain(sourceId);
+  });
+
+  it("extracts paper metadata from arxiv PDF sources while preserving pdf source type", async () => {
+    const harness = createHarness();
+    const abstract = "PDF parser foundations keep paper evidence bounded before retrieval.";
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://arxiv.org/pdf/2601.01234v3.pdf",
+        sourceTitle: "arXiv PDF",
+        normalizedText: [
+          "Title: Parser-First PDF Ingest for Local RAG",
+          "Authors: Ada Lovelace and Grace Hopper",
+          `Abstract: ${abstract}`,
+          "Subjects: Computation and Language (cs.CL); Machine Learning (cs.LG)",
+          "DOI: 10.5555/clio.pdf",
+          "",
+          "1 Introduction",
+          "PDF parser output enters chunks before any model sees bounded windows.",
+          "",
+          "2 Method",
+          "The adapter reuses paper metadata extraction.",
+        ].join("\n"),
+        metadata: {},
+      }),
+    });
+    const sourceId = capture.memory.id;
+
+    expect(capture.status).toBe("saved");
+    expect(capture.memory.sourceTitle).toBe("Parser-First PDF Ingest for Local RAG");
+    expect(harness.count("sources", "id = ? AND source_type = 'pdf'", [sourceId])).toBe(1);
+
+    const detail = await harness.request({ kind: "getMemory", id: sourceId });
+    expect(detail?.metadata.source_type).toBe("pdf");
+    expect(detail?.metadata.adapter).toBe("pdf");
+    expect(detail?.metadata.paper_source).toBe("arxiv");
+    expect(detail?.metadata.arxiv_id).toBe("2601.01234");
+    expect(detail?.metadata.arxiv_version).toBe("v3");
+    expect(detail?.metadata.year).toBe(2026);
+    expect(detail?.metadata.doi).toBe("10.5555/clio.pdf");
+    expect(detail?.metadata.abstract).toBe(abstract);
+    expect(detail?.metadata.authors).toEqual(["Ada Lovelace", "Grace Hopper"]);
+    expect(detail?.metadata.categories).toEqual(["cs.CL", "cs.LG"]);
+    expect(detail?.metadata.sectionOutline).toEqual([
+      { level: 1, text: "Introduction" },
+      { level: 1, text: "Method" },
+    ]);
+  });
+
+  it("rejects PDFs without readable parser text", async () => {
+    const harness = createHarness();
+
+    await expect(
+      harness.request({
+        kind: "capturePage",
+        payload: pagePayload({
+          sourceUrl: "https://example.test/scanned.pdf",
+          sourceTitle: "Scanned PDF",
+          normalizedText: "   ",
+          metadata: {
+            source_type: "pdf",
+            mime_type: "application/pdf",
+          },
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: "EMPTY_CAPTURE",
+    });
+
+    expect(harness.count("sources", "source_type = 'pdf'")).toBe(0);
+    expect(harness.count("source_chunks")).toBe(0);
+  });
 });
 
 function createHarness() {
