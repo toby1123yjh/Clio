@@ -126,6 +126,12 @@ const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
 const staleSessionLeaseMs = 30_000;
 const defaultRrfK = 60;
+const chunkMetaHeadVersion = 1;
+const chunkMetaTitleMaxChars = 500;
+const chunkMetaSourceTypeMaxChars = 100;
+const chunkMetaDocContextMaxChars = 1_600;
+const chunkMetaAbstractMaxChars = 1_200;
+const chunkMetaEmbeddingPrefixMaxChars = 2_000;
 const defaultEmbeddingProvider = {
   modelId: "clio-local-hash-v1",
   provider: "local-deterministic",
@@ -183,6 +189,21 @@ interface DocumentDraft {
   capturedAt: string;
   metadataJson: string;
   versionGroupKey: string;
+}
+
+interface ChunkMetaHeadV1 {
+  version: typeof chunkMetaHeadVersion;
+  tier: "tier0";
+  source: {
+    title: string;
+    type: string;
+    abstract: string | null;
+  };
+  docContext: string;
+  sectionPath: string | null;
+  chunkSummary: string | null;
+  roleHint: string | null;
+  relations: string[];
 }
 
 interface SourceAdapterInput {
@@ -364,6 +385,7 @@ export class LocalEngine {
         : Math.max(1, numberField(previousVersion, "version_no")) + 1;
     const supersedesSourceId =
       previousVersion === undefined ? undefined : stringField(previousVersion, "id");
+    const chunkMetaHeadJson = buildChunkMetaHeadJson(draft);
 
     transaction(db, () => {
       insertSourceRow(db, {
@@ -426,7 +448,7 @@ export class LocalEngine {
             char_start,
             char_end,
             meta_head_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'child', NULL, NULL, NULL, NULL, NULL)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'child', NULL, NULL, NULL, NULL, ?)`,
           bind: [
             chunkId,
             sourceId,
@@ -435,6 +457,7 @@ export class LocalEngine {
             chunk.tokenCount,
             chunk.hash,
             expandChineseBigrams(chunk.text),
+            chunkMetaHeadJson,
           ],
         });
         insertSourceFtsRow(db, {
@@ -2841,6 +2864,70 @@ function buildDocumentDraft(
   };
 }
 
+function buildChunkMetaHeadJson(draft: DocumentDraft) {
+  const metadata = parseMetadata(draft.metadataJson);
+  const title = boundedNormalizedText(
+    stringMetadataField(metadata, "title") ?? draft.sourceTitle,
+    chunkMetaTitleMaxChars,
+  );
+  const sourceType = boundedNormalizedText(
+    stringMetadataField(metadata, "source_type") ?? draft.kind,
+    chunkMetaSourceTypeMaxChars,
+  );
+  const abstract = stringMetadataField(metadata, "abstract");
+  const boundedAbstract =
+    abstract === null ? null : boundedNormalizedText(abstract, chunkMetaAbstractMaxChars);
+  const docContext = boundedNormalizedText(
+    [
+      title.length > 0 ? `Title: ${title}` : "",
+      sourceType.length > 0 ? `Source type: ${sourceType}` : "",
+      boundedAbstract !== null && boundedAbstract.length > 0 ? `Abstract: ${boundedAbstract}` : "",
+    ]
+      .filter((part) => part.length > 0)
+      .join("\n"),
+    chunkMetaDocContextMaxChars,
+  );
+  const metaHead: ChunkMetaHeadV1 = {
+    version: chunkMetaHeadVersion,
+    tier: "tier0",
+    source: {
+      title,
+      type: sourceType,
+      abstract: boundedAbstract,
+    },
+    docContext,
+    sectionPath: null,
+    chunkSummary: null,
+    roleHint: null,
+    relations: [],
+  };
+  return JSON.stringify(metaHead);
+}
+
+function buildChunkEmbeddingInput(chunk: SqlRow) {
+  const text = stringField(chunk, "text");
+  const prefix = buildChunkMetaEmbeddingPrefix(stringField(chunk, "meta_head_json"));
+  return prefix.length === 0 ? text : `${prefix}\n\n${text}`;
+}
+
+function buildChunkMetaEmbeddingPrefix(metaHeadJson: string) {
+  const metaHead = parseMetadata(metaHeadJson);
+  const docContext = stringMetadataField(metaHead, "docContext") ?? "";
+  const chunkSummary = stringMetadataField(metaHead, "chunkSummary") ?? "";
+  return boundedNormalizedText(
+    [docContext, chunkSummary.length > 0 ? `Chunk summary: ${chunkSummary}` : ""]
+      .filter((part) => part.length > 0)
+      .join("\n"),
+    chunkMetaEmbeddingPrefixMaxChars,
+  );
+}
+
+function boundedNormalizedText(input: string, maxLength: number) {
+  const normalized = normalizeText(input);
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
 function payloadMetadata(payload: CaptureBasePayload): Record<string, unknown> {
   return payload.metadata ?? {};
 }
@@ -4094,7 +4181,7 @@ function runEmbeddingStageForSource(db: SqliteDb, sourceId: string): Record<stri
     );
   }
   const chunks = db.selectObjects(
-    `SELECT id, source_id, text, hash
+    `SELECT id, source_id, text, hash, meta_head_json
      FROM source_chunks
      WHERE source_id = ?
      ORDER BY ord ASC`,
@@ -4164,7 +4251,8 @@ function upsertSourceChunkEmbedding(
   chunk: SqlRow,
   now: string,
 ) {
-  const vector = provider.embed(stringField(chunk, "text"));
+  const embeddingInput = buildChunkEmbeddingInput(chunk);
+  const vector = provider.embed(embeddingInput);
   if (vector.length !== provider.dimension) {
     throw new EngineRpcError("EMBEDDING_DIMENSION_MISMATCH", "Embedding dimension mismatch.");
   }
@@ -4189,7 +4277,7 @@ function upsertSourceChunkEmbedding(
       stringField(chunk, "id"),
       stringField(chunk, "source_id"),
       JSON.stringify(vector),
-      stringField(chunk, "hash") || hashText(stringField(chunk, "text")),
+      hashText(embeddingInput),
       now,
       now,
     ],

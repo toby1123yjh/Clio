@@ -5,6 +5,7 @@ import type {
   EngineResultFor,
   RetrieveSourcesResult,
 } from "@/src/shared/rpc";
+import { hashText } from "@/src/shared/text";
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -45,6 +46,29 @@ describe("local engine behavior harness", () => {
 
     expect(capture.status).toBe("saved");
     const sourceId = capture.memory.id;
+    const firstChunk = harness.selectObject(
+      "SELECT id, text, hash, meta_head_json FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
+      [sourceId],
+    );
+    const metaHead = JSON.parse(String(firstChunk?.meta_head_json ?? "{}")) as {
+      version?: number;
+      tier?: string;
+      docContext?: string;
+      source?: { title?: string; type?: string; abstract?: string | null };
+      chunkSummary?: string | null;
+      roleHint?: string | null;
+      relations?: unknown[];
+    };
+    expect(metaHead.version).toBe(1);
+    expect(metaHead.tier).toBe("tier0");
+    expect(metaHead.docContext).toContain("Alpha Metadata Retrieval");
+    expect(metaHead.docContext).toContain(
+      "Alpha metadata connects source-level search with bounded evidence windows.",
+    );
+    expect(metaHead.source?.type).toBe("research-note");
+    expect(metaHead.chunkSummary).toBeNull();
+    expect(metaHead.roleHint).toBeNull();
+    expect(metaHead.relations).toEqual([]);
 
     const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
     expect(queued.jobs).toHaveLength(1);
@@ -61,6 +85,13 @@ describe("local engine behavior harness", () => {
     expect(
       harness.count("source_embeddings", "source_id = ? AND target_kind = 'chunk'", [sourceId]),
     ).toBeGreaterThan(0);
+    const chunkEmbedding = harness.selectObject(
+      "SELECT text_hash FROM source_embeddings WHERE source_id = ? AND target_kind = 'chunk' ORDER BY target_id ASC LIMIT 1",
+      [sourceId],
+    );
+    const prefixedEmbeddingInput = `${metaHead.docContext}\n\n${String(firstChunk?.text ?? "")}`;
+    expect(chunkEmbedding?.text_hash).toBe(hashText(prefixedEmbeddingInput));
+    expect(chunkEmbedding?.text_hash).not.toBe(firstChunk?.hash);
 
     const retrieved = await harness.request({
       kind: "retrieveSources",
@@ -97,6 +128,46 @@ describe("local engine behavior harness", () => {
     expect(windows.items[0]?.chunks.map((chunk) => chunk.text).join("\n").length).toBeLessThan(
       sourceText.length,
     );
+  });
+
+  it("falls back to raw chunk text when chunk meta head is missing or malformed", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/malformed-meta-head",
+        sourceTitle: "Malformed Meta Head",
+        normalizedText: ragText("malformed meta head fallback", 20),
+        metadata: {
+          source_type: "webpage",
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+    const chunk = harness.selectObject(
+      "SELECT id, text, hash, meta_head_json FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
+      [sourceId],
+    );
+    const metaHead = JSON.parse(String(chunk?.meta_head_json ?? "{}")) as {
+      docContext?: string;
+      source?: { abstract?: string | null };
+    };
+    expect(metaHead.docContext).toContain("Malformed Meta Head");
+    expect(metaHead.source?.abstract).toBeNull();
+
+    harness.exec("UPDATE source_chunks SET meta_head_json = ? WHERE id = ?", [
+      "{not valid json",
+      String(chunk?.id ?? ""),
+    ]);
+    const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
+    await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+
+    const embedding = harness.selectObject(
+      "SELECT text_hash FROM source_embeddings WHERE source_id = ? AND target_kind = 'chunk' ORDER BY target_id ASC LIMIT 1",
+      [sourceId],
+    );
+    expect(embedding?.text_hash).toBe(hashText(String(chunk?.text ?? "")));
+    expect(embedding?.text_hash).toBe(chunk?.hash);
   });
 
   it("keeps duplicate, page version, and selection capture behavior distinct", async () => {
@@ -542,6 +613,14 @@ function createHarness() {
       const suffix = where === undefined || where.length === 0 ? "" : ` WHERE ${where}`;
       const sql = `SELECT COUNT(*) FROM ${table}${suffix}`;
       return Number((bind.length === 0 ? db.selectValue(sql) : db.selectValue(sql, bind)) ?? 0);
+    },
+    exec(sql: string, bind: unknown[] = []) {
+      if (db === undefined) throw new Error("Test database is not open.");
+      db.exec({ sql, bind });
+    },
+    selectObject(sql: string, bind: unknown[] = []) {
+      if (db === undefined) throw new Error("Test database is not open.");
+      return db.selectObject(sql, bind);
     },
   };
 }

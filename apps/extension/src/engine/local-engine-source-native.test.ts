@@ -22,6 +22,7 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_chunks");
+    expect(workerSource).toContain("meta_head_json TEXT");
     expect(workerSource).toContain("CREATE VIRTUAL TABLE IF NOT EXISTS source_fts");
     expect(workerSource).toContain("CREATE VIRTUAL TABLE IF NOT EXISTS source_metadata_fts");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_lifecycle_events");
@@ -115,17 +116,20 @@ describe("local engine source-native storage foundation", () => {
     expect(captureSection).toContain("defaultSourceAdapterRegistry.resolve");
     expect(captureSection).toContain("adapter.adapt");
     expect(captureSection).toContain("const chunks = chunkText(draft.normalizedText)");
+    expect(captureSection).toContain("const chunkMetaHeadJson = buildChunkMetaHeadJson(draft)");
     expect(captureSection).toContain("transaction(db, () => {");
     expect(captureSection).toContain("insertSourceRow(db");
     expect(captureSection).toContain("insertSourceLifecycleEvent(db");
     expect(captureSection).toContain("insertSourceAuditLog(db");
     expect(captureSection).toContain("INSERT INTO source_chunks");
+    expect(captureSection).toContain("meta_head_json");
     expect(captureSection).toContain("insertSourceFtsRow(db");
     expect(captureSection).toContain("insertAnchor(");
     expect(captureSection).toContain('enqueueJob(db, "post_capture_hardening"');
     expect(captureSection).toContain('action: "source.stage_queued"');
     expect(captureSection).not.toContain("runEmbeddingStageForSource");
     expect(captureSection).not.toContain("upsertSourceChunkEmbedding");
+    expect(captureSection).not.toContain("buildChunkEmbeddingInput");
     expect(captureSection).not.toContain("embedLocalDeterministic");
   });
 
@@ -312,6 +316,7 @@ describe("local engine source-native storage foundation", () => {
     expect(embeddingStageSection).toContain("source_deleted");
     expect(embeddingStageSection).toContain("getActiveEmbeddingProvider(db)");
     expect(embeddingStageSection).toContain("EMBEDDING_MODEL_UNAVAILABLE");
+    expect(embeddingStageSection).toContain("meta_head_json");
     expect(embeddingStageSection).toContain("ORDER BY ord ASC");
     expect(embeddingStageSection).toContain("loadSourceMetaEmbeddingInput(db, sourceId)");
     expect(embeddingStageSection).toContain("buildSourceMetaEmbeddingText(metaInput)");
@@ -328,7 +333,30 @@ describe("local engine source-native storage foundation", () => {
     expect(upsertSection).toContain("provider.modelId");
     expect(upsertSection).toContain("'chunk'");
     expect(upsertSection).toContain("'meta'");
+    expect(upsertSection).toContain("buildChunkEmbeddingInput(chunk)");
+    expect(upsertSection).toContain("provider.embed(embeddingInput)");
+    expect(upsertSection).toContain("hashText(embeddingInput)");
     expect(upsertSection).toContain("hashText(input.text)");
     expect(upsertSection).toContain("EMBEDDING_DIMENSION_MISMATCH");
+  });
+
+  it("defines chunk meta head Tier0 builders without changing prompt evidence output", () => {
+    expect(workerSource).toContain("interface ChunkMetaHeadV1");
+    expect(workerSource).toContain("const chunkMetaHeadVersion = 1");
+    expect(workerSource).toContain("function buildChunkMetaHeadJson");
+    expect(workerSource).toContain('tier: "tier0"');
+    expect(workerSource).toContain("docContext");
+    expect(workerSource).toContain("chunkSummary: null");
+    expect(workerSource).toContain("roleHint: null");
+    expect(workerSource).toContain("relations: []");
+    expect(workerSource).toContain("function buildChunkEmbeddingInput");
+    expect(workerSource).toContain("function buildChunkMetaEmbeddingPrefix");
+
+    const evidenceWindowSection = workerSource.slice(
+      workerSource.indexOf("function loadSourceEvidenceWindow"),
+      workerSource.indexOf("function optionalAnchorFromRow"),
+    );
+    expect(evidenceWindowSection).not.toContain("meta_head_json");
+    expect(evidenceWindowSection).not.toContain("docContext");
   });
 });
