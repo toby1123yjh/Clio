@@ -238,6 +238,11 @@ describe("local engine behavior harness", () => {
     expect(harness.count("source_embeddings", "source_id = ?", [sourceId])).toBeGreaterThan(0);
     expect(harness.count("source_metadata", "source_id = ?", [sourceId])).toBe(1);
     expect(harness.count("anchors", "memory_id = ?", [sourceId])).toBe(1);
+    await harness.request({
+      kind: "pinWorkingSetSource",
+      payload: { sourceId, loadDepth: "chunks" },
+    });
+    expect(harness.count("source_working_set", "source_id = ?", [sourceId])).toBe(1);
 
     const deleted = await harness.request({ kind: "deleteMemory", id: sourceId });
     expect(deleted.deleted).toBe(true);
@@ -245,6 +250,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("source_fts", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_metadata_fts", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_embeddings", "source_id = ?", [sourceId])).toBe(0);
+    expect(harness.count("source_working_set", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_metadata", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("anchors", "memory_id = ?", [sourceId])).toBe(0);
 
@@ -254,14 +260,19 @@ describe("local engine behavior harness", () => {
     });
     expect(retrievalAfterDelete.items.map((item) => item.id)).not.toContain(sourceId);
 
-    await harness.request({
+    const resetSource = await harness.request({
       kind: "capturePage",
       payload: pagePayload({
         sourceUrl: "https://example.test/reset",
         normalizedText: ragText("reset library rows", 8),
       }),
     });
+    await harness.request({
+      kind: "pinWorkingSetSource",
+      payload: { sourceId: resetSource.memory.id, loadDepth: "meta" },
+    });
     expect(harness.count("sources", "lifecycle_status <> 'deleted'")).toBe(1);
+    expect(harness.count("source_working_set")).toBe(1);
 
     const reset = await harness.request({ kind: "repair", action: "reset_library" });
     expect(reset.action).toBe("reset_library");
@@ -270,9 +281,93 @@ describe("local engine behavior harness", () => {
     expect(harness.count("source_fts")).toBe(0);
     expect(harness.count("source_metadata_fts")).toBe(0);
     expect(harness.count("source_embeddings")).toBe(0);
+    expect(harness.count("source_working_set")).toBe(0);
     expect(harness.count("source_metadata")).toBe(0);
     expect(harness.count("anchors")).toBe(0);
     expect(harness.count("jobs")).toBe(0);
+  });
+
+  it("manages context working set state without leaking full source text", async () => {
+    const harness = createHarness();
+    const fullTextOnlyNeedle = "FULL_TEXT_ONLY_NEEDLE_SHOULD_NOT_LEAK";
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/working-set",
+        sourceTitle: "Working Set Source",
+        normalizedText: `${ragText("context manager bounded source", 30)} ${fullTextOnlyNeedle}`,
+        metadata: {
+          title: "Working Set Source",
+          abstract: "Working set metadata stays bounded.",
+          source_type: "research-note",
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+
+    const emptyStatus = await harness.request({ kind: "getWorkingSetStatus" });
+    expect(emptyStatus.entries).toEqual([]);
+    expect(emptyStatus.budget).toBe(32_000);
+
+    const pinned = await harness.request({
+      kind: "pinWorkingSetSource",
+      payload: { sourceId, loadDepth: "meta" },
+    });
+    expect(pinned.entries).toHaveLength(1);
+    expect(pinned.entries[0]?.source.id).toBe(sourceId);
+    expect(pinned.entries[0]?.source.sourceType).toBe("research-note");
+    expect(pinned.entries[0]?.source.abstract).toBe("Working set metadata stays bounded.");
+    expect(pinned.entries[0]?.source.chunkCount).toBeGreaterThan(0);
+    expect(pinned.entries[0]?.loadDepth).toBe("meta");
+    expect(pinned.entries[0]?.pinStatus).toBe("pinned");
+    expect(JSON.stringify(pinned)).not.toContain(fullTextOnlyNeedle);
+
+    const deepened = await harness.request({
+      kind: "setWorkingSetSourceDepth",
+      payload: { sourceId, loadDepth: "chunks" },
+    });
+    expect(deepened.entries[0]?.loadDepth).toBe("chunks");
+    expect(deepened.entries[0]?.pinStatus).toBe("pinned");
+    expect(deepened.entries[0]?.tokenEstimate).toBeGreaterThan(
+      pinned.entries[0]?.tokenEstimate ?? 0,
+    );
+
+    const evicted = await harness.request({
+      kind: "evictWorkingSetSource",
+      payload: { sourceId, reason: "over budget" },
+    });
+    expect(evicted.entries[0]?.loadDepth).toBe("meta");
+    expect(evicted.entries[0]?.pinStatus).toBe("evicted");
+    expect(evicted.entries[0]?.evictReason).toBe("over budget");
+
+    const reloaded = await harness.request({
+      kind: "reloadWorkingSetSource",
+      payload: { sourceId, loadDepth: "outline" },
+    });
+    expect(reloaded.entries[0]?.loadDepth).toBe("outline");
+    expect(reloaded.entries[0]?.pinStatus).toBe("auto");
+    expect(reloaded.entries[0]?.reloadCount).toBe(1);
+
+    const listed = await harness.request({ kind: "listWorkingSetEntries" });
+    expect(listed.entries.map((entry) => entry.source.id)).toEqual([sourceId]);
+
+    const deleted = await harness.request({ kind: "deleteMemory", id: sourceId });
+    expect(deleted.deleted).toBe(true);
+    expect(harness.count("source_working_set", "source_id = ?", [sourceId])).toBe(0);
+    expect((await harness.request({ kind: "getWorkingSetStatus" })).entries).toEqual([]);
+  });
+
+  it("rejects working set operations for missing sources", async () => {
+    const harness = createHarness();
+
+    await expect(
+      harness.request({
+        kind: "pinWorkingSetSource",
+        payload: { sourceId: "missing-source", loadDepth: "chunks" },
+      }),
+    ).rejects.toMatchObject({
+      code: "WORKING_SET_SOURCE_NOT_FOUND",
+    });
   });
 
   it("returns recent sources and truthful skipped traces for empty query", async () => {

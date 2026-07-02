@@ -64,6 +64,8 @@ import {
   type WikiCompileJobStatus,
   type WikiCompileJobSummary,
   type WikiCompileResultPayload,
+  type WorkingSetLoadDepth,
+  type WorkingSetStatusResult,
   engineErrorFromUnknown,
   isWorkerRequestMessage,
 } from "@/src/shared/rpc";
@@ -120,7 +122,7 @@ export interface LocalEngineOptions {
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
-const schemaVersion = 15;
+const schemaVersion = 16;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -132,6 +134,8 @@ const chunkMetaSourceTypeMaxChars = 100;
 const chunkMetaDocContextMaxChars = 1_600;
 const chunkMetaAbstractMaxChars = 1_200;
 const chunkMetaEmbeddingPrefixMaxChars = 2_000;
+const defaultWorkingSetBudgetTokens = 32_000;
+const workingSetExcerptMaxChars = 280;
 const defaultEmbeddingProvider = {
   modelId: "clio-local-hash-v1",
   provider: "local-deterministic",
@@ -144,6 +148,7 @@ const searchableSourceLifecycleStatuses = ["fresh", "stale", "archived"] as cons
 type SourceLifecycleStatus = "fresh" | "stale" | "archived" | "deleted";
 type SearchableSourceLifecycleStatus = Exclude<SourceLifecycleStatus, "deleted">;
 type SourceAnalysisLevel = "saved" | "analyzed";
+const workingSetLoadDepths = ["meta", "outline", "chunks", "full"] as const;
 type SourceAuditAction =
   | "source.created"
   | "source.superseded"
@@ -249,6 +254,23 @@ export class LocalEngine {
         return await this.capture("selection", request.payload);
       case "retrieveSources":
         return await this.retrieveSources(request.payload);
+      case "listWorkingSetEntries":
+      case "getWorkingSetStatus":
+        return await this.getWorkingSetStatus();
+      case "pinWorkingSetSource":
+        return await this.pinWorkingSetSource(request.payload.sourceId, request.payload.loadDepth);
+      case "evictWorkingSetSource":
+        return await this.evictWorkingSetSource(request.payload.sourceId, request.payload.reason);
+      case "setWorkingSetSourceDepth":
+        return await this.setWorkingSetSourceDepth(
+          request.payload.sourceId,
+          request.payload.loadDepth,
+        );
+      case "reloadWorkingSetSource":
+        return await this.reloadWorkingSetSource(
+          request.payload.sourceId,
+          request.payload.loadDepth,
+        );
       case "searchMemory":
         return await this.search(request.query, request.limit);
       case "listMemories":
@@ -874,6 +896,83 @@ export class LocalEngine {
     };
   }
 
+  private async getWorkingSetStatus(): Promise<WorkingSetStatusResult> {
+    const db = await this.ensureReady();
+    return loadWorkingSetStatus(db);
+  }
+
+  private async pinWorkingSetSource(
+    sourceId: string,
+    loadDepth: WorkingSetLoadDepth = "meta",
+  ): Promise<WorkingSetStatusResult> {
+    const db = await this.ensureReady();
+    upsertWorkingSetEntry(db, {
+      sourceId,
+      loadDepth,
+      pinStatus: "pinned",
+      evictReason: null,
+      reload: false,
+    });
+    return loadWorkingSetStatus(db);
+  }
+
+  private async evictWorkingSetSource(
+    sourceId: string,
+    reason?: string,
+  ): Promise<WorkingSetStatusResult> {
+    const db = await this.ensureReady();
+    assertWorkingSetSource(db, sourceId);
+    const now = new Date().toISOString();
+    db.exec({
+      sql: `INSERT INTO source_working_set (
+              source_id,
+              load_depth,
+              pin_status,
+              evict_reason,
+              reload_count,
+              loaded_at,
+              updated_at
+            ) VALUES (?, 'meta', 'evicted', ?, 0, ?, ?)
+            ON CONFLICT(source_id) DO UPDATE SET
+              load_depth = 'meta',
+              pin_status = 'evicted',
+              evict_reason = excluded.evict_reason,
+              updated_at = excluded.updated_at`,
+      bind: [normalizeRequiredId(sourceId, "sourceId"), normalizeText(reason ?? ""), now, now],
+    });
+    return loadWorkingSetStatus(db);
+  }
+
+  private async setWorkingSetSourceDepth(
+    sourceId: string,
+    loadDepth: WorkingSetLoadDepth,
+  ): Promise<WorkingSetStatusResult> {
+    const db = await this.ensureReady();
+    upsertWorkingSetEntry(db, {
+      sourceId,
+      loadDepth,
+      pinStatus: "auto",
+      evictReason: null,
+      reload: false,
+    });
+    return loadWorkingSetStatus(db);
+  }
+
+  private async reloadWorkingSetSource(
+    sourceId: string,
+    loadDepth: WorkingSetLoadDepth = "chunks",
+  ): Promise<WorkingSetStatusResult> {
+    const db = await this.ensureReady();
+    upsertWorkingSetEntry(db, {
+      sourceId,
+      loadDepth,
+      pinStatus: "auto",
+      evictReason: null,
+      reload: true,
+    });
+    return loadWorkingSetStatus(db);
+  }
+
   private async delete(id: string): Promise<DeleteMemoryResult> {
     const db = await this.ensureReady();
     let deleted = false;
@@ -899,6 +998,7 @@ export class LocalEngine {
       db.exec({ sql: "DELETE FROM anchors WHERE memory_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM topic_graph_edges WHERE memory_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_embeddings WHERE source_id = ?", bind: [id] });
+      db.exec({ sql: "DELETE FROM source_working_set WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_metadata_fts WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_fts WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_chunks WHERE source_id = ?", bind: [id] });
@@ -2124,6 +2224,7 @@ export class LocalEngine {
       db.exec("DELETE FROM jobs");
       db.exec("DELETE FROM source_audit_log");
       db.exec("DELETE FROM source_lifecycle_events");
+      db.exec("DELETE FROM source_working_set");
       db.exec("DELETE FROM source_metadata");
       db.exec("DELETE FROM topic_graph_edges");
       db.exec("DELETE FROM wiki_compile_job_events");
@@ -2375,6 +2476,17 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS source_working_set (
+      source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+      load_depth TEXT NOT NULL CHECK (load_depth IN ('meta', 'outline', 'chunks', 'full')),
+      pin_status TEXT NOT NULL CHECK (pin_status IN ('pinned', 'auto', 'evicted')),
+      evict_reason TEXT,
+      reload_count INTEGER NOT NULL DEFAULT 0,
+      loaded_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS source_lifecycle_events (
       id TEXT PRIMARY KEY,
       source_id TEXT REFERENCES sources(id) ON DELETE SET NULL,
@@ -2615,6 +2727,9 @@ function migrate(db: SqliteDb) {
     "CREATE INDEX IF NOT EXISTS idx_source_embeddings_target ON source_embeddings(target_kind, target_id)",
   );
   db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_source_working_set_updated ON source_working_set(pin_status, updated_at DESC)",
+  );
+  db.exec(
     "CREATE INDEX IF NOT EXISTS idx_source_lifecycle_source ON source_lifecycle_events(source_id, created_at)",
   );
   db.exec(
@@ -2676,6 +2791,7 @@ function dropPreSourceNativeTables(db: SqliteDb) {
   db.exec("DROP TABLE IF EXISTS wiki_compile_jobs");
   db.exec("DROP TABLE IF EXISTS topic_pages");
   db.exec("DROP TABLE IF EXISTS anchors");
+  db.exec("DROP TABLE IF EXISTS source_working_set");
   db.exec("DROP TABLE IF EXISTS source_embeddings");
   db.exec("DROP TABLE IF EXISTS embedding_models");
   db.exec("DROP TABLE IF EXISTS source_metadata_fts");
@@ -4580,6 +4696,174 @@ function insertSourceMetadataFtsRow(
   });
 }
 
+function loadWorkingSetStatus(db: SqliteDb): WorkingSetStatusResult {
+  const rows = db.selectObjects(
+    `SELECT
+      ws.source_id,
+      s.id,
+      ws.load_depth,
+      ws.pin_status,
+      ws.evict_reason,
+      ws.reload_count,
+      ws.loaded_at,
+      ws.updated_at,
+      s.source_kind,
+      s.source_url,
+      s.normalized_source_url,
+      s.source_title,
+      s.captured_at,
+      s.content_hash,
+      s.lifecycle_status,
+      s.version_group_key,
+      s.version_no,
+      s.supersedes_source_id,
+      s.superseded_by_source_id,
+      s.is_current,
+      sm.source_type,
+      sm.abstract,
+      COUNT(c.id) AS chunk_count,
+      COALESCE(SUM(c.token_count), 0) AS chunk_tokens
+     FROM source_working_set ws
+     JOIN sources s ON s.id = ws.source_id
+     LEFT JOIN source_metadata sm ON sm.source_id = ws.source_id
+     LEFT JOIN source_chunks c ON c.source_id = ws.source_id
+     WHERE s.lifecycle_status <> 'deleted'
+     GROUP BY ws.source_id
+     ORDER BY
+      CASE ws.pin_status
+        WHEN 'pinned' THEN 0
+        WHEN 'auto' THEN 1
+        ELSE 2
+      END,
+      ws.updated_at DESC,
+      s.captured_at DESC`,
+  );
+  const entries = rows.map((row) => workingSetEntryFromRow(row));
+  return {
+    entries,
+    totalTokenEstimate: entries.reduce((sum, entry) => sum + entry.tokenEstimate, 0),
+    budget: defaultWorkingSetBudgetTokens,
+  };
+}
+
+function upsertWorkingSetEntry(
+  db: SqliteDb,
+  input: {
+    sourceId: string;
+    loadDepth: WorkingSetLoadDepth;
+    pinStatus: "pinned" | "auto";
+    evictReason: string | null;
+    reload: boolean;
+  },
+) {
+  const sourceId = normalizeRequiredId(input.sourceId, "sourceId");
+  assertWorkingSetLoadDepth(input.loadDepth);
+  assertWorkingSetSource(db, sourceId);
+  const now = new Date().toISOString();
+  db.exec({
+    sql: `INSERT INTO source_working_set (
+            source_id,
+            load_depth,
+            pin_status,
+            evict_reason,
+            reload_count,
+            loaded_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(source_id) DO UPDATE SET
+            load_depth = excluded.load_depth,
+            pin_status = CASE
+              WHEN source_working_set.pin_status = 'pinned'
+                AND excluded.pin_status = 'auto'
+              THEN 'pinned'
+              ELSE excluded.pin_status
+            END,
+            evict_reason = excluded.evict_reason,
+            reload_count = source_working_set.reload_count + ?,
+            loaded_at = CASE
+              WHEN ? = 1 THEN excluded.loaded_at
+              ELSE source_working_set.loaded_at
+            END,
+            updated_at = excluded.updated_at`,
+    bind: [
+      sourceId,
+      input.loadDepth,
+      input.pinStatus,
+      input.evictReason,
+      input.reload ? 1 : 0,
+      now,
+      now,
+      input.reload ? 1 : 0,
+      input.reload ? 1 : 0,
+    ],
+  });
+}
+
+function assertWorkingSetSource(db: SqliteDb, sourceId: string) {
+  const id = normalizeRequiredId(sourceId, "sourceId");
+  const source = db.selectObject(
+    "SELECT id FROM sources WHERE id = ? AND lifecycle_status <> 'deleted' LIMIT 1",
+    [id],
+  );
+  if (source === undefined) {
+    throw new EngineRpcError("WORKING_SET_SOURCE_NOT_FOUND", `Source not found: ${id}`);
+  }
+}
+
+function normalizeRequiredId(value: string, fieldName: string) {
+  const id = normalizeText(value);
+  if (id.length === 0) {
+    throw new EngineRpcError("INVALID_REQUEST", `${fieldName} is required.`);
+  }
+  return id;
+}
+
+function assertWorkingSetLoadDepth(value: WorkingSetLoadDepth) {
+  if (!workingSetLoadDepths.includes(value)) {
+    throw new EngineRpcError("INVALID_WORKING_SET_DEPTH", `Invalid working-set depth: ${value}`);
+  }
+}
+
+function workingSetEntryFromRow(row: SqlRow): WorkingSetStatusResult["entries"][number] {
+  const abstract = optionalString(row, "abstract");
+  const loadDepth = workingSetLoadDepthField(row, "load_depth");
+  const chunkCount = numberField(row, "chunk_count");
+  const chunkTokens = numberField(row, "chunk_tokens");
+  const fallbackExcerpt =
+    abstract ?? (stringField(row, "source_title") || stringField(row, "source_url"));
+  return {
+    source: {
+      ...memorySummaryFromRetrievalRow(row, fallbackExcerpt),
+      sourceType: stringField(row, "source_type") || "webpage",
+      lifecycleStatus: searchableLifecycleStatusField(row, "lifecycle_status"),
+      ...(abstract === undefined ? {} : { abstract: excerpt(abstract, workingSetExcerptMaxChars) }),
+      chunkCount,
+    },
+    loadDepth,
+    pinStatus: workingSetPinStatusField(row, "pin_status"),
+    ...(optionalString(row, "evict_reason") === undefined
+      ? {}
+      : { evictReason: stringField(row, "evict_reason") }),
+    reloadCount: numberField(row, "reload_count"),
+    loadedAt: stringField(row, "loaded_at"),
+    updatedAt: stringField(row, "updated_at"),
+    tokenEstimate: estimateWorkingSetTokens(loadDepth, chunkCount, chunkTokens, abstract),
+  };
+}
+
+function estimateWorkingSetTokens(
+  loadDepth: WorkingSetLoadDepth,
+  chunkCount: number,
+  chunkTokens: number,
+  abstract: string | undefined,
+) {
+  const metaTokens = Math.max(80, Math.ceil((abstract?.length ?? workingSetExcerptMaxChars) / 4));
+  if (loadDepth === "meta") return metaTokens;
+  if (loadDepth === "outline") return metaTokens + Math.min(400, Math.max(80, chunkCount * 24));
+  if (loadDepth === "chunks") return metaTokens + Math.min(chunkTokens, 8_000);
+  return metaTokens + Math.min(chunkTokens, 16_000);
+}
+
 function insertAnchor(
   db: SqliteDb,
   memoryId: string,
@@ -5891,6 +6175,27 @@ function sourceLifecycleStatusFromRow(
     return value;
   }
   return null;
+}
+
+function searchableLifecycleStatusField(row: SqlRow, key: string): SearchableSourceLifecycleStatus {
+  const value = sourceLifecycleStatusFromRow(row, key);
+  if (value === "stale" || value === "archived") return value;
+  return "fresh";
+}
+
+function workingSetLoadDepthField(row: SqlRow, key: string): WorkingSetLoadDepth {
+  const value = stringField(row, key);
+  if (value === "outline" || value === "chunks" || value === "full") return value;
+  return "meta";
+}
+
+function workingSetPinStatusField(
+  row: SqlRow,
+  key: string,
+): WorkingSetStatusResult["entries"][number]["pinStatus"] {
+  const value = stringField(row, key);
+  if (value === "pinned" || value === "evicted") return value;
+  return "auto";
 }
 
 function imageGenerationModeField(row: SqlRow, key: string): ImageGenerationHistoryRecord["mode"] {

@@ -650,6 +650,62 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts working set requests and rejects invalid load depths", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "getWorkingSetStatus" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listWorkingSetEntries" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "pinWorkingSetSource",
+          payload: { sourceId: "source-1", loadDepth: "chunks" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "reloadWorkingSetSource",
+          payload: { sourceId: "source-1", loadDepth: "full" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "evictWorkingSetSource",
+          payload: { sourceId: "source-1", reason: "over budget" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "setWorkingSetSourceDepth",
+          payload: { sourceId: "source-1", loadDepth: "document" },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("types meta source hits as source-level tracks without widening chunk tracks", () => {
     const item = {
       id: "source-1",
