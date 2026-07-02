@@ -150,6 +150,7 @@ import {
   type ImageGenerationHistoryRecord,
   type MemoryDetail,
   type MemoryEvidenceWindow,
+  type RetrieveSourceItem,
   type RetrieveSourcesResult,
   type SearchMemoryItem,
   type TopicGraphEdge,
@@ -490,6 +491,13 @@ function retrievalEvidenceWindowAnchors(
       ];
     }),
   );
+}
+
+function toKnowledgeBaseSearchItem(item: RetrieveSourceItem): SearchMemoryItem {
+  return {
+    ...toSearchItem(item),
+    snippet: item.hitChunks[0]?.snippet ?? item.excerpt,
+  };
 }
 
 async function loadLocalRagEvidencePack(query: string): Promise<EvidenceItem[]> {
@@ -930,10 +938,14 @@ function ClioContentApp() {
           kind: "listWikiCompileJobs",
           limit: 8,
         });
-        const result =
-          nextQuery.trim().length > 0
-            ? await requestEngine({ kind: "searchMemory", query: nextQuery, limit: 40 })
-            : await requestEngine({ kind: "listMemories", limit: 40 });
+        const result = await requestEngine({
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: nextQuery,
+            limit: 40,
+            includeChunks: 2,
+          },
+        });
         setTopicPages(topicResult.items);
         setWikiCompileJobs(wikiJobsResult.jobs);
         if (wikiJobsResult.jobs[0] !== undefined) {
@@ -941,7 +953,7 @@ function ClioContentApp() {
         } else {
           setWikiCompileJobEvents([]);
         }
-        setItems(result.items.map(toSearchItem));
+        setItems(result.items.map(toKnowledgeBaseSearchItem));
       } catch (error) {
         showToast(errorToast(error));
       } finally {

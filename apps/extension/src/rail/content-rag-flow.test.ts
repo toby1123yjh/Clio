@@ -25,4 +25,16 @@ describe("content local RAG flow", () => {
     expect(localRagSection).toContain("assembleLocalRagEvidencePack");
     expect(localRagSection).not.toContain('kind: "getMemory"');
   });
+
+  it("routes Knowledge Base page search through source-level KB search", () => {
+    const loadLibrarySection = contentSource.slice(
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+      contentSource.indexOf("const loadChatHistory = React.useCallback"),
+    );
+
+    expect(loadLibrarySection).toContain('kind: "searchKnowledgeBase"');
+    expect(loadLibrarySection).toContain("toKnowledgeBaseSearchItem");
+    expect(loadLibrarySection).not.toContain('kind: "searchMemory"');
+    expect(loadLibrarySection).not.toContain('kind: "listMemories"');
+  });
 });

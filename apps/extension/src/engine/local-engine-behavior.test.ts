@@ -130,6 +130,65 @@ describe("local engine behavior harness", () => {
     );
   });
 
+  it("builds keyword index and expands knowledge base page search locally", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceTitle: "Long Context Degradation Study",
+        normalizedText: ragText("attention failure evidence window retrieval", 24),
+        metadata: {
+          title: "Long Context Degradation Study",
+          abstract: "Saved library terminology should help clipped queries find source evidence.",
+          source_type: "paper",
+          authors: ["Ada Lovelace"],
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+
+    expect(harness.count("keyword_index", "term = ?", ["degradation"])).toBe(1);
+    expect(
+      harness.count("keyword_index_sources", "term = ? AND source_id = ?", [
+        "degradation",
+        sourceId,
+      ]),
+    ).toBe(1);
+
+    const original = await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "degrad", limit: 5, includeChunks: 1 },
+    });
+    expect(original.items.map((item) => item.id)).not.toContain(sourceId);
+
+    const expanded = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: { query: "degrad", limit: 5, includeChunks: 1 },
+    });
+    expect(expanded.items.map((item) => item.id)).toContain(sourceId);
+    expect(expanded.expansion.status).toBe("used");
+    expect(expanded.expansion.terms).toContain("degradation");
+    expect(expanded.expansion.expandedQuery).toContain("degradation");
+
+    const filtered = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "degrad",
+        limit: 5,
+        filter: { sourceTypes: ["pdf"] },
+      },
+    });
+    expect(filtered.items.map((item) => item.id)).not.toContain(sourceId);
+    expect(filtered.expansion.status).toBe("skipped");
+
+    harness.exec("DELETE FROM keyword_index_sources");
+    harness.exec("DELETE FROM keyword_index");
+    expect(harness.count("keyword_index")).toBe(0);
+    const reindex = await harness.request({ kind: "reindex", scope: "fts" });
+    expect(reindex.status).toBe("done");
+    expect(harness.count("keyword_index", "term = ?", ["degradation"])).toBe(1);
+  });
+
   it("falls back to raw chunk text when chunk meta head is missing or malformed", async () => {
     const harness = createHarness();
     const capture = await harness.request({
@@ -235,6 +294,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("source_chunks", "source_id = ?", [sourceId])).toBeGreaterThan(0);
     expect(harness.count("source_fts", "source_id = ?", [sourceId])).toBeGreaterThan(0);
     expect(harness.count("source_metadata_fts", "source_id = ?", [sourceId])).toBe(1);
+    expect(harness.count("keyword_index_sources", "source_id = ?", [sourceId])).toBeGreaterThan(0);
     expect(harness.count("source_embeddings", "source_id = ?", [sourceId])).toBeGreaterThan(0);
     expect(harness.count("source_metadata", "source_id = ?", [sourceId])).toBe(1);
     expect(harness.count("anchors", "memory_id = ?", [sourceId])).toBe(1);
@@ -249,6 +309,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("source_chunks", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_fts", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_metadata_fts", "source_id = ?", [sourceId])).toBe(0);
+    expect(harness.count("keyword_index_sources", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_embeddings", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_working_set", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_metadata", "source_id = ?", [sourceId])).toBe(0);
@@ -280,6 +341,8 @@ describe("local engine behavior harness", () => {
     expect(harness.count("source_chunks")).toBe(0);
     expect(harness.count("source_fts")).toBe(0);
     expect(harness.count("source_metadata_fts")).toBe(0);
+    expect(harness.count("keyword_index")).toBe(0);
+    expect(harness.count("keyword_index_sources")).toBe(0);
     expect(harness.count("source_embeddings")).toBe(0);
     expect(harness.count("source_working_set")).toBe(0);
     expect(harness.count("source_metadata")).toBe(0);

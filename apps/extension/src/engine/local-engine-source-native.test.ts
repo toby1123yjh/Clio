@@ -17,7 +17,7 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 16");
+    expect(workerSource).toContain("const schemaVersion = 17");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
@@ -30,6 +30,8 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("CREATE VIRTUAL TABLE IF NOT EXISTS source_fts");
     expect(workerSource).toContain("CREATE VIRTUAL TABLE IF NOT EXISTS source_metadata_fts");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_working_set");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS keyword_index");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS keyword_index_sources");
     expect(workerSource).toContain("load_depth TEXT NOT NULL CHECK");
     expect(workerSource).toContain("pin_status TEXT NOT NULL CHECK");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_lifecycle_events");
@@ -39,6 +41,8 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("DROP TABLE IF EXISTS topic_pages");
     expect(workerSource).toContain("DROP TABLE IF EXISTS wiki_compile_jobs");
     expect(workerSource).toContain("DROP TABLE IF EXISTS source_working_set");
+    expect(workerSource).toContain("DROP TABLE IF EXISTS keyword_index_sources");
+    expect(workerSource).toContain("DROP TABLE IF EXISTS keyword_index");
     expect(workerSource).toContain("DROP TABLE IF EXISTS source_metadata_fts");
     expect(workerSource).toContain("DROP TABLE IF EXISTS memory_fts");
     expect(workerSource).toContain("DROP TABLE IF EXISTS chunks");
@@ -152,9 +156,12 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("DELETE FROM source_embeddings WHERE source_id = ?");
     expect(workerSource).toContain("DELETE FROM source_working_set WHERE source_id = ?");
     expect(workerSource).toContain("DELETE FROM source_metadata_fts WHERE source_id = ?");
+    expect(workerSource).toContain("function deleteKeywordIndexForSource");
     expect(workerSource).toContain('db.exec("DELETE FROM source_embeddings")');
     expect(workerSource).toContain('db.exec("DELETE FROM source_working_set")');
     expect(workerSource).toContain('db.exec("DELETE FROM source_metadata_fts")');
+    expect(workerSource).toContain('db.exec("DELETE FROM keyword_index_sources")');
+    expect(workerSource).toContain('db.exec("DELETE FROM keyword_index")');
 
     const deleteSection = sourceSection("private async delete", "private async listTopicPages");
     expect(deleteSection).toContain("DELETE FROM anchors WHERE memory_id = ?");
@@ -163,6 +170,7 @@ describe("local engine source-native storage foundation", () => {
     expect(deleteSection).toContain("DELETE FROM source_working_set WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_metadata_fts WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_fts WHERE source_id = ?");
+    expect(deleteSection).toContain("deleteKeywordIndexForSource(db, id)");
     expect(deleteSection).toContain("DELETE FROM source_chunks WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_metadata WHERE source_id = ?");
     expect(deleteSection).toContain("markSourceDeleted(db");
@@ -173,6 +181,8 @@ describe("local engine source-native storage foundation", () => {
     expect(resetSection).toContain('db.exec("DELETE FROM source_embeddings")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_working_set")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_metadata_fts")');
+    expect(resetSection).toContain('db.exec("DELETE FROM keyword_index_sources")');
+    expect(resetSection).toContain('db.exec("DELETE FROM keyword_index")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_fts")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_chunks")');
     expect(resetSection).toContain('db.exec("DELETE FROM sources")');
@@ -185,13 +195,30 @@ describe("local engine source-native storage foundation", () => {
     );
     expect(rebuildSection).toContain("DELETE FROM source_fts");
     expect(rebuildSection).toContain("DELETE FROM source_metadata_fts");
+    expect(rebuildSection).toContain("DELETE FROM keyword_index_sources");
+    expect(rebuildSection).toContain("DELETE FROM keyword_index");
     expect(rebuildSection).toContain("FROM source_chunks c");
     expect(rebuildSection).toContain("JOIN sources s ON s.id = c.source_id");
     expect(rebuildSection).toContain("WHERE s.lifecycle_status <> 'deleted'");
     expect(rebuildSection).toContain("insertSourceFtsRow(db");
     expect(rebuildSection).toContain("LEFT JOIN source_metadata sm ON sm.source_id = s.id");
     expect(rebuildSection).toContain("insertSourceMetadataFtsRow(db");
+    expect(rebuildSection).toContain("replaceKeywordIndexForSource(db");
     expect(rebuildSection).not.toContain("source_embeddings");
+  });
+
+  it("exposes knowledge-base search expansion over the local keyword index", () => {
+    expect(workerSource).toContain('case "searchKnowledgeBase"');
+    expect(workerSource).toContain("private async searchKnowledgeBase");
+    expect(workerSource).toContain("function replaceKeywordIndexForSource");
+    expect(workerSource).toContain("function collectKeywordTermsForSource");
+    expect(workerSource).toContain("function findKeywordExpansionTerms");
+    expect(workerSource).toContain("function mergeKnowledgeBaseSearchItems");
+    expect(workerSource).toContain("JOIN keyword_index_sources kis ON kis.term = ki.term");
+    expect(workerSource).toContain("JOIN sources s ON s.id = kis.source_id");
+    expect(workerSource).toContain("const original = await this.retrieveSources");
+    expect(workerSource).toContain("const expanded = await this.retrieveSources");
+    expect(workerSource).toContain("expansion: {");
   });
 
   it("loads prompt evidence through bounded source chunk windows", () => {

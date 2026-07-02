@@ -45,6 +45,8 @@ import {
   type RetrieveSourcesResult,
   type RetrieveSourcesTraceTrack,
   type RetrieveTrackName,
+  type SearchKnowledgeBasePayload,
+  type SearchKnowledgeBaseResult,
   type SearchMemoryResult,
   type SessionEvidenceRecord,
   type SessionLeaseResult,
@@ -122,12 +124,18 @@ export interface LocalEngineOptions {
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
-const schemaVersion = 16;
+const schemaVersion = 17;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
 const staleSessionLeaseMs = 30_000;
 const defaultRrfK = 60;
+const keywordIndexMaxExpansionTerms = 6;
+const keywordIndexMaxTermsPerSource = 160;
+const keywordIndexMaxTermChars = 160;
+const keywordIndexMaxChunkSamples = 12;
+const keywordIndexMaxChunkSampleChars = 12_000;
+const keywordIndexChunkTextMaxChars = 24_000;
 const chunkMetaHeadVersion = 1;
 const chunkMetaTitleMaxChars = 500;
 const chunkMetaSourceTypeMaxChars = 100;
@@ -144,6 +152,47 @@ const defaultEmbeddingProvider = {
   metric: "cosine",
 } as const;
 const searchableSourceLifecycleStatuses = ["fresh", "stale", "archived"] as const;
+const keywordIndexStopWords = new Set([
+  "about",
+  "after",
+  "again",
+  "also",
+  "and",
+  "are",
+  "because",
+  "before",
+  "between",
+  "but",
+  "can",
+  "chunk",
+  "could",
+  "for",
+  "from",
+  "has",
+  "have",
+  "into",
+  "its",
+  "local",
+  "may",
+  "not",
+  "or",
+  "our",
+  "source",
+  "such",
+  "than",
+  "that",
+  "the",
+  "their",
+  "then",
+  "there",
+  "these",
+  "this",
+  "through",
+  "using",
+  "was",
+  "were",
+  "with",
+]);
 
 type SourceLifecycleStatus = "fresh" | "stale" | "archived" | "deleted";
 type SearchableSourceLifecycleStatus = Exclude<SourceLifecycleStatus, "deleted">;
@@ -254,6 +303,8 @@ export class LocalEngine {
         return await this.capture("selection", request.payload);
       case "retrieveSources":
         return await this.retrieveSources(request.payload);
+      case "searchKnowledgeBase":
+        return await this.searchKnowledgeBase(request.payload);
       case "listWorkingSetEntries":
       case "getWorkingSetStatus":
         return await this.getWorkingSetStatus();
@@ -510,6 +561,7 @@ export class LocalEngine {
           text: chunk.text,
         });
       }
+      replaceKeywordIndexForSource(db, sourceId);
 
       if (draft.kind === "selection") {
         insertAnchor(
@@ -686,6 +738,102 @@ export class LocalEngine {
         strategy: "rrf",
         rrfK: defaultRrfK,
         tracks: traceTracks,
+      },
+    };
+  }
+
+  private async searchKnowledgeBase(
+    payload: SearchKnowledgeBasePayload,
+  ): Promise<SearchKnowledgeBaseResult> {
+    const db = await this.ensureReady();
+    const query = normalizeText(payload.query);
+    const limit = clampOptionalLimit(payload.limit, 20, 50);
+    const includeChunks = clampOptionalLimit(payload.includeChunks, 3, 8);
+    const original = await this.retrieveSources({
+      query,
+      limit,
+      includeChunks,
+      filter: payload.filter,
+    });
+
+    if (query.length === 0) {
+      return {
+        ...original,
+        expansion: {
+          status: "skipped",
+          terms: [],
+          reason: "empty_query",
+          originalItemCount: original.items.length,
+          expandedItemCount: 0,
+        },
+      };
+    }
+
+    const filters = normalizeRetrieveSourcesFilter(payload.filter);
+    if (filters.hasImpossibleFilter) {
+      return {
+        ...original,
+        expansion: {
+          status: "skipped",
+          terms: [],
+          reason: "filter_no_match",
+          originalItemCount: original.items.length,
+          expandedItemCount: 0,
+        },
+      };
+    }
+
+    const terms = findKeywordExpansionTerms(db, {
+      query,
+      limit: keywordIndexMaxExpansionTerms,
+      filter: filters,
+    });
+    if (terms.length === 0) {
+      return {
+        ...original,
+        expansion: {
+          status: "skipped",
+          terms: [],
+          reason: "no_terms",
+          originalItemCount: original.items.length,
+          expandedItemCount: 0,
+        },
+      };
+    }
+
+    const expandedQuery = normalizeText([query, ...terms].join(" "));
+    if (buildFtsQuery(expandedQuery).length === 0) {
+      return {
+        ...original,
+        expansion: {
+          status: "skipped",
+          terms,
+          reason: "expanded_query_empty",
+          originalItemCount: original.items.length,
+          expandedItemCount: 0,
+        },
+      };
+    }
+
+    const expanded = await this.retrieveSources({
+      query: expandedQuery,
+      limit,
+      includeChunks,
+      filter: payload.filter,
+    });
+
+    return {
+      ...original,
+      items: mergeKnowledgeBaseSearchItems(original.items, expanded.items, {
+        limit,
+        includeChunks,
+      }),
+      expansion: {
+        status: "used",
+        terms,
+        expandedQuery,
+        originalItemCount: original.items.length,
+        expandedItemCount: expanded.items.length,
       },
     };
   }
@@ -1001,6 +1149,7 @@ export class LocalEngine {
       db.exec({ sql: "DELETE FROM source_working_set WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_metadata_fts WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_fts WHERE source_id = ?", bind: [id] });
+      deleteKeywordIndexForSource(db, id);
       db.exec({ sql: "DELETE FROM source_chunks WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_metadata WHERE source_id = ?", bind: [id] });
       markSourceDeleted(db, {
@@ -2226,6 +2375,8 @@ export class LocalEngine {
       db.exec("DELETE FROM source_lifecycle_events");
       db.exec("DELETE FROM source_working_set");
       db.exec("DELETE FROM source_metadata");
+      db.exec("DELETE FROM keyword_index_sources");
+      db.exec("DELETE FROM keyword_index");
       db.exec("DELETE FROM topic_graph_edges");
       db.exec("DELETE FROM wiki_compile_job_events");
       db.exec("DELETE FROM wiki_compile_jobs");
@@ -2473,6 +2624,23 @@ function migrate(db: SqliteDb) {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       PRIMARY KEY (model_id, target_kind, target_id)
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS keyword_index (
+      term TEXT PRIMARY KEY,
+      normalized_term TEXT NOT NULL,
+      source_count INTEGER NOT NULL DEFAULT 0,
+      hit_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS keyword_index_sources (
+      term TEXT NOT NULL REFERENCES keyword_index(term) ON DELETE CASCADE,
+      source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+      hit_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (term, source_id)
     )
   `);
   db.exec(`
@@ -2727,6 +2895,12 @@ function migrate(db: SqliteDb) {
     "CREATE INDEX IF NOT EXISTS idx_source_embeddings_target ON source_embeddings(target_kind, target_id)",
   );
   db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_keyword_index_normalized_term ON keyword_index(normalized_term)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_keyword_index_sources_source ON keyword_index_sources(source_id)",
+  );
+  db.exec(
     "CREATE INDEX IF NOT EXISTS idx_source_working_set_updated ON source_working_set(pin_status, updated_at DESC)",
   );
   db.exec(
@@ -2792,6 +2966,8 @@ function dropPreSourceNativeTables(db: SqliteDb) {
   db.exec("DROP TABLE IF EXISTS topic_pages");
   db.exec("DROP TABLE IF EXISTS anchors");
   db.exec("DROP TABLE IF EXISTS source_working_set");
+  db.exec("DROP TABLE IF EXISTS keyword_index_sources");
+  db.exec("DROP TABLE IF EXISTS keyword_index");
   db.exec("DROP TABLE IF EXISTS source_embeddings");
   db.exec("DROP TABLE IF EXISTS embedding_models");
   db.exec("DROP TABLE IF EXISTS source_metadata_fts");
@@ -4390,6 +4566,8 @@ function rebuildFtsData(db: SqliteDb) {
   transaction(db, () => {
     db.exec("DELETE FROM source_fts");
     db.exec("DELETE FROM source_metadata_fts");
+    db.exec("DELETE FROM keyword_index_sources");
+    db.exec("DELETE FROM keyword_index");
     const rows = db.selectObjects(
       `SELECT
         s.id AS source_id,
@@ -4439,6 +4617,7 @@ function rebuildFtsData(db: SqliteDb) {
         abstract: stringField(row, "meta_abstract"),
         url: stringField(row, "source_url"),
       });
+      replaceKeywordIndexForSource(db, stringField(row, "source_id"));
     }
   });
 }
@@ -4694,6 +4873,241 @@ function insertSourceMetadataFtsRow(
       input.url,
     ],
   });
+}
+
+function replaceKeywordIndexForSource(db: SqliteDb, sourceId: string) {
+  const previousTerms = new Set(
+    db
+      .selectObjects("SELECT term FROM keyword_index_sources WHERE source_id = ?", [sourceId])
+      .map((row) => stringField(row, "term"))
+      .filter((term) => term.length > 0),
+  );
+  db.exec({ sql: "DELETE FROM keyword_index_sources WHERE source_id = ?", bind: [sourceId] });
+
+  const terms = collectKeywordTermsForSource(db, sourceId);
+  const now = new Date().toISOString();
+  for (const [term, hitCount] of terms) {
+    const normalizedTerm = normalizeKeywordTerm(term);
+    if (normalizedTerm === undefined) continue;
+    db.exec({
+      sql: `INSERT INTO keyword_index (
+              term,
+              normalized_term,
+              source_count,
+              hit_count,
+              updated_at
+            ) VALUES (?, ?, 0, 0, ?)
+            ON CONFLICT(term) DO UPDATE SET
+              normalized_term = excluded.normalized_term,
+              updated_at = excluded.updated_at`,
+      bind: [normalizedTerm, normalizedTerm, now],
+    });
+    db.exec({
+      sql: `INSERT INTO keyword_index_sources (
+              term,
+              source_id,
+              hit_count
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(term, source_id) DO UPDATE SET
+              hit_count = excluded.hit_count`,
+      bind: [normalizedTerm, sourceId, hitCount],
+    });
+    previousTerms.add(normalizedTerm);
+  }
+
+  for (const term of previousTerms) {
+    refreshKeywordIndexTerm(db, term, now);
+  }
+}
+
+function deleteKeywordIndexForSource(db: SqliteDb, sourceId: string) {
+  const terms = new Set(
+    db
+      .selectObjects("SELECT term FROM keyword_index_sources WHERE source_id = ?", [sourceId])
+      .map((row) => stringField(row, "term"))
+      .filter((term) => term.length > 0),
+  );
+  db.exec({ sql: "DELETE FROM keyword_index_sources WHERE source_id = ?", bind: [sourceId] });
+  const now = new Date().toISOString();
+  for (const term of terms) {
+    refreshKeywordIndexTerm(db, term, now);
+  }
+}
+
+function refreshKeywordIndexTerm(db: SqliteDb, term: string, updatedAt: string) {
+  const normalizedTerm = normalizeKeywordTerm(term);
+  if (normalizedTerm === undefined) return;
+  const aggregate = db.selectObject(
+    `SELECT
+      COUNT(DISTINCT source_id) AS source_count,
+      COALESCE(SUM(hit_count), 0) AS hit_count
+     FROM keyword_index_sources
+     WHERE term = ?`,
+    [normalizedTerm],
+  );
+  const sourceCount = numberField(aggregate ?? {}, "source_count");
+  if (sourceCount <= 0) {
+    db.exec({ sql: "DELETE FROM keyword_index WHERE term = ?", bind: [normalizedTerm] });
+    return;
+  }
+  db.exec({
+    sql: `UPDATE keyword_index
+          SET source_count = ?,
+              hit_count = ?,
+              updated_at = ?
+          WHERE term = ?`,
+    bind: [sourceCount, numberField(aggregate ?? {}, "hit_count"), updatedAt, normalizedTerm],
+  });
+}
+
+function collectKeywordTermsForSource(db: SqliteDb, sourceId: string) {
+  const row = db.selectObject(
+    `SELECT
+      s.source_title,
+      s.source_url,
+      s.source_type,
+      s.lifecycle_status,
+      sm.title AS meta_title,
+      sm.abstract AS meta_abstract,
+      sm.source_type AS meta_source_type,
+      sm.authors_json,
+      sm.metadata_json
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.id = ?
+       AND s.lifecycle_status <> 'deleted'
+     LIMIT 1`,
+    [sourceId],
+  );
+  const terms = new Map<string, number>();
+  if (row === undefined) return terms;
+
+  addKeywordTermsFromText(terms, stringField(row, "source_title"), 5);
+  addKeywordTermsFromText(terms, stringField(row, "meta_title"), 5);
+  addKeywordTermsFromText(terms, stringField(row, "meta_abstract"), 3);
+  addKeywordTermsFromText(terms, stringField(row, "meta_source_type"), 2);
+  addKeywordTermsFromText(terms, stringField(row, "source_type"), 2);
+  for (const author of parseStringArray(stringField(row, "authors_json")).slice(0, 20)) {
+    addKeywordTermsFromText(terms, author, 2);
+  }
+
+  const metadata = parseMetadata(stringField(row, "metadata_json"));
+  for (const key of ["title", "abstract", "source_type", "paper_source", "venue", "doi"]) {
+    const value = stringMetadataField(metadata, key);
+    if (value !== null) addKeywordTermsFromText(terms, value, key === "abstract" ? 2 : 3);
+  }
+  for (const key of ["authors", "categories", "subjects", "keywords"]) {
+    for (const value of stringArrayMetadataField(metadata, key)) {
+      addKeywordTermsFromText(terms, value, 2);
+    }
+  }
+
+  let sampledChunkChars = 0;
+  const chunkRows = db.selectObjects(
+    `SELECT text, meta_head_json
+     FROM source_chunks
+     WHERE source_id = ?
+     ORDER BY ord ASC
+     LIMIT ?`,
+    [sourceId, keywordIndexMaxChunkSamples],
+  );
+  for (const chunk of chunkRows) {
+    const metaHead = parseMetadata(stringField(chunk, "meta_head_json"));
+    const docContext = stringMetadataField(metaHead, "docContext");
+    if (docContext !== null) addKeywordTermsFromText(terms, docContext, 2);
+    const chunkSummary = stringMetadataField(metaHead, "chunkSummary");
+    if (chunkSummary !== null) addKeywordTermsFromText(terms, chunkSummary, 2);
+
+    if (sampledChunkChars < keywordIndexChunkTextMaxChars) {
+      const sample = stringField(chunk, "text").slice(
+        0,
+        Math.max(0, keywordIndexMaxChunkSampleChars),
+      );
+      sampledChunkChars += sample.length;
+      addKeywordTermsFromText(terms, sample, 1);
+    }
+    if (terms.size >= keywordIndexMaxTermsPerSource) break;
+  }
+
+  return terms;
+}
+
+function addKeywordTermsFromText(terms: Map<string, number>, input: string, weight: number) {
+  if (terms.size >= keywordIndexMaxTermsPerSource) return;
+  const tokens = keywordTokens(input).filter(isUsefulKeywordToken);
+  for (const token of tokens) {
+    addKeywordTerm(terms, token, weight);
+    if (terms.size >= keywordIndexMaxTermsPerSource) return;
+    if (isHanText(token)) {
+      for (const bigram of hanBigrams(token)) {
+        addKeywordTerm(terms, bigram, weight);
+        if (terms.size >= keywordIndexMaxTermsPerSource) return;
+      }
+    }
+  }
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    for (let size = 2; size <= 4; size += 1) {
+      const slice = tokens.slice(index, index + size);
+      if (slice.length !== size || !slice.every(isUsefulKeywordToken)) continue;
+      addKeywordTerm(terms, slice.join(" "), weight + size - 1);
+      if (terms.size >= keywordIndexMaxTermsPerSource) return;
+    }
+  }
+}
+
+function addKeywordTerm(terms: Map<string, number>, input: string, weight: number) {
+  const term = normalizeKeywordTerm(input);
+  if (term === undefined) return;
+  terms.set(term, (terms.get(term) ?? 0) + Math.max(1, Math.floor(weight)));
+}
+
+function keywordTokens(input: string) {
+  return (
+    normalizeText(input)
+      .toLocaleLowerCase()
+      .match(/\p{Script=Han}+|[\p{L}\p{N}_-]+/gu) ?? []
+  ).flatMap((token) => {
+    const normalized = normalizeKeywordTerm(token);
+    return normalized === undefined ? [] : [normalized];
+  });
+}
+
+function normalizeKeywordTerm(input: string) {
+  const normalized = normalizeText(input)
+    .toLocaleLowerCase()
+    .replace(/[_-]{2,}/g, "-")
+    .replace(/\s+/g, " ")
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")
+    .slice(0, keywordIndexMaxTermChars)
+    .trim();
+  if (normalized.length < 2 || normalized.length > keywordIndexMaxTermChars) return undefined;
+  if (/^\d+$/u.test(normalized)) return undefined;
+  if (!normalized.match(/[\p{L}\p{N}]/u)) return undefined;
+  if (keywordIndexStopWords.has(normalized)) return undefined;
+  return normalized;
+}
+
+function isUsefulKeywordToken(token: string) {
+  if (keywordIndexStopWords.has(token)) return false;
+  if (/^\d+$/u.test(token)) return false;
+  if (isHanText(token)) return Array.from(token).length >= 2;
+  return token.length >= 3;
+}
+
+function isHanText(input: string) {
+  return /^\p{Script=Han}+$/u.test(input);
+}
+
+function hanBigrams(input: string) {
+  const chars = Array.from(input);
+  const bigrams: string[] = [];
+  for (let index = 0; index < chars.length - 1; index += 1) {
+    const current = chars[index];
+    const next = chars[index + 1];
+    if (current !== undefined && next !== undefined) bigrams.push(`${current}${next}`);
+  }
+  return bigrams;
 }
 
 function loadWorkingSetStatus(db: SqliteDb): WorkingSetStatusResult {
@@ -5290,6 +5704,88 @@ function emptyFilteredRetrieveSourcesResult(
   };
 }
 
+function findKeywordExpansionTerms(
+  db: SqliteDb,
+  input: { query: string; limit: number; filter: NormalizedRetrieveSourcesFilter },
+) {
+  const needles = keywordTokens(input.query).filter(isUsefulKeywordToken).slice(0, 8);
+  const normalizedQuery = normalizeKeywordTerm(input.query);
+  if (needles.length === 0 && normalizedQuery === undefined) return [];
+  const likeNeedles =
+    needles.length > 0 ? needles : normalizedQuery === undefined ? [] : [normalizedQuery];
+  if (likeNeedles.length === 0) return [];
+
+  const sourceFilter = sourceFilterWhereClause(input.filter);
+  const likeClause = likeNeedles.map(() => "ki.normalized_term LIKE ? ESCAPE '\\'").join(" OR ");
+  const rows = db.selectObjects(
+    `SELECT
+      ki.term,
+      ki.normalized_term,
+      COUNT(DISTINCT kis.source_id) AS source_count,
+      COALESCE(SUM(kis.hit_count), 0) AS hit_count
+     FROM keyword_index ki
+     JOIN keyword_index_sources kis ON kis.term = ki.term
+     JOIN sources s ON s.id = kis.source_id
+     WHERE (${likeClause})
+       AND ${sourceFilter.sql}
+     GROUP BY ki.term, ki.normalized_term
+     ORDER BY source_count DESC, hit_count DESC, ki.term ASC
+     LIMIT ?`,
+    [
+      ...likeNeedles.map((needle) => `%${escapeSqlLike(needle)}%`),
+      ...sourceFilter.bind,
+      Math.max(input.limit * 8, 24),
+    ],
+  );
+
+  return rows
+    .flatMap((row) => {
+      const term = normalizeKeywordTerm(stringField(row, "term"));
+      if (term === undefined) return [];
+      if (normalizedQuery !== undefined && term === normalizedQuery) return [];
+      return [
+        {
+          term,
+          score: keywordExpansionScore(term, {
+            normalizedQuery,
+            needles,
+            sourceCount: numberField(row, "source_count"),
+            hitCount: numberField(row, "hit_count"),
+          }),
+        },
+      ];
+    })
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score || left.term.localeCompare(right.term))
+    .slice(0, input.limit)
+    .map((candidate) => candidate.term);
+}
+
+function keywordExpansionScore(
+  term: string,
+  input: {
+    normalizedQuery: string | undefined;
+    needles: string[];
+    sourceCount: number;
+    hitCount: number;
+  },
+) {
+  let score = 0;
+  if (input.normalizedQuery !== undefined && term.includes(input.normalizedQuery)) score += 10;
+  for (const needle of input.needles) {
+    if (term === needle) score += 4;
+    else if (term.startsWith(needle)) score += 6;
+    else if (term.includes(needle)) score += 3;
+  }
+  score += Math.min(input.sourceCount, 8) * 0.25;
+  score += Math.min(input.hitCount, 40) * 0.02;
+  return score;
+}
+
+function escapeSqlLike(input: string) {
+  return input.replace(/[\\%_]/g, (match) => `\\${match}`);
+}
+
 function loadMetaSourceRetrievalHits(
   db: SqliteDb,
   input: { query: string; limit: number; filter: NormalizedRetrieveSourcesFilter },
@@ -5705,6 +6201,96 @@ function fuseSourceRetrievalHits(
       tracks: Array.from(item.tracks),
       hitChunks: item.chunks,
     }));
+}
+
+function mergeKnowledgeBaseSearchItems(
+  originalItems: RetrieveSourceItem[],
+  expandedItems: RetrieveSourceItem[],
+  input: { limit: number; includeChunks: number },
+): RetrieveSourceItem[] {
+  const merged = new Map<
+    string,
+    {
+      item: RetrieveSourceItem;
+      score: number;
+      firstSeenRank: number;
+    }
+  >();
+
+  const addItem = (item: RetrieveSourceItem, rank: number, source: "original" | "expanded") => {
+    const existing = merged.get(item.id);
+    const weightedScore = source === "original" ? item.score + 1 : item.score * 0.75;
+    if (existing === undefined) {
+      merged.set(item.id, {
+        item: {
+          ...item,
+          score: weightedScore,
+          tracks: [...item.tracks],
+          hitChunks: item.hitChunks.slice(0, input.includeChunks),
+        },
+        score: weightedScore,
+        firstSeenRank: source === "original" ? rank : rank + originalItems.length,
+      });
+      return;
+    }
+
+    existing.score += weightedScore;
+    existing.item = {
+      ...existing.item,
+      score: existing.score,
+      excerpt:
+        existing.item.hitChunks.length > 0 || item.hitChunks.length === 0
+          ? existing.item.excerpt
+          : item.excerpt,
+      tracks: mergeRetrieveTracks(existing.item.tracks, item.tracks),
+      hitChunks: mergeRetrieveHitChunks(
+        existing.item.hitChunks,
+        item.hitChunks,
+        input.includeChunks,
+      ),
+    };
+    existing.firstSeenRank = Math.min(
+      existing.firstSeenRank,
+      source === "original" ? rank : rank + originalItems.length,
+    );
+  };
+
+  originalItems.forEach((item, index) => addItem(item, index + 1, "original"));
+  expandedItems.forEach((item, index) => addItem(item, index + 1, "expanded"));
+
+  return Array.from(merged.values())
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        left.firstSeenRank - right.firstSeenRank ||
+        right.item.capturedAt.localeCompare(left.item.capturedAt) ||
+        left.item.sourceTitle.localeCompare(right.item.sourceTitle),
+    )
+    .slice(0, input.limit)
+    .map(({ item, score }) => ({
+      ...item,
+      score,
+    }));
+}
+
+function mergeRetrieveTracks(left: RetrieveTrackName[], right: RetrieveTrackName[]) {
+  return Array.from(new Set<RetrieveTrackName>([...left, ...right]));
+}
+
+function mergeRetrieveHitChunks(
+  left: RetrieveSourceHitChunk[],
+  right: RetrieveSourceHitChunk[],
+  limit: number,
+) {
+  const seen = new Set<string>();
+  const chunks: RetrieveSourceHitChunk[] = [];
+  for (const chunk of [...left, ...right]) {
+    if (seen.has(chunk.chunkId)) continue;
+    seen.add(chunk.chunkId);
+    chunks.push(chunk);
+    if (chunks.length >= limit) break;
+  }
+  return chunks;
 }
 
 function reciprocalRankFusionScore(rank: number, rrfK = defaultRrfK) {

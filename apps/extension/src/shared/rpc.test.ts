@@ -650,6 +650,68 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts knowledge base search requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "long context degradation",
+            limit: 20,
+            includeChunks: 2,
+            filter: {
+              sourceTypes: ["paper", "pdf"],
+              lifecycleStatuses: ["fresh", "stale"],
+            },
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "long context degradation",
+            filter: {
+              lifecycleStatuses: ["deleted"],
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            limit: 20,
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "long context degradation",
+            filter: {
+              sourceTypes: "paper",
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts working set requests and rejects invalid load depths", () => {
     expect(
       isEngineRequestMessage({
