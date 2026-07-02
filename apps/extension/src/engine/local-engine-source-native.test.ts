@@ -95,8 +95,10 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("const defaultSourceAdapterRegistry");
     expect(workerSource).toContain("const webpageSourceAdapter");
     expect(workerSource).toContain("const markdownSourceAdapter");
+    expect(workerSource).toContain("const paperSourceAdapter");
     expect(workerSource).toContain('sourceTypes: ["webpage"]');
     expect(workerSource).toContain('sourceTypes: ["markdown"]');
+    expect(workerSource).toContain('sourceTypes: ["paper"]');
     expect(workerSource).toContain("Duplicate source adapter id");
     expect(workerSource).toContain("Duplicate active source adapter for source_type");
     expect(workerSource).toContain("defaultSourceAdapterRegistry.resolve({ kind, payload })");

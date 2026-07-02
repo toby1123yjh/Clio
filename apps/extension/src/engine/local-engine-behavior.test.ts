@@ -392,6 +392,129 @@ describe("local engine behavior harness", () => {
     });
     expect(excluded.items.map((item) => item.id)).not.toContain(sourceId);
   });
+
+  it("adapts arxiv sources through the paper adapter boundary", async () => {
+    const harness = createHarness();
+    const abstract =
+      "This paper studies bounded evidence retrieval for local research memory systems.";
+    const paperText = [
+      "Title: Bounded Evidence Retrieval for Local Research Memory",
+      "Authors: Ada Lovelace, Grace Hopper",
+      `Abstract: ${abstract}`,
+      "Subjects: Computation and Language (cs.CL); Machine Learning (cs.LG)",
+      "DOI: 10.5555/clio.2024",
+      "",
+      "1 Introduction",
+      "Bounded evidence retrieval keeps long documents out of prompt assembly.",
+      "",
+      "2 Method",
+      "The method stores source metadata separately from chunk evidence.",
+    ].join("\n");
+
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://arxiv.org/abs/2401.01234v2",
+        sourceTitle: "arXiv:2401.01234",
+        normalizedText: paperText,
+        metadata: {},
+      }),
+    });
+    const sourceId = capture.memory.id;
+
+    expect(capture.status).toBe("saved");
+    expect(capture.memory.sourceTitle).toBe("Bounded Evidence Retrieval for Local Research Memory");
+    expect(harness.count("sources", "id = ? AND source_type = 'paper'", [sourceId])).toBe(1);
+    expect(
+      harness.count(
+        "source_metadata",
+        "source_id = ? AND source_type = 'paper' AND title = ? AND abstract = ?",
+        [sourceId, "Bounded Evidence Retrieval for Local Research Memory", abstract],
+      ),
+    ).toBe(1);
+    expect(harness.count("source_metadata_fts", "source_id = ?", [sourceId])).toBe(1);
+
+    const detail = await harness.request({ kind: "getMemory", id: sourceId });
+    expect(detail?.metadata.source_type).toBe("paper");
+    expect(detail?.metadata.adapter).toBe("paper");
+    expect(detail?.metadata.paper_source).toBe("arxiv");
+    expect(detail?.metadata.arxiv_id).toBe("2401.01234");
+    expect(detail?.metadata.arxiv_version).toBe("v2");
+    expect(detail?.metadata.year).toBe(2024);
+    expect(detail?.metadata.doi).toBe("10.5555/clio.2024");
+    expect(detail?.metadata.authors).toEqual(["Ada Lovelace", "Grace Hopper"]);
+    expect(detail?.metadata.categories).toEqual(["cs.CL", "cs.LG"]);
+    expect(detail?.metadata.sectionOutline).toEqual([
+      { level: 1, text: "Introduction" },
+      { level: 1, text: "Method" },
+    ]);
+
+    const retrieved = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "bounded evidence retrieval local research",
+        limit: 5,
+        filter: { sourceTypes: ["paper"] },
+      },
+    });
+    expect(retrieved.items.map((item) => item.id)).toEqual([sourceId]);
+    expect(trackStatus(retrieved, "meta_sources")).toBe("used");
+
+    const excluded = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "bounded evidence retrieval local research",
+        limit: 5,
+        filter: { sourceTypes: ["webpage"] },
+      },
+    });
+    expect(excluded.items.map((item) => item.id)).not.toContain(sourceId);
+  });
+
+  it("uses explicit arxiv hints and keeps degraded paper capture non-blocking", async () => {
+    const harness = createHarness();
+    const hinted = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/papers/local-rag",
+        sourceTitle: "Explicit Paper Hint",
+        normalizedText: [
+          "Title: Explicit Hint Paper",
+          "Authors: Alan Turing and Barbara Liskov",
+          "Abstract: Explicit adapter hints should route through paper metadata.",
+          "Subjects: Computer Science (cs.AI)",
+        ].join("\n"),
+        metadata: {
+          source_adapter: "arxiv",
+        },
+      }),
+    });
+    const hintedDetail = await harness.request({ kind: "getMemory", id: hinted.memory.id });
+    expect(hinted.status).toBe("saved");
+    expect(hintedDetail?.metadata.source_type).toBe("paper");
+    expect(hintedDetail?.metadata.paper_source).toBe("arxiv");
+    expect(hintedDetail?.metadata.authors).toEqual(["Alan Turing", "Barbara Liskov"]);
+
+    const degraded = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://arxiv.org/abs/not-a-valid-id",
+        sourceTitle: "Malformed Arxiv Metadata",
+        normalizedText: "Readable paper text without structured metadata still saves.",
+        metadata: {},
+      }),
+    });
+    const degradedDetail = await harness.request({ kind: "getMemory", id: degraded.memory.id });
+
+    expect(degraded.status).toBe("saved");
+    expect(harness.count("sources", "id = ? AND source_type = 'paper'", [degraded.memory.id])).toBe(
+      1,
+    );
+    expect(degradedDetail?.metadata.source_type).toBe("paper");
+    expect(degradedDetail?.metadata.paper_source).toBe("arxiv");
+    expect(degradedDetail?.metadata.arxiv_id).toBeUndefined();
+    expect(degraded.memory.sourceTitle).toBe("Malformed Arxiv Metadata");
+  });
 });
 
 function createHarness() {

@@ -2761,9 +2761,39 @@ const markdownSourceAdapter: SourceAdapter = {
   },
 };
 
+const paperSourceAdapter: SourceAdapter = {
+  id: "paper",
+  sourceTypes: ["paper"],
+  match: (input) => isPaperAdapterInput(input),
+  adapt: ({ kind, payload }) => {
+    const inputMetadata = payloadMetadata(payload);
+    const extraction = extractPaperMetadata(payload);
+    const sourceUrl = metadataDisplayString(inputMetadata, "source_url") ?? payload.sourceUrl;
+    const capturedAt = metadataDisplayString(inputMetadata, "captured_at") ?? payload.capturedAt;
+    const metadata: Record<string, unknown> = {
+      ...inputMetadata,
+      adapter: "paper",
+      source_type: "paper",
+    };
+
+    normalizePaperMetadata(metadata, inputMetadata, extraction);
+    const sourceTitle =
+      metadataDisplayString(metadata, "title") ?? extraction.title ?? payload.sourceTitle;
+    setMetadataIfMissing(metadata, "title", sourceTitle);
+
+    return buildDocumentDraft(kind, payload, {
+      sourceUrl,
+      sourceTitle,
+      capturedAt,
+      metadata,
+    });
+  },
+};
+
 const defaultSourceAdapterRegistry = createSourceAdapterRegistry([
   webpageSourceAdapter,
   markdownSourceAdapter,
+  paperSourceAdapter,
 ]);
 
 function createSourceAdapterRegistry(adapters: SourceAdapter[]) {
@@ -2963,6 +2993,365 @@ function markdownSectionOutline(markdown: string) {
       return [{ level: marker.length, text }];
     })
     .slice(0, 200);
+}
+
+interface ArxivParseResult {
+  isArxiv: boolean;
+  arxivId?: string;
+  arxivVersion?: string;
+  year?: number;
+}
+
+interface PaperMetadataExtraction extends ArxivParseResult {
+  title?: string;
+  abstract?: string;
+  authors: string[];
+  doi?: string;
+  categories: string[];
+  sectionOutline: Array<{ level: number; text: string }>;
+}
+
+function isPaperAdapterInput(input: SourceAdapterInput) {
+  const metadata = payloadMetadata(input.payload);
+  const adapterHint = adapterHintFromMetadata(metadata);
+  if (adapterHint === "paper" || adapterHint === "arxiv") return true;
+  const sourceType = metadataString(metadata, "source_type");
+  if (sourceType === "paper" || sourceType === "arxiv") return true;
+  const paperSource =
+    metadataString(metadata, "paper_source") ?? metadataString(metadata, "source_provider");
+  if (paperSource === "arxiv") return true;
+  if (parseArxivUrl(input.payload.sourceUrl).isArxiv) return true;
+  return hasArxivTextPattern(input.payload.normalizedText);
+}
+
+function extractPaperMetadata(payload: CaptureBasePayload): PaperMetadataExtraction {
+  const fromUrl = parseArxivUrl(payload.sourceUrl);
+  const textMetadata = extractPaperTextMetadata(payload.normalizedText);
+  const fromText = parseArxivText(payload.normalizedText);
+  const arxivId = fromUrl.arxivId ?? fromText.arxivId;
+  const arxivVersion = fromUrl.arxivVersion ?? fromText.arxivVersion;
+  const year = fromUrl.year ?? inferArxivYear(arxivId);
+
+  return {
+    isArxiv: fromUrl.isArxiv || fromText.isArxiv || hasArxivTextPattern(payload.normalizedText),
+    ...(arxivId === undefined ? {} : { arxivId }),
+    ...(arxivVersion === undefined ? {} : { arxivVersion }),
+    ...(year === undefined ? {} : { year }),
+    ...textMetadata,
+  };
+}
+
+function normalizePaperMetadata(
+  metadata: Record<string, unknown>,
+  inputMetadata: Record<string, unknown>,
+  extraction: PaperMetadataExtraction,
+) {
+  const explicitAuthors = parseMetadataAuthors(inputMetadata);
+  const explicitCategories = parseMetadataCategories(inputMetadata);
+  const explicitYear = metadataInteger(inputMetadata, "year");
+  const explicitAdapterHint = adapterHintFromMetadata(inputMetadata);
+  const explicitSourceType = metadataString(inputMetadata, "source_type");
+  const explicitPaperSource =
+    metadataString(inputMetadata, "paper_source") ??
+    metadataString(inputMetadata, "source_provider");
+
+  if (explicitAuthors.length > 0) metadata.authors = explicitAuthors;
+  if (explicitCategories.length > 0) metadata.categories = explicitCategories;
+  if (explicitYear !== undefined) metadata.year = explicitYear;
+
+  if (
+    extraction.isArxiv ||
+    explicitAdapterHint === "arxiv" ||
+    explicitSourceType === "arxiv" ||
+    explicitPaperSource === "arxiv"
+  ) {
+    setMetadataIfMissing(metadata, "paper_source", "arxiv");
+  }
+  setMetadataIfMissing(metadata, "title", extraction.title);
+  setMetadataIfMissing(metadata, "abstract", extraction.abstract);
+  setMetadataIfMissing(metadata, "authors", extraction.authors);
+  setMetadataIfMissing(metadata, "year", extraction.year);
+  setMetadataIfMissing(metadata, "arxiv_id", extraction.arxivId);
+  setMetadataIfMissing(metadata, "arxiv_version", extraction.arxivVersion);
+  setMetadataIfMissing(metadata, "doi", extraction.doi);
+  setMetadataIfMissing(metadata, "categories", extraction.categories);
+  setMetadataIfMissing(metadata, "sectionOutline", extraction.sectionOutline);
+}
+
+function parseArxivUrl(sourceUrl: string): ArxivParseResult {
+  try {
+    const url = new URL(sourceUrl);
+    const host = url.hostname.toLowerCase();
+    if (host !== "arxiv.org" && !host.endsWith(".arxiv.org")) return { isArxiv: false };
+    const match = /^\/(?:abs|html|pdf)\/([^?#/]+)(?:\.pdf)?$/i.exec(url.pathname);
+    if (match === null) return { isArxiv: false };
+    return arxivParseResultFromIdCandidate(match[1] ?? "");
+  } catch {
+    const match = /arxiv\.org\/(?:abs|html|pdf)\/([^?#/]+)(?:\.pdf)?/i.exec(sourceUrl);
+    if (match === null) return { isArxiv: false };
+    return arxivParseResultFromIdCandidate(match[1] ?? "");
+  }
+}
+
+function parseArxivText(text: string): ArxivParseResult {
+  const prefix = normalizeText(text).slice(0, 16_000);
+  const match = /\barxiv(?:\s*id)?\s*[: ]\s*([a-z.-]+\/\d{7}|\d{4}\.\d{4,5})(v\d+)?\b/i.exec(
+    prefix,
+  );
+  if (match === null) return { isArxiv: false };
+  return arxivParseResultFromIdCandidate(`${match[1] ?? ""}${match[2] ?? ""}`);
+}
+
+function arxivParseResultFromIdCandidate(candidate: string): ArxivParseResult {
+  const decoded = decodeURIComponent(candidate)
+    .replace(/\.pdf$/i, "")
+    .trim();
+  const match = /^([a-z.-]+\/\d{7}|\d{4}\.\d{4,5})(v\d+)?$/i.exec(decoded);
+  if (match === null) return { isArxiv: true };
+  const arxivId = (match[1] ?? "").toLowerCase();
+  const arxivVersion = match[2]?.toLowerCase();
+  const year = inferArxivYear(arxivId);
+  return {
+    isArxiv: true,
+    arxivId,
+    ...(arxivVersion === undefined ? {} : { arxivVersion }),
+    ...(year === undefined ? {} : { year }),
+  };
+}
+
+function inferArxivYear(arxivId: string | undefined) {
+  if (arxivId === undefined) return undefined;
+  const match = /^(\d{2})(\d{2})\.\d{4,5}$/i.exec(arxivId);
+  if (match === null) return undefined;
+  const shortYear = Number(match[1]);
+  const month = Number(match[2]);
+  if (!Number.isFinite(shortYear) || month < 1 || month > 12) return undefined;
+  const year = shortYear < 90 ? 2000 + shortYear : 1900 + shortYear;
+  return isReasonablePaperYear(year) ? year : undefined;
+}
+
+function extractPaperTextMetadata(
+  text: string,
+): Omit<PaperMetadataExtraction, "isArxiv" | "arxivId" | "arxivVersion" | "year"> {
+  const prefix = normalizeText(text).slice(0, 24_000);
+  const lines = prefix.split("\n").slice(0, 320);
+  const categoryText =
+    extractLabeledLine(lines, ["subjects", "categories", "category"]) ??
+    extractLabeledBlock(lines, ["subjects", "categories", "category"]);
+
+  return {
+    title: extractLabeledLine(lines, ["title"]),
+    abstract: extractLabeledBlock(lines, ["abstract"]),
+    authors: parsePaperAuthors(extractLabeledLine(lines, ["authors", "author"]) ?? ""),
+    doi: extractDoi(prefix),
+    categories: parsePaperCategories(categoryText ?? ""),
+    sectionOutline: paperSectionOutline(text),
+  };
+}
+
+function extractLabeledLine(lines: string[], labels: string[]) {
+  for (const line of lines) {
+    const value = labeledValue(line, labels);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+function extractLabeledBlock(lines: string[], labels: string[]) {
+  const stopLabels = [
+    "authors",
+    "author",
+    "subjects",
+    "categories",
+    "category",
+    "comments",
+    "journal-ref",
+    "doi",
+    "msc class",
+    "acm class",
+    "submitted",
+  ];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const inlineValue = labeledValue(line, labels);
+    const isStandaloneLabel = inlineValue === undefined && isStandaloneLabelLine(line, labels);
+    if (inlineValue === undefined && !isStandaloneLabel) continue;
+
+    const parts: string[] = inlineValue === undefined ? [] : [inlineValue];
+    for (let cursor = index + 1; cursor < Math.min(lines.length, index + 40); cursor += 1) {
+      const next = normalizeText(lines[cursor] ?? "");
+      if (next.length === 0 && parts.length > 0) break;
+      if (labeledValue(next, stopLabels) !== undefined) break;
+      if (isStandaloneLabelLine(next, stopLabels)) break;
+      if (parts.length > 0 && looksLikePaperSectionHeading(next)) break;
+      if (next.length > 0) parts.push(next);
+    }
+    const joined = normalizeText(parts.join(" "));
+    if (joined.length > 0) return joined.slice(0, 4_000);
+  }
+  return undefined;
+}
+
+function labeledValue(line: string, labels: string[]) {
+  const normalized = normalizeText(line);
+  for (const label of labels) {
+    const escaped = escapeRegExp(label);
+    const match = new RegExp(`^${escaped}\\s*:\\s*(.+)$`, "i").exec(normalized);
+    if (match === null) continue;
+    const value = normalizeText(match[1] ?? "");
+    if (value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function isStandaloneLabelLine(line: string, labels: string[]) {
+  const normalized = normalizeText(line).replace(/:$/, "");
+  return labels.some((label) => normalized.toLowerCase() === label.toLowerCase());
+}
+
+function parseMetadataAuthors(metadata: Record<string, unknown>) {
+  const arrayAuthors = metadataStringArray(metadata, "authors");
+  if (arrayAuthors.length > 0) return arrayAuthors;
+  return parsePaperAuthors(metadataDisplayString(metadata, "authors") ?? "");
+}
+
+function parseMetadataCategories(metadata: Record<string, unknown>) {
+  const arrayCategories = metadataStringArray(metadata, "categories");
+  if (arrayCategories.length > 0) return arrayCategories;
+  return parsePaperCategories(
+    metadataDisplayString(metadata, "categories") ??
+      metadataDisplayString(metadata, "subjects") ??
+      "",
+  );
+}
+
+function parsePaperAuthors(input: string) {
+  return input
+    .replace(/^authors?\s*:\s*/i, "")
+    .split(/\s+(?:and|&)\s+|[,;]/i)
+    .map((item) => normalizeText(item))
+    .filter((item) => item.length > 0)
+    .slice(0, 50);
+}
+
+function parsePaperCategories(input: string) {
+  const normalized = normalizeText(input.replace(/^subjects?\s*:\s*/i, ""));
+  const codeMatches = Array.from(normalized.matchAll(/\(([a-z-]+(?:\.[A-Z]{2})?)\)/gi)).map(
+    (match) => normalizeText(match[1] ?? ""),
+  );
+  const values =
+    codeMatches.length > 0
+      ? codeMatches
+      : normalized
+          .split(/[;,]/)
+          .map((item) => normalizeText(item))
+          .filter((item) => item.length > 0);
+  return Array.from(new Set(values)).slice(0, 30);
+}
+
+function extractDoi(input: string) {
+  const match = /\b(10\.\d{4,9}\/[-._;()/:A-Z0-9]+)\b/i.exec(input);
+  if (match === null) return undefined;
+  return normalizeText(match[1] ?? "").replace(/[).,;]+$/, "");
+}
+
+function paperSectionOutline(text: string) {
+  const markdownOutline = markdownSectionOutline(text);
+  if (markdownOutline.length > 0) return markdownOutline.slice(0, 200);
+
+  return normalizeText(text)
+    .split("\n")
+    .slice(0, 1_200)
+    .flatMap((line) => {
+      const heading = normalizeText(line);
+      if (!looksLikePaperSectionHeading(heading)) return [];
+      const level = paperHeadingLevel(heading);
+      const text = heading.replace(/^\d+(?:\.\d+)*\.?\s+/, "");
+      return [{ level, text }];
+    })
+    .slice(0, 200);
+}
+
+function looksLikePaperSectionHeading(line: string) {
+  if (line.length === 0 || line.length > 140) return false;
+  if (/^(?:title|authors?|abstract|subjects?|categories|comments|doi)\s*:/i.test(line)) {
+    return false;
+  }
+  if (/^\d+(?:\.\d+)*\.?\s+[A-Z][\p{L}\p{N} ,:;()/-]{2,}$/u.test(line)) return true;
+  return /^(abstract|introduction|related work|background|method|methods|approach|experiments|evaluation|results|discussion|conclusion|references|bibliography|appendix)\b/i.test(
+    line,
+  );
+}
+
+function paperHeadingLevel(line: string) {
+  const match = /^(\d+(?:\.\d+)*)/.exec(line);
+  if (match === null) return 1;
+  return Math.min(6, match[1]?.split(".").length ?? 1);
+}
+
+function hasArxivTextPattern(text: string) {
+  const prefix = normalizeText(text).slice(0, 12_000);
+  if (/\barxiv(?:\s*id)?\s*[: ]\s*(?:[a-z.-]+\/\d{7}|\d{4}\.\d{4,5})/i.test(prefix)) {
+    return true;
+  }
+  return (
+    /\btitle\s*:/i.test(prefix) &&
+    /\bauthors?\s*:/i.test(prefix) &&
+    /\babstract\s*:/i.test(prefix) &&
+    /\bsubjects?\s*:/i.test(prefix)
+  );
+}
+
+function setMetadataIfMissing(metadata: Record<string, unknown>, key: string, value: unknown) {
+  if (metadataHasValue(metadata, key)) return;
+  const normalized = normalizeMetadataValue(value);
+  if (normalized !== undefined) metadata[key] = normalized;
+}
+
+function metadataHasValue(metadata: Record<string, unknown>, key: string) {
+  return normalizeMetadataValue(metadata[key]) !== undefined;
+}
+
+function normalizeMetadataValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    const normalized = normalizeText(value);
+    return normalized.length === 0 ? undefined : normalized;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : undefined;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return undefined;
+    if (value.every((item) => typeof item === "string")) {
+      const normalized = value.flatMap((item) => {
+        const text = normalizeText(item);
+        return text.length === 0 ? [] : [text];
+      });
+      return normalized.length === 0 ? undefined : normalized;
+    }
+    return value.slice(0, 200);
+  }
+  return undefined;
+}
+
+function metadataInteger(metadata: Record<string, unknown>, key: string) {
+  const value = metadata[key];
+  const numberValue =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number.parseInt(value, 10)
+        : Number.NaN;
+  if (!Number.isInteger(numberValue)) return undefined;
+  return isReasonablePaperYear(numberValue) ? numberValue : undefined;
+}
+
+function isReasonablePaperYear(year: number) {
+  return year >= 1900 && year <= 2100;
+}
+
+function escapeRegExp(input: string) {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function insertSourceRow(
