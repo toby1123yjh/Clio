@@ -88,9 +88,30 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).not.toContain('"ingest_graph"');
   });
 
+  it("defines a Source Adapter registry for source-native capture", () => {
+    expect(workerSource).toContain("interface SourceAdapter");
+    expect(workerSource).toContain("class SourceAdapterRegistry");
+    expect(workerSource).toContain("function createSourceAdapterRegistry");
+    expect(workerSource).toContain("const defaultSourceAdapterRegistry");
+    expect(workerSource).toContain("const webpageSourceAdapter");
+    expect(workerSource).toContain("const markdownSourceAdapter");
+    expect(workerSource).toContain('sourceTypes: ["webpage"]');
+    expect(workerSource).toContain('sourceTypes: ["markdown"]');
+    expect(workerSource).toContain("Duplicate source adapter id");
+    expect(workerSource).toContain("Duplicate active source adapter for source_type");
+    expect(workerSource).toContain("defaultSourceAdapterRegistry.resolve({ kind, payload })");
+    expect(workerSource).toContain("adapter.adapt({ kind, payload })");
+
+    const adapterContract = sourceSection("interface SourceAdapter", "export class LocalEngine");
+    expect(adapterContract).not.toContain("SqliteDb");
+    expect(adapterContract).not.toContain("db:");
+  });
+
   it("keeps capture source-native and defers embedding work outside the capture transaction", () => {
     const captureSection = sourceSection("private async capture", "private async retrieveSources");
 
+    expect(captureSection).toContain("defaultSourceAdapterRegistry.resolve");
+    expect(captureSection).toContain("adapter.adapt");
     expect(captureSection).toContain("const chunks = chunkText(draft.normalizedText)");
     expect(captureSection).toContain("transaction(db, () => {");
     expect(captureSection).toContain("insertSourceRow(db");

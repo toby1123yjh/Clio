@@ -185,6 +185,18 @@ interface DocumentDraft {
   versionGroupKey: string;
 }
 
+interface SourceAdapterInput {
+  kind: SourceKind;
+  payload: CaptureBasePayload;
+}
+
+interface SourceAdapter {
+  readonly id: string;
+  readonly sourceTypes: readonly string[];
+  match(input: SourceAdapterInput): boolean;
+  adapt(input: SourceAdapterInput): DocumentDraft;
+}
+
 export class LocalEngine {
   private db: SqliteDb | null = null;
   private healthState: EngineHealth = startingHealth();
@@ -319,7 +331,8 @@ export class LocalEngine {
 
   private async capture(kind: SourceKind, payload: CaptureBasePayload): Promise<CaptureResult> {
     const db = await this.ensureReady();
-    const draft = buildDocumentDraft(kind, payload);
+    const adapter = defaultSourceAdapterRegistry.resolve({ kind, payload });
+    const draft = adapter.adapt({ kind, payload });
     const existing = db.selectObject(
       `SELECT *
        FROM sources
@@ -2652,15 +2665,138 @@ function tableCreateSql(db: SqliteDb, table: string) {
   return stringField(row ?? {}, "sql");
 }
 
-function buildDocumentDraft(kind: SourceKind, payload: CaptureBasePayload): DocumentDraft {
-  const normalizedText = normalizeText(payload.normalizedText);
+class SourceAdapterRegistry {
+  private readonly adapters: SourceAdapter[] = [];
+  private readonly adaptersById = new Map<string, SourceAdapter>();
+  private readonly adaptersBySourceType = new Map<string, SourceAdapter>();
+
+  constructor(private readonly fallbackAdapter: SourceAdapter) {}
+
+  registerAdapter(adapter: SourceAdapter) {
+    const adapterId = normalizeAdapterKey(adapter.id);
+    if (adapterId === undefined) throw new Error("Source adapter id is required.");
+    if (this.adaptersById.has(adapterId)) {
+      throw new Error(`Duplicate source adapter id: ${adapter.id}`);
+    }
+
+    const sourceTypes = adapter.sourceTypes.map((value) => normalizeAdapterKey(value));
+    for (const sourceType of sourceTypes) {
+      if (sourceType === undefined) continue;
+      if (this.adaptersBySourceType.has(sourceType)) {
+        throw new Error(`Duplicate active source adapter for source_type: ${sourceType}`);
+      }
+    }
+
+    this.adapters.push(adapter);
+    this.adaptersById.set(adapterId, adapter);
+    for (const sourceType of sourceTypes) {
+      if (sourceType !== undefined) this.adaptersBySourceType.set(sourceType, adapter);
+    }
+  }
+
+  resolve(input: SourceAdapterInput): SourceAdapter {
+    const metadata = payloadMetadata(input.payload);
+    const adapterHint = adapterHintFromMetadata(metadata);
+    const hintedAdapter =
+      adapterHint === undefined
+        ? undefined
+        : (this.adaptersById.get(adapterHint) ?? this.adaptersBySourceType.get(adapterHint));
+    if (hintedAdapter !== undefined) return hintedAdapter;
+
+    const sourceType = metadataString(metadata, "source_type");
+    const sourceTypeAdapter =
+      sourceType === undefined ? undefined : this.adaptersBySourceType.get(sourceType);
+    if (sourceTypeAdapter !== undefined) return sourceTypeAdapter;
+
+    const matched = this.adapters.find(
+      (adapter) => adapter !== this.fallbackAdapter && adapter.match(input),
+    );
+    return matched ?? this.fallbackAdapter;
+  }
+}
+
+const webpageSourceAdapter: SourceAdapter = {
+  id: "webpage",
+  sourceTypes: ["webpage"],
+  match: () => true,
+  adapt: ({ kind, payload }) => buildDocumentDraft(kind, payload),
+};
+
+const markdownSourceAdapter: SourceAdapter = {
+  id: "markdown",
+  sourceTypes: ["markdown"],
+  match: (input) => isMarkdownAdapterInput(input),
+  adapt: ({ kind, payload }) => {
+    const source = parseMarkdownDocument(payload.normalizedText);
+    const inputMetadata = payloadMetadata(payload);
+    const frontmatter = source.frontmatter;
+    const sourceUrl = metadataDisplayString(frontmatter, "source_url") ?? payload.sourceUrl;
+    const capturedAt = metadataDisplayString(frontmatter, "captured_at") ?? payload.capturedAt;
+    const sourceTitle =
+      metadataDisplayString(frontmatter, "title") ??
+      firstMarkdownHeading(source.body, 1) ??
+      payload.sourceTitle;
+    const sectionOutline = markdownSectionOutline(source.body);
+    const metadata: Record<string, unknown> = {
+      ...inputMetadata,
+      ...frontmatter,
+      adapter: "markdown",
+      source_type: "markdown",
+      title: sourceTitle,
+      source_url: sourceUrl,
+    };
+    const abstract = metadataDisplayString(frontmatter, "abstract");
+    if (abstract !== undefined) metadata.abstract = abstract;
+    const authors = metadataStringArray(frontmatter, "authors");
+    if (authors.length > 0) metadata.authors = authors;
+    if (sectionOutline.length > 0) metadata.sectionOutline = sectionOutline;
+
+    return buildDocumentDraft(kind, payload, {
+      sourceUrl,
+      sourceTitle,
+      normalizedText: source.body,
+      capturedAt,
+      metadata,
+    });
+  },
+};
+
+const defaultSourceAdapterRegistry = createSourceAdapterRegistry([
+  webpageSourceAdapter,
+  markdownSourceAdapter,
+]);
+
+function createSourceAdapterRegistry(adapters: SourceAdapter[]) {
+  const fallbackAdapter =
+    adapters.find((adapter) => adapter.id === "webpage") ?? webpageSourceAdapter;
+  const registry = new SourceAdapterRegistry(fallbackAdapter);
+  registry.registerAdapter(fallbackAdapter);
+  for (const adapter of adapters) {
+    if (adapter !== fallbackAdapter) registry.registerAdapter(adapter);
+  }
+  return registry;
+}
+
+function buildDocumentDraft(
+  kind: SourceKind,
+  payload: CaptureBasePayload,
+  overrides: {
+    sourceUrl?: string;
+    sourceTitle?: string;
+    normalizedText?: string;
+    capturedAt?: string;
+    metadata?: Record<string, unknown>;
+  } = {},
+): DocumentDraft {
+  const normalizedText = normalizeText(overrides.normalizedText ?? payload.normalizedText);
   if (normalizedText.length === 0) {
     throw new EngineRpcError("EMPTY_CAPTURE", "Nothing readable was found to save.");
   }
 
-  const sourceUrl = payload.sourceUrl.trim();
+  const sourceUrl = (overrides.sourceUrl ?? payload.sourceUrl).trim();
   const normalizedSourceUrl = normalizeSourceUrl(sourceUrl);
-  const sourceTitle = payload.sourceTitle.trim() || fallbackTitle(sourceUrl);
+  const sourceTitle =
+    (overrides.sourceTitle ?? payload.sourceTitle).trim() || fallbackTitle(sourceUrl);
   const textHash = hashText(normalizedText);
   return {
     kind,
@@ -2669,10 +2805,164 @@ function buildDocumentDraft(kind: SourceKind, payload: CaptureBasePayload): Docu
     sourceTitle,
     normalizedText,
     textHash,
-    capturedAt: payload.capturedAt ?? new Date().toISOString(),
-    metadataJson: JSON.stringify(payload.metadata ?? {}),
+    capturedAt: overrides.capturedAt ?? payload.capturedAt ?? new Date().toISOString(),
+    metadataJson: JSON.stringify(overrides.metadata ?? payload.metadata ?? {}),
     versionGroupKey: buildMemoryVersionGroupKey(kind, normalizedSourceUrl, textHash),
   };
+}
+
+function payloadMetadata(payload: CaptureBasePayload): Record<string, unknown> {
+  return payload.metadata ?? {};
+}
+
+function normalizeAdapterKey(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const normalized = normalizeText(value).toLowerCase();
+  return normalized.length === 0 ? undefined : normalized;
+}
+
+function metadataString(metadata: Record<string, unknown>, key: string) {
+  return normalizeAdapterKey(metadata[key]);
+}
+
+function metadataDisplayString(metadata: Record<string, unknown>, key: string) {
+  const value = metadata[key];
+  if (typeof value !== "string") return undefined;
+  const normalized = normalizeText(value);
+  return normalized.length === 0 ? undefined : normalized;
+}
+
+function metadataStringArray(metadata: Record<string, unknown>, key: string) {
+  const value = metadata[key];
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => {
+      if (typeof item !== "string") return [];
+      const normalized = normalizeText(item);
+      return normalized.length === 0 ? [] : [normalized];
+    });
+  }
+  if (typeof value !== "string") return [];
+  return value
+    .split(",")
+    .map((item) => normalizeText(stripYamlScalarQuotes(item)))
+    .filter((item) => item.length > 0);
+}
+
+function adapterHintFromMetadata(metadata: Record<string, unknown>) {
+  return metadataString(metadata, "adapter") ?? metadataString(metadata, "source_adapter");
+}
+
+function isMarkdownAdapterInput(input: SourceAdapterInput) {
+  const metadata = payloadMetadata(input.payload);
+  const adapterHint = adapterHintFromMetadata(metadata);
+  if (adapterHint === "markdown") return true;
+  if (metadataString(metadata, "source_type") === "markdown") return true;
+  const mimeType =
+    metadataString(metadata, "mime_type") ??
+    metadataString(metadata, "mimeType") ??
+    metadataString(metadata, "content_type") ??
+    metadataString(metadata, "contentType");
+  if (mimeType === "text/markdown" || mimeType === "text/x-markdown" || mimeType === "text/md") {
+    return true;
+  }
+  return markdownUrlPath(input.payload.sourceUrl);
+}
+
+function markdownUrlPath(sourceUrl: string) {
+  try {
+    const pathname = new URL(sourceUrl).pathname.toLowerCase();
+    return pathname.endsWith(".md") || pathname.endsWith(".markdown");
+  } catch {
+    const normalized = sourceUrl.trim().toLowerCase();
+    return normalized.endsWith(".md") || normalized.endsWith(".markdown");
+  }
+}
+
+function parseMarkdownDocument(input: string): {
+  body: string;
+  frontmatter: Record<string, unknown>;
+} {
+  const normalized = input.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  if (lines[0]?.trim() !== "---") return { body: input, frontmatter: {} };
+  const maxFrontmatterLines = Math.min(lines.length, 80);
+  let endLine = -1;
+  for (let index = 1; index < maxFrontmatterLines; index += 1) {
+    if (lines[index]?.trim() === "---") {
+      endLine = index;
+      break;
+    }
+  }
+  if (endLine < 0) return { body: input, frontmatter: {} };
+  return {
+    body: lines.slice(endLine + 1).join("\n"),
+    frontmatter: parseMarkdownFrontmatterLines(lines.slice(1, endLine)),
+  };
+}
+
+function parseMarkdownFrontmatterLines(lines: string[]) {
+  const metadata: Record<string, unknown> = {};
+  for (const line of lines.slice(0, 80)) {
+    const match = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
+    if (match === null) continue;
+    const key = match[1];
+    if (key === undefined) continue;
+    const rawValue = match[2]?.trim() ?? "";
+    if (key === "authors") {
+      metadata.authors = parseMarkdownAuthors(rawValue);
+      continue;
+    }
+    metadata[key] = stripYamlScalarQuotes(rawValue);
+  }
+  return metadata;
+}
+
+function parseMarkdownAuthors(input: string) {
+  const trimmed = input.trim();
+  const body = trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
+  return body
+    .split(",")
+    .map((item) => normalizeText(stripYamlScalarQuotes(item)))
+    .filter((item) => item.length > 0)
+    .slice(0, 50);
+}
+
+function stripYamlScalarQuotes(input: string) {
+  const trimmed = input.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function firstMarkdownHeading(markdown: string, level: number) {
+  const prefix = "#".repeat(level);
+  for (const line of markdown.split(/\r?\n/)) {
+    const match = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line.trim());
+    if (match !== null && match[1] === prefix) {
+      const text = normalizeText(match[2] ?? "");
+      if (text.length > 0) return text;
+    }
+  }
+  return undefined;
+}
+
+function markdownSectionOutline(markdown: string) {
+  return markdown
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      const match = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line.trim());
+      if (match === null) return [];
+      const marker = match[1];
+      if (marker === undefined) return [];
+      const text = normalizeText(match[2] ?? "");
+      if (text.length === 0) return [];
+      return [{ level: marker.length, text }];
+    })
+    .slice(0, 200);
 }
 
 function insertSourceRow(

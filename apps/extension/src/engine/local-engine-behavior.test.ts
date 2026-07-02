@@ -312,6 +312,86 @@ describe("local engine behavior harness", () => {
       expect.arrayContaining(["fts_chunks", "vector_chunks"]),
     );
   });
+
+  it("adapts markdown sources through the registered adapter boundary", async () => {
+    const harness = createHarness();
+    const markdownText = [
+      "---",
+      "title: Markdown Adapter Notes",
+      "abstract: Adapter registry metadata lives in markdown frontmatter.",
+      "authors: [Ada Lovelace, Grace Hopper]",
+      "source_url: https://example.test/notes.md",
+      "captured_at: 2026-07-02T00:00:00.000Z",
+      "---",
+      "# Markdown Adapter Notes",
+      "",
+      "## Registry Design",
+      "",
+      "Adapter registry evidence appears in markdown body.",
+    ].join("\n");
+
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/raw",
+        sourceTitle: "Raw Markdown Payload",
+        normalizedText: markdownText,
+        metadata: {
+          source_type: "markdown",
+          mime_type: "text/markdown",
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+
+    expect(capture.status).toBe("saved");
+    expect(capture.memory.sourceUrl).toBe("https://example.test/notes.md");
+    expect(capture.memory.sourceTitle).toBe("Markdown Adapter Notes");
+    expect(harness.count("sources", "id = ? AND source_type = 'markdown'", [sourceId])).toBe(1);
+    expect(
+      harness.count(
+        "source_metadata",
+        "source_id = ? AND source_type = 'markdown' AND title = ? AND abstract = ?",
+        [
+          sourceId,
+          "Markdown Adapter Notes",
+          "Adapter registry metadata lives in markdown frontmatter.",
+        ],
+      ),
+    ).toBe(1);
+    expect(harness.count("source_metadata_fts", "source_id = ?", [sourceId])).toBe(1);
+
+    const detail = await harness.request({ kind: "getMemory", id: sourceId });
+    expect(detail?.normalizedText).not.toContain("captured_at:");
+    expect(detail?.metadata.source_type).toBe("markdown");
+    expect(detail?.metadata.adapter).toBe("markdown");
+    expect(detail?.metadata.authors).toEqual(["Ada Lovelace", "Grace Hopper"]);
+    expect(detail?.metadata.sectionOutline).toEqual([
+      { level: 1, text: "Markdown Adapter Notes" },
+      { level: 2, text: "Registry Design" },
+    ]);
+
+    const retrieved = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "adapter registry metadata",
+        limit: 5,
+        filter: { sourceTypes: ["markdown"] },
+      },
+    });
+    expect(retrieved.items.map((item) => item.id)).toEqual([sourceId]);
+    expect(trackStatus(retrieved, "meta_sources")).toBe("used");
+
+    const excluded = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "adapter registry metadata",
+        limit: 5,
+        filter: { sourceTypes: ["webpage"] },
+      },
+    });
+    expect(excluded.items.map((item) => item.id)).not.toContain(sourceId);
+  });
 });
 
 function createHarness() {
