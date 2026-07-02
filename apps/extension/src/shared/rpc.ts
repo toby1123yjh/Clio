@@ -102,6 +102,8 @@ export interface MemoryDetail extends MemorySummary {
     ord: number;
     text: string;
     tokenCount: number;
+    pageStart?: number;
+    pageEnd?: number;
   }>;
 }
 
@@ -134,6 +136,8 @@ export interface MemoryEvidenceWindow {
     ord: number;
     text: string;
     tokenCount: number;
+    pageStart?: number;
+    pageEnd?: number;
   }>;
 }
 
@@ -172,6 +176,8 @@ export interface RetrieveSourceHitChunk {
   snippet: string;
   score: number;
   track: "fts_chunks" | "vector_chunks";
+  pageStart?: number;
+  pageEnd?: number;
 }
 
 export interface RetrieveSourceItem extends MemorySummary {

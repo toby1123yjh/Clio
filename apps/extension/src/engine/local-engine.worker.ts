@@ -120,7 +120,7 @@ export interface LocalEngineOptions {
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
-const schemaVersion = 14;
+const schemaVersion = 15;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -189,6 +189,18 @@ interface DocumentDraft {
   capturedAt: string;
   metadataJson: string;
   versionGroupKey: string;
+  pdfPages: PdfPageTextRange[];
+}
+
+interface PdfPageTextRange {
+  pageNumber: number;
+  charStart: number;
+  charEnd: number;
+}
+
+interface ChunkPageRange {
+  pageStart: number | null;
+  pageEnd: number | null;
 }
 
 interface ChunkMetaHeadV1 {
@@ -375,6 +387,7 @@ export class LocalEngine {
     if (chunks.length === 0) {
       throw new EngineRpcError("EMPTY_CAPTURE", "Nothing readable was found to save.");
     }
+    const chunkRanges = locateChunkTextRanges(draft.normalizedText, chunks);
 
     const sourceId = createId("src");
     const previousVersion =
@@ -433,6 +446,7 @@ export class LocalEngine {
 
       for (const chunk of chunks) {
         const chunkId = `${sourceId}:${chunk.ord}`;
+        const pageRange = pageRangeForChunk(chunkRanges.get(chunk.ord), draft.pdfPages);
         db.exec({
           sql: `INSERT INTO source_chunks (
             id,
@@ -447,8 +461,10 @@ export class LocalEngine {
             section_path,
             char_start,
             char_end,
+            page_start,
+            page_end,
             meta_head_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'child', NULL, NULL, NULL, NULL, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'child', NULL, NULL, ?, ?, ?, ?, ?)`,
           bind: [
             chunkId,
             sourceId,
@@ -457,6 +473,10 @@ export class LocalEngine {
             chunk.tokenCount,
             chunk.hash,
             expandChineseBigrams(chunk.text),
+            chunkRanges.get(chunk.ord)?.charStart ?? null,
+            chunkRanges.get(chunk.ord)?.charEnd ?? null,
+            pageRange.pageStart,
+            pageRange.pageEnd,
             chunkMetaHeadJson,
           ],
         });
@@ -728,7 +748,7 @@ export class LocalEngine {
     );
     if (row === undefined) return null;
     const chunkRows = db.selectObjects(
-      `SELECT id, ord, text, token_count
+      `SELECT id, ord, text, token_count, page_start, page_end
        FROM source_chunks
        WHERE source_id = ?
        ORDER BY ord ASC`,
@@ -750,6 +770,7 @@ export class LocalEngine {
         ord: numberField(chunk, "ord"),
         text: stringField(chunk, "text"),
         tokenCount: numberField(chunk, "token_count"),
+        ...optionalPageRangeFromRow(chunk),
       })),
     };
   }
@@ -2298,10 +2319,14 @@ function migrate(db: SqliteDb) {
       section_path TEXT,
       char_start INTEGER,
       char_end INTEGER,
+      page_start INTEGER,
+      page_end INTEGER,
       meta_head_json TEXT,
       UNIQUE (source_id, ord)
     )
   `);
+  ensureColumn(db, "source_chunks", "page_start", "INTEGER");
+  ensureColumn(db, "source_chunks", "page_end", "INTEGER");
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS source_fts USING fts5(
       source_id UNINDEXED,
@@ -2688,6 +2713,12 @@ function tableCreateSql(db: SqliteDb, table: string) {
   return stringField(row ?? {}, "sql");
 }
 
+function ensureColumn(db: SqliteDb, table: string, column: string, definition: string) {
+  const rows = db.selectObjects(`PRAGMA table_info(${table})`);
+  if (rows.some((row) => stringField(row, "name") === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
 class SourceAdapterRegistry {
   private readonly adapters: SourceAdapter[] = [];
   private readonly adaptersById = new Map<string, SourceAdapter>();
@@ -2894,6 +2925,114 @@ function buildDocumentDraft(
     capturedAt: overrides.capturedAt ?? payload.capturedAt ?? new Date().toISOString(),
     metadataJson: JSON.stringify(overrides.metadata ?? payload.metadata ?? {}),
     versionGroupKey: buildMemoryVersionGroupKey(kind, normalizedSourceUrl, textHash),
+    pdfPages: pdfPageTextRanges(overrides.metadata ?? payload.metadata ?? {}),
+  };
+}
+
+function pdfPageTextRanges(metadata: Record<string, unknown>): PdfPageTextRange[] {
+  const rawPages = metadata.pdf_pages;
+  if (!Array.isArray(rawPages)) return [];
+  return rawPages
+    .flatMap((page): PdfPageTextRange[] => {
+      if (!isRecord(page)) return [];
+      const pageNumber = metadataNumber(page.pageNumber);
+      const charStart = metadataNumber(page.charStart);
+      const charEnd = metadataNumber(page.charEnd);
+      if (
+        pageNumber === undefined ||
+        charStart === undefined ||
+        charEnd === undefined ||
+        pageNumber < 1 ||
+        charStart < 0 ||
+        charEnd < charStart
+      ) {
+        return [];
+      }
+      return [
+        {
+          pageNumber: Math.floor(pageNumber),
+          charStart: Math.floor(charStart),
+          charEnd: Math.floor(charEnd),
+        },
+      ];
+    })
+    .sort((left, right) => left.charStart - right.charStart || left.pageNumber - right.pageNumber);
+}
+
+function locateChunkTextRanges(
+  normalizedText: string,
+  chunks: Array<{ ord: number; text: string }>,
+) {
+  const ranges = new Map<number, { charStart: number; charEnd: number }>();
+  let cursor = 0;
+  for (const chunk of chunks) {
+    const charStart = normalizedText.indexOf(chunk.text, cursor);
+    if (charStart < 0) break;
+    const charEnd = charStart + chunk.text.length;
+    ranges.set(chunk.ord, { charStart, charEnd });
+    cursor = Math.max(cursor, charStart + 1);
+  }
+  if (ranges.size === chunks.length) return ranges;
+
+  const compact = compactTextWithOriginalOffsets(normalizedText);
+  ranges.clear();
+  cursor = 0;
+  for (const chunk of chunks) {
+    const compactChunk = normalizeText(chunk.text).replace(/\s+/g, " ");
+    const compactStart = compact.text.indexOf(compactChunk, cursor);
+    if (compactStart < 0) continue;
+    const compactEnd = compactStart + compactChunk.length;
+    const charStart = compact.offsets[compactStart];
+    const charEndOffset = compact.offsets[Math.max(compactStart, compactEnd - 1)];
+    if (charStart === undefined || charEndOffset === undefined) continue;
+    ranges.set(chunk.ord, { charStart, charEnd: charEndOffset + 1 });
+    cursor = Math.max(cursor, compactStart + 1);
+  }
+  return ranges;
+}
+
+function compactTextWithOriginalOffsets(input: string) {
+  const chars: string[] = [];
+  const offsets: number[] = [];
+  let inWhitespace = false;
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (char === undefined) continue;
+    if (/\s/.test(char)) {
+      if (!inWhitespace && chars.length > 0) {
+        chars.push(" ");
+        offsets.push(index);
+      }
+      inWhitespace = true;
+      continue;
+    }
+    chars.push(char);
+    offsets.push(index);
+    inWhitespace = false;
+  }
+  if (chars[chars.length - 1] === " ") {
+    chars.pop();
+    offsets.pop();
+  }
+  return { text: chars.join(""), offsets };
+}
+
+function pageRangeForChunk(
+  chunkRange: { charStart: number; charEnd: number } | undefined,
+  pages: PdfPageTextRange[],
+): ChunkPageRange {
+  if (chunkRange === undefined || pages.length === 0) {
+    return { pageStart: null, pageEnd: null };
+  }
+  const overlapping = pages.filter(
+    (page) => page.charEnd > chunkRange.charStart && page.charStart < chunkRange.charEnd,
+  );
+  if (overlapping.length === 0) {
+    return { pageStart: null, pageEnd: null };
+  }
+  return {
+    pageStart: overlapping[0]?.pageNumber ?? null,
+    pageEnd: overlapping[overlapping.length - 1]?.pageNumber ?? null,
   };
 }
 
@@ -4732,7 +4871,7 @@ function loadSourceEvidenceWindow(
   const startOrd = Math.max(0, input.anchorOrd - input.contextChunksBefore);
   const endOrd = input.anchorOrd + input.contextChunksAfter;
   const rows = db.selectObjects(
-    `SELECT id, ord, text, token_count
+    `SELECT id, ord, text, token_count, page_start, page_end
      FROM source_chunks
      WHERE source_id = ?
        AND ord BETWEEN ? AND ?
@@ -4746,6 +4885,7 @@ function loadSourceEvidenceWindow(
     ord: numberField(row, "ord"),
     text: stringField(row, "text"),
     tokenCount: numberField(row, "token_count"),
+    ...optionalPageRangeFromRow(row),
   }));
   const anchorChunk =
     chunks.find((chunk) => chunk.ord === input.anchorOrd) ?? chunks[Math.floor(chunks.length / 2)];
@@ -4935,6 +5075,8 @@ function loadFtsChunkRetrievalHits(
       c.id AS chunk_id,
       c.ord AS chunk_ord,
       c.text AS chunk_text,
+      c.page_start AS chunk_page_start,
+      c.page_end AS chunk_page_end,
       bm25(source_fts) AS score
      FROM source_fts
      JOIN sources s ON s.id = source_fts.source_id
@@ -4955,6 +5097,7 @@ function loadFtsChunkRetrievalHits(
       snippet: excerpt(stringField(row, "chunk_text")),
       score: realField(row, "score"),
       track: "fts_chunks",
+      ...optionalChunkPageRangeFromRow(row),
     },
   }));
 }
@@ -5112,6 +5255,8 @@ function loadVectorChunkRetrievalHits(
       c.id AS chunk_id,
       c.ord AS chunk_ord,
       c.text AS chunk_text,
+      c.page_start AS chunk_page_start,
+      c.page_end AS chunk_page_end,
       se.vector_json,
       se.text_hash
      FROM source_embeddings se
@@ -5168,6 +5313,7 @@ function loadVectorChunkRetrievalHits(
         snippet: excerpt(stringField(row, "chunk_text")),
         score,
         track: "vector_chunks",
+        ...optionalChunkPageRangeFromRow(row),
       },
     })),
     trace: {
@@ -5570,13 +5716,44 @@ function isStaleSessionLease(heartbeatAt: string) {
 function parseMetadata(input: string): Record<string, unknown> {
   try {
     const value = JSON.parse(input) as unknown;
-    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    if (isRecord(value)) {
       return value as Record<string, unknown>;
     }
   } catch {
     return {};
   }
   return {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function metadataNumber(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function optionalPageRangeFromRow(row: SqlRow) {
+  if (row.page_start === undefined || row.page_start === null) return {};
+  if (row.page_end === undefined || row.page_end === null) return {};
+  const pageStart = numberField(row, "page_start");
+  const pageEnd = numberField(row, "page_end");
+  if (pageStart < 1 || pageEnd < pageStart) return {};
+  return { pageStart, pageEnd };
+}
+
+function optionalChunkPageRangeFromRow(row: SqlRow) {
+  if (row.chunk_page_start === undefined || row.chunk_page_start === null) return {};
+  if (row.chunk_page_end === undefined || row.chunk_page_end === null) return {};
+  const pageStart = numberField(row, "chunk_page_start");
+  const pageEnd = numberField(row, "chunk_page_end");
+  if (pageStart < 1 || pageEnd < pageStart) return {};
+  return { pageStart, pageEnd };
 }
 
 function parseOptionalRecord(input: string): Record<string, unknown> | undefined {

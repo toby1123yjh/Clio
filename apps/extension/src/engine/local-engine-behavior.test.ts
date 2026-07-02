@@ -589,23 +589,27 @@ describe("local engine behavior harness", () => {
 
   it("adapts ordinary PDF sources without classifying them as papers", async () => {
     const harness = createHarness();
+    const page1 = "Product Guide page one covers local PDF evidence.";
+    const page2 = "Product Guide page two covers retrieval page anchors.";
+    const normalizedText = `${page1}\n\n${page2}`;
     const capture = await harness.request({
       kind: "capturePage",
       payload: pagePayload({
         sourceUrl: "https://example.test/manuals/product-guide.pdf",
         sourceTitle: "Raw PDF Title",
-        normalizedText: [
-          "Product Guide",
-          "",
-          "This PDF explains local operating procedures and support workflows.",
-          "",
-          "1 Overview",
-          "Support teams use bounded PDF evidence instead of loading the full document.",
-        ].join("\n"),
+        normalizedText,
         metadata: {
           mime_type: "application/pdf",
-          pdf_page_count: 3,
+          pdf_page_count: 2,
           title: "Product Guide",
+          pdf_pages: [
+            { pageNumber: 1, charStart: 0, charEnd: page1.length },
+            {
+              pageNumber: 2,
+              charStart: page1.length + 2,
+              charEnd: page1.length + 2 + page2.length,
+            },
+          ],
         },
       }),
     });
@@ -626,23 +630,45 @@ describe("local engine behavior harness", () => {
     expect(detail?.metadata.adapter).toBe("pdf");
     expect(detail?.metadata.parser).toBe("pdfjs");
     expect(detail?.metadata.mime_type).toBe("application/pdf");
-    expect(detail?.metadata.pdf_page_count).toBe(3);
+    expect(detail?.metadata.pdf_page_count).toBe(2);
     expect(detail?.metadata.paper_source).toBeUndefined();
+    expect(detail?.chunks[0]?.pageStart).toBe(1);
+    expect(detail?.chunks[0]?.pageEnd).toBe(2);
+    expect(
+      harness.count("source_chunks", "source_id = ? AND page_start = 1 AND page_end = 2", [
+        sourceId,
+      ]),
+    ).toBe(1);
 
     const retrieved = await harness.request({
       kind: "retrieveSources",
       payload: {
-        query: "bounded PDF evidence",
+        query: "retrieval page anchors",
         limit: 5,
+        includeChunks: 1,
         filter: { sourceTypes: ["pdf"] },
       },
     });
     expect(retrieved.items.map((item) => item.id)).toEqual([sourceId]);
+    expect(retrieved.items[0]?.hitChunks[0]?.pageStart).toBe(1);
+    expect(retrieved.items[0]?.hitChunks[0]?.pageEnd).toBe(2);
+
+    const windows = await harness.request({
+      kind: "getMemoryEvidenceWindows",
+      payload: {
+        anchors: [{ memoryId: sourceId, ord: 0 }],
+        limit: 1,
+        contextChunksBefore: 0,
+        contextChunksAfter: 0,
+      },
+    });
+    expect(windows.items[0]?.chunks[0]?.pageStart).toBe(1);
+    expect(windows.items[0]?.chunks[0]?.pageEnd).toBe(2);
 
     const excluded = await harness.request({
       kind: "retrieveSources",
       payload: {
-        query: "bounded PDF evidence",
+        query: "retrieval page anchors",
         limit: 5,
         filter: { sourceTypes: ["paper"] },
       },

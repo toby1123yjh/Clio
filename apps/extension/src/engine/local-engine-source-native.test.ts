@@ -17,11 +17,15 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 14");
+    expect(workerSource).toContain("const schemaVersion = 15");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_chunks");
+    expect(workerSource).toContain("page_start INTEGER");
+    expect(workerSource).toContain("page_end INTEGER");
+    expect(workerSource).toContain('ensureColumn(db, "source_chunks", "page_start", "INTEGER")');
+    expect(workerSource).toContain('ensureColumn(db, "source_chunks", "page_end", "INTEGER")');
     expect(workerSource).toContain("meta_head_json TEXT");
     expect(workerSource).toContain("CREATE VIRTUAL TABLE IF NOT EXISTS source_fts");
     expect(workerSource).toContain("CREATE VIRTUAL TABLE IF NOT EXISTS source_metadata_fts");
@@ -118,12 +122,16 @@ describe("local engine source-native storage foundation", () => {
     expect(captureSection).toContain("defaultSourceAdapterRegistry.resolve");
     expect(captureSection).toContain("adapter.adapt");
     expect(captureSection).toContain("const chunks = chunkText(draft.normalizedText)");
+    expect(captureSection).toContain("const chunkRanges = locateChunkTextRanges");
     expect(captureSection).toContain("const chunkMetaHeadJson = buildChunkMetaHeadJson(draft)");
     expect(captureSection).toContain("transaction(db, () => {");
     expect(captureSection).toContain("insertSourceRow(db");
     expect(captureSection).toContain("insertSourceLifecycleEvent(db");
     expect(captureSection).toContain("insertSourceAuditLog(db");
     expect(captureSection).toContain("INSERT INTO source_chunks");
+    expect(captureSection).toContain("pageRangeForChunk");
+    expect(captureSection).toContain("page_start");
+    expect(captureSection).toContain("page_end");
     expect(captureSection).toContain("meta_head_json");
     expect(captureSection).toContain("insertSourceFtsRow(db");
     expect(captureSection).toContain("insertAnchor(");
