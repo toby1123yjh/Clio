@@ -1,4 +1,4 @@
-export type SlashCommandId = "compact" | "image" | "image-gen";
+export type SlashCommandId = "compact" | "image" | "image-gen" | "research";
 
 export type SlashCommandArgumentPolicy = "none" | "rest";
 
@@ -12,6 +12,7 @@ export interface SlashCommandContext {
 export interface SlashCommandActions {
   compact: () => void;
   imageGen: (prompt?: string) => void;
+  research: (question?: string) => void;
 }
 
 export interface SlashCommand {
@@ -40,6 +41,15 @@ export function createSlashCommands(actions: SlashCommandActions): SlashCommand[
       argumentPolicy: "none",
       isAvailable: compactAvailable,
       execute: actions.compact,
+    },
+    {
+      id: "research",
+      trigger: "/research",
+      title: "Research",
+      description: "Answer with saved source context",
+      argumentPolicy: "rest",
+      isAvailable: researchAvailable,
+      execute: actions.research,
     },
     {
       id: "image",
@@ -114,6 +124,10 @@ export function executeSlashCommand(
 function compactAvailable(context: SlashCommandContext) {
   if (context.activeSessionId === undefined) return true;
   return !context.active && !context.hasQueuedMessages && !context.hasUnresolvedInterruptedAnswer;
+}
+
+function researchAvailable(context: SlashCommandContext) {
+  return !context.hasQueuedMessages && !context.hasUnresolvedInterruptedAnswer;
 }
 
 function alwaysAvailable() {

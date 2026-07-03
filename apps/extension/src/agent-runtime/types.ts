@@ -34,6 +34,10 @@ export interface ProviderContext {
   evidence: EvidenceItem[];
 }
 
+export interface SourceContextPackRequestOptions {
+  mode: "research";
+}
+
 export interface AgentChatRequest {
   runId: string;
   sessionId?: string;
@@ -46,6 +50,7 @@ export interface AgentChatRequest {
   pageTitle: string;
   evidence: EvidenceItem[];
   currentTurnEvidenceRefs?: string[];
+  sourceContextPack?: SourceContextPackRequestOptions;
   providerContext?: ProviderContext;
   createdAt: string;
 }

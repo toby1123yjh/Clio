@@ -4,6 +4,7 @@ import type {
   CompactionRecord,
   CreateCompactionPayload,
   EngineRequest,
+  SourceContextPackResult,
 } from "@/src/shared/rpc";
 import { describe, expect, it } from "vitest";
 import { AgentRunHost } from "./agent-run-host";
@@ -34,6 +35,76 @@ const memoryEvidence = {
   text: "Bounded memory evidence",
   excerpt: "Bounded memory evidence",
 } satisfies AgentChatRequest["evidence"][number];
+
+const sourceContextPack = {
+  query: "Explain persistence",
+  sources: [
+    {
+      id: "source-1",
+      sourceKind: "page",
+      sourceUrl: "https://example.com/paper.pdf",
+      sourceTitle: "Persistence Paper",
+      capturedAt: "2026-05-21T00:00:00.000Z",
+      sourceType: "pdf",
+      sectionOutline: [],
+      chunkCount: 4,
+      tokenEstimate: 400,
+      selectedTokenEstimate: 24,
+      requestedLoadDepth: "chunks",
+      selectedLoadDepth: "chunks",
+      windowCount: 1,
+    },
+  ],
+  groups: [
+    {
+      id: "group-1",
+      sourceIds: ["source-1"],
+      tokenEstimate: 24,
+      windows: [
+        {
+          sourceId: "source-1",
+          chunkId: "chunk-1",
+          ord: 0,
+          text: "  Bounded   source context text. ",
+          tokenCount: 24,
+          sourceKind: "page",
+          sourceUrl: "https://example.com/paper.pdf",
+          sourceTitle: "Persistence Paper",
+          sourceType: "pdf",
+          priority: "query",
+        },
+      ],
+    },
+  ],
+  compressionLog: [
+    {
+      reason: "full_depth_bounded",
+      message: "Full depth was bounded to selected windows.",
+      sourceId: "source-1",
+    },
+  ],
+  trace: {
+    strategy: "source_context_pack_v1",
+    requestedSourceCount: 1,
+    packedSourceCount: 1,
+    totalTokenEstimate: 24,
+    budget: 10_000,
+  },
+} satisfies SourceContextPackResult;
+
+const emptySourceContextPack = {
+  query: "Explain persistence",
+  sources: [],
+  groups: [],
+  compressionLog: [],
+  trace: {
+    strategy: "source_context_pack_v1",
+    requestedSourceCount: 0,
+    packedSourceCount: 0,
+    totalTokenEstimate: 0,
+    budget: 10_000,
+  },
+} satisfies SourceContextPackResult;
 
 function runtimeFrom(events: AgentStreamEvent[]): IAgentRuntime {
   return {
@@ -217,6 +288,147 @@ describe("AgentRunHost", () => {
           }),
         }),
       ]),
+    );
+    expect(
+      engine.calls.some((engineRequest) => engineRequest.kind === "buildSourceContextPack"),
+    ).toBe(false);
+  });
+
+  it("builds source context pack evidence for explicit research runs", async () => {
+    const calls: EngineRequest[] = [];
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          providerRequests.push(agentRequest);
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
+        if (engineRequest.kind === "buildSourceContextPack") return sourceContextPack as T;
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: { mode: "research" },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(calls).toContainEqual(
+      expect.objectContaining({
+        kind: "buildSourceContextPack",
+        payload: expect.objectContaining({
+          query: "Explain persistence",
+          useWorkingSet: true,
+          maxWindowsPerSource: 2,
+          contextChunksBefore: 1,
+          contextChunksAfter: 1,
+        }),
+      }),
+    );
+    expect(providerRequests[0]?.evidence).toEqual([
+      expect.objectContaining({
+        id: "memory:source-1:chunk:chunk-1",
+        sourceKind: "memory",
+        sourceTitle: "Persistence Paper",
+        text: "Bounded source context text.",
+      }),
+    ]);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "runtime_status",
+        message:
+          "Loaded source context: 1 source(s), 1 group(s), 1 window(s); " +
+          "groups group-1; depths chunks->chunks; adjusted full_depth_bounded.",
+      }),
+    );
+    expect(emitted.find((event) => event.type === "citation_validation")).toMatchObject({
+      validation: {
+        memoryEvidenceCount: 1,
+      },
+    });
+  });
+
+  it("continues research runs when the source context pack is empty", async () => {
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          providerRequests.push(agentRequest);
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        if (engineRequest.kind === "buildSourceContextPack") return emptySourceContextPack as T;
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: { mode: "research" },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(providerRequests[0]?.evidence).toEqual([]);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "runtime_status",
+        message: "No source context found; continuing without it.",
+      }),
+    );
+  });
+
+  it("continues research runs when source context pack loading fails", async () => {
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          providerRequests.push(agentRequest);
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        if (engineRequest.kind === "buildSourceContextPack") {
+          throw new Error("engine unavailable");
+        }
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: { mode: "research" },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(providerRequests[0]?.evidence).toEqual([]);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "runtime_status",
+        message: "Source context unavailable; continuing without it.",
+      }),
     );
   });
 
@@ -592,6 +804,7 @@ describe("AgentRunHost", () => {
 
   it("uses the provider question metadata when starting a queued skill follow-up", async () => {
     const providerQuestions: string[] = [];
+    const sourceContextOptions: Array<AgentChatRequest["sourceContextPack"]> = [];
     const assistantRetries: unknown[] = [];
     let messages: ChatMessageRecord[] = [
       ...session().messages,
@@ -615,6 +828,7 @@ describe("AgentRunHost", () => {
           role: "user",
           content: "Translate page",
           clioProviderQuestion: "Translate the attached page.\n\nSource: Page.",
+          clioSourceContextPack: { mode: "research" },
           timestamp: Date.parse("2026-05-22T00:00:01.000Z"),
         },
       },
@@ -623,6 +837,7 @@ describe("AgentRunHost", () => {
       runtime: {
         streamChat: async function* (agentRequest) {
           providerQuestions.push(agentRequest.question);
+          sourceContextOptions.push(agentRequest.sourceContextPack);
           yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
         },
       },
@@ -687,9 +902,11 @@ describe("AgentRunHost", () => {
       "Explain persistence",
       "Translate the attached page.\n\nSource: Page.",
     ]);
+    expect(sourceContextOptions).toEqual([undefined, { mode: "research" }]);
     expect(assistantRetries).toContainEqual(
       expect.objectContaining({
         question: "Translate the attached page.\n\nSource: Page.",
+        sourceContextPack: { mode: "research" },
       }),
     );
   });

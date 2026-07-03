@@ -506,11 +506,31 @@ describe("session engine RPC guards", () => {
             pageTitle: "Example",
             evidence: [],
             currentTurnEvidenceRefs: ["ev-1"],
+            sourceContextPack: { mode: "research" },
             createdAt: "2026-05-22T00:00:00.000Z",
           },
         },
       }),
     ).toBe(true);
+
+    expect(
+      isAgentRunRequestMessage({
+        type: CLIO_AGENT_RUN_REQUEST,
+        request: {
+          kind: "start",
+          request: {
+            runId: "run-1",
+            question: "Explain persistence",
+            scope: "general",
+            pageUrl: "https://example.com/a",
+            pageTitle: "Example",
+            evidence: [],
+            sourceContextPack: { mode: "auto" },
+            createdAt: "2026-05-22T00:00:00.000Z",
+          },
+        },
+      }),
+    ).toBe(false);
 
     expect(
       isAgentRunRequestMessage({

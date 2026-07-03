@@ -2644,6 +2644,7 @@ function ClioContentApp() {
       attachmentKind?: ComposerContextAttachmentKind,
       forcedScope?: ComposerScope,
       skillMode?: ComposerSkillMode,
+      options: { sourceContextPack?: AgentChatRequest["sourceContextPack"] } = {},
     ) => {
       const runId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
       const now = new Date().toISOString();
@@ -2695,6 +2696,9 @@ function ClioContentApp() {
             selectionText: attachmentKind === "selection" ? selectionSnapshot?.text : undefined,
             attachedEvidence,
             skillRequest,
+            ...(options.sourceContextPack === undefined
+              ? {}
+              : { sourceContextPack: options.sourceContextPack }),
             createdAt: now,
             runId,
           });
@@ -2729,7 +2733,9 @@ function ClioContentApp() {
       const targetSessionId = existingSession === null ? undefined : sessionId;
       const previousEvidence = existingSession?.evidence.map(evidenceRecordToAgentEvidence) ?? [];
       const localRagEvidence =
-        scope === "general" ? await loadLocalRagEvidencePack(providerQuestion) : [];
+        scope === "general" && options.sourceContextPack === undefined
+          ? await loadLocalRagEvidencePack(providerQuestion)
+          : [];
       const evidence =
         scope === "general"
           ? localRagEvidence
@@ -2750,6 +2756,9 @@ function ClioContentApp() {
           evidence,
           attachedEvidence,
           skillRequest,
+          ...(options.sourceContextPack === undefined
+            ? {}
+            : { sourceContextPack: options.sourceContextPack }),
           createdAt: now,
           runId,
         });
@@ -2784,6 +2793,9 @@ function ClioContentApp() {
         pageTitle: pageContext.title,
         evidence,
         currentTurnEvidenceRefs: turn.evidenceRecord === undefined ? [] : [turn.evidenceRecord.id],
+        ...(options.sourceContextPack === undefined
+          ? {}
+          : { sourceContextPack: options.sourceContextPack }),
         createdAt: now,
       };
 
@@ -2829,6 +2841,20 @@ function ClioContentApp() {
       void startAgentRun(content, attachment, undefined, railState.composerSkillMode);
     },
     [railState.composerSkillMode, startAgentRun],
+  );
+
+  const handleResearchCommand = React.useCallback(
+    (question?: string) => {
+      const normalizedQuestion = normalizeText(question ?? "");
+      if (normalizedQuestion.length === 0) {
+        dispatch({ type: "SET_RUNTIME_STATUS", message: "Usage: /research <question>" });
+        return;
+      }
+      void startAgentRun(normalizedQuestion, undefined, "general", undefined, {
+        sourceContextPack: { mode: "research" },
+      });
+    },
+    [startAgentRun],
   );
 
   const handleCancelDialogue = React.useCallback(() => {
@@ -3128,8 +3154,9 @@ function ClioContentApp() {
       createSlashCommands({
         compact: handleManualCompact,
         imageGen: openImageGen,
+        research: handleResearchCommand,
       }),
-    [handleManualCompact, openImageGen],
+    [handleManualCompact, handleResearchCommand, openImageGen],
   );
 
   const handleExecuteCommand = React.useCallback((command: RailCommand) => {

@@ -2398,12 +2398,18 @@ function isAgentChatRequest(value: unknown): value is AgentChatRequest {
     (value.currentTurnEvidenceRefs === undefined ||
       (Array.isArray(value.currentTurnEvidenceRefs) &&
         value.currentTurnEvidenceRefs.every((item) => typeof item === "string"))) &&
+    (value.sourceContextPack === undefined ||
+      isSourceContextPackRequestOptions(value.sourceContextPack)) &&
     (value.providerContext === undefined || isProviderContext(value.providerContext)) &&
     (value.sessionId === undefined || typeof value.sessionId === "string") &&
     (value.userMessageId === undefined || typeof value.userMessageId === "string") &&
     (value.assistantMessageId === undefined || typeof value.assistantMessageId === "string") &&
     (value.evidenceRevision === undefined || typeof value.evidenceRevision === "number")
   );
+}
+
+function isSourceContextPackRequestOptions(value: unknown) {
+  return isRecord(value) && value.mode === "research";
 }
 
 function isProviderContext(value: unknown) {

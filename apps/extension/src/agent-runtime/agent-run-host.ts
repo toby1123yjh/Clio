@@ -4,6 +4,8 @@ import type {
   CompactionRecord,
   EngineRequest,
   SessionEvidenceRecord,
+  SourceContextPackResult,
+  SourceContextPackWindow,
 } from "@/src/shared/rpc";
 import { citationValidatorErrorResult, validateCitationCoverage } from "./citation-validator";
 import {
@@ -19,6 +21,16 @@ import type {
   IAgentRuntime,
   LocalCitation,
 } from "./types";
+
+const sourceContextPackPayloadDefaults = {
+  maxTotalTokens: 10_000,
+  maxGroups: 3,
+  maxGroupTokens: 4_000,
+  maxSources: 8,
+  maxWindowsPerSource: 2,
+  contextChunksBefore: 1,
+  contextChunksAfter: 1,
+} as const;
 
 export interface AgentRunHostOptions {
   runtime: IAgentRuntime;
@@ -216,16 +228,22 @@ export class AgentRunHost {
   }
 
   private async prepareProviderRequest(run: HostedAgentRun): Promise<AgentChatRequest | undefined> {
-    const { sessionId } = run.request;
+    const sourceContextRequest = await this.buildSourceContextPackRequest(run);
+    if (run.abortController.signal.aborted) {
+      await this.resolvePreProviderStop(run);
+      return undefined;
+    }
+
+    const { sessionId } = sourceContextRequest;
     if (this.compactionRuntime === undefined || sessionId === undefined) {
-      return run.request;
+      return sourceContextRequest;
     }
 
     const session = await this.requestEngine<ChatSessionDetail | null>({
       kind: "loadChatSession",
       sessionId,
     });
-    if (session === null) return run.request;
+    if (session === null) return sourceContextRequest;
 
     let latestCompaction = await this.requestEngine<CompactionRecord | null>({
       kind: "getLatestCompaction",
@@ -233,7 +251,7 @@ export class AgentRunHost {
     });
     const contextWindow = await this.compactionRuntime.getContextWindow();
     let requestWithContext = buildRequestWithProviderContext({
-      request: run.request,
+      request: sourceContextRequest,
       session,
       latestCompaction,
     });
@@ -254,7 +272,7 @@ export class AgentRunHost {
         const outcome = await this.compactionRuntime.compact({
           session,
           latestCompaction,
-          currentRequest: run.request,
+          currentRequest: sourceContextRequest,
           signal: run.abortController.signal,
         });
         if (run.abortController.signal.aborted) {
@@ -267,7 +285,7 @@ export class AgentRunHost {
             payload: outcome.payload,
           });
           requestWithContext = buildRequestWithProviderContext({
-            request: run.request,
+            request: sourceContextRequest,
             session,
             latestCompaction,
           });
@@ -295,6 +313,55 @@ export class AgentRunHost {
     }
 
     return requestWithContext;
+  }
+
+  private async buildSourceContextPackRequest(run: HostedAgentRun): Promise<AgentChatRequest> {
+    if (run.request.sourceContextPack?.mode !== "research") return run.request;
+
+    this.emitEvent({
+      type: "runtime_status",
+      runId: run.request.runId,
+      message: "Building source context...",
+      running: true,
+    });
+
+    try {
+      const pack = await this.requestEngine<SourceContextPackResult>({
+        kind: "buildSourceContextPack",
+        payload: {
+          query: run.request.question,
+          useWorkingSet: true,
+          ...sourceContextPackPayloadDefaults,
+        },
+      });
+      const packEvidence = sourceContextPackToEvidence(pack);
+      if (packEvidence.length === 0) {
+        this.emitEvent({
+          type: "runtime_status",
+          runId: run.request.runId,
+          message: "No source context found; continuing without it.",
+        });
+        return run.request;
+      }
+
+      this.emitEvent({
+        type: "runtime_status",
+        runId: run.request.runId,
+        message: sourceContextPackStatusMessage(pack, packEvidence.length),
+      });
+
+      return {
+        ...run.request,
+        evidence: mergeEvidence(run.request.evidence, packEvidence),
+      };
+    } catch {
+      this.emitEvent({
+        type: "runtime_status",
+        runId: run.request.runId,
+        message: "Source context unavailable; continuing without it.",
+      });
+      return run.request;
+    }
   }
 
   private async pumpManualCompact(run: HostedManualCompactRun) {
@@ -443,6 +510,7 @@ export class AgentRunHost {
     const assistantMessageId = `${runId}:assistant`;
     const currentTurnEvidenceRefs = queuedUser.evidenceRefs;
     const providerQuestion = providerQuestionFromMessage(queuedUser);
+    const sourceContextPack = sourceContextPackFromMessage(queuedUser);
 
     await this.requestEngine<ChatMessageRecord>({
       kind: "updateChatMessage",
@@ -473,6 +541,7 @@ export class AgentRunHost {
           pageUrl,
           selectionText: queuedUser.selectionText,
           evidenceRevision: session.currentEvidenceRevision,
+          ...(sourceContextPack === undefined ? {} : { sourceContextPack }),
         },
         runId,
         createdAt: now,
@@ -498,6 +567,7 @@ export class AgentRunHost {
         pageTitle,
         evidence,
         currentTurnEvidenceRefs,
+        ...(sourceContextPack === undefined ? {} : { sourceContextPack }),
         createdAt: now,
       },
       abortController: new AbortController(),
@@ -675,6 +745,90 @@ function citationEvidenceForRequest(request: AgentChatRequest) {
   return request.providerContext?.evidence ?? request.evidence;
 }
 
+function sourceContextPackToEvidence(pack: SourceContextPackResult): EvidenceItem[] {
+  const seen = new Set<string>();
+  return pack.groups.flatMap((group) =>
+    group.windows.flatMap((window) => {
+      const evidence = sourceContextWindowToEvidence(window);
+      if (seen.has(evidence.id)) return [];
+      seen.add(evidence.id);
+      return [evidence];
+    }),
+  );
+}
+
+function sourceContextWindowToEvidence(window: SourceContextPackWindow): EvidenceItem {
+  const text = compactEvidenceText(window.text);
+  return {
+    id: `memory:${window.sourceId}:chunk:${window.chunkId}`,
+    sourceKind: "memory",
+    sourceUrl: window.sourceUrl,
+    sourceTitle: window.sourceTitle,
+    text,
+    excerpt: excerptEvidenceText(text),
+    ...(window.anchor === undefined
+      ? {}
+      : {
+          anchor: {
+            selectedText: window.anchor.selectedText,
+            contextBefore: window.anchor.contextBefore,
+            contextAfter: window.anchor.contextAfter,
+            ...(window.anchor.xpath === undefined ? {} : { xpath: window.anchor.xpath }),
+            ...(window.anchor.textFragment === undefined
+              ? {}
+              : { textFragment: window.anchor.textFragment }),
+          },
+        }),
+  };
+}
+
+function mergeEvidence(existing: EvidenceItem[], next: EvidenceItem[]) {
+  const byId = new Map(existing.map((item) => [item.id, item]));
+  for (const item of next) {
+    byId.set(item.id, item);
+  }
+  return Array.from(byId.values());
+}
+
+function sourceContextPackStatusMessage(pack: SourceContextPackResult, evidenceCount: number) {
+  const sourceCount = pack.sources.length;
+  const groupCount = pack.groups.length;
+  const groupIds = sourceContextPackGroupIdSummary(pack);
+  const depths = sourceContextPackDepthSummary(pack);
+  const prefix =
+    `Loaded source context: ${sourceCount} source(s), ` +
+    `${groupCount} group(s), ${evidenceCount} window(s)`;
+  if (pack.compressionLog.length === 0) {
+    return `${prefix}; groups ${groupIds}; depths ${depths}.`;
+  }
+  const reasons = Array.from(new Set(pack.compressionLog.map((entry) => entry.reason))).join(", ");
+  return `${prefix}; groups ${groupIds}; depths ${depths}; adjusted ${reasons}.`;
+}
+
+function sourceContextPackGroupIdSummary(pack: SourceContextPackResult) {
+  const groupIds = pack.groups.map((group) => group.id).filter((id) => id.length > 0);
+  if (groupIds.length === 0) return "none";
+  return groupIds.slice(0, 4).join(", ");
+}
+
+function sourceContextPackDepthSummary(pack: SourceContextPackResult) {
+  const depths = Array.from(
+    new Set(
+      pack.sources.map((source) => `${source.requestedLoadDepth}->${source.selectedLoadDepth}`),
+    ),
+  );
+  return depths.length === 0 ? "none" : depths.join(", ");
+}
+
+function compactEvidenceText(input: string) {
+  return input.replace(/\s+/g, " ").trim();
+}
+
+function excerptEvidenceText(input: string) {
+  const compact = compactEvidenceText(input);
+  return compact.length <= 240 ? compact : `${compact.slice(0, 237)}...`;
+}
+
 function findNextQueuedUserMessage(messages: ChatMessageRecord[]) {
   return messages
     .filter((message) => message.role === "user" && message.status === "queued")
@@ -695,6 +849,14 @@ function providerQuestionFromMessage(message: ChatMessageRecord) {
   return typeof value === "string" && value.trim().length > 0 ? value : message.content;
 }
 
+function sourceContextPackFromMessage(
+  message: ChatMessageRecord,
+): AgentChatRequest["sourceContextPack"] | undefined {
+  const value = message.piAgentMessageJson?.clioSourceContextPack;
+  if (!isRecord(value) || value.mode !== "research") return undefined;
+  return { mode: "research" };
+}
+
 function sessionEvidenceToAgentEvidence(record: SessionEvidenceRecord): EvidenceItem {
   return {
     id: record.id,
@@ -713,4 +875,8 @@ function isTerminalAgentEvent(event: AgentStreamEvent) {
     event.type === "run_cancelled" ||
     event.type === "run_resolved"
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

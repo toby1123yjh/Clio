@@ -11,6 +11,7 @@ function actions(): SlashCommandActions {
   return {
     compact: vi.fn(),
     imageGen: vi.fn(),
+    research: vi.fn(),
   };
 }
 
@@ -41,6 +42,11 @@ describe("slash command registry", () => {
       input: "/image-gen cat",
       argument: "cat",
     });
+    expect(parseSlashCommandInput("/research bounded context", commands)).toMatchObject({
+      kind: "exact",
+      input: "/research bounded context",
+      argument: "bounded context",
+    });
     expect(parseSlashCommandInput("/compact ", commands)).toEqual({
       kind: "unknown",
       input: "/compact ",
@@ -56,7 +62,7 @@ describe("slash command registry", () => {
     const commands = createSlashCommands(actions());
 
     expect(filterAvailableSlashCommands(commands, idleContext, "/").map((item) => item.id)).toEqual(
-      ["compact", "image", "image-gen"],
+      ["compact", "research", "image", "image-gen"],
     );
     expect(
       filterAvailableSlashCommands(commands, idleContext, "/co").map((item) => item.id),
@@ -64,7 +70,17 @@ describe("slash command registry", () => {
     expect(filterAvailableSlashCommands(commands, idleContext, "/Co")).toEqual([]);
     expect(filterAvailableSlashCommands(commands, idleContext, "/compact now")).toEqual([]);
     expect(
+      filterAvailableSlashCommands(commands, idleContext, "/re").map((item) => item.id),
+    ).toEqual(["research"]);
+    expect(
       filterAvailableSlashCommands(commands, { ...idleContext, active: true }, "/compact"),
+    ).toEqual([]);
+    expect(
+      filterAvailableSlashCommands(
+        commands,
+        { ...idleContext, hasQueuedMessages: true },
+        "/research",
+      ),
     ).toEqual([]);
   });
 
@@ -103,5 +119,18 @@ describe("slash command registry", () => {
     expect(executeSlashCommand(imageGen, idleContext, "city skyline")).toBe(true);
     expect(registryActions.imageGen).toHaveBeenNthCalledWith(1, "cat");
     expect(registryActions.imageGen).toHaveBeenNthCalledWith(2, "city skyline");
+  });
+
+  it("executes research with a question argument", () => {
+    const registryActions = actions();
+    const commands = createSlashCommands(registryActions);
+    const research = commands.find((command) => command.id === "research");
+    if (research === undefined) throw new Error("research command missing");
+
+    expect(executeSlashCommand(research, idleContext, "compare source packs")).toBe(true);
+    expect(registryActions.research).toHaveBeenCalledWith("compare source packs");
+    expect(
+      executeSlashCommand(research, { ...idleContext, hasUnresolvedInterruptedAnswer: true }),
+    ).toBe(false);
   });
 });

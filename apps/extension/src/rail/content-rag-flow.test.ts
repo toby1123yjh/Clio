@@ -37,4 +37,23 @@ describe("content local RAG flow", () => {
     expect(loadLibrarySection).not.toContain('kind: "searchMemory"');
     expect(loadLibrarySection).not.toContain('kind: "listMemories"');
   });
+
+  it("keeps source context packs behind explicit research mode", () => {
+    const startRunSection = contentSource.slice(
+      contentSource.indexOf("const startAgentRun = React.useCallback"),
+      contentSource.indexOf("const handleCancelDialogue = React.useCallback"),
+    );
+    const slashSection = contentSource.slice(
+      contentSource.indexOf("const handleResearchCommand = React.useCallback"),
+      contentSource.indexOf("const handleExecuteCommand = React.useCallback"),
+    );
+
+    expect(startRunSection).toContain(
+      'scope === "general" && options.sourceContextPack === undefined',
+    );
+    expect(startRunSection).toContain("sourceContextPack: options.sourceContextPack");
+    expect(slashSection).toContain('sourceContextPack: { mode: "research" }');
+    expect(slashSection).toContain("research: handleResearchCommand");
+    expect(startRunSection).not.toContain('kind: "buildSourceContextPack"');
+  });
 });

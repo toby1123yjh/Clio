@@ -25,6 +25,7 @@ export interface StartSessionTurnInput {
   evidence: EvidenceItem[];
   attachedEvidence?: EvidenceItem;
   skillRequest?: RailSkillRequestDisplay;
+  sourceContextPack?: AgentChatRequest["sourceContextPack"];
   createdAt: string;
   runId: string;
 }
@@ -47,6 +48,7 @@ export interface EnqueueSessionFollowUpInput {
   selectionText?: string;
   attachedEvidence?: EvidenceItem;
   skillRequest?: RailSkillRequestDisplay;
+  sourceContextPack?: AgentChatRequest["sourceContextPack"];
   createdAt: string;
   runId: string;
 }
@@ -178,6 +180,9 @@ export async function createOrLoadSessionForTurn(input: StartSessionTurnInput) {
         content: displayContent,
         clioProviderQuestion: input.question,
         ...(input.skillRequest === undefined ? {} : { clioSkillRequest: input.skillRequest }),
+        ...(input.sourceContextPack === undefined
+          ? {}
+          : { clioSourceContextPack: input.sourceContextPack }),
         timestamp: Date.parse(input.createdAt) || Date.now(),
       },
     },
@@ -201,6 +206,9 @@ export async function createOrLoadSessionForTurn(input: StartSessionTurnInput) {
         pageUrl: input.pageContext.url,
         selectionText: input.selectionText,
         evidenceRevision,
+        ...(input.sourceContextPack === undefined
+          ? {}
+          : { sourceContextPack: input.sourceContextPack }),
       },
       runId: input.runId,
       createdAt: input.createdAt,
@@ -281,6 +289,9 @@ export async function enqueueSessionFollowUp(input: EnqueueSessionFollowUpInput)
         content: displayContent,
         clioProviderQuestion: input.question,
         ...(input.skillRequest === undefined ? {} : { clioSkillRequest: input.skillRequest }),
+        ...(input.sourceContextPack === undefined
+          ? {}
+          : { clioSourceContextPack: input.sourceContextPack }),
         timestamp: Date.parse(input.createdAt) || Date.now(),
       },
     },
@@ -350,12 +361,14 @@ export async function retryInterruptedAssistant(input: RetryInterruptedAssistant
   const pageTitle = assistantMessage.pageTitle ?? input.fallbackPageContext.title;
   const selectionText =
     readString(assistantMessage.retry, "selectionText") ?? assistantMessage.selectionText;
+  const sourceContextPack = readSourceContextPack(assistantMessage.retry, "sourceContextPack");
   const retry = buildRetryMetadata(assistantMessage, input.createdAt, {
     question: retryQuestion,
     scope: retryScope,
     pageUrl,
     selectionText,
     evidenceRevision,
+    sourceContextPack,
   });
 
   const updatedAssistant = await requestEngine({
@@ -389,6 +402,7 @@ export async function retryInterruptedAssistant(input: RetryInterruptedAssistant
       pageUrl,
       pageTitle,
       evidence,
+      ...(sourceContextPack === undefined ? {} : { sourceContextPack }),
       createdAt: input.createdAt,
     },
   } satisfies RetryInterruptedAssistantResult;
@@ -577,14 +591,22 @@ function buildRetryMetadata(
     pageUrl: string;
     selectionText?: string;
     evidenceRevision: number;
+    sourceContextPack?: AgentChatRequest["sourceContextPack"];
   },
 ) {
   const existing = isPlainRecord(message.retry) ? message.retry : {};
   const attempts = Array.isArray(existing.attempts) ? existing.attempts : [];
   const attemptCount = readNumber(existing, "attemptCount") ?? 0;
+  const sourceContextPack =
+    base.sourceContextPack === undefined ? {} : { sourceContextPack: base.sourceContextPack };
   return {
     ...existing,
-    ...base,
+    question: base.question,
+    scope: base.scope,
+    pageUrl: base.pageUrl,
+    selectionText: base.selectionText,
+    evidenceRevision: base.evidenceRevision,
+    ...sourceContextPack,
     attemptCount: attemptCount + 1,
     attempts: [
       ...attempts,
@@ -614,6 +636,16 @@ function readAgentScope(value: unknown, key: string): AgentScope | undefined {
   const field = readString(value, key);
   if (field === "general" || field === "current-page" || field === "selection") return field;
   return undefined;
+}
+
+function readSourceContextPack(
+  value: unknown,
+  key: string,
+): AgentChatRequest["sourceContextPack"] | undefined {
+  if (!isPlainRecord(value)) return undefined;
+  const field = value[key];
+  if (!isPlainRecord(field) || field.mode !== "research") return undefined;
+  return { mode: "research" };
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
