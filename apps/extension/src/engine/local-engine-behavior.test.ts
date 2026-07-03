@@ -29,6 +29,96 @@ afterEach(() => {
 });
 
 describe("local engine behavior harness", () => {
+  it("builds and queries explicit source graph with evidence anchors", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/graph",
+        sourceTitle: "Graph Retrieval Study",
+        normalizedText: [
+          "# Graph Retrieval Study",
+          "## Architecture",
+          "The RAG graph pipeline uses a retrieval adapter and embedding index.",
+          "## Dataset",
+          "The benchmark dataset measures recall precision and latency score quality.",
+          "## Problem",
+          "The failure limitation is long context evidence overload.",
+        ].join("\n"),
+        metadata: {
+          title: "Graph Retrieval Study",
+          abstract: "RAG graph architecture links retrieval method evidence to bounded chunks.",
+          source_type: "paper",
+          authors: ["Ada Lovelace", "Grace Hopper"],
+          venue: "Local RAG Symposium",
+          categories: ["knowledge graph"],
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+
+    const queued = await harness.request({ kind: "getJobStatus", status: "queued", limit: 10 });
+    for (const job of queued.jobs) {
+      const result = await harness.request({ kind: "runJob", id: job.id });
+      expect(result.status).toBe("done");
+    }
+    const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
+      queued.jobs[0]?.id ?? "",
+    ]);
+    expect(String(finishedJob?.result_json ?? "")).toContain("explicit_build_required");
+
+    expect(harness.count("graph_nodes")).toBe(0);
+    expect(harness.count("graph_edges")).toBe(0);
+
+    const build = await harness.request({
+      kind: "buildSourceGraph",
+      payload: { sourceId, mode: "deterministic" },
+    });
+    expect(build.sourceId).toBe(sourceId);
+    expect(build.nodeCount).toBeGreaterThan(1);
+    expect(build.edgeCount).toBeGreaterThan(0);
+    expect(build.evidenceChunkCount).toBeGreaterThan(0);
+    expect(harness.count("sources", "id = ? AND analysis_level = 'analyzed'", [sourceId])).toBe(1);
+
+    const neighbors = await harness.request({
+      kind: "queryGraphNeighbors",
+      payload: { sourceId, limit: 100 },
+    });
+    expect(neighbors.nodes.some((node) => node.kind === "source" && node.refId === sourceId)).toBe(
+      true,
+    );
+    expect(neighbors.nodes.some((node) => node.kind === "person")).toBe(true);
+    expect(neighbors.nodes.some((node) => node.kind === "method")).toBe(true);
+    expect(
+      neighbors.edges.some(
+        (edge) => edge.dimension === "metadata" && edge.edgeType === "authored_by",
+      ),
+    ).toBe(true);
+    expect(
+      neighbors.edges.some(
+        (edge) => edge.evidenceSourceId === sourceId && edge.evidenceChunkIds.length > 0,
+      ),
+    ).toBe(true);
+    expect(
+      neighbors.evidence.some(
+        (anchor) => anchor.sourceId === sourceId && anchor.excerpt.length > 0,
+      ),
+    ).toBe(true);
+
+    const subgraph = await harness.request({
+      kind: "queryGraphSubgraph",
+      payload: { sourceIds: [sourceId], dimension: "domain", limit: 20 },
+    });
+    expect(subgraph.edges.length).toBeGreaterThan(0);
+    expect(subgraph.edges.length).toBeLessThanOrEqual(20);
+    expect(subgraph.nodes.length).toBeGreaterThan(0);
+    expect(subgraph.evidence.some((anchor) => anchor.sourceId === sourceId)).toBe(true);
+
+    await harness.request({ kind: "deleteMemory", id: sourceId });
+    expect(harness.count("graph_edges")).toBe(0);
+    expect(harness.count("graph_nodes", "kind = 'source' AND ref_id = ?", [sourceId])).toBe(0);
+  });
+
   it("runs capture, post-capture embedding, retrieval, and evidence windows", async () => {
     const harness = createHarness();
     const sourceText = ragText("alpha metadata retrieval evidence", 700);

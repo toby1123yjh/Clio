@@ -17,7 +17,7 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 17");
+    expect(workerSource).toContain("const schemaVersion = 18");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
@@ -52,6 +52,36 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).not.toContain("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts");
     expect(workerSource).not.toContain('ensureColumn(db, "memories"');
     expect(workerSource).not.toContain('ensureColumn(db, "chunks"');
+  });
+
+  it("defines the explicit source graph substrate without reusing wiki graph rows", () => {
+    expect(workerSource).toContain('case "buildSourceGraph"');
+    expect(workerSource).toContain('case "queryGraphNeighbors"');
+    expect(workerSource).toContain('case "queryGraphSubgraph"');
+    expect(workerSource).toContain("private async buildSourceGraph");
+    expect(workerSource).toContain("private async queryGraphNeighbors");
+    expect(workerSource).toContain("private async queryGraphSubgraph");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS graph_nodes");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS graph_edges");
+    expect(workerSource).toContain(
+      "kind IN ('source', 'person', 'venue', 'domain', 'problem', 'method', 'dataset', 'metric')",
+    );
+    expect(workerSource).toContain(
+      "CHECK (dimension IN ('metadata', 'citation', 'domain', 'technical'))",
+    );
+    expect(workerSource).toContain("CHECK (created_by IN ('adapter', 'graph_builder', 'user'))");
+    expect(workerSource).toContain("REFERENCES sources(id) ON DELETE CASCADE");
+    expect(workerSource).toContain("idx_graph_nodes_kind_canonical");
+    expect(workerSource).toContain("idx_graph_nodes_kind_ref");
+    expect(workerSource).toContain("idx_graph_edges_source_dimension");
+    expect(workerSource).toContain("idx_graph_edges_target_dimension");
+    expect(workerSource).toContain("idx_graph_edges_evidence_source");
+    expect(workerSource).toContain("function buildDeterministicGraphForSource");
+    expect(workerSource).toContain("function queryGraphNeighbors");
+    expect(workerSource).toContain("function queryGraphSubgraph");
+    expect(workerSource).not.toContain(
+      "INSERT INTO topic_graph_edges (\n            id,\n            from_topic_id",
+    );
   });
 
   it("defines the local embedding substrate and default model registry", () => {
@@ -94,6 +124,7 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("function upsertSourceChunkEmbedding");
     expect(workerSource).toContain("function upsertSourceMetaEmbedding");
     expect(workerSource).toContain("result = runPostCaptureHardeningJob");
+    expect(workerSource).toContain('reason: "explicit_build_required"');
     expect(workerSource).toContain('"EMBEDDING_MODEL_UNAVAILABLE"');
     expect(workerSource).not.toContain("Reserved job types are intentionally no-op");
     expect(workerSource).not.toContain('"ingest_embedding"');
@@ -157,7 +188,10 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("DELETE FROM source_working_set WHERE source_id = ?");
     expect(workerSource).toContain("DELETE FROM source_metadata_fts WHERE source_id = ?");
     expect(workerSource).toContain("function deleteKeywordIndexForSource");
+    expect(workerSource).toContain("function deleteGraphForSource");
     expect(workerSource).toContain('db.exec("DELETE FROM source_embeddings")');
+    expect(workerSource).toContain('db.exec("DELETE FROM graph_edges")');
+    expect(workerSource).toContain('db.exec("DELETE FROM graph_nodes")');
     expect(workerSource).toContain('db.exec("DELETE FROM source_working_set")');
     expect(workerSource).toContain('db.exec("DELETE FROM source_metadata_fts")');
     expect(workerSource).toContain('db.exec("DELETE FROM keyword_index_sources")');
@@ -166,6 +200,7 @@ describe("local engine source-native storage foundation", () => {
     const deleteSection = sourceSection("private async delete", "private async listTopicPages");
     expect(deleteSection).toContain("DELETE FROM anchors WHERE memory_id = ?");
     expect(deleteSection).toContain("DELETE FROM topic_graph_edges WHERE memory_id = ?");
+    expect(deleteSection).toContain("deleteGraphForSource(db, id)");
     expect(deleteSection).toContain("DELETE FROM source_embeddings WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_working_set WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_metadata_fts WHERE source_id = ?");
@@ -177,6 +212,8 @@ describe("local engine source-native storage foundation", () => {
 
     const resetSection = sourceSection("private async resetLibrary", "private async ensureReady");
     expect(resetSection).toContain('db.exec("DELETE FROM jobs")');
+    expect(resetSection).toContain('db.exec("DELETE FROM graph_edges")');
+    expect(resetSection).toContain('db.exec("DELETE FROM graph_nodes")');
     expect(resetSection).toContain('db.exec("DELETE FROM topic_graph_edges")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_embeddings")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_working_set")');
@@ -314,6 +351,14 @@ describe("local engine source-native storage foundation", () => {
       "[...metaHits, ...vectorMetaResult.hits, ...ftsHits, ...vectorResult.hits]",
     );
     expect(retrieveSection).not.toContain("normalized_text");
+    expect(retrieveSection).not.toContain("graph_nodes");
+    expect(retrieveSection).not.toContain("graph_edges");
+    const searchKnowledgeBaseSection = workerSource.slice(
+      workerSource.indexOf("private async searchKnowledgeBase"),
+      workerSource.indexOf("private async getMemoryEvidenceWindows"),
+    );
+    expect(searchKnowledgeBaseSection).not.toContain("graph_nodes");
+    expect(searchKnowledgeBaseSection).not.toContain("graph_edges");
     const metaRetrievalSection = workerSource.slice(
       workerSource.indexOf("function loadMetaSourceRetrievalHits"),
       workerSource.indexOf("function loadFtsChunkRetrievalHits"),

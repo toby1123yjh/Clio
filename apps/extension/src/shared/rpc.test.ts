@@ -249,6 +249,90 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts typed graph build and query requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceGraph",
+          payload: { sourceId: "source-1", mode: "deterministic" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphNeighbors",
+          payload: {
+            sourceId: "source-1",
+            kind: "method",
+            dimension: "technical",
+            depth: 2,
+            limit: 40,
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphSubgraph",
+          payload: {
+            sourceIds: ["source-1", "source-2"],
+            dimension: "domain",
+            limit: 80,
+          },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects invalid graph build and query payloads", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceGraph",
+          payload: { sourceId: "source-1", mode: "provider" },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphNeighbors",
+          payload: { sourceId: "source-1", kind: "chunk" },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphNeighbors",
+          payload: { sourceId: "source-1", dimension: "semantic" },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphSubgraph",
+          payload: { sourceIds: ["source-1", 42] },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("rejects invalid wiki compile event payloads", () => {
     expect(
       isEngineRequestMessage({

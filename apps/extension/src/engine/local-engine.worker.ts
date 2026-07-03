@@ -3,6 +3,8 @@ import {
   type AnchorInfo,
   type AnchorResolveResult,
   type AppendSessionEvidencePayload,
+  type BuildSourceGraphPayload,
+  type BuildSourceGraphResult,
   CLIO_WORKER_RESPONSE,
   type CaptureBasePayload,
   type CaptureResult,
@@ -27,6 +29,15 @@ import {
   type GetMemoryEvidenceWindowAnchor,
   type GetMemoryEvidenceWindowsPayload,
   type GetMemoryEvidenceWindowsResult,
+  type GraphEdge,
+  type GraphEdgeCreatedBy,
+  type GraphEdgeDimension,
+  type GraphEvidenceAnchor,
+  type GraphNeighborsPayload,
+  type GraphNode,
+  type GraphNodeKind,
+  type GraphQueryResult,
+  type GraphSubgraphPayload,
   type ImageGenerationHistoryRecord,
   type JobStatus,
   type JobSummary,
@@ -124,7 +135,7 @@ export interface LocalEngineOptions {
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
-const schemaVersion = 17;
+const schemaVersion = 18;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -136,6 +147,9 @@ const keywordIndexMaxTermChars = 160;
 const keywordIndexMaxChunkSamples = 12;
 const keywordIndexMaxChunkSampleChars = 12_000;
 const keywordIndexChunkTextMaxChars = 24_000;
+const graphBuilderMaxChunkSamples = 12;
+const graphBuilderMaxChunkSampleChars = 24_000;
+const graphBuilderMaxTermsPerKind = 12;
 const chunkMetaHeadVersion = 1;
 const chunkMetaTitleMaxChars = 500;
 const chunkMetaSourceTypeMaxChars = 100;
@@ -231,6 +245,32 @@ interface EmbeddingProvider {
   readonly provider: string;
   readonly dimension: number;
   embed(input: string): number[];
+}
+
+interface GraphNodeInput {
+  kind: GraphNodeKind;
+  label: string;
+  canonicalId: string;
+  refId?: string;
+}
+
+interface GraphEdgeInput {
+  sourceNodeId: string;
+  targetNodeId: string;
+  dimension: GraphEdgeDimension;
+  edgeType: string;
+  evidenceSourceId?: string;
+  evidenceChunkIds: string[];
+  weight: number;
+  createdBy: GraphEdgeCreatedBy;
+}
+
+interface DeterministicGraphBuild {
+  nodes: GraphNodeInput[];
+  edges: Array<
+    Omit<GraphEdgeInput, "sourceNodeId" | "targetNodeId"> & { targetCanonicalId: string }
+  >;
+  evidenceChunkIds: string[];
 }
 
 interface DocumentDraft {
@@ -365,6 +405,12 @@ export class LocalEngine {
         );
       case "listTopicGraphEdges":
         return await this.listTopicGraphEdges(request.topicId, request.edgeKind);
+      case "buildSourceGraph":
+        return await this.buildSourceGraph(request.payload);
+      case "queryGraphNeighbors":
+        return await this.queryGraphNeighbors(request.payload);
+      case "queryGraphSubgraph":
+        return await this.queryGraphSubgraph(request.payload);
       case "repair":
         return await this.repair(request.action);
       case "getJobStatus":
@@ -1145,6 +1191,7 @@ export class LocalEngine {
       });
       db.exec({ sql: "DELETE FROM anchors WHERE memory_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM topic_graph_edges WHERE memory_id = ?", bind: [id] });
+      deleteGraphForSource(db, id);
       db.exec({ sql: "DELETE FROM source_embeddings WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_working_set WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_metadata_fts WHERE source_id = ?", bind: [id] });
@@ -1556,6 +1603,109 @@ export class LocalEngine {
             [topicId, topicId, kind],
           );
     return { edges: rows.map(topicGraphEdgeFromRow) };
+  }
+
+  private async buildSourceGraph(
+    payload: BuildSourceGraphPayload,
+  ): Promise<BuildSourceGraphResult> {
+    const db = await this.ensureReady();
+    const sourceId = normalizeRequiredId(payload.sourceId, "sourceId");
+    if (payload.mode !== undefined && payload.mode !== "deterministic") {
+      throw new EngineRpcError("INVALID_GRAPH_MODE", `Unsupported graph mode: ${payload.mode}`);
+    }
+
+    const source = db.selectObject(
+      `SELECT id
+       FROM sources
+       WHERE id = ?
+         AND lifecycle_status <> 'deleted'
+       LIMIT 1`,
+      [sourceId],
+    );
+    if (source === undefined) {
+      throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
+    }
+
+    let result: BuildSourceGraphResult = {
+      sourceId,
+      nodeCount: 0,
+      edgeCount: 0,
+      evidenceChunkCount: 0,
+    };
+    transaction(db, () => {
+      deleteGraphForSource(db, sourceId);
+      const build = buildDeterministicGraphForSource(db, sourceId);
+      if (build.nodes.length === 0) {
+        result = {
+          sourceId,
+          nodeCount: 0,
+          edgeCount: 0,
+          evidenceChunkCount: 0,
+          skipped: true,
+          reason: "no_graph_candidates",
+        };
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const nodeIdsByCanonicalId = new Map<string, string>();
+      for (const node of build.nodes) {
+        const nodeId = upsertGraphNode(db, node, now);
+        nodeIdsByCanonicalId.set(node.canonicalId, nodeId);
+      }
+
+      const sourceNodeId = nodeIdsByCanonicalId.get(`source:${sourceId}`);
+      if (sourceNodeId === undefined) {
+        throw new EngineRpcError("GRAPH_BUILD_FAILED", `Source graph node missing: ${sourceId}`);
+      }
+
+      let edgeCount = 0;
+      for (const edge of build.edges) {
+        const targetNodeId = nodeIdsByCanonicalId.get(edge.targetCanonicalId);
+        if (targetNodeId === undefined) continue;
+        insertGraphEdge(
+          db,
+          {
+            sourceNodeId,
+            targetNodeId,
+            dimension: edge.dimension,
+            edgeType: edge.edgeType,
+            evidenceSourceId: edge.evidenceSourceId,
+            evidenceChunkIds: edge.evidenceChunkIds,
+            weight: edge.weight,
+            createdBy: edge.createdBy,
+          },
+          now,
+        );
+        edgeCount += 1;
+      }
+
+      db.exec({
+        sql: `UPDATE sources
+              SET analysis_level = 'analyzed',
+                  updated_at = ?
+              WHERE id = ?`,
+        bind: [now, sourceId],
+      });
+
+      result = {
+        sourceId,
+        nodeCount: build.nodes.length,
+        edgeCount,
+        evidenceChunkCount: build.evidenceChunkIds.length,
+      };
+    });
+    return result;
+  }
+
+  private async queryGraphNeighbors(payload: GraphNeighborsPayload): Promise<GraphQueryResult> {
+    const db = await this.ensureReady();
+    return queryGraphNeighbors(db, payload);
+  }
+
+  private async queryGraphSubgraph(payload: GraphSubgraphPayload): Promise<GraphQueryResult> {
+    const db = await this.ensureReady();
+    return queryGraphSubgraph(db, payload);
   }
 
   private async repair(action: RepairAction): Promise<RepairResult> {
@@ -2373,6 +2523,8 @@ export class LocalEngine {
       db.exec("DELETE FROM jobs");
       db.exec("DELETE FROM source_audit_log");
       db.exec("DELETE FROM source_lifecycle_events");
+      db.exec("DELETE FROM graph_edges");
+      db.exec("DELETE FROM graph_nodes");
       db.exec("DELETE FROM source_working_set");
       db.exec("DELETE FROM source_metadata");
       db.exec("DELETE FROM keyword_index_sources");
@@ -2873,6 +3025,34 @@ function migrate(db: SqliteDb) {
       created_at TEXT NOT NULL
     )
   `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS graph_nodes (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (
+        kind IN ('source', 'person', 'venue', 'domain', 'problem', 'method', 'dataset', 'metric')
+      ),
+      label TEXT NOT NULL,
+      canonical_id TEXT NOT NULL,
+      ref_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (kind, canonical_id)
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS graph_edges (
+      id TEXT PRIMARY KEY,
+      source_node_id TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+      target_node_id TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+      dimension TEXT NOT NULL CHECK (dimension IN ('metadata', 'citation', 'domain', 'technical')),
+      edge_type TEXT NOT NULL,
+      evidence_source_id TEXT REFERENCES sources(id) ON DELETE CASCADE,
+      evidence_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+      weight REAL NOT NULL DEFAULT 1 CHECK (weight >= 0 AND weight <= 1),
+      created_by TEXT NOT NULL CHECK (created_by IN ('adapter', 'graph_builder', 'user')),
+      created_at TEXT NOT NULL
+    )
+  `);
   ensureAgentScopeCheckConstraints(db);
 
   db.exec("CREATE INDEX IF NOT EXISTS idx_sources_captured_at ON sources(captured_at DESC)");
@@ -2954,6 +3134,19 @@ function migrate(db: SqliteDb) {
   );
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_topic_graph_edges_memory ON topic_graph_edges(memory_id, kind)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_canonical ON graph_nodes(kind, canonical_id)",
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_ref ON graph_nodes(kind, ref_id)");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_graph_edges_source_dimension ON graph_edges(source_node_id, dimension)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_graph_edges_target_dimension ON graph_edges(target_node_id, dimension)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_graph_edges_evidence_source ON graph_edges(evidence_source_id)",
   );
   ensureDefaultEmbeddingModel(db);
   db.exec(`PRAGMA user_version = ${schemaVersion}`);
@@ -4628,10 +4821,16 @@ function runPostCaptureHardeningJob(db: SqliteDb, payloadJson: string): Record<s
     throw new EngineRpcError("INVALID_JOB_PAYLOAD", "Post-capture job is missing sourceId.");
   }
   const shouldRunEmbedding = payload.stages.length === 0 || payload.stages.includes("embedding");
-  if (!shouldRunEmbedding) {
-    return { ok: true, embedding: { skipped: true, reason: "stage_not_requested" } };
-  }
-  return runEmbeddingStageForSource(db, payload.sourceId);
+  const shouldRunGraph = payload.stages.includes("graph");
+  const result = shouldRunEmbedding
+    ? runEmbeddingStageForSource(db, payload.sourceId)
+    : { ok: true, embedding: { skipped: true, reason: "stage_not_requested" } };
+  return {
+    ...result,
+    graph: shouldRunGraph
+      ? { skipped: true, reason: "explicit_build_required" }
+      : { skipped: true, reason: "stage_not_requested" },
+  };
 }
 
 function parsePostCaptureHardeningPayload(payloadJson: string) {
@@ -4873,6 +5072,739 @@ function insertSourceMetadataFtsRow(
       input.url,
     ],
   });
+}
+
+function buildDeterministicGraphForSource(db: SqliteDb, sourceId: string): DeterministicGraphBuild {
+  const source = db.selectObject(
+    `SELECT
+      s.id,
+      s.source_title,
+      s.source_type,
+      sm.title AS meta_title,
+      sm.abstract AS meta_abstract,
+      sm.authors_json,
+      sm.metadata_json,
+      sm.section_outline_json
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.id = ?
+       AND s.lifecycle_status <> 'deleted'
+     LIMIT 1`,
+    [sourceId],
+  );
+  if (source === undefined) return { nodes: [], edges: [], evidenceChunkIds: [] };
+
+  const nodesByCanonicalId = new Map<string, GraphNodeInput>();
+  const edges: DeterministicGraphBuild["edges"] = [];
+  const evidenceChunkIds = new Set<string>();
+  const metadata = parseMetadata(stringField(source, "metadata_json"));
+  const sourceLabel =
+    stringField(source, "meta_title") || stringField(source, "source_title") || sourceId;
+  const sourceNode: GraphNodeInput = {
+    kind: "source",
+    label: sourceLabel,
+    canonicalId: `source:${sourceId}`,
+    refId: sourceId,
+  };
+  addGraphNodeInput(nodesByCanonicalId, sourceNode);
+
+  const addEntityEdge = (
+    kind: GraphNodeKind,
+    label: string,
+    input: {
+      dimension: GraphEdgeDimension;
+      edgeType: string;
+      weight: number;
+      evidenceChunkIds?: string[];
+    },
+  ) => {
+    const node = graphEntityNodeInput(kind, label);
+    if (node === undefined) return;
+    addGraphNodeInput(nodesByCanonicalId, node);
+    const chunks = boundedUniqueStrings(input.evidenceChunkIds, 8);
+    for (const chunkId of chunks) evidenceChunkIds.add(chunkId);
+    edges.push({
+      targetCanonicalId: node.canonicalId,
+      dimension: input.dimension,
+      edgeType: input.edgeType,
+      evidenceSourceId: sourceId,
+      evidenceChunkIds: chunks,
+      weight: clampGraphWeight(input.weight),
+      createdBy: "graph_builder",
+    });
+  };
+
+  for (const author of parseStringArray(stringField(source, "authors_json")).slice(0, 20)) {
+    addEntityEdge("person", author, {
+      dimension: "metadata",
+      edgeType: "authored_by",
+      weight: 1,
+    });
+  }
+
+  const venue =
+    stringMetadataField(metadata, "venue") ??
+    stringMetadataField(metadata, "paper_source") ??
+    stringMetadataField(metadata, "publisher");
+  if (venue !== null) {
+    addEntityEdge("venue", venue, {
+      dimension: "metadata",
+      edgeType: "published_in",
+      weight: 0.9,
+    });
+  }
+
+  for (const domain of [
+    stringField(source, "source_type"),
+    ...stringArrayMetadataField(metadata, "categories"),
+    ...stringArrayMetadataField(metadata, "subjects"),
+    ...stringArrayMetadataField(metadata, "keywords"),
+  ]) {
+    addEntityEdge("domain", domain, {
+      dimension: "metadata",
+      edgeType: "in_domain",
+      weight: 0.75,
+    });
+  }
+
+  const headingRows = graphSectionHeadingLabels(stringField(source, "section_outline_json"));
+  for (const heading of headingRows) {
+    addEntityEdge(classifyGraphHeadingKind(heading), heading, {
+      dimension: "domain",
+      edgeType: "section_mentions",
+      weight: 0.65,
+    });
+  }
+
+  const chunkRows = db.selectObjects(
+    `SELECT id, ord, text, meta_head_json, page_start, page_end
+     FROM source_chunks
+     WHERE source_id = ?
+     ORDER BY ord ASC
+     LIMIT ?`,
+    [sourceId, graphBuilderMaxChunkSamples],
+  );
+  let sampledChunkChars = 0;
+  const chunkTermsByKind = new Map<
+    GraphNodeKind,
+    Map<string, { hitCount: number; chunks: Set<string> }>
+  >();
+  for (const chunk of chunkRows) {
+    const chunkId = stringField(chunk, "id");
+    const metaHead = parseMetadata(stringField(chunk, "meta_head_json"));
+    const textParts = [
+      stringMetadataField(metaHead, "docContext") ?? "",
+      stringMetadataField(metaHead, "chunkSummary") ?? "",
+    ];
+    if (sampledChunkChars < graphBuilderMaxChunkSampleChars) {
+      const sample = stringField(chunk, "text").slice(
+        0,
+        Math.max(0, graphBuilderMaxChunkSampleChars - sampledChunkChars),
+      );
+      sampledChunkChars += sample.length;
+      textParts.push(sample);
+    }
+    for (const term of graphCandidateTerms(textParts.join("\n"))) {
+      const kind = classifyGraphTermKind(term);
+      const byTerm =
+        chunkTermsByKind.get(kind) ?? new Map<string, { hitCount: number; chunks: Set<string> }>();
+      const entry = byTerm.get(term) ?? { hitCount: 0, chunks: new Set<string>() };
+      entry.hitCount += 1;
+      if (chunkId.length > 0) entry.chunks.add(chunkId);
+      byTerm.set(term, entry);
+      chunkTermsByKind.set(kind, byTerm);
+    }
+  }
+
+  for (const [kind, byTerm] of chunkTermsByKind) {
+    const sorted = Array.from(byTerm.entries())
+      .sort(
+        (left, right) => right[1].hitCount - left[1].hitCount || left[0].localeCompare(right[0]),
+      )
+      .slice(0, graphBuilderMaxTermsPerKind);
+    for (const [term, entry] of sorted) {
+      const dimension: GraphEdgeDimension = kind === "method" ? "technical" : "domain";
+      addEntityEdge(kind, term, {
+        dimension,
+        edgeType: dimension === "technical" ? "uses" : "mentions",
+        weight: Math.min(0.85, 0.45 + entry.hitCount * 0.08),
+        evidenceChunkIds: Array.from(entry.chunks).slice(0, 4),
+      });
+    }
+  }
+
+  return {
+    nodes: Array.from(nodesByCanonicalId.values()),
+    edges: dedupeGraphEdgeInputs(edges),
+    evidenceChunkIds: Array.from(evidenceChunkIds),
+  };
+}
+
+function addGraphNodeInput(nodes: Map<string, GraphNodeInput>, node: GraphNodeInput) {
+  if (node.label.length === 0 || node.canonicalId.length === 0) return;
+  if (!nodes.has(node.canonicalId)) nodes.set(node.canonicalId, node);
+}
+
+function graphEntityNodeInput(kind: GraphNodeKind, label: string): GraphNodeInput | undefined {
+  if (kind === "source") return undefined;
+  const normalizedLabel = normalizeGraphLabel(label);
+  const canonicalLabel = normalizeGraphCanonicalLabel(normalizedLabel);
+  if (normalizedLabel.length === 0 || canonicalLabel.length === 0) return undefined;
+  return {
+    kind,
+    label: normalizedLabel,
+    canonicalId: `${kind}:${canonicalLabel}`,
+  };
+}
+
+function upsertGraphNode(db: SqliteDb, input: GraphNodeInput, now: string) {
+  const existing = db.selectObject(
+    "SELECT id FROM graph_nodes WHERE kind = ? AND canonical_id = ? LIMIT 1",
+    [input.kind, input.canonicalId],
+  );
+  const nodeId = stringField(existing ?? {}, "id") || createId("graph_node");
+  db.exec({
+    sql: `INSERT INTO graph_nodes (
+            id,
+            kind,
+            label,
+            canonical_id,
+            ref_id,
+            created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(kind, canonical_id) DO UPDATE SET
+            label = excluded.label,
+            ref_id = COALESCE(excluded.ref_id, graph_nodes.ref_id),
+            updated_at = excluded.updated_at`,
+    bind: [nodeId, input.kind, input.label, input.canonicalId, input.refId ?? null, now, now],
+  });
+  return nodeId;
+}
+
+function insertGraphEdge(db: SqliteDb, input: GraphEdgeInput, now: string) {
+  db.exec({
+    sql: `INSERT INTO graph_edges (
+            id,
+            source_node_id,
+            target_node_id,
+            dimension,
+            edge_type,
+            evidence_source_id,
+            evidence_chunk_ids_json,
+            weight,
+            created_by,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    bind: [
+      createId("graph_edge"),
+      input.sourceNodeId,
+      input.targetNodeId,
+      input.dimension,
+      normalizeText(input.edgeType),
+      input.evidenceSourceId ?? null,
+      JSON.stringify(boundedUniqueStrings(input.evidenceChunkIds, 8)),
+      clampGraphWeight(input.weight),
+      input.createdBy,
+      now,
+    ],
+  });
+}
+
+function deleteGraphForSource(db: SqliteDb, sourceId: string) {
+  const sourceNodeRows = db.selectObjects(
+    "SELECT id FROM graph_nodes WHERE kind = 'source' AND ref_id = ?",
+    [sourceId],
+  );
+  const sourceNodeIds = sourceNodeRows
+    .map((row) => stringField(row, "id"))
+    .filter((id) => id.length > 0);
+  db.exec({ sql: "DELETE FROM graph_edges WHERE evidence_source_id = ?", bind: [sourceId] });
+  if (sourceNodeIds.length > 0) {
+    db.exec({
+      sql: `DELETE FROM graph_edges
+            WHERE source_node_id IN (${sourceNodeIds.map(() => "?").join(", ")})
+               OR target_node_id IN (${sourceNodeIds.map(() => "?").join(", ")})`,
+      bind: [...sourceNodeIds, ...sourceNodeIds],
+    });
+  }
+  db.exec({
+    sql: "DELETE FROM graph_nodes WHERE kind = 'source' AND ref_id = ?",
+    bind: [sourceId],
+  });
+  db.exec(`
+    DELETE FROM graph_nodes
+    WHERE kind <> 'source'
+      AND id NOT IN (
+        SELECT source_node_id FROM graph_edges
+        UNION
+        SELECT target_node_id FROM graph_edges
+      )
+  `);
+}
+
+function queryGraphNeighbors(db: SqliteDb, payload: GraphNeighborsPayload): GraphQueryResult {
+  const startNodes = resolveGraphStartNodes(db, payload);
+  if (startNodes.length === 0) return emptyGraphQueryResult();
+  const limit = clampOptionalLimit(payload.limit, 50, 200);
+  const depth = Math.max(1, Math.min(2, Math.floor(payload.depth ?? 1)));
+  const dimension = normalizeGraphDimension(payload.dimension);
+  const edgesById = new Map<string, GraphEdge>();
+  const nodesById = new Map<string, GraphNode>();
+  let frontier = startNodes.map((node) => node.id);
+  for (const node of startNodes) nodesById.set(node.id, node);
+
+  for (let level = 0; level < depth && frontier.length > 0 && edgesById.size < limit; level += 1) {
+    const rows = loadGraphEdgesAdjacentToNodes(db, frontier, dimension, limit - edgesById.size);
+    const nextFrontier: string[] = [];
+    for (const row of rows) {
+      const edge = graphEdgeFromRow(row);
+      if (!edgesById.has(edge.id)) edgesById.set(edge.id, edge);
+      for (const nodeId of [edge.sourceNodeId, edge.targetNodeId]) {
+        if (nodesById.has(nodeId)) continue;
+        const node = loadGraphNode(db, nodeId);
+        if (node === undefined) continue;
+        nodesById.set(nodeId, node);
+        nextFrontier.push(nodeId);
+      }
+    }
+    frontier = nextFrontier;
+  }
+
+  const edges = Array.from(edgesById.values()).slice(0, limit);
+  const nodes = Array.from(nodesById.values()).slice(0, limit + startNodes.length);
+  return {
+    nodes,
+    edges,
+    evidence: loadGraphEvidenceAnchors(db, edges),
+  };
+}
+
+function queryGraphSubgraph(db: SqliteDb, payload: GraphSubgraphPayload): GraphQueryResult {
+  const sourceIds = boundedUniqueStrings(payload.sourceIds, 40);
+  const limit = clampOptionalLimit(payload.limit, 80, 200);
+  const dimension = normalizeGraphDimension(payload.dimension);
+  const rows =
+    sourceIds.length === 0
+      ? loadGraphEdges(db, dimension, limit)
+      : loadGraphEdgesForSources(db, sourceIds, dimension, limit);
+  const edges = rows.map(graphEdgeFromRow);
+  return {
+    nodes: loadGraphNodesForEdges(db, edges),
+    edges,
+    evidence: loadGraphEvidenceAnchors(db, edges),
+  };
+}
+
+function resolveGraphStartNodes(db: SqliteDb, payload: GraphNeighborsPayload): GraphNode[] {
+  if (payload.nodeId !== undefined) {
+    const node = loadGraphNode(db, normalizeText(payload.nodeId));
+    return node === undefined ? [] : [node];
+  }
+  if (payload.sourceId !== undefined) {
+    const rows = db.selectObjects(
+      "SELECT * FROM graph_nodes WHERE kind = 'source' AND ref_id = ? ORDER BY updated_at DESC LIMIT 5",
+      [normalizeText(payload.sourceId)],
+    );
+    return rows.map(graphNodeFromRow);
+  }
+  if (payload.canonicalId !== undefined) {
+    const canonicalId = normalizeText(payload.canonicalId);
+    const kind = normalizeGraphNodeKind(payload.kind);
+    const rows =
+      kind === undefined
+        ? db.selectObjects(
+            "SELECT * FROM graph_nodes WHERE canonical_id = ? ORDER BY updated_at DESC LIMIT 20",
+            [canonicalId],
+          )
+        : db.selectObjects(
+            "SELECT * FROM graph_nodes WHERE kind = ? AND canonical_id = ? ORDER BY updated_at DESC LIMIT 20",
+            [kind, canonicalId],
+          );
+    return rows.map(graphNodeFromRow);
+  }
+  return [];
+}
+
+function loadGraphEdgesAdjacentToNodes(
+  db: SqliteDb,
+  nodeIds: string[],
+  dimension: GraphEdgeDimension | undefined,
+  limit: number,
+) {
+  const boundedNodeIds = boundedUniqueStrings(nodeIds, 80);
+  if (boundedNodeIds.length === 0) return [];
+  const placeholders = boundedNodeIds.map(() => "?").join(", ");
+  const dimensionSql = dimension === undefined ? "" : " AND dimension = ?";
+  const bind = [
+    ...boundedNodeIds,
+    ...boundedNodeIds,
+    ...(dimension === undefined ? [] : [dimension]),
+    limit,
+  ];
+  return db.selectObjects(
+    `SELECT *
+     FROM graph_edges
+     WHERE (source_node_id IN (${placeholders}) OR target_node_id IN (${placeholders}))
+       ${dimensionSql}
+     ORDER BY weight DESC, created_at DESC
+     LIMIT ?`,
+    bind,
+  );
+}
+
+function loadGraphEdges(db: SqliteDb, dimension: GraphEdgeDimension | undefined, limit: number) {
+  return dimension === undefined
+    ? db.selectObjects(
+        `SELECT *
+         FROM graph_edges
+         ORDER BY weight DESC, created_at DESC
+         LIMIT ?`,
+        [limit],
+      )
+    : db.selectObjects(
+        `SELECT *
+         FROM graph_edges
+         WHERE dimension = ?
+         ORDER BY weight DESC, created_at DESC
+         LIMIT ?`,
+        [dimension, limit],
+      );
+}
+
+function loadGraphEdgesForSources(
+  db: SqliteDb,
+  sourceIds: string[],
+  dimension: GraphEdgeDimension | undefined,
+  limit: number,
+) {
+  const sourceNodes = db.selectObjects(
+    `SELECT id
+     FROM graph_nodes
+     WHERE kind = 'source'
+       AND ref_id IN (${sourceIds.map(() => "?").join(", ")})`,
+    sourceIds,
+  );
+  const sourceNodeIds = sourceNodes
+    .map((row) => stringField(row, "id"))
+    .filter((id) => id.length > 0);
+  const nodeSql =
+    sourceNodeIds.length === 0
+      ? ""
+      : ` OR source_node_id IN (${sourceNodeIds.map(() => "?").join(", ")})
+            OR target_node_id IN (${sourceNodeIds.map(() => "?").join(", ")})`;
+  const dimensionSql = dimension === undefined ? "" : " AND dimension = ?";
+  return db.selectObjects(
+    `SELECT *
+     FROM graph_edges
+     WHERE (evidence_source_id IN (${sourceIds.map(() => "?").join(", ")})${nodeSql})
+       ${dimensionSql}
+     ORDER BY weight DESC, created_at DESC
+     LIMIT ?`,
+    [
+      ...sourceIds,
+      ...sourceNodeIds,
+      ...sourceNodeIds,
+      ...(dimension === undefined ? [] : [dimension]),
+      limit,
+    ],
+  );
+}
+
+function loadGraphNode(db: SqliteDb, nodeId: string): GraphNode | undefined {
+  const row = db.selectObject("SELECT * FROM graph_nodes WHERE id = ? LIMIT 1", [nodeId]);
+  return row === undefined ? undefined : graphNodeFromRow(row);
+}
+
+function loadGraphNodesForEdges(db: SqliteDb, edges: GraphEdge[]) {
+  const nodeIds = boundedUniqueStrings(
+    edges.flatMap((edge) => [edge.sourceNodeId, edge.targetNodeId]),
+    240,
+  );
+  if (nodeIds.length === 0) return [];
+  const rows = db.selectObjects(
+    `SELECT *
+     FROM graph_nodes
+     WHERE id IN (${nodeIds.map(() => "?").join(", ")})
+     ORDER BY kind ASC, label ASC`,
+    nodeIds,
+  );
+  return rows.map(graphNodeFromRow);
+}
+
+function loadGraphEvidenceAnchors(db: SqliteDb, edges: GraphEdge[]): GraphEvidenceAnchor[] {
+  const anchorsByKey = new Map<string, GraphEvidenceAnchor>();
+  const chunkIds = boundedUniqueStrings(
+    edges.flatMap((edge) => edge.evidenceChunkIds),
+    240,
+  );
+  if (chunkIds.length > 0) {
+    const rows = db.selectObjects(
+      `SELECT source_id, id, ord, text, page_start, page_end
+       FROM source_chunks
+       WHERE id IN (${chunkIds.map(() => "?").join(", ")})
+       ORDER BY source_id ASC, ord ASC`,
+      chunkIds,
+    );
+    for (const row of rows) {
+      const anchor = graphEvidenceAnchorFromChunkRow(row);
+      anchorsByKey.set(`${anchor.sourceId}:${anchor.chunkId ?? ""}`, anchor);
+    }
+  }
+
+  const sourceOnlyIds = boundedUniqueStrings(
+    edges.flatMap((edge) =>
+      edge.evidenceSourceId !== undefined && edge.evidenceChunkIds.length === 0
+        ? [edge.evidenceSourceId]
+        : [],
+    ),
+    80,
+  );
+  for (const sourceId of sourceOnlyIds) {
+    if (Array.from(anchorsByKey.values()).some((anchor) => anchor.sourceId === sourceId)) continue;
+    const row = db.selectObject(
+      `SELECT source_id, id, ord, text, page_start, page_end
+       FROM source_chunks
+       WHERE source_id = ?
+       ORDER BY ord ASC
+       LIMIT 1`,
+      [sourceId],
+    );
+    if (row === undefined) continue;
+    const anchor = graphEvidenceAnchorFromChunkRow(row);
+    anchorsByKey.set(`${anchor.sourceId}:${anchor.chunkId ?? ""}`, anchor);
+  }
+
+  return Array.from(anchorsByKey.values());
+}
+
+function graphNodeFromRow(row: SqlRow): GraphNode {
+  const refId = optionalString(row, "ref_id");
+  return {
+    id: stringField(row, "id"),
+    kind: graphNodeKindField(row, "kind"),
+    label: stringField(row, "label"),
+    canonicalId: stringField(row, "canonical_id"),
+    ...(refId === undefined ? {} : { refId }),
+    createdAt: stringField(row, "created_at"),
+    updatedAt: stringField(row, "updated_at"),
+  };
+}
+
+function graphEdgeFromRow(row: SqlRow): GraphEdge {
+  const evidenceSourceId = optionalString(row, "evidence_source_id");
+  return {
+    id: stringField(row, "id"),
+    sourceNodeId: stringField(row, "source_node_id"),
+    targetNodeId: stringField(row, "target_node_id"),
+    dimension: graphEdgeDimensionField(row, "dimension"),
+    edgeType: stringField(row, "edge_type"),
+    ...(evidenceSourceId === undefined ? {} : { evidenceSourceId }),
+    evidenceChunkIds: parseStringArray(stringField(row, "evidence_chunk_ids_json")),
+    weight: realField(row, "weight"),
+    createdBy: graphEdgeCreatedByField(row, "created_by"),
+    createdAt: stringField(row, "created_at"),
+  };
+}
+
+function graphEvidenceAnchorFromChunkRow(row: SqlRow): GraphEvidenceAnchor {
+  return {
+    sourceId: stringField(row, "source_id"),
+    chunkId: stringField(row, "id"),
+    ord: numberField(row, "ord"),
+    excerpt: excerpt(stringField(row, "text")),
+    ...optionalPageRangeFromRow(row),
+  };
+}
+
+function emptyGraphQueryResult(): GraphQueryResult {
+  return { nodes: [], edges: [], evidence: [] };
+}
+
+function clampGraphWeight(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function graphSectionHeadingLabels(sectionOutlineJson: string) {
+  const headings = parseJsonArray(sectionOutlineJson);
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (const item of headings) {
+    if (typeof item !== "object" || item === null) continue;
+    const text =
+      "text" in item && typeof item.text === "string" ? normalizeGraphLabel(item.text) : "";
+    const key = normalizeGraphCanonicalLabel(text);
+    if (text.length === 0 || key.length === 0 || text.length > 160 || seen.has(key)) continue;
+    seen.add(key);
+    labels.push(text);
+    if (labels.length >= 40) break;
+  }
+  return labels;
+}
+
+function classifyGraphHeadingKind(label: string): GraphNodeKind {
+  const normalized = normalizeGraphCanonicalLabel(label);
+  if (
+    /\b(method|methods|approach|architecture|implementation|pipeline|algorithm|adapter)\b/u.test(
+      normalized,
+    )
+  ) {
+    return "method";
+  }
+  if (/\b(problem|challenge|limitation|failure|risk|error)\b/u.test(normalized)) return "problem";
+  if (/\b(dataset|benchmark|corpus|evaluation set)\b/u.test(normalized)) return "dataset";
+  if (/\b(metric|evaluation|result|score|accuracy|latency|recall|precision)\b/u.test(normalized)) {
+    return "metric";
+  }
+  return "domain";
+}
+
+function graphCandidateTerms(input: string) {
+  const terms = new Map<string, number>();
+  const tokens = keywordTokens(input).filter(isUsefulKeywordToken).slice(0, 400);
+  for (const token of tokens) {
+    addGraphCandidateTerm(terms, token, 1);
+    if (isHanText(token)) {
+      for (const bigram of hanBigrams(token)) addGraphCandidateTerm(terms, bigram, 1);
+    }
+  }
+  for (let index = 0; index < tokens.length; index += 1) {
+    for (let size = 2; size <= 4; size += 1) {
+      const slice = tokens.slice(index, index + size);
+      if (slice.length !== size || !slice.every(isUsefulKeywordToken)) continue;
+      addGraphCandidateTerm(terms, slice.join(" "), size);
+    }
+  }
+  return Array.from(terms.entries())
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([term]) => term)
+    .slice(0, 80);
+}
+
+function addGraphCandidateTerm(terms: Map<string, number>, input: string, weight: number) {
+  const label = normalizeGraphLabel(input);
+  const canonical = normalizeGraphCanonicalLabel(label);
+  if (label.length === 0 || canonical.length === 0) return;
+  if (label.length < 2 || label.length > 80) return;
+  if (
+    /^(http|https|www|com|org|net|pdf|page|section|figure|table|appendix|copyright)$/iu.test(
+      canonical,
+    )
+  ) {
+    return;
+  }
+  terms.set(label, (terms.get(label) ?? 0) + weight);
+}
+
+function classifyGraphTermKind(term: string): GraphNodeKind {
+  const normalized = normalizeGraphCanonicalLabel(term);
+  if (
+    /\b(model|algorithm|rag|retrieval|embedding|parser|adapter|index|search|queue|graph|api|agent|workflow|pipeline|chunk|rerank)\b/u.test(
+      normalized,
+    )
+  ) {
+    return "method";
+  }
+  if (/\b(dataset|benchmark|corpus|sample|eval set)\b/u.test(normalized)) return "dataset";
+  if (
+    /\b(accuracy|latency|recall|precision|score|metric|evaluation|throughput|quality)\b/u.test(
+      normalized,
+    )
+  ) {
+    return "metric";
+  }
+  if (/\b(failure|problem|error|limitation|challenge|risk|gap|issue)\b/u.test(normalized))
+    return "problem";
+  return "domain";
+}
+
+function dedupeGraphEdgeInputs(edges: DeterministicGraphBuild["edges"]) {
+  const byKey = new Map<string, DeterministicGraphBuild["edges"][number]>();
+  for (const edge of edges) {
+    const key = [
+      edge.targetCanonicalId,
+      edge.dimension,
+      normalizeText(edge.edgeType),
+      edge.evidenceSourceId ?? "",
+    ].join("|");
+    const existing = byKey.get(key);
+    if (existing === undefined) {
+      byKey.set(key, {
+        ...edge,
+        edgeType: normalizeText(edge.edgeType),
+        evidenceChunkIds: boundedUniqueStrings(edge.evidenceChunkIds, 8),
+        weight: clampGraphWeight(edge.weight),
+      });
+      continue;
+    }
+    byKey.set(key, {
+      ...existing,
+      evidenceChunkIds: boundedUniqueStrings(
+        [...existing.evidenceChunkIds, ...edge.evidenceChunkIds],
+        8,
+      ),
+      weight: Math.max(existing.weight, clampGraphWeight(edge.weight)),
+    });
+  }
+  return Array.from(byKey.values());
+}
+
+function normalizeGraphLabel(label: string) {
+  return normalizeText(label)
+    .replace(/\s+/g, " ")
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N})\]]+$/gu, "")
+    .slice(0, 120)
+    .trim();
+}
+
+function normalizeGraphCanonicalLabel(label: string) {
+  return normalizeText(label)
+    .toLocaleLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")
+    .slice(0, 160)
+    .trim();
+}
+
+function normalizeGraphDimension(
+  value: GraphEdgeDimension | undefined,
+): GraphEdgeDimension | undefined {
+  if (value === "metadata" || value === "citation" || value === "domain" || value === "technical") {
+    return value;
+  }
+  return undefined;
+}
+
+function normalizeGraphNodeKind(value: GraphNodeKind | undefined): GraphNodeKind | undefined {
+  if (
+    value === "source" ||
+    value === "person" ||
+    value === "venue" ||
+    value === "domain" ||
+    value === "problem" ||
+    value === "method" ||
+    value === "dataset" ||
+    value === "metric"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function graphNodeKindField(row: SqlRow, key: string): GraphNodeKind {
+  return normalizeGraphNodeKind(stringField(row, key) as GraphNodeKind) ?? "domain";
+}
+
+function graphEdgeDimensionField(row: SqlRow, key: string): GraphEdgeDimension {
+  return normalizeGraphDimension(stringField(row, key) as GraphEdgeDimension) ?? "domain";
+}
+
+function graphEdgeCreatedByField(row: SqlRow, key: string): GraphEdgeCreatedBy {
+  const value = stringField(row, key);
+  if (value === "adapter" || value === "user") return value;
+  return "graph_builder";
 }
 
 function replaceKeywordIndexForSource(db: SqliteDb, sourceId: string) {
