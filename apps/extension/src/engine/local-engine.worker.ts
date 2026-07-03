@@ -3,6 +3,7 @@ import {
   type AnchorInfo,
   type AnchorResolveResult,
   type AppendSessionEvidencePayload,
+  type BuildSourceContextPackPayload,
   type BuildSourceGraphPayload,
   type BuildSourceGraphResult,
   CLIO_WORKER_RESPONSE,
@@ -61,6 +62,13 @@ import {
   type SearchMemoryResult,
   type SessionEvidenceRecord,
   type SessionLeaseResult,
+  type SourceContextCompressionLogEntry,
+  type SourceContextPackGroup,
+  type SourceContextPackOutlineItem,
+  type SourceContextPackResult,
+  type SourceContextPackSource,
+  type SourceContextPackWindow,
+  type SourceContextPackWindowPriority,
   type SourceKind,
   type TopicGraphEdge,
   type TopicGraphEdgeInput,
@@ -158,6 +166,20 @@ const chunkMetaAbstractMaxChars = 1_200;
 const chunkMetaEmbeddingPrefixMaxChars = 2_000;
 const defaultWorkingSetBudgetTokens = 32_000;
 const workingSetExcerptMaxChars = 280;
+const defaultSourceContextPackTotalTokens = 12_000;
+const maxSourceContextPackTotalTokens = 64_000;
+const defaultSourceContextPackGroupTokens = 4_000;
+const maxSourceContextPackGroupTokens = 24_000;
+const defaultSourceContextPackGroups = 4;
+const maxSourceContextPackGroups = 12;
+const defaultSourceContextPackSources = 8;
+const maxSourceContextPackSources = 40;
+const defaultSourceContextPackWindowsPerSource = 2;
+const maxSourceContextPackWindowsPerSource = 8;
+const sourceContextPackMetaMaxTokens = 600;
+const sourceContextPackOutlineMaxItems = 40;
+const sourceContextPackOutlineMaxTokens = 800;
+const sourceContextPackWindowSearchLimitMultiplier = 4;
 const defaultEmbeddingProvider = {
   modelId: "clio-local-hash-v1",
   provider: "local-deterministic",
@@ -273,6 +295,56 @@ interface DeterministicGraphBuild {
   evidenceChunkIds: string[];
 }
 
+interface SourceContextPackOptions {
+  query: string;
+  ftsQuery: string;
+  sourceIds: string[];
+  anchors: GetMemoryEvidenceWindowAnchor[];
+  useWorkingSet: boolean;
+  maxTotalTokens: number;
+  maxGroups: number;
+  maxGroupTokens: number;
+  maxSources: number;
+  maxWindowsPerSource: number;
+  contextChunksBefore: number;
+  contextChunksAfter: number;
+}
+
+interface SourceContextPackCandidate {
+  sourceId: string;
+  rank: number;
+  explicit: boolean;
+  anchored: boolean;
+  query: boolean;
+  workingSet?: {
+    loadDepth: WorkingSetLoadDepth;
+    pinStatus: WorkingSetStatusResult["entries"][number]["pinStatus"];
+    updatedAt: string;
+  };
+}
+
+interface SourceContextSourceState {
+  source: SourceContextPackSource;
+  rank: number;
+  capturedAt: string;
+  updatedAt: string;
+  metaTokenEstimate: number;
+  outlineTokenEstimate: number;
+  totalChunkTokens: number;
+}
+
+interface InternalSourceContextWindow extends SourceContextPackWindow {
+  tokenEstimate: number;
+}
+
+interface SourceContextSourcePack {
+  source: SourceContextPackSource;
+  windows: InternalSourceContextWindow[];
+  tokenEstimate: number;
+  omittedWindowCount: number;
+  omittedTokenEstimate: number;
+}
+
 interface DocumentDraft {
   kind: SourceKind;
   sourceUrl: string;
@@ -370,6 +442,8 @@ export class LocalEngine {
         return await this.get(request.id);
       case "getMemoryEvidenceWindows":
         return await this.getMemoryEvidenceWindows(request.payload);
+      case "buildSourceContextPack":
+        return await this.buildSourceContextPack(request.payload);
       case "deleteMemory":
         return await this.delete(request.id);
       case "listTopicPages":
@@ -1093,6 +1167,13 @@ export class LocalEngine {
   private async getWorkingSetStatus(): Promise<WorkingSetStatusResult> {
     const db = await this.ensureReady();
     return loadWorkingSetStatus(db);
+  }
+
+  private async buildSourceContextPack(
+    payload: BuildSourceContextPackPayload,
+  ): Promise<SourceContextPackResult> {
+    const db = await this.ensureReady();
+    return buildSourceContextPack(db, payload);
   }
 
   private async pinWorkingSetSource(
@@ -6208,6 +6289,785 @@ function estimateWorkingSetTokens(
   if (loadDepth === "outline") return metaTokens + Math.min(400, Math.max(80, chunkCount * 24));
   if (loadDepth === "chunks") return metaTokens + Math.min(chunkTokens, 8_000);
   return metaTokens + Math.min(chunkTokens, 16_000);
+}
+
+function buildSourceContextPack(
+  db: SqliteDb,
+  payload: BuildSourceContextPackPayload,
+): SourceContextPackResult {
+  const options = normalizeSourceContextPackOptions(payload);
+  const compressionLog: SourceContextCompressionLogEntry[] = [];
+  const candidates = resolveSourceContextPackCandidates(db, options, compressionLog);
+  const states = loadSourceContextSourceStates(db, candidates, compressionLog);
+  const sourcePacks = states.flatMap((state) => {
+    const pack = buildSourceContextSourcePack(db, state, options, compressionLog);
+    return pack === undefined ? [] : [pack];
+  });
+  const packed = packSourceContextGroups(sourcePacks, options, compressionLog);
+  const totalTokenEstimate = packed.groups.reduce((sum, group) => sum + group.tokenEstimate, 0);
+
+  return {
+    ...(options.query.length === 0 ? {} : { query: options.query }),
+    sources: packed.sources,
+    groups: packed.groups,
+    compressionLog,
+    trace: {
+      strategy: "source_context_pack_v1",
+      requestedSourceCount: candidates.length,
+      packedSourceCount: packed.sources.length,
+      totalTokenEstimate,
+      budget: options.maxTotalTokens,
+    },
+  };
+}
+
+function normalizeSourceContextPackOptions(
+  payload: BuildSourceContextPackPayload,
+): SourceContextPackOptions {
+  const query = normalizeText(payload.query ?? "");
+  const maxTotalTokens = clampTokenBudget(
+    payload.maxTotalTokens,
+    defaultSourceContextPackTotalTokens,
+    maxSourceContextPackTotalTokens,
+  );
+  const maxGroupTokens = Math.min(
+    maxTotalTokens,
+    clampTokenBudget(
+      payload.maxGroupTokens,
+      Math.min(defaultSourceContextPackGroupTokens, maxTotalTokens),
+      maxSourceContextPackGroupTokens,
+    ),
+  );
+  return {
+    query,
+    ftsQuery: buildFtsQuery(query),
+    sourceIds: boundedUniqueStrings(payload.sourceIds, maxSourceContextPackSources),
+    anchors: boundedEvidenceWindowAnchors(payload.anchors, 80),
+    useWorkingSet: payload.useWorkingSet !== false,
+    maxTotalTokens,
+    maxGroups: clampOptionalLimit(
+      payload.maxGroups,
+      defaultSourceContextPackGroups,
+      maxSourceContextPackGroups,
+    ),
+    maxGroupTokens,
+    maxSources: clampOptionalLimit(
+      payload.maxSources,
+      defaultSourceContextPackSources,
+      maxSourceContextPackSources,
+    ),
+    maxWindowsPerSource: clampOptionalLimit(
+      payload.maxWindowsPerSource,
+      defaultSourceContextPackWindowsPerSource,
+      maxSourceContextPackWindowsPerSource,
+    ),
+    contextChunksBefore: clampOptionalCount(payload.contextChunksBefore, 1, 3),
+    contextChunksAfter: clampOptionalCount(payload.contextChunksAfter, 1, 3),
+  };
+}
+
+function clampTokenBudget(value: number | undefined, fallback: number, max: number) {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(Math.floor(value), max));
+}
+
+function resolveSourceContextPackCandidates(
+  db: SqliteDb,
+  options: SourceContextPackOptions,
+  compressionLog: SourceContextCompressionLogEntry[],
+): SourceContextPackCandidate[] {
+  const candidates = new Map<string, SourceContextPackCandidate>();
+
+  const touchCandidate = (
+    sourceId: string,
+    update: Omit<Partial<SourceContextPackCandidate>, "sourceId" | "rank">,
+  ) => {
+    const id = normalizeText(sourceId);
+    if (id.length === 0) return;
+    const existing = candidates.get(id);
+    if (existing === undefined && candidates.size >= options.maxSources) return;
+    if (existing === undefined) {
+      candidates.set(id, {
+        sourceId: id,
+        rank: candidates.size,
+        explicit: update.explicit === true,
+        anchored: update.anchored === true,
+        query: update.query === true,
+        ...(update.workingSet === undefined ? {} : { workingSet: update.workingSet }),
+      });
+      return;
+    }
+    candidates.set(id, {
+      ...existing,
+      explicit: existing.explicit || update.explicit === true,
+      anchored: existing.anchored || update.anchored === true,
+      query: existing.query || update.query === true,
+      workingSet: update.workingSet ?? existing.workingSet,
+    });
+  };
+
+  for (const sourceId of options.sourceIds) {
+    touchCandidate(sourceId, { explicit: true });
+  }
+  for (const anchor of options.anchors) {
+    touchCandidate(anchor.memoryId, { anchored: true });
+  }
+  if (options.useWorkingSet) {
+    for (const row of loadActiveWorkingSetSourceRows(db, options.maxSources)) {
+      touchCandidate(stringField(row, "source_id"), {
+        workingSet: {
+          loadDepth: workingSetLoadDepthField(row, "load_depth"),
+          pinStatus: workingSetPinStatusField(row, "pin_status"),
+          updatedAt: stringField(row, "updated_at"),
+        },
+      });
+    }
+  }
+  if (candidates.size === 0 && options.ftsQuery.length > 0) {
+    for (const sourceId of loadSourceContextQuerySourceIds(
+      db,
+      options.ftsQuery,
+      options.maxSources,
+    )) {
+      touchCandidate(sourceId, { query: true });
+    }
+    if (candidates.size === 0) {
+      compressionLog.push({
+        reason: "query_no_hits",
+        message: "Query did not match any saved source for context packing.",
+      });
+    }
+  }
+
+  return [...candidates.values()].slice(0, options.maxSources);
+}
+
+function loadActiveWorkingSetSourceRows(db: SqliteDb, limit: number) {
+  return db.selectObjects(
+    `SELECT
+      ws.source_id,
+      ws.load_depth,
+      ws.pin_status,
+      ws.updated_at
+     FROM source_working_set ws
+     JOIN sources s ON s.id = ws.source_id
+     WHERE s.lifecycle_status <> 'deleted'
+       AND ws.pin_status <> 'evicted'
+     ORDER BY
+      CASE ws.pin_status
+        WHEN 'pinned' THEN 0
+        ELSE 1
+      END,
+      ws.updated_at DESC,
+      s.captured_at DESC
+     LIMIT ?`,
+    [limit],
+  );
+}
+
+function loadSourceContextQuerySourceIds(db: SqliteDb, ftsQuery: string, limit: number) {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  const addRows = (rows: SqlRow[]) => {
+    for (const row of rows) {
+      const id = stringField(row, "source_id");
+      if (id.length === 0 || seen.has(id) || ids.length >= limit) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+  };
+
+  addRows(
+    db.selectObjects(
+      `SELECT
+        s.id AS source_id,
+        bm25(source_fts) AS score
+       FROM source_fts
+       JOIN sources s ON s.id = source_fts.source_id
+       WHERE source_fts MATCH ?
+         AND s.lifecycle_status <> 'deleted'
+       ORDER BY score ASC
+       LIMIT ?`,
+      [ftsQuery, limit * 2],
+    ),
+  );
+  if (ids.length < limit) {
+    addRows(
+      db.selectObjects(
+        `SELECT
+          s.id AS source_id,
+          bm25(source_metadata_fts) AS score
+         FROM source_metadata_fts
+         JOIN sources s ON s.id = source_metadata_fts.source_id
+         WHERE source_metadata_fts MATCH ?
+           AND s.lifecycle_status <> 'deleted'
+         ORDER BY score ASC
+         LIMIT ?`,
+        [ftsQuery, limit * 2],
+      ),
+    );
+  }
+
+  return ids;
+}
+
+function loadSourceContextSourceStates(
+  db: SqliteDb,
+  candidates: SourceContextPackCandidate[],
+  compressionLog: SourceContextCompressionLogEntry[],
+): SourceContextSourceState[] {
+  if (candidates.length === 0) return [];
+  const candidateById = new Map(candidates.map((candidate) => [candidate.sourceId, candidate]));
+  const rows = db.selectObjects(
+    `SELECT
+      s.id,
+      s.source_kind,
+      s.source_type,
+      s.source_url,
+      s.source_title,
+      s.captured_at,
+      sm.source_type AS meta_source_type,
+      sm.abstract,
+      sm.section_outline_json,
+      ws.load_depth,
+      ws.pin_status,
+      ws.updated_at AS working_set_updated_at,
+      COUNT(c.id) AS chunk_count,
+      COALESCE(SUM(c.token_count), 0) AS chunk_tokens
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     LEFT JOIN source_working_set ws ON ws.source_id = s.id
+     LEFT JOIN source_chunks c ON c.source_id = s.id
+     WHERE s.lifecycle_status <> 'deleted'
+       AND s.id IN (${candidates.map(() => "?").join(", ")})
+     GROUP BY s.id`,
+    candidates.map((candidate) => candidate.sourceId),
+  );
+  const found = new Set(rows.map((row) => stringField(row, "id")));
+  for (const candidate of candidates) {
+    if (!found.has(candidate.sourceId)) {
+      compressionLog.push({
+        reason: "source_not_found",
+        sourceId: candidate.sourceId,
+        message: "Requested source was missing or deleted and was skipped.",
+      });
+    }
+  }
+
+  return rows
+    .flatMap((row): SourceContextSourceState[] => {
+      const sourceId = stringField(row, "id");
+      const candidate = candidateById.get(sourceId);
+      if (candidate === undefined) return [];
+      const abstract = optionalString(row, "abstract");
+      const sectionOutline = parseSourceContextSectionOutline(
+        stringField(row, "section_outline_json"),
+      );
+      const chunkCount = numberField(row, "chunk_count");
+      const totalChunkTokens = numberField(row, "chunk_tokens");
+      const sourceType =
+        stringField(row, "meta_source_type") || stringField(row, "source_type") || "webpage";
+      const requestedLoadDepth =
+        optionalString(row, "load_depth") === undefined
+          ? "chunks"
+          : workingSetLoadDepthField(row, "load_depth");
+      const pinStatus =
+        optionalString(row, "pin_status") === undefined
+          ? undefined
+          : workingSetPinStatusField(row, "pin_status");
+      const metaTokenEstimate = estimateSourceContextMetaTokens(row, abstract);
+      const outlineTokenEstimate = estimateSourceContextOutlineTokens(sectionOutline);
+      return [
+        {
+          rank: candidate.rank,
+          capturedAt: stringField(row, "captured_at"),
+          updatedAt:
+            optionalString(row, "working_set_updated_at") ?? stringField(row, "captured_at"),
+          metaTokenEstimate,
+          outlineTokenEstimate,
+          totalChunkTokens,
+          source: {
+            id: sourceId,
+            sourceKind: sourceKindField(row, "source_kind"),
+            sourceUrl: stringField(row, "source_url"),
+            sourceTitle: stringField(row, "source_title"),
+            capturedAt: stringField(row, "captured_at"),
+            sourceType,
+            ...(abstract === undefined
+              ? {}
+              : { abstract: excerpt(abstract, chunkMetaAbstractMaxChars) }),
+            sectionOutline,
+            chunkCount,
+            tokenEstimate: metaTokenEstimate + outlineTokenEstimate + totalChunkTokens,
+            selectedTokenEstimate: 0,
+            requestedLoadDepth,
+            selectedLoadDepth: requestedLoadDepth,
+            ...(pinStatus === undefined ? {} : { pinStatus }),
+            windowCount: 0,
+          },
+        },
+      ];
+    })
+    .sort(compareSourceContextSourceState);
+}
+
+function parseSourceContextSectionOutline(input: string): SourceContextPackOutlineItem[] {
+  const raw = parseJsonArray(input).slice(0, sourceContextPackOutlineMaxItems);
+  return raw.flatMap((item): SourceContextPackOutlineItem[] => {
+    if (!isRecord(item)) return [];
+    const text = typeof item.text === "string" ? normalizeText(item.text).slice(0, 240) : "";
+    if (text.length === 0) return [];
+    const level =
+      typeof item.level === "number" && Number.isFinite(item.level)
+        ? Math.max(1, Math.min(Math.floor(item.level), 6))
+        : undefined;
+    return [{ text, ...(level === undefined ? {} : { level }) }];
+  });
+}
+
+function estimateSourceContextMetaTokens(row: SqlRow, abstract: string | undefined) {
+  const text = [
+    stringField(row, "source_title"),
+    stringField(row, "source_url"),
+    stringField(row, "meta_source_type") || stringField(row, "source_type"),
+    abstract ?? "",
+  ]
+    .map(normalizeText)
+    .filter((part) => part.length > 0)
+    .join("\n");
+  return Math.min(sourceContextPackMetaMaxTokens, estimateTokens(text || "source metadata"));
+}
+
+function estimateSourceContextOutlineTokens(outline: SourceContextPackOutlineItem[]) {
+  if (outline.length === 0) return 0;
+  return Math.min(
+    sourceContextPackOutlineMaxTokens,
+    estimateTokens(outline.map((item) => item.text).join("\n")),
+  );
+}
+
+function compareSourceContextSourceState(
+  left: SourceContextSourceState,
+  right: SourceContextSourceState,
+) {
+  const leftPinned = left.source.pinStatus === "pinned" ? 0 : 1;
+  const rightPinned = right.source.pinStatus === "pinned" ? 0 : 1;
+  if (leftPinned !== rightPinned) return leftPinned - rightPinned;
+  if (left.rank !== right.rank) return left.rank - right.rank;
+  if (left.source.selectedTokenEstimate !== right.source.selectedTokenEstimate) {
+    return left.source.selectedTokenEstimate - right.source.selectedTokenEstimate;
+  }
+  const updated = right.updatedAt.localeCompare(left.updatedAt);
+  if (updated !== 0) return updated;
+  const captured = right.capturedAt.localeCompare(left.capturedAt);
+  if (captured !== 0) return captured;
+  return left.source.id.localeCompare(right.source.id);
+}
+
+function buildSourceContextSourcePack(
+  db: SqliteDb,
+  state: SourceContextSourceState,
+  options: SourceContextPackOptions,
+  compressionLog: SourceContextCompressionLogEntry[],
+): SourceContextSourcePack | undefined {
+  const requestedDepth = state.source.requestedLoadDepth;
+  const baseTokenEstimate = sourceContextBaseTokenEstimate(state, requestedDepth);
+  const metaOnlyTokenEstimate = sourceContextBaseTokenEstimate(state, "meta");
+  if (metaOnlyTokenEstimate > options.maxGroupTokens) {
+    compressionLog.push({
+      reason: "source_over_budget",
+      sourceId: state.source.id,
+      requestedLoadDepth: requestedDepth,
+      tokenEstimate: metaOnlyTokenEstimate,
+      message: "Source metadata exceeded the per-group context budget and was skipped.",
+    });
+    return undefined;
+  }
+
+  const windows = loadSourceContextCandidateWindows(db, state, options);
+  const maxSourceTokens = Math.min(options.maxGroupTokens, options.maxTotalTokens);
+  let selectedDepth = requestedDepth;
+  let tokenEstimate = baseTokenEstimate;
+  const selectedWindows: InternalSourceContextWindow[] = [];
+  let omittedWindowCount = 0;
+  let omittedTokenEstimate = 0;
+
+  if (baseTokenEstimate > maxSourceTokens) {
+    selectedDepth = "meta";
+    tokenEstimate = metaOnlyTokenEstimate;
+    compressionLog.push({
+      reason: "source_downgraded",
+      sourceId: state.source.id,
+      requestedLoadDepth: requestedDepth,
+      selectedLoadDepth: selectedDepth,
+      tokenEstimate: baseTokenEstimate,
+      message: "Source outline/context metadata was downgraded to metadata-only to fit budget.",
+    });
+  }
+
+  for (const window of windows) {
+    if (selectedWindows.length >= options.maxWindowsPerSource) {
+      omittedWindowCount += 1;
+      omittedTokenEstimate += window.tokenEstimate;
+      continue;
+    }
+    if (tokenEstimate + window.tokenEstimate > maxSourceTokens) {
+      omittedWindowCount += 1;
+      omittedTokenEstimate += window.tokenEstimate;
+      continue;
+    }
+    selectedWindows.push(window);
+    tokenEstimate += window.tokenEstimate;
+  }
+
+  if (requestedDepth === "full") {
+    const selectedWindowTokens = selectedWindows.reduce(
+      (sum, window) => sum + window.tokenEstimate,
+      0,
+    );
+    compressionLog.push({
+      reason: "full_depth_bounded",
+      sourceId: state.source.id,
+      requestedLoadDepth: "full",
+      selectedLoadDepth: selectedWindows.length > 0 ? "chunks" : selectedDepth,
+      omittedTokenEstimate: Math.max(0, state.totalChunkTokens - selectedWindowTokens),
+      message: "Full depth was bounded to selected chunk windows; no whole source text was loaded.",
+    });
+  }
+  if (omittedWindowCount > 0) {
+    compressionLog.push({
+      reason: "chunk_window_omitted",
+      sourceId: state.source.id,
+      requestedLoadDepth: requestedDepth,
+      omittedTokenEstimate,
+      omittedWindowCount,
+      message: "Some candidate chunk windows were omitted because of per-source or token limits.",
+    });
+  }
+
+  const effectiveDepth = selectedSourceContextDepth(requestedDepth, selectedDepth, selectedWindows);
+  if (effectiveDepth !== requestedDepth && requestedDepth !== "full") {
+    compressionLog.push({
+      reason: "source_downgraded",
+      sourceId: state.source.id,
+      requestedLoadDepth: requestedDepth,
+      selectedLoadDepth: effectiveDepth,
+      message: "Source context depth was downgraded after bounded window selection.",
+    });
+  }
+
+  return {
+    source: {
+      ...state.source,
+      selectedTokenEstimate: tokenEstimate,
+      selectedLoadDepth: effectiveDepth,
+      windowCount: selectedWindows.length,
+    },
+    windows: selectedWindows,
+    tokenEstimate,
+    omittedWindowCount,
+    omittedTokenEstimate,
+  };
+}
+
+function sourceContextBaseTokenEstimate(
+  state: SourceContextSourceState,
+  depth: WorkingSetLoadDepth,
+) {
+  if (depth === "meta") return state.metaTokenEstimate;
+  return state.metaTokenEstimate + state.outlineTokenEstimate;
+}
+
+function selectedSourceContextDepth(
+  requestedDepth: WorkingSetLoadDepth,
+  selectedDepth: WorkingSetLoadDepth,
+  windows: InternalSourceContextWindow[],
+): WorkingSetLoadDepth {
+  if (windows.length > 0) return requestedDepth === "full" ? "chunks" : selectedDepth;
+  if (selectedDepth === "meta") return "meta";
+  return selectedDepth === "full" || selectedDepth === "chunks" ? "outline" : selectedDepth;
+}
+
+function loadSourceContextCandidateWindows(
+  db: SqliteDb,
+  state: SourceContextSourceState,
+  options: SourceContextPackOptions,
+): InternalSourceContextWindow[] {
+  const windows: InternalSourceContextWindow[] = [];
+  const seenWindows = new Set<string>();
+  const anchorRows = loadAnchorsBySourceId(db, [state.source.id]);
+
+  const addWindow = (anchorOrd: number, priority: SourceContextPackWindowPriority) => {
+    const window = loadSourceEvidenceWindow(db, {
+      sourceId: state.source.id,
+      anchorOrd,
+      contextChunksBefore: options.contextChunksBefore,
+      contextChunksAfter: options.contextChunksAfter,
+      anchor: anchorRows.get(state.source.id),
+    });
+    if (window === undefined) return;
+    const key = `${window.memoryId}:${window.chunkId}`;
+    if (seenWindows.has(key)) return;
+    seenWindows.add(key);
+    windows.push(sourceContextWindowFromEvidenceWindow(window, state.source.sourceType, priority));
+  };
+
+  for (const anchor of options.anchors) {
+    if (anchor.memoryId !== state.source.id) continue;
+    const anchorOrd = resolveEvidenceWindowAnchorOrd(db, anchor);
+    if (anchorOrd === undefined) continue;
+    addWindow(anchorOrd, "anchor");
+  }
+
+  const depth = state.source.requestedLoadDepth;
+  if (depth === "meta" || depth === "outline") {
+    return windows;
+  }
+
+  if (options.ftsQuery.length > 0) {
+    const rows = db.selectObjects(
+      `SELECT
+        c.ord AS chunk_ord,
+        bm25(source_fts) AS score
+       FROM source_fts
+       JOIN sources s ON s.id = source_fts.source_id
+       JOIN source_chunks c ON c.id = source_fts.chunk_id
+       WHERE source_fts MATCH ?
+         AND s.id = ?
+         AND s.lifecycle_status <> 'deleted'
+       ORDER BY score ASC
+       LIMIT ?`,
+      [
+        options.ftsQuery,
+        state.source.id,
+        Math.max(
+          options.maxWindowsPerSource * sourceContextPackWindowSearchLimitMultiplier,
+          options.maxWindowsPerSource,
+        ),
+      ],
+    );
+    for (const row of rows) {
+      addWindow(numberField(row, "chunk_ord"), "query");
+    }
+  }
+
+  if (windows.length < options.maxWindowsPerSource) {
+    const fallback = db.selectObject(
+      `SELECT MIN(ord) AS chunk_ord
+       FROM source_chunks
+       WHERE source_id = ?`,
+      [state.source.id],
+    );
+    if (fallback !== undefined) addWindow(numberField(fallback, "chunk_ord"), "fallback");
+  }
+
+  return windows;
+}
+
+function sourceContextWindowFromEvidenceWindow(
+  window: MemoryEvidenceWindow,
+  sourceType: string,
+  priority: SourceContextPackWindowPriority,
+): InternalSourceContextWindow {
+  const text = window.chunks.map((chunk) => chunk.text).join("\n\n");
+  const tokenEstimate = window.chunks.reduce((sum, chunk) => sum + chunk.tokenCount, 0);
+  const pageStart = firstDefinedNumber(window.chunks.map((chunk) => chunk.pageStart));
+  const pageEnd = lastDefinedNumber(window.chunks.map((chunk) => chunk.pageEnd));
+  return {
+    sourceId: window.memoryId,
+    chunkId: window.chunkId,
+    ord:
+      window.chunks.find((chunk) => chunk.id === window.chunkId)?.ord ?? window.chunks[0]?.ord ?? 0,
+    text,
+    tokenCount: tokenEstimate,
+    tokenEstimate: Math.max(1, tokenEstimate),
+    sourceKind: window.sourceKind,
+    sourceUrl: window.sourceUrl,
+    sourceTitle: window.sourceTitle,
+    sourceType,
+    priority,
+    ...(window.anchor === undefined ? {} : { anchor: window.anchor }),
+    ...(pageStart === undefined ? {} : { pageStart }),
+    ...(pageEnd === undefined ? {} : { pageEnd }),
+  };
+}
+
+function firstDefinedNumber(values: Array<number | undefined>) {
+  return values.find((value) => typeof value === "number");
+}
+
+function lastDefinedNumber(values: Array<number | undefined>) {
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const value = values[index];
+    if (typeof value === "number") return value;
+  }
+  return undefined;
+}
+
+function packSourceContextGroups(
+  packs: SourceContextSourcePack[],
+  options: SourceContextPackOptions,
+  compressionLog: SourceContextCompressionLogEntry[],
+): { sources: SourceContextPackSource[]; groups: SourceContextPackGroup[] } {
+  const groups: SourceContextPackGroup[] = [];
+  const sources: SourceContextPackSource[] = [];
+  let current = emptySourceContextPackGroup(1);
+  let totalTokenEstimate = 0;
+
+  const flushCurrent = () => {
+    if (current.sourceIds.length === 0) return;
+    groups.push(current);
+    current = emptySourceContextPackGroup(groups.length + 1);
+  };
+
+  for (const pack of packs) {
+    if (totalTokenEstimate >= options.maxTotalTokens) {
+      compressionLog.push({
+        reason: "source_over_budget",
+        sourceId: pack.source.id,
+        tokenEstimate: pack.tokenEstimate,
+        message: "Source was skipped because the total context pack budget was exhausted.",
+      });
+      continue;
+    }
+
+    let candidate = trimSourceContextPackToBudget(
+      pack,
+      options.maxTotalTokens - totalTokenEstimate,
+      compressionLog,
+    );
+    if (candidate === undefined) continue;
+
+    if (
+      current.sourceIds.length > 0 &&
+      current.tokenEstimate + candidate.tokenEstimate > options.maxGroupTokens
+    ) {
+      flushCurrent();
+    }
+    if (groups.length >= options.maxGroups) {
+      compressionLog.push({
+        reason: "group_limit_reached",
+        sourceId: candidate.source.id,
+        tokenEstimate: candidate.tokenEstimate,
+        message: "Source was skipped because the context pack group limit was reached.",
+      });
+      continue;
+    }
+
+    candidate = trimSourceContextPackToBudget(
+      candidate,
+      Math.min(
+        options.maxGroupTokens - current.tokenEstimate,
+        options.maxTotalTokens - totalTokenEstimate,
+      ),
+      compressionLog,
+    );
+    if (candidate === undefined) continue;
+
+    current.sourceIds.push(candidate.source.id);
+    current.tokenEstimate += candidate.tokenEstimate;
+    current.windows.push(...candidate.windows.map(publicSourceContextWindow));
+    totalTokenEstimate += candidate.tokenEstimate;
+    sources.push(candidate.source);
+  }
+
+  flushCurrent();
+  return { sources, groups };
+}
+
+function emptySourceContextPackGroup(index: number): SourceContextPackGroup {
+  return {
+    id: `context-pack-group-${index}`,
+    sourceIds: [],
+    tokenEstimate: 0,
+    windows: [],
+  };
+}
+
+function trimSourceContextPackToBudget(
+  pack: SourceContextSourcePack,
+  budget: number,
+  compressionLog: SourceContextCompressionLogEntry[],
+): SourceContextSourcePack | undefined {
+  if (budget <= 0) return undefined;
+  if (pack.tokenEstimate <= budget) return pack;
+  const windowTokens = pack.windows.reduce((sum, window) => sum + window.tokenEstimate, 0);
+  const baseTokenEstimate = pack.tokenEstimate - windowTokens;
+  if (baseTokenEstimate > budget) {
+    compressionLog.push({
+      reason: "source_over_budget",
+      sourceId: pack.source.id,
+      tokenEstimate: baseTokenEstimate,
+      message: "Source metadata could not fit the remaining context pack budget.",
+    });
+    return undefined;
+  }
+
+  const selectedWindows: InternalSourceContextWindow[] = [];
+  let tokenEstimate = baseTokenEstimate;
+  let omittedWindowCount = pack.omittedWindowCount;
+  let omittedTokenEstimate = pack.omittedTokenEstimate;
+  for (const window of pack.windows) {
+    if (tokenEstimate + window.tokenEstimate <= budget) {
+      selectedWindows.push(window);
+      tokenEstimate += window.tokenEstimate;
+      continue;
+    }
+    omittedWindowCount += 1;
+    omittedTokenEstimate += window.tokenEstimate;
+  }
+  if (omittedWindowCount > pack.omittedWindowCount) {
+    compressionLog.push({
+      reason: "chunk_window_omitted",
+      sourceId: pack.source.id,
+      requestedLoadDepth: pack.source.requestedLoadDepth,
+      omittedWindowCount: omittedWindowCount - pack.omittedWindowCount,
+      omittedTokenEstimate: omittedTokenEstimate - pack.omittedTokenEstimate,
+      message: "Chunk windows were omitted while fitting source context into group/global budget.",
+    });
+  }
+  const selectedLoadDepth = selectedSourceContextDepth(
+    pack.source.requestedLoadDepth,
+    pack.source.selectedLoadDepth,
+    selectedWindows,
+  );
+  return {
+    ...pack,
+    windows: selectedWindows,
+    tokenEstimate,
+    omittedWindowCount,
+    omittedTokenEstimate,
+    source: {
+      ...pack.source,
+      selectedTokenEstimate: tokenEstimate,
+      selectedLoadDepth,
+      windowCount: selectedWindows.length,
+    },
+  };
+}
+
+function publicSourceContextWindow(window: InternalSourceContextWindow): SourceContextPackWindow {
+  return {
+    sourceId: window.sourceId,
+    chunkId: window.chunkId,
+    ord: window.ord,
+    text: window.text,
+    tokenCount: window.tokenCount,
+    sourceKind: window.sourceKind,
+    sourceUrl: window.sourceUrl,
+    sourceTitle: window.sourceTitle,
+    sourceType: window.sourceType,
+    priority: window.priority,
+    ...(window.anchor === undefined ? {} : { anchor: window.anchor }),
+    ...(window.pageStart === undefined ? {} : { pageStart: window.pageStart }),
+    ...(window.pageEnd === undefined ? {} : { pageEnd: window.pageEnd }),
+  };
+}
+
+function estimateTokens(input: string) {
+  const normalized = normalizeText(input);
+  if (normalized.length === 0) return 0;
+  return Math.max(1, Math.ceil(normalized.length / 4));
 }
 
 function insertAnchor(

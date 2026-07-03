@@ -303,6 +303,41 @@ describe("local engine source-native storage foundation", () => {
     expect(evidenceWindowSection).toContain("maxWindowsPerMemory");
   });
 
+  it("builds source context packs from bounded metadata and chunk windows", () => {
+    expect(workerSource).toContain('case "buildSourceContextPack"');
+    expect(workerSource).toContain("private async buildSourceContextPack");
+    expect(workerSource).toContain("function buildSourceContextPack");
+    expect(workerSource).toContain("function resolveSourceContextPackCandidates");
+    expect(workerSource).toContain("function loadSourceContextSourceStates");
+    expect(workerSource).toContain("function loadSourceContextCandidateWindows");
+    expect(workerSource).toContain("function packSourceContextGroups");
+    expect(workerSource).toContain("function trimSourceContextPackToBudget");
+    expect(workerSource).toContain("FROM source_working_set ws");
+    expect(workerSource).toContain("FROM source_fts");
+    expect(workerSource).toContain("JOIN source_chunks c ON c.id = source_fts.chunk_id");
+    expect(workerSource).toContain("LEFT JOIN source_metadata sm ON sm.source_id = s.id");
+    expect(workerSource).toContain("full_depth_bounded");
+    expect(workerSource).toContain("source_context_pack_v1");
+    expect(workerSource).not.toContain("CREATE TABLE IF NOT EXISTS compression_log");
+
+    const handlerSection = sourceSection(
+      "private async buildSourceContextPack",
+      "private async pinWorkingSetSource",
+    );
+    expect(handlerSection).not.toContain("normalized_text");
+    const packSection = sourceSection("function buildSourceContextPack", "function insertAnchor");
+    expect(packSection).not.toContain("normalized_text");
+    expect(packSection).not.toContain("getMemory(");
+
+    const retrieveSection = sourceSection("private async retrieveSources", "private async search");
+    expect(retrieveSection).not.toContain("buildSourceContextPack");
+    const searchKnowledgeBaseSection = sourceSection(
+      "private async searchKnowledgeBase",
+      "private async getMemoryEvidenceWindows",
+    );
+    expect(searchKnowledgeBaseSection).not.toContain("buildSourceContextPack");
+  });
+
   it("exposes source-native retrieval with RRF fusion and truthful vector trace", () => {
     expect(workerSource).toContain('case "retrieveSources"');
     expect(workerSource).toContain("private async retrieveSources");

@@ -658,6 +658,81 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts source context pack requests and rejects invalid payloads", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceContextPack",
+          payload: {
+            query: "bounded source context",
+            sourceIds: ["source-1", "source-2"],
+            anchors: [
+              { memoryId: "source-1", chunkId: "chunk-1" },
+              { memoryId: "source-2", ord: 4 },
+            ],
+            useWorkingSet: true,
+            maxTotalTokens: 12_000,
+            maxGroups: 3,
+            maxGroupTokens: 4_000,
+            maxSources: 8,
+            maxWindowsPerSource: 2,
+            contextChunksBefore: 1,
+            contextChunksAfter: 1,
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceContextPack",
+          payload: {
+            sourceIds: ["source-1", 42],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceContextPack",
+          payload: {
+            anchors: [{ memoryId: "source-1" }],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceContextPack",
+          payload: {
+            useWorkingSet: "yes",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceContextPack",
+          payload: {
+            maxGroupTokens: "large",
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts source retrieval requests", () => {
     expect(
       isEngineRequestMessage({

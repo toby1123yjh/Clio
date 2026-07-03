@@ -523,6 +523,152 @@ describe("local engine behavior harness", () => {
     });
   });
 
+  it("builds bounded source context packs for explicit sources and anchors", async () => {
+    const harness = createHarness();
+    const hiddenTailNeedle = "SOURCE_CONTEXT_PACK_HIDDEN_TAIL_NEEDLE";
+    const sourceText = `${ragText("alpha context pack anchor evidence", 700)} ${hiddenTailNeedle}`;
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/context-pack",
+        sourceTitle: "Context Pack Source",
+        normalizedText: sourceText,
+        metadata: {
+          title: "Context Pack Source",
+          abstract: "Context packing should select bounded chunk windows.",
+          source_type: "paper",
+          sectionOutline: [
+            { level: 1, text: "Overview" },
+            { level: 2, text: "Evidence Windows" },
+          ],
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+    const firstChunk = harness.selectObject(
+      "SELECT id FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
+      [sourceId],
+    );
+
+    const pack = await harness.request({
+      kind: "buildSourceContextPack",
+      payload: {
+        query: "alpha context pack",
+        sourceIds: [sourceId],
+        anchors: [{ memoryId: sourceId, chunkId: String(firstChunk?.id ?? "") }],
+        useWorkingSet: false,
+        maxTotalTokens: 2_000,
+        maxGroupTokens: 1_200,
+        maxWindowsPerSource: 1,
+        contextChunksBefore: 0,
+        contextChunksAfter: 0,
+      },
+    });
+
+    expect(pack.trace.strategy).toBe("source_context_pack_v1");
+    expect(pack.trace.requestedSourceCount).toBe(1);
+    expect(pack.trace.packedSourceCount).toBe(1);
+    expect(pack.sources[0]?.id).toBe(sourceId);
+    expect(pack.sources[0]?.sourceType).toBe("paper");
+    expect(pack.sources[0]?.sectionOutline.map((item) => item.text)).toEqual([
+      "Overview",
+      "Evidence Windows",
+    ]);
+    expect(pack.sources[0]?.windowCount).toBe(1);
+    expect(pack.groups).toHaveLength(1);
+    expect(pack.groups[0]?.windows).toHaveLength(1);
+    expect(pack.groups[0]?.windows[0]?.priority).toBe("anchor");
+    expect(pack.groups[0]?.windows[0]?.sourceId).toBe(sourceId);
+    expect(JSON.stringify(pack)).not.toContain(hiddenTailNeedle);
+
+    const tightPack = await harness.request({
+      kind: "buildSourceContextPack",
+      payload: {
+        sourceIds: [sourceId],
+        useWorkingSet: false,
+        maxTotalTokens: 80,
+        maxGroupTokens: 80,
+        maxWindowsPerSource: 3,
+      },
+    });
+    expect(tightPack.groups[0]?.windows).toEqual([]);
+    expect(tightPack.compressionLog.map((entry) => entry.reason)).toEqual(
+      expect.arrayContaining(["chunk_window_omitted", "source_downgraded"]),
+    );
+
+    await harness.request({ kind: "deleteMemory", id: sourceId });
+    const afterDelete = await harness.request({
+      kind: "buildSourceContextPack",
+      payload: { sourceIds: [sourceId], useWorkingSet: false },
+    });
+    expect(afterDelete.sources).toEqual([]);
+    expect(afterDelete.groups).toEqual([]);
+    expect(afterDelete.compressionLog.map((entry) => entry.reason)).toContain("source_not_found");
+  });
+
+  it("builds source context packs from working-set depths without full document loading", async () => {
+    const harness = createHarness();
+    const metaCapture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/context-pack-meta",
+        sourceTitle: "Meta Depth Source",
+        normalizedText: ragText("meta depth should stay metadata only", 120),
+        metadata: {
+          title: "Meta Depth Source",
+          abstract: "Metadata-only source context.",
+          source_type: "research-note",
+        },
+      }),
+    });
+    const fullCapture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/context-pack-full",
+        sourceTitle: "Full Depth Source",
+        normalizedText: ragText("full depth still uses bounded windows", 900),
+        metadata: {
+          title: "Full Depth Source",
+          abstract: "Full depth must not load the whole source.",
+          source_type: "paper",
+        },
+      }),
+    });
+
+    await harness.request({
+      kind: "pinWorkingSetSource",
+      payload: { sourceId: metaCapture.memory.id, loadDepth: "meta" },
+    });
+    await harness.request({
+      kind: "pinWorkingSetSource",
+      payload: { sourceId: fullCapture.memory.id, loadDepth: "full" },
+    });
+
+    const pack = await harness.request({
+      kind: "buildSourceContextPack",
+      payload: {
+        useWorkingSet: true,
+        maxWindowsPerSource: 1,
+        contextChunksBefore: 0,
+        contextChunksAfter: 0,
+        maxTotalTokens: 3_000,
+        maxGroupTokens: 1_500,
+      },
+    });
+
+    const metaSource = pack.sources.find((source) => source.id === metaCapture.memory.id);
+    const fullSource = pack.sources.find((source) => source.id === fullCapture.memory.id);
+    expect(metaSource?.requestedLoadDepth).toBe("meta");
+    expect(metaSource?.selectedLoadDepth).toBe("meta");
+    expect(metaSource?.windowCount).toBe(0);
+    expect(metaSource?.pinStatus).toBe("pinned");
+    expect(fullSource?.requestedLoadDepth).toBe("full");
+    expect(fullSource?.selectedLoadDepth).toBe("chunks");
+    expect(fullSource?.windowCount).toBeLessThanOrEqual(1);
+    expect(pack.groups.flatMap((group) => group.windows).length).toBeLessThanOrEqual(1);
+    expect(pack.compressionLog.map((entry) => entry.reason)).toContain("full_depth_bounded");
+  });
+
   it("returns recent sources and truthful skipped traces for empty query", async () => {
     const harness = createHarness();
     const first = await harness.request({
