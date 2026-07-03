@@ -5,6 +5,7 @@ import type {
   EngineRequest,
   SessionEvidenceRecord,
 } from "@/src/shared/rpc";
+import { citationValidatorErrorResult, validateCitationCoverage } from "./citation-validator";
 import {
   type IClioCompactionRuntime,
   buildRequestWithProviderContext,
@@ -13,6 +14,7 @@ import {
 import type {
   AgentChatRequest,
   AgentStreamEvent,
+  CitationValidationResult,
   EvidenceItem,
   IAgentRuntime,
   LocalCitation,
@@ -36,6 +38,7 @@ interface HostedAgentRun {
   abortController: AbortController;
   providerStarted: boolean;
   citations: LocalCitation[];
+  citationValidation?: CitationValidationResult;
   worldKnowledge: string[];
   content: string;
 }
@@ -155,6 +158,11 @@ export class AgentRunHost {
       for await (const event of this.runtime.streamChat(run.request, {
         signal: run.abortController.signal,
       })) {
+        if (event.type === "run_completed") {
+          const validationEvent = this.buildCitationValidationEvent(run);
+          await this.persistEvent(run, validationEvent);
+          this.emitEvent(validationEvent);
+        }
         await this.persistEvent(run, event);
         if (isTerminalAgentEvent(event)) {
           terminalEventEmitted = true;
@@ -502,6 +510,26 @@ export class AgentRunHost {
     void this.pump(nextRun);
   }
 
+  private buildCitationValidationEvent(run: HostedAgentRun): AgentStreamEvent {
+    const input = {
+      evidence: citationEvidenceForRequest(run.request),
+      citations: run.citations,
+    };
+    try {
+      return {
+        type: "citation_validation",
+        runId: run.request.runId,
+        validation: validateCitationCoverage(input),
+      };
+    } catch {
+      return {
+        type: "citation_validation",
+        runId: run.request.runId,
+        validation: citationValidatorErrorResult(input),
+      };
+    }
+  }
+
   private async persistEvent(run: HostedAgentRun, event: AgentStreamEvent) {
     const { sessionId, assistantMessageId } = run.request;
     if (sessionId === undefined || assistantMessageId === undefined) return;
@@ -516,7 +544,11 @@ export class AgentRunHost {
           sessionId,
           appendContent: event.delta,
           status: "streaming",
-          piAgentMessageJson: assistantPiAgentMessageJson(run.content, updatedAt),
+          piAgentMessageJson: assistantPiAgentMessageJson(
+            run.content,
+            updatedAt,
+            run.citationValidation,
+          ),
           updatedAt,
         },
       });
@@ -550,6 +582,20 @@ export class AgentRunHost {
       });
       return;
     }
+    if (event.type === "citation_validation") {
+      run.citationValidation = event.validation;
+      const updatedAt = new Date().toISOString();
+      await this.requestEngine<ChatMessageRecord>({
+        kind: "updateChatMessage",
+        payload: {
+          id: assistantMessageId,
+          sessionId,
+          piAgentMessageJson: assistantPiAgentMessageJson(run.content, updatedAt, event.validation),
+          updatedAt,
+        },
+      });
+      return;
+    }
     if (event.type === "run_completed") {
       const updatedAt = new Date().toISOString();
       await this.requestEngine<ChatMessageRecord>({
@@ -558,7 +604,11 @@ export class AgentRunHost {
           id: assistantMessageId,
           sessionId,
           status: "completed",
-          piAgentMessageJson: assistantPiAgentMessageJson(run.content, updatedAt),
+          piAgentMessageJson: assistantPiAgentMessageJson(
+            run.content,
+            updatedAt,
+            run.citationValidation,
+          ),
           updatedAt,
         },
       });
@@ -573,7 +623,11 @@ export class AgentRunHost {
           sessionId,
           status: event.error.code === "PROVIDER_INTERRUPTED" ? "interrupted" : "failed",
           error: event.error,
-          piAgentMessageJson: assistantPiAgentMessageJson(run.content, updatedAt),
+          piAgentMessageJson: assistantPiAgentMessageJson(
+            run.content,
+            updatedAt,
+            run.citationValidation,
+          ),
           updatedAt,
         },
       });
@@ -592,7 +646,11 @@ export class AgentRunHost {
             message: event.reason ?? "Response stopped.",
           },
           clearRetry: true,
-          piAgentMessageJson: assistantPiAgentMessageJson(run.content, updatedAt),
+          piAgentMessageJson: assistantPiAgentMessageJson(
+            run.content,
+            updatedAt,
+            run.citationValidation,
+          ),
           updatedAt,
         },
       });
@@ -600,12 +658,21 @@ export class AgentRunHost {
   }
 }
 
-function assistantPiAgentMessageJson(content: string, at: string) {
+function assistantPiAgentMessageJson(
+  content: string,
+  at: string,
+  validation?: CitationValidationResult,
+) {
   return {
     role: "assistant",
     content,
     timestamp: Date.parse(at) || Date.now(),
+    ...(validation === undefined ? {} : { clioCitationValidation: validation }),
   };
+}
+
+function citationEvidenceForRequest(request: AgentChatRequest) {
+  return request.providerContext?.evidence ?? request.evidence;
 }
 
 function findNextQueuedUserMessage(messages: ChatMessageRecord[]) {

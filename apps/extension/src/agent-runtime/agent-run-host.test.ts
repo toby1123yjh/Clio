@@ -26,6 +26,15 @@ function request(overrides: Partial<AgentChatRequest> = {}): AgentChatRequest {
   };
 }
 
+const memoryEvidence = {
+  id: "memory:mem-1:chunk:chunk-1",
+  sourceKind: "memory",
+  sourceUrl: "https://example.com/memory",
+  sourceTitle: "Saved Memory",
+  text: "Bounded memory evidence",
+  excerpt: "Bounded memory evidence",
+} satisfies AgentChatRequest["evidence"][number];
+
 function runtimeFrom(events: AgentStreamEvent[]): IAgentRuntime {
   return {
     streamChat: async function* () {
@@ -119,6 +128,7 @@ describe("AgentRunHost", () => {
     expect(emitted.map((event) => event.type)).toEqual([
       "run_started",
       "text_delta",
+      "citation_validation",
       "run_completed",
     ]);
     expect(engine.calls).toEqual(
@@ -137,6 +147,73 @@ describe("AgentRunHost", () => {
             id: "run-1:assistant",
             sessionId: "session-1",
             status: "completed",
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("emits and persists citation validation before completing local memory answers", async () => {
+    const engine = engineRecorder();
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: runtimeFrom([
+        { type: "run_started", runId: "run-1" },
+        { type: "run_completed", runId: "run-1" },
+      ]),
+      requestEngine: engine.requestEngine,
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        evidence: [memoryEvidence],
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(emitted.map((event) => event.type)).toEqual([
+      "run_started",
+      "citation_validation",
+      "run_completed",
+    ]);
+    expect(emitted.find((event) => event.type === "citation_validation")).toMatchObject({
+      validation: {
+        status: "warning",
+        reason: "missing_memory_citation",
+        memoryEvidenceCount: 1,
+        citationCount: 0,
+      },
+    });
+    expect(engine.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "updateChatMessage",
+          payload: expect.objectContaining({
+            id: "run-1:assistant",
+            sessionId: "session-1",
+            piAgentMessageJson: expect.objectContaining({
+              clioCitationValidation: expect.objectContaining({
+                status: "warning",
+                reason: "missing_memory_citation",
+              }),
+            }),
+          }),
+        }),
+        expect.objectContaining({
+          kind: "updateChatMessage",
+          payload: expect.objectContaining({
+            id: "run-1:assistant",
+            sessionId: "session-1",
+            status: "completed",
+            piAgentMessageJson: expect.objectContaining({
+              clioCitationValidation: expect.objectContaining({
+                status: "warning",
+                reason: "missing_memory_citation",
+              }),
+            }),
           }),
         }),
       ]),

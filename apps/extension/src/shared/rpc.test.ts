@@ -857,6 +857,42 @@ describe("session engine RPC guards", () => {
         },
       }),
     ).toBe(false);
+
+    expect(
+      isAgentStreamEventMessage({
+        type: CLIO_AGENT_STREAM_EVENT,
+        requestId: "request-1",
+        event: {
+          type: "citation_validation",
+          runId: "run-1",
+          validation: {
+            status: "warning",
+            reason: "missing_memory_citation",
+            evidenceCount: 1,
+            memoryEvidenceCount: 1,
+            citationCount: 0,
+            validCitationCount: 0,
+            validMemoryCitationCount: 0,
+            message: "Source citation could not be verified.",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isAgentStreamEventMessage({
+        type: CLIO_AGENT_STREAM_EVENT,
+        requestId: "request-1",
+        event: {
+          type: "citation_validation",
+          runId: "run-1",
+          validation: {
+            status: "warning",
+            reason: "missing_memory_citation",
+          },
+        },
+      }),
+    ).toBe(false);
   });
 
   it("accepts typed multi-provider setup requests", () => {

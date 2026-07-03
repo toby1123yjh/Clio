@@ -61,6 +61,26 @@ export interface LocalCitation {
   anchor?: EvidenceAnchor;
 }
 
+export type CitationValidationStatus = "valid" | "warning";
+
+export type CitationValidationReason =
+  | "no_memory_evidence"
+  | "valid_memory_citation"
+  | "missing_memory_citation"
+  | "invalid_citation"
+  | "validator_error";
+
+export interface CitationValidationResult {
+  status: CitationValidationStatus;
+  reason: CitationValidationReason;
+  evidenceCount: number;
+  memoryEvidenceCount: number;
+  citationCount: number;
+  validCitationCount: number;
+  validMemoryCitationCount: number;
+  message?: string;
+}
+
 export type AgentErrorCode =
   | "NO_EVIDENCE"
   | "LOW_CONFIDENCE_EXTRACTION"
@@ -99,6 +119,7 @@ export type AgentStreamEvent =
   | { type: "tool_trace"; runId: string; trace: AgentToolTrace }
   | { type: "text_delta"; runId: string; delta: string }
   | { type: "citation"; runId: string; citation: LocalCitation }
+  | { type: "citation_validation"; runId: string; validation: CitationValidationResult }
   | { type: "world_knowledge"; runId: string; note: string }
   | { type: "run_completed"; runId: string }
   | { type: "run_failed"; runId: string; error: AgentErrorInfo }

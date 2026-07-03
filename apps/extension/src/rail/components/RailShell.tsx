@@ -1,3 +1,4 @@
+import { citationValidationWarningMessage } from "@/src/agent-runtime/citation-validator";
 import {
   type ImageGenerationSettings,
   type SaveImageGenerationSettingsInput,
@@ -1211,6 +1212,12 @@ function DialogueMessage({
                   World knowledge: {note}
                 </div>
               ))}
+            </div>
+          ) : null}
+          {message.citationValidation?.status === "warning" ? (
+            <div className="mt-2.5 flex items-start gap-1.5 rounded-md border border-warning-border bg-warning-background px-2.5 py-1.5 text-[11px] leading-4 text-warning-foreground">
+              <ShieldAlert className="mt-0.5 shrink-0" size={12} />
+              <span>{message.citationValidation.message ?? citationValidationWarningMessage}</span>
             </div>
           ) : null}
           {message.error !== undefined && message.status !== "cancelled" ? (

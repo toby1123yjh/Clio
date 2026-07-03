@@ -3,6 +3,7 @@ import type {
   AgentScope,
   AgentStreamEvent,
   AgentToolTrace,
+  CitationValidationResult,
   LocalCitation,
 } from "@/src/agent-runtime/types";
 import type { ReplyActionSuggestion } from "@/src/suggestions/suggestion-types";
@@ -50,6 +51,7 @@ export interface RailDialogueMessage {
   pageTitle?: string;
   selectionText?: string;
   citations: LocalCitation[];
+  citationValidation?: CitationValidationResult;
   worldKnowledge: string[];
   thinkingTrace?: string;
   toolTraces?: AgentToolTrace[];
@@ -805,6 +807,7 @@ function reduceAssistantMessage(
         error: undefined,
         thinkingTrace: undefined,
         toolTraces: [],
+        citationValidation: undefined,
         replySuggestions: [],
         explicitToolTraces: [],
       };
@@ -833,6 +836,11 @@ function reduceAssistantMessage(
         citations: [...message.citations, event.citation],
       };
     }
+    case "citation_validation":
+      return {
+        ...message,
+        citationValidation: event.validation,
+      };
     case "world_knowledge":
       if (message.worldKnowledge.includes(event.note)) return message;
       return {

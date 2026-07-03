@@ -315,16 +315,56 @@ describe("rail state reducer", () => {
         },
       },
     });
-    const completed = reduceRailState(withCitation, {
+    const withValidation = reduceRailState(withCitation, {
+      type: "APPLY_AGENT_EVENT",
+      event: {
+        type: "citation_validation",
+        runId: "run-1",
+        validation: {
+          status: "valid",
+          reason: "no_memory_evidence",
+          evidenceCount: 1,
+          memoryEvidenceCount: 0,
+          citationCount: 1,
+          validCitationCount: 1,
+          validMemoryCitationCount: 0,
+        },
+      },
+    });
+    const completed = reduceRailState(withValidation, {
       type: "APPLY_AGENT_EVENT",
       event: { type: "run_completed", runId: "run-1" },
+    });
+    const ignoredLateValidation = reduceRailState(completed, {
+      type: "APPLY_AGENT_EVENT",
+      event: {
+        type: "citation_validation",
+        runId: "run-1",
+        validation: {
+          status: "warning",
+          reason: "missing_memory_citation",
+          evidenceCount: 1,
+          memoryEvidenceCount: 1,
+          citationCount: 0,
+          validCitationCount: 0,
+          validMemoryCitationCount: 0,
+        },
+      },
     });
 
     const assistant = completed.dialogueMessages[1];
     expect(assistant?.content).toBe("Mock answer. ");
     expect(assistant?.citations).toHaveLength(1);
+    expect(assistant?.citationValidation).toMatchObject({
+      status: "valid",
+      reason: "no_memory_evidence",
+    });
     expect(assistant?.status).toBe("completed");
     expect(completed.activeAgentRun).toBeUndefined();
+    expect(ignoredLateValidation.dialogueMessages[1]?.citationValidation).toMatchObject({
+      status: "valid",
+      reason: "no_memory_evidence",
+    });
   });
 
   it("tracks assistant thinking and tool traces as transient message state", () => {

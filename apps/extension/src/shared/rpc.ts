@@ -1,3 +1,4 @@
+import { isCitationValidationResult } from "@/src/agent-runtime/citation-validator";
 import type {
   ImageGenerationSettings,
   SaveImageGenerationSettingsInput,
@@ -2194,6 +2195,8 @@ function isAgentStreamEvent(value: unknown): value is AgentStreamEvent {
       return typeof value.delta === "string";
     case "citation":
       return isLocalCitation(value.citation);
+    case "citation_validation":
+      return isCitationValidationResult(value.validation);
     case "world_knowledge":
       return typeof value.note === "string";
     case "run_failed":

@@ -25,9 +25,10 @@ function request(overrides: Partial<AgentChatRequest> = {}): AgentChatRequest {
 }
 
 describe("Clio user prompt", () => {
-  it("uses source placeholders instead of legacy cite markers", () => {
-    expect(clioAgentSystemPrompt).toContain("[source]");
-    expect(clioAgentSystemPrompt).not.toContain("[[cite");
+  it("requires exact citation markers only for attached evidence", () => {
+    expect(clioAgentSystemPrompt).toContain("[[cite:<exact evidence id>]]");
+    expect(clioAgentSystemPrompt).toContain("Use only exact ids listed in the evidence blocks");
+    expect(clioAgentSystemPrompt).not.toContain("[source]");
   });
 
   it("keeps general chat free of page metadata and evidence", () => {

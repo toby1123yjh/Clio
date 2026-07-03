@@ -1,3 +1,4 @@
+import { readClioCitationValidation } from "@/src/agent-runtime/citation-validator";
 import type {
   ImageGenerationSettings,
   SaveImageGenerationSettingsInput,
@@ -261,6 +262,7 @@ function chatMessageToRailMessage(record: ChatMessageRecord): RailDialogueMessag
     pageTitle: record.pageTitle,
     selectionText: record.selectionText,
     citations: record.citations,
+    citationValidation: readClioCitationValidation(record.piAgentMessageJson),
     worldKnowledge: record.worldKnowledge,
     error: record.error,
     skillRequest: readSkillRequest(record.piAgentMessageJson),

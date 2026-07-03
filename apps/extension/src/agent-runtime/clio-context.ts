@@ -2,9 +2,9 @@ import type { AgentChatRequest } from "./types";
 
 export const clioAgentSystemPrompt =
   "You are Clio, a browser assistant. If attached evidence is provided, use it first. " +
-  "Do not emit raw citation ids or machine citation markers. " +
-  "When a response should visibly indicate attached source usage, write [source] and Clio will render the real source link. " +
-  "If no evidence is attached, answer as a general assistant without source markers.";
+  "When a factual sentence uses attached evidence, append [[cite:<exact evidence id>]] after that sentence. " +
+  "Use only exact ids listed in the evidence blocks, and do not invent ids. " +
+  "If no evidence is attached, answer as a general assistant without citation markers.";
 
 export function buildClioUserPrompt(request: AgentChatRequest): string {
   if (request.providerContext !== undefined) {
@@ -66,7 +66,7 @@ function buildCompactedContextPrompt(request: AgentChatRequest): string {
         : [
             "Evidence summary (background only; not a visible source marker):",
             context.evidenceSummary,
-            "Do not expose summarized-only evidence as [source]. Use [source] only for concrete evidence listed below.",
+            "Do not cite summarized-only evidence. Use citation markers only for concrete evidence listed below.",
           ];
 
   return buildPromptBlocks([
