@@ -1062,6 +1062,46 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
 
     expect(
+      isAgentRunEventMessage({
+        type: CLIO_AGENT_RUN_EVENT,
+        event: {
+          type: "citation",
+          runId: "run-1",
+          citation: {
+            id: "cite-1",
+            evidenceId: "page:0",
+            label: "Page",
+            sourceKind: "page",
+            sourceUrl: "https://example.com",
+            sourceTitle: "Example",
+            excerpt: "Excerpt",
+            outputOffset: 12,
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isAgentRunEventMessage({
+        type: CLIO_AGENT_RUN_EVENT,
+        event: {
+          type: "citation",
+          runId: "run-1",
+          citation: {
+            id: "cite-1",
+            evidenceId: "page:0",
+            label: "Page",
+            sourceKind: "page",
+            sourceUrl: "https://example.com",
+            sourceTitle: "Example",
+            excerpt: "Excerpt",
+            outputOffset: -1,
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
       isAgentStreamEventMessage({
         type: CLIO_AGENT_STREAM_EVENT,
         requestId: "request-1",
@@ -1076,11 +1116,51 @@ describe("session engine RPC guards", () => {
             citationCount: 0,
             validCitationCount: 0,
             validMemoryCitationCount: 0,
+            claimCount: 1,
+            coveredClaimCount: 0,
+            uncoveredClaimCount: 1,
+            uncoveredClaims: [
+              {
+                text: "The saved memory preserves bounded evidence.",
+                position: 0,
+                reason: "missing_memory_citation",
+              },
+            ],
             message: "Source citation could not be verified.",
           },
         },
       }),
     ).toBe(true);
+
+    expect(
+      isAgentStreamEventMessage({
+        type: CLIO_AGENT_STREAM_EVENT,
+        requestId: "request-1",
+        event: {
+          type: "citation_validation",
+          runId: "run-1",
+          validation: {
+            status: "warning",
+            reason: "missing_memory_claim_citation",
+            evidenceCount: 1,
+            memoryEvidenceCount: 1,
+            citationCount: 0,
+            validCitationCount: 0,
+            validMemoryCitationCount: 0,
+            claimCount: 1,
+            coveredClaimCount: 0,
+            uncoveredClaimCount: 1,
+            uncoveredClaims: [
+              {
+                text: "The saved memory preserves bounded evidence.",
+                position: -1,
+                reason: "missing_memory_citation",
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
 
     expect(
       isAgentStreamEventMessage({

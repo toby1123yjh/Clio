@@ -64,6 +64,7 @@ export interface LocalCitation {
   sourceTitle: string;
   excerpt: string;
   anchor?: EvidenceAnchor;
+  outputOffset?: number;
 }
 
 export type CitationValidationStatus = "valid" | "warning";
@@ -71,9 +72,19 @@ export type CitationValidationStatus = "valid" | "warning";
 export type CitationValidationReason =
   | "no_memory_evidence"
   | "valid_memory_citation"
+  | "valid_memory_claims"
   | "missing_memory_citation"
+  | "missing_memory_claim_citation"
   | "invalid_citation"
   | "validator_error";
+
+export type CitationValidationClaimPreviewReason = "missing_memory_citation";
+
+export interface CitationValidationClaimPreview {
+  text: string;
+  position: number;
+  reason: CitationValidationClaimPreviewReason;
+}
 
 export interface CitationValidationResult {
   status: CitationValidationStatus;
@@ -83,6 +94,10 @@ export interface CitationValidationResult {
   citationCount: number;
   validCitationCount: number;
   validMemoryCitationCount: number;
+  claimCount?: number;
+  coveredClaimCount?: number;
+  uncoveredClaimCount?: number;
+  uncoveredClaims?: CitationValidationClaimPreview[];
   message?: string;
 }
 

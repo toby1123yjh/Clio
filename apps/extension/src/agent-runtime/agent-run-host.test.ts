@@ -230,6 +230,11 @@ describe("AgentRunHost", () => {
     const host = new AgentRunHost({
       runtime: runtimeFrom([
         { type: "run_started", runId: "run-1" },
+        {
+          type: "text_delta",
+          runId: "run-1",
+          delta: "The saved memory preserves bounded evidence.",
+        },
         { type: "run_completed", runId: "run-1" },
       ]),
       requestEngine: engine.requestEngine,
@@ -247,15 +252,18 @@ describe("AgentRunHost", () => {
 
     expect(emitted.map((event) => event.type)).toEqual([
       "run_started",
+      "text_delta",
       "citation_validation",
       "run_completed",
     ]);
     expect(emitted.find((event) => event.type === "citation_validation")).toMatchObject({
       validation: {
         status: "warning",
-        reason: "missing_memory_citation",
+        reason: "missing_memory_claim_citation",
         memoryEvidenceCount: 1,
         citationCount: 0,
+        claimCount: 1,
+        uncoveredClaimCount: 1,
       },
     });
     expect(engine.calls).toEqual(
@@ -268,7 +276,8 @@ describe("AgentRunHost", () => {
             piAgentMessageJson: expect.objectContaining({
               clioCitationValidation: expect.objectContaining({
                 status: "warning",
-                reason: "missing_memory_citation",
+                reason: "missing_memory_claim_citation",
+                claimCount: 1,
               }),
             }),
           }),
@@ -282,7 +291,8 @@ describe("AgentRunHost", () => {
             piAgentMessageJson: expect.objectContaining({
               clioCitationValidation: expect.objectContaining({
                 status: "warning",
-                reason: "missing_memory_citation",
+                reason: "missing_memory_claim_citation",
+                claimCount: 1,
               }),
             }),
           }),

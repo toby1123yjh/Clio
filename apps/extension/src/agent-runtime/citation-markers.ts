@@ -7,6 +7,7 @@ export class CitationMarkerParser {
   private readonly evidenceById: Map<string, EvidenceItem>;
   private readonly emittedEvidenceIds = new Set<string>();
   private pending = "";
+  private outputOffset = 0;
 
   constructor(evidence: EvidenceItem[]) {
     this.evidenceById = new Map(evidence.map((item) => [item.id, item]));
@@ -24,12 +25,12 @@ export class CitationMarkerParser {
         const pendingLength = citationMarkerPrefixSuffixLength(text);
         const emitText = text.slice(0, text.length - pendingLength);
         this.pending = text.slice(text.length - pendingLength);
-        if (emitText.length > 0) yield { type: "text_delta", runId, delta: emitText };
+        if (emitText.length > 0) yield this.textDelta(runId, emitText);
         return;
       }
 
       const before = input.slice(cursor, markerStart);
-      if (before.length > 0) yield { type: "text_delta", runId, delta: before };
+      if (before.length > 0) yield this.textDelta(runId, before);
 
       const markerEnd = input.indexOf(citationMarkerEnd, markerStart + citationMarkerStart.length);
       if (markerEnd === -1) {
@@ -38,7 +39,7 @@ export class CitationMarkerParser {
       }
 
       const evidenceId = input.slice(markerStart + citationMarkerStart.length, markerEnd).trim();
-      const citation = this.buildCitation(runId, evidenceId);
+      const citation = this.buildCitation(runId, evidenceId, this.outputOffset);
       if (citation !== undefined) {
         yield { type: "citation", runId, citation };
       }
@@ -51,10 +52,19 @@ export class CitationMarkerParser {
     const text = this.pending;
     this.pending = "";
     if (text.startsWith(citationMarkerStart) || citationMarkerStart.startsWith(text)) return;
-    yield { type: "text_delta", runId, delta: text };
+    yield this.textDelta(runId, text);
   }
 
-  private buildCitation(runId: string, evidenceId: string): LocalCitation | undefined {
+  private textDelta(runId: string, delta: string): AgentStreamEvent {
+    this.outputOffset += delta.length;
+    return { type: "text_delta", runId, delta };
+  }
+
+  private buildCitation(
+    runId: string,
+    evidenceId: string,
+    outputOffset: number,
+  ): LocalCitation | undefined {
     if (this.emittedEvidenceIds.has(evidenceId)) return undefined;
     const evidence = this.evidenceById.get(evidenceId);
     if (evidence === undefined) return undefined;
@@ -67,6 +77,7 @@ export class CitationMarkerParser {
       sourceUrl: evidence.sourceUrl,
       sourceTitle: evidence.sourceTitle,
       excerpt: evidence.excerpt,
+      outputOffset,
       ...(evidence.anchor === undefined ? {} : { anchor: evidence.anchor }),
     };
   }

@@ -2852,7 +2852,11 @@ function isLocalCitation(value: unknown): value is LocalCitation {
     isEvidenceSourceKind(value.sourceKind) &&
     typeof value.sourceUrl === "string" &&
     typeof value.sourceTitle === "string" &&
-    typeof value.excerpt === "string"
+    typeof value.excerpt === "string" &&
+    (value.outputOffset === undefined ||
+      (typeof value.outputOffset === "number" &&
+        Number.isFinite(value.outputOffset) &&
+        value.outputOffset >= 0))
   );
 }
 

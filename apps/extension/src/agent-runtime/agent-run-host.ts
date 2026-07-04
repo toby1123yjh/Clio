@@ -584,6 +584,7 @@ export class AgentRunHost {
     const input = {
       evidence: citationEvidenceForRequest(run.request),
       citations: run.citations,
+      content: run.content,
     };
     try {
       return {

@@ -34,6 +34,7 @@ describe("CitationMarkerParser", () => {
       citation: {
         evidenceId: "ev_123",
         label: "Selection",
+        outputOffset: "Grounded ".length,
       },
     });
     expect(textFrom(events)).toBe("Grounded  answer.");
@@ -74,8 +75,24 @@ describe("CitationMarkerParser", () => {
         evidenceId: "memory:mem-1:chunk:chunk-1",
         label: "Memory",
         sourceKind: "memory",
+        outputOffset: "Grounded ".length,
       },
     });
+  });
+
+  it("keeps citation offsets in visible text coordinates", () => {
+    const events = collect(new CitationMarkerParser([evidence]), [
+      "First claim. ",
+      "Second claim[[cite:ev_123]] after marker.",
+    ]);
+
+    expect(events.find((event) => event.type === "citation")).toMatchObject({
+      citation: {
+        evidenceId: "ev_123",
+        outputOffset: "First claim. Second claim".length,
+      },
+    });
+    expect(textFrom(events)).toBe("First claim. Second claim after marker.");
   });
 });
 
