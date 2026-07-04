@@ -546,6 +546,8 @@ function sessionEvidenceForAppend(
       return { ...evidence, sourceKind: "selection" };
     case "memory":
       throw new Error("Memory evidence cannot be persisted as session evidence.");
+    case "web":
+      throw new Error("Web evidence cannot be persisted as session evidence.");
     default:
       return evidence.sourceKind satisfies never;
   }

@@ -11,7 +11,7 @@ describe("content local RAG flow", () => {
   it("selects retrieval candidates before loading bounded evidence windows", () => {
     const localRagSection = contentSource.slice(
       contentSource.indexOf("async function loadLocalRagEvidencePack"),
-      contentSource.indexOf("function buildAttachedEvidence"),
+      contentSource.indexOf("async function loadMultiSourceRagEvidencePack"),
     );
 
     expect(localRagSection).toContain('kind: "retrieveSources"');
@@ -24,6 +24,24 @@ describe("content local RAG flow", () => {
     expect(localRagSection).toContain("memoryIds,");
     expect(localRagSection).toContain("assembleLocalRagEvidencePack");
     expect(localRagSection).not.toContain('kind: "getMemory"');
+  });
+
+  it("keeps ordinary chat behind multi-source local-only policy without silent Web Search", () => {
+    const multiSourceSection = contentSource.slice(
+      contentSource.indexOf("async function loadMultiSourceRagEvidencePack"),
+      contentSource.indexOf("function buildAttachedEvidence"),
+    );
+    const startRunSection = contentSource.slice(
+      contentSource.indexOf("const startAgentRun = React.useCallback"),
+      contentSource.indexOf("const handleCancelDialogue = React.useCallback"),
+    );
+
+    expect(multiSourceSection).toContain("buildMultiSourceRetrievalResult");
+    expect(multiSourceSection).toContain('trigger: { kind: "ordinary_chat" }');
+    expect(multiSourceSection).toContain("allowExternal: false");
+    expect(multiSourceSection).not.toContain("openWebSearchStream");
+    expect(startRunSection).toContain("await loadMultiSourceRagEvidencePack(providerQuestion)");
+    expect(startRunSection).not.toContain("await openWebSearchStream");
   });
 
   it("routes Knowledge Base page search through source-level KB search", () => {

@@ -78,6 +78,8 @@ export function citationLabel(sourceKind: EvidenceSourceKind) {
       return "Selection";
     case "memory":
       return "Memory";
+    case "web":
+      return "Web";
     case "page":
       return "Page";
     default:

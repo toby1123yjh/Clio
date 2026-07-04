@@ -16,6 +16,10 @@ import {
   assembleLocalRagEvidencePack,
   planLocalRagRetrieval,
 } from "@/src/agent-runtime/local-rag-evidence";
+import {
+  type MultiSourceRetrievalResult,
+  buildMultiSourceRetrievalResult,
+} from "@/src/agent-runtime/multi-source-retrieval";
 import type {
   ProviderId,
   ProviderSettings,
@@ -546,6 +550,20 @@ async function loadLocalRagEvidencePack(query: string): Promise<EvidenceItem[]> 
   } catch {
     return [];
   }
+}
+
+async function loadMultiSourceRagEvidencePack(query: string): Promise<MultiSourceRetrievalResult> {
+  const normalizedQuery = normalizeText(query);
+  const localEvidence = await loadLocalRagEvidencePack(normalizedQuery);
+  return buildMultiSourceRetrievalResult({
+    request: {
+      query: normalizedQuery,
+      trigger: { kind: "ordinary_chat" },
+      allowExternal: false,
+      externalAvailable: false,
+    },
+    localEvidence,
+  });
 }
 
 function buildAttachedEvidence(
@@ -2861,10 +2879,11 @@ function ClioContentApp() {
       }
       const targetSessionId = existingSession === null ? undefined : sessionId;
       const previousEvidence = existingSession?.evidence.map(evidenceRecordToAgentEvidence) ?? [];
-      const localRagEvidence =
+      const multiSourceRag =
         scope === "general" && options.sourceContextPack === undefined
-          ? await loadLocalRagEvidencePack(providerQuestion)
-          : [];
+          ? await loadMultiSourceRagEvidencePack(providerQuestion)
+          : undefined;
+      const localRagEvidence = multiSourceRag?.evidence ?? [];
       const evidence =
         scope === "general"
           ? localRagEvidence

@@ -2,7 +2,7 @@ import type { EvidenceAnchor, EvidenceSourceKind, LocalCitation } from "../../ag
 import { excerpt, normalizeText } from "../../shared/text";
 import type { PageContext, RailDialogueMessage } from "./rail-state";
 
-export type MarkdownSourceKind = "page" | "selection" | "memory" | "chat" | "unknown";
+export type MarkdownSourceKind = "page" | "selection" | "memory" | "web" | "chat" | "unknown";
 
 export interface MarkdownSource {
   id: string;
@@ -124,6 +124,13 @@ function sourceLabel(kind: EvidenceSourceKind, title: string | undefined, fallba
     const compact = excerpt(fallback, 44);
     return compact.length === 0 ? "Memory" : `Memory: ${compact}`;
   }
+  if (kind === "web") {
+    const compactTitle = normalizeText(title ?? "");
+    if (compactTitle.length > 0 && !isGenericSourceLabel(compactTitle)) {
+      return excerpt(compactTitle, 52);
+    }
+    return sourceHost(fallback);
+  }
   const compactTitle = normalizeText(title ?? "");
   if (compactTitle.length > 0 && !isGenericSourceLabel(compactTitle)) {
     return excerpt(compactTitle, 52);
@@ -133,7 +140,12 @@ function sourceLabel(kind: EvidenceSourceKind, title: string | undefined, fallba
 
 function isGenericSourceLabel(value: string) {
   const normalized = value.trim().toLowerCase();
-  return normalized === "page" || normalized === "selection" || normalized === "memory";
+  return (
+    normalized === "page" ||
+    normalized === "selection" ||
+    normalized === "memory" ||
+    normalized === "web"
+  );
 }
 
 function sourceHost(url: string) {

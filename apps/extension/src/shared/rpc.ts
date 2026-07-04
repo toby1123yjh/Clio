@@ -2566,7 +2566,7 @@ function isSessionEvidenceItem(value: unknown): value is EvidenceItem & { source
 }
 
 function isEvidenceSourceKind(value: unknown): value is EvidenceSourceKind {
-  return value === "page" || value === "selection" || value === "memory";
+  return value === "page" || value === "selection" || value === "memory" || value === "web";
 }
 
 function isSourceKind(value: unknown): value is SourceKind {
