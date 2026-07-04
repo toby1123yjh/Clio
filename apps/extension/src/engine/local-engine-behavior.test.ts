@@ -1,6 +1,7 @@
 import type {
   CaptureBasePayload,
   CaptureSelectionPayload,
+  EmbeddingReindexModelDescriptor,
   EngineRequest,
   EngineResultFor,
   RetrieveSourcesResult,
@@ -9,7 +10,10 @@ import { hashText } from "@/src/shared/text";
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  type ActiveEmbeddingModel,
+  type EmbeddingProvider,
   LocalEngine,
+  type LocalEngineOptions,
   type LocalEngineSqliteApi,
   type LocalEngineSqliteDb,
 } from "./local-engine.worker";
@@ -218,6 +222,243 @@ describe("local engine behavior harness", () => {
     expect(windows.items[0]?.chunks.map((chunk) => chunk.text).join("\n").length).toBeLessThan(
       sourceText.length,
     );
+  });
+
+  it("uses a remote active embedding factory for jobs and vector retrieval", async () => {
+    const remoteModel: ActiveEmbeddingModel = {
+      modelId: "openai:remote-test:semantic-bridge:d3",
+      provider: "openai",
+      dimension: 3,
+    };
+    const requestedModels: ActiveEmbeddingModel[] = [];
+    const embeddedInputs: string[] = [];
+    const harness = createHarness({
+      embeddingProviderFactory: (model) => {
+        requestedModels.push(model);
+        if (
+          model.modelId !== remoteModel.modelId ||
+          model.provider !== remoteModel.provider ||
+          model.dimension !== remoteModel.dimension
+        ) {
+          return null;
+        }
+        const provider: EmbeddingProvider = {
+          ...remoteModel,
+          embedTexts: async (inputs) => {
+            embeddedInputs.push(...inputs);
+            return inputs.map(remoteEmbeddingVector);
+          },
+        };
+        return provider;
+      },
+    });
+
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/remote-embedding",
+        sourceTitle: "Remote Semantic Bridge",
+        normalizedText: ragText("remote semantic bridge evidence", 80),
+        metadata: {
+          title: "Remote Semantic Bridge",
+          abstract: "Remote semantic bridge evidence should use provider vectors.",
+          source_type: "paper",
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+    const now = "2026-07-03T00:00:00.000Z";
+    harness.exec("UPDATE embedding_models SET status = 'disabled'");
+    harness.exec(
+      `INSERT INTO embedding_models (
+        id,
+        provider,
+        label,
+        dimension,
+        metric,
+        status,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, 'cosine', 'active', ?, ?)`,
+      [remoteModel.modelId, remoteModel.provider, "Remote test embeddings", 3, now, now],
+    );
+
+    const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
+    const job = await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+    expect(job.status).toBe("done");
+    expect(
+      harness.count("source_embeddings", "source_id = ? AND model_id = ?", [
+        sourceId,
+        remoteModel.modelId,
+      ]),
+    ).toBeGreaterThan(1);
+    expect(
+      harness.count("source_embeddings", "source_id = ? AND model_id = 'clio-local-hash-v1'", [
+        sourceId,
+      ]),
+    ).toBe(0);
+
+    const retrieved = await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "remote semantic bridge", limit: 5, includeChunks: 1 },
+    });
+    expect(retrieved.items[0]?.id).toBe(sourceId);
+    expect(trackStatus(retrieved, "vector_meta")).toBe("used");
+    expect(trackStatus(retrieved, "vector_chunks")).toBe("used");
+    expect(requestedModels.some((model) => model.modelId === remoteModel.modelId)).toBe(true);
+    expect(embeddedInputs.some((input) => input.includes("Remote Semantic Bridge"))).toBe(true);
+    expect(embeddedInputs).toContain("remote semantic bridge");
+  });
+
+  it("reindexes remote embeddings after authorization without switching early", async () => {
+    const remoteModel = embeddingModelDescriptor("openai:remote-reindex:semantic:d3");
+    const embeddedInputs: string[] = [];
+    const harness = createHarness({
+      embeddingProviderFactory: (model) =>
+        model.modelId === remoteModel.id
+          ? {
+              modelId: model.modelId,
+              provider: model.provider,
+              dimension: model.dimension,
+              embedTexts: async (inputs) => {
+                embeddedInputs.push(...inputs);
+                return inputs.map(remoteEmbeddingVector);
+              },
+            }
+          : null,
+    });
+    const sourceText = ragText("remote semantic reindex evidence", 700);
+    const active = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/remote-reindex-active",
+        sourceTitle: "Remote Reindex Active",
+        normalizedText: sourceText,
+        metadata: {
+          title: "Remote Reindex Active",
+          abstract: "Remote semantic reindex evidence should rebuild safely.",
+          source_type: "paper",
+        },
+      }),
+    });
+    const deleted = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/remote-reindex-deleted",
+        sourceTitle: "Deleted Remote Reindex",
+        normalizedText: ragText("deleted remote semantic reindex evidence", 50),
+      }),
+    });
+    for (const job of (await harness.request({ kind: "getJobStatus", status: "queued" })).jobs) {
+      await harness.request({ kind: "runJob", id: job.id });
+    }
+    await harness.request({ kind: "deleteMemory", id: deleted.memory.id });
+
+    const initialModel = await harness.request({ kind: "getActiveEmbeddingModel" });
+    expect(initialModel).toMatchObject({
+      id: "clio-local-hash-v1",
+      provider: "local-deterministic",
+      dimension: 64,
+      metric: "cosine",
+      status: "active",
+    });
+    expect(initialModel).not.toHaveProperty("apiKey");
+
+    const reindex = await harness.request({
+      kind: "reindex",
+      scope: "embeddings",
+      model: remoteModel,
+    });
+    expect(reindex.status).toBe("done");
+    expect(harness.count("jobs", "id = ? AND type = 'reindex_embeddings'", [reindex.jobId])).toBe(
+      1,
+    );
+    const activeModel = await harness.request({ kind: "getActiveEmbeddingModel" });
+    expect(activeModel).toMatchObject({
+      id: remoteModel.id,
+      provider: remoteModel.provider,
+      label: remoteModel.label,
+      dimension: remoteModel.dimension,
+      metric: "cosine",
+      status: "active",
+    });
+    expect(activeModel).not.toHaveProperty("apiKey");
+    expect(
+      harness.count("embedding_models", "id = ? AND status = 'active'", [remoteModel.id]),
+    ).toBe(1);
+    expect(
+      harness.count("embedding_models", "id = 'clio-local-hash-v1' AND status = 'disabled'"),
+    ).toBe(1);
+    expect(
+      harness.count("source_embeddings", "source_id = ? AND model_id = ?", [
+        active.memory.id,
+        remoteModel.id,
+      ]),
+    ).toBeGreaterThan(1);
+    expect(
+      harness.count("source_embeddings", "source_id = ? AND model_id = ?", [
+        deleted.memory.id,
+        remoteModel.id,
+      ]),
+    ).toBe(0);
+    expect(
+      harness.count("source_embeddings", "source_id = ? AND model_id = 'clio-local-hash-v1'", [
+        active.memory.id,
+      ]),
+    ).toBeGreaterThan(0);
+    expect(embeddedInputs.every((input) => input.length < sourceText.length)).toBe(true);
+    expect(embeddedInputs.some((input) => input.includes("Deleted Remote Reindex"))).toBe(false);
+
+    const retrieved = await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "remote semantic reindex", limit: 5, includeChunks: 1 },
+    });
+    expect(retrieved.items[0]?.id).toBe(active.memory.id);
+    expect(trackStatus(retrieved, "vector_meta")).toBe("used");
+    expect(trackStatus(retrieved, "vector_chunks")).toBe("used");
+  });
+
+  it("keeps the previous active embedding model when remote reindex fails", async () => {
+    const remoteModel = embeddingModelDescriptor("openai:failing-reindex:semantic:d3");
+    const harness = createHarness({
+      embeddingProviderFactory: (model) =>
+        model.modelId === remoteModel.id
+          ? {
+              modelId: model.modelId,
+              provider: model.provider,
+              dimension: model.dimension,
+              embedTexts: async () => {
+                throw new Error("remote embedding failed");
+              },
+            }
+          : null,
+    });
+    await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/failing-reindex",
+        sourceTitle: "Failing Reindex",
+        normalizedText: ragText("remote semantic failure evidence", 20),
+      }),
+    });
+
+    const reindex = await harness.request({
+      kind: "reindex",
+      scope: "embeddings",
+      model: remoteModel,
+    });
+    expect(reindex.status).toBe("queued");
+    expect(
+      harness.count("embedding_models", "id = 'clio-local-hash-v1' AND status = 'active'"),
+    ).toBe(1);
+    expect(
+      harness.count("embedding_models", "id = ? AND status = 'disabled'", [remoteModel.id]),
+    ).toBe(1);
+    expect(await harness.request({ kind: "getActiveEmbeddingModel" })).toMatchObject({
+      id: "clio-local-hash-v1",
+      provider: "local-deterministic",
+      status: "active",
+    });
   });
 
   it("builds keyword index and expands knowledge base page search locally", async () => {
@@ -1142,12 +1383,13 @@ describe("local engine behavior harness", () => {
   });
 });
 
-function createHarness() {
+function createHarness(options: Omit<LocalEngineOptions, "openDatabase"> = {}) {
   const dbPath = `/local-engine-behavior-${Date.now()}-${Math.random()
     .toString(36)
     .slice(2)}.sqlite3`;
   let db: LocalEngineSqliteDb | undefined;
   const engine = new LocalEngine({
+    ...options,
     openDatabase: async () => {
       db = new sqliteApi.oo1.DB({ filename: dbPath, flags: "c" });
       return {
@@ -1209,6 +1451,25 @@ function selectionPayload(
 
 function ragText(seed: string, repeat: number) {
   return Array.from({ length: repeat }, (_, index) => `${seed} chunk ${index}.`).join(" ");
+}
+
+function remoteEmbeddingVector(input: string) {
+  const normalized = input.toLowerCase();
+  return [
+    normalized.includes("remote") ? 1 : 0,
+    normalized.includes("semantic") ? 1 : 0,
+    normalized.includes("bridge") ? 1 : 0,
+  ];
+}
+
+function embeddingModelDescriptor(id: string): EmbeddingReindexModelDescriptor {
+  return {
+    id,
+    provider: "openai",
+    label: "Remote test embeddings",
+    dimension: 3,
+    metric: "cosine",
+  };
 }
 
 function trackStatus(result: RetrieveSourcesResult, name: string) {

@@ -1,4 +1,11 @@
 import { testGeminiProviderConnection } from "@/src/agent-runtime/browser-pi-runtime";
+import { ClioEmbeddingProviderRuntime } from "@/src/agent-runtime/embedding-provider-runtime";
+import {
+  getEmbeddingProviderSettings,
+  resolveEmbeddingRuntimeConfig,
+  saveEmbeddingProviderSettings,
+  saveEmbeddingProviderTestResult,
+} from "@/src/agent-runtime/embedding-provider-settings";
 import { hasGeminiHostPermission } from "@/src/agent-runtime/gemini-permission";
 import {
   normalizeImageBaseUrl,
@@ -59,6 +66,7 @@ import {
   type ImageGenerationRunRequest,
   type ImageGenerationStreamEventMessage,
   type ProviderRequest,
+  type ReindexResult,
   type UiRequest,
   type WebSearchRunRequest,
   type WebSearchStreamEventMessage,
@@ -780,6 +788,78 @@ async function routeProviderRequest(request: ProviderRequest) {
         "Image provider host access is unavailable in this build.",
       );
       return getProviderSettings();
+    }
+    case "getEmbeddingProviderSettings":
+      return getEmbeddingProviderSettings();
+    case "saveEmbeddingProviderSettings":
+      return saveEmbeddingProviderSettings(request.settings);
+    case "ensureEmbeddingProviderHostPermission": {
+      const settings = await getEmbeddingProviderSettings();
+      const provider = request.provider ?? settings.activeProvider;
+      if (provider === "openai-compatible") {
+        const baseUrl =
+          normalizeOpenAICompatibleBaseUrl(request.baseUrl) ??
+          settings.openaiCompatible.baseUrl ??
+          defaultOpenAICompatibleBaseUrl;
+        await requireOpenAICompatibleHostPermission(
+          baseUrl,
+          "Embedding provider host access is unavailable in this build.",
+        );
+        return getEmbeddingProviderSettings();
+      }
+      const baseUrl = normalizeOpenAIBaseUrl(request.baseUrl) ?? settings.openai.baseUrl;
+      await requireOpenAIHostPermission(
+        baseUrl,
+        "Embedding provider host access is unavailable in this build.",
+      );
+      return getEmbeddingProviderSettings();
+    }
+    case "testEmbeddingProvider": {
+      if (request.settings !== undefined) {
+        await saveEmbeddingProviderSettings(request.settings);
+      }
+      const runtime = new ClioEmbeddingProviderRuntime({
+        loadEmbeddingProviderSettings: () => getEmbeddingProviderSettings(),
+        ensureOpenAIHostPermission: (baseUrl) => hasOpenAIHostPermission(baseUrl),
+        ensureOpenAICompatibleHostPermission: (baseUrl) =>
+          hasOpenAICompatibleHostPermission(baseUrl),
+      });
+      const result = await runtime.testEmbeddingProvider();
+      await saveEmbeddingProviderTestResult(result);
+      return result;
+    }
+    case "authorizeEmbeddingReindex": {
+      const config = resolveEmbeddingRuntimeConfig(await getEmbeddingProviderSettings());
+      if (config.provider === "openai-compatible") {
+        await requireOpenAICompatibleHostPermission(
+          config.baseUrl,
+          "Embedding provider host access is unavailable in this build.",
+        );
+      } else {
+        await requireOpenAIHostPermission(
+          config.baseUrl,
+          "Embedding provider host access is unavailable in this build.",
+        );
+      }
+      const response = (await routeEngineRequest({
+        kind: "reindex",
+        scope: "embeddings",
+        model: {
+          id: config.modelId,
+          provider: config.provider,
+          label: config.label,
+          dimension: config.dimension,
+          metric: "cosine",
+        },
+      })) as EngineResponse<ReindexResult>;
+      if (!response.ok) {
+        throw new EngineRpcError(
+          response.error.code,
+          response.error.message,
+          response.error.detail,
+        );
+      }
+      return response.value;
     }
     default:
       return assertNever(request);

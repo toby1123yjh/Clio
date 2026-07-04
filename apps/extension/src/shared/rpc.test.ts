@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  type ActiveEmbeddingModelSummary,
   CLIO_AGENT_RUN_EVENT,
   CLIO_AGENT_RUN_REQUEST,
   CLIO_AGENT_STREAM_COMPACT,
@@ -19,6 +20,8 @@ import {
   CLIO_WEB_SEARCH_RUN_REQUEST,
   CLIO_WEB_SEARCH_STREAM_EVENT,
   CLIO_WEB_SEARCH_STREAM_REQUEST,
+  CLIO_WORKER_EMBEDDING_REQUEST,
+  CLIO_WORKER_EMBEDDING_RESPONSE,
   type RetrieveSourceHitChunk,
   type RetrieveSourceItem,
   isAgentRunEventMessage,
@@ -40,6 +43,8 @@ import {
   isWebSearchRunRequestMessage,
   isWebSearchStreamEventMessage,
   isWebSearchStreamRequestMessage,
+  isWorkerEmbeddingRequestMessage,
+  isWorkerEmbeddingResponseMessage,
 } from "./rpc";
 
 describe("session engine RPC guards", () => {
@@ -978,6 +983,25 @@ describe("session engine RPC guards", () => {
   });
 
   it("accepts explicit queued job run requests", () => {
+    const activeModel = {
+      id: "openai:base:model:d1536",
+      provider: "openai",
+      label: "OpenAI text-embedding-3-small",
+      dimension: 1536,
+      metric: "cosine",
+      status: "active",
+      updatedAt: "2026-07-03T00:00:00.000Z",
+    } satisfies ActiveEmbeddingModelSummary;
+
+    expect(activeModel).not.toHaveProperty("apiKey");
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "getActiveEmbeddingModel" },
+      }),
+    ).toBe(true);
+
     expect(
       isEngineRequestMessage({
         type: CLIO_ENGINE_REQUEST,
@@ -1168,6 +1192,133 @@ describe("session engine RPC guards", () => {
       isProviderRequestMessage({
         type: CLIO_PROVIDER_REQUEST,
         request: { kind: "setActiveProvider", provider: "openai-compatible" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: { kind: "getEmbeddingProviderSettings" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "saveEmbeddingProviderSettings",
+          settings: {
+            activeProvider: "openai-compatible",
+            openai: {
+              apiKey: "sk-embedding",
+              model: "text-embedding-3-small",
+              baseUrl: "https://api.openai.example.test/v1",
+              dimension: 1536,
+            },
+            openaiCompatible: {
+              apiKey: "sk-compatible",
+              model: "embed-custom",
+              baseUrl: "https://embeddings.example.test/v1",
+              providerName: "custom",
+              dimension: 768,
+            },
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "testEmbeddingProvider",
+          settings: {
+            activeProvider: "openai",
+            openai: {
+              apiKey: "sk-embedding",
+              model: "text-embedding-3-small",
+              baseUrl: "https://api.openai.example.test/v1",
+            },
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "ensureEmbeddingProviderHostPermission",
+          provider: "openai-compatible",
+          baseUrl: "https://embeddings.example.test/v1",
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: { kind: "authorizeEmbeddingReindex" },
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts typed embedding reindex engine requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "reindex",
+          scope: "embeddings",
+          model: {
+            id: "openai:abcd:text-embedding-3-small:d1536",
+            provider: "openai",
+            label: "OpenAI Embeddings text-embedding-3-small (1536d)",
+            dimension: 1536,
+            metric: "cosine",
+          },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts typed worker embedding bridge messages", () => {
+    expect(
+      isWorkerEmbeddingRequestMessage({
+        type: CLIO_WORKER_EMBEDDING_REQUEST,
+        requestId: "embedding-request-1",
+        request: {
+          modelId: "openai:abcd:text-embedding-3-small:d1536",
+          inputs: ["bounded chunk text", "bounded meta text"],
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isWorkerEmbeddingResponseMessage({
+        type: CLIO_WORKER_EMBEDDING_RESPONSE,
+        requestId: "embedding-request-1",
+        response: {
+          ok: true,
+          value: [
+            [0.1, 0.2, 0.3],
+            [0.4, 0.5, 0.6],
+          ],
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isWorkerEmbeddingResponseMessage({
+        type: CLIO_WORKER_EMBEDDING_RESPONSE,
+        requestId: "embedding-request-1",
+        response: {
+          ok: false,
+          error: {
+            code: "PROVIDER_AUTH_ERROR",
+            message: "Embedding provider auth failed.",
+          },
+        },
       }),
     ).toBe(true);
   });
@@ -1559,6 +1710,93 @@ describe("session engine RPC guards", () => {
           settings: {
             size: "512x512",
           },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "saveEmbeddingProviderSettings",
+          settings: {
+            activeProvider: "gemini",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "testEmbeddingProvider",
+          settings: {
+            activeProvider: "openai",
+            openai: {
+              apiKey: 42,
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "ensureEmbeddingProviderHostPermission",
+          provider: "anthropic",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "authorizeEmbeddingReindex",
+          apiKey: "sk-should-not-cross-authorization-boundary",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "reindex",
+          scope: "embeddings",
+          model: {
+            id: "openai:abcd:text-embedding-3-small:d1536",
+            provider: "openai",
+            label: "OpenAI Embeddings text-embedding-3-small (1536d)",
+            dimension: "1536",
+            metric: "cosine",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerEmbeddingRequestMessage({
+        type: CLIO_WORKER_EMBEDDING_REQUEST,
+        requestId: "embedding-request-1",
+        request: {
+          modelId: "openai:abcd:text-embedding-3-small:d1536",
+          inputs: ["bounded text"],
+          apiKey: "sk-should-not-cross-worker-boundary",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerEmbeddingResponseMessage({
+        type: CLIO_WORKER_EMBEDDING_RESPONSE,
+        requestId: "embedding-request-1",
+        response: {
+          ok: true,
+          value: [[0.1, Number.NaN]],
         },
       }),
     ).toBe(false);

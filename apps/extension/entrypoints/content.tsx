@@ -1,5 +1,9 @@
 import { readClioCitationValidation } from "@/src/agent-runtime/citation-validator";
 import type {
+  EmbeddingProviderSettings,
+  SaveEmbeddingProviderSettingsInput,
+} from "@/src/agent-runtime/embedding-provider-settings";
+import type {
   ImageGenerationSettings,
   SaveImageGenerationSettingsInput,
 } from "@/src/agent-runtime/image-generation-settings";
@@ -137,6 +141,7 @@ import {
 import { requestEngine, requestProvider } from "@/src/shared/chrome-client";
 import { sourceUrlsMatch } from "@/src/shared/reliability";
 import {
+  type ActiveEmbeddingModelSummary,
   type CaptureSelectionPayload,
   type ChatMessageRecord,
   type ChatSessionDetail,
@@ -752,6 +757,10 @@ function ClioContentApp() {
   const [providerSettings, setProviderSettings] = React.useState<ProviderSettings | null>(null);
   const [searchProviderSettings, setSearchProviderSettings] =
     React.useState<SearchProviderSettings | null>(null);
+  const [embeddingProviderSettings, setEmbeddingProviderSettings] =
+    React.useState<EmbeddingProviderSettings | null>(null);
+  const [activeEmbeddingModel, setActiveEmbeddingModel] =
+    React.useState<ActiveEmbeddingModelSummary | null>(null);
   const [imageGenerationSettings, setImageGenerationSettings] =
     React.useState<ImageGenerationSettings | null>(null);
   const [imageGenerationHistory, setImageGenerationHistory] = React.useState<
@@ -866,6 +875,33 @@ function ClioContentApp() {
       return false;
     } finally {
       setProviderLoading(false);
+    }
+  }, []);
+
+  const loadEmbeddingProviderSettings = React.useCallback(async () => {
+    setProviderLoading(true);
+    setProviderMessage(null);
+    try {
+      const settings = await requestProvider({ kind: "getEmbeddingProviderSettings" });
+      setEmbeddingProviderSettings(settings);
+      return true;
+    } catch (error) {
+      setProviderMessage(
+        error instanceof Error ? error.message : "Unable to read embedding provider setup.",
+      );
+      return false;
+    } finally {
+      setProviderLoading(false);
+    }
+  }, []);
+
+  const loadActiveEmbeddingModel = React.useCallback(async () => {
+    try {
+      const model = await requestEngine({ kind: "getActiveEmbeddingModel" });
+      setActiveEmbeddingModel(model);
+      return true;
+    } catch {
+      return false;
     }
   }, []);
 
@@ -1138,14 +1174,30 @@ function ClioContentApp() {
     void loadProviderSettings();
     void loadSearchProviderSettings();
     void loadImageGenerationSettings();
-  }, [loadImageGenerationSettings, loadProviderSettings, loadSearchProviderSettings]);
+    void loadEmbeddingProviderSettings();
+    void loadActiveEmbeddingModel();
+  }, [
+    loadActiveEmbeddingModel,
+    loadEmbeddingProviderSettings,
+    loadImageGenerationSettings,
+    loadProviderSettings,
+    loadSearchProviderSettings,
+  ]);
 
   const refreshSettingsProviders = React.useCallback(async () => {
     const providerOk = await loadProviderSettings();
     const searchOk = await loadSearchProviderSettings();
     const imageOk = await loadImageGenerationSettings();
-    return providerOk && searchOk && imageOk;
-  }, [loadImageGenerationSettings, loadProviderSettings, loadSearchProviderSettings]);
+    const embeddingOk = await loadEmbeddingProviderSettings();
+    const activeEmbeddingOk = await loadActiveEmbeddingModel();
+    return providerOk && searchOk && imageOk && embeddingOk && activeEmbeddingOk;
+  }, [
+    loadActiveEmbeddingModel,
+    loadEmbeddingProviderSettings,
+    loadImageGenerationSettings,
+    loadProviderSettings,
+    loadSearchProviderSettings,
+  ]);
 
   const changeRailTheme = React.useCallback((theme: RailTheme) => {
     setRailTheme(theme);
@@ -1331,6 +1383,75 @@ function ClioContentApp() {
     },
     [],
   );
+
+  const saveEmbeddingProviderSettings = React.useCallback(
+    async (input: SaveEmbeddingProviderSettingsInput) => {
+      setProviderLoading(true);
+      setProviderMessage(null);
+      try {
+        const settings = await requestProvider({
+          kind: "saveEmbeddingProviderSettings",
+          settings: input,
+        });
+        setEmbeddingProviderSettings(settings);
+        setProviderMessage("Embedding provider saved.");
+        return true;
+      } catch (error) {
+        setProviderMessage(
+          error instanceof Error ? error.message : "Unable to save embedding provider.",
+        );
+        return false;
+      } finally {
+        setProviderLoading(false);
+      }
+    },
+    [],
+  );
+
+  const testEmbeddingProvider = React.useCallback(
+    async (input: SaveEmbeddingProviderSettingsInput) => {
+      setProviderLoading(true);
+      setProviderMessage(null);
+      try {
+        const result = await requestProvider({
+          kind: "testEmbeddingProvider",
+          settings: input,
+        });
+        await loadEmbeddingProviderSettings();
+        setProviderMessage(`Embedding connection works: ${result.dimension}d (${result.modelId}).`);
+        return true;
+      } catch (error) {
+        setProviderMessage(
+          error instanceof Error ? error.message : "Embedding connection test failed.",
+        );
+        return false;
+      } finally {
+        setProviderLoading(false);
+      }
+    },
+    [loadEmbeddingProviderSettings],
+  );
+
+  const authorizeEmbeddingReindex = React.useCallback(async () => {
+    setProviderLoading(true);
+    setProviderMessage(null);
+    try {
+      const result = await requestProvider({ kind: "authorizeEmbeddingReindex" });
+      await loadActiveEmbeddingModel();
+      await loadEmbeddingProviderSettings();
+      setProviderMessage(
+        `Embedding rebuild queued: ${result.status} job ${result.jobId.slice(0, 8)}.`,
+      );
+      return true;
+    } catch (error) {
+      setProviderMessage(
+        error instanceof Error ? error.message : "Unable to start embedding rebuild.",
+      );
+      return false;
+    } finally {
+      setProviderLoading(false);
+    }
+  }, [loadActiveEmbeddingModel, loadEmbeddingProviderSettings]);
 
   const testOpenAICompatibleProvider = React.useCallback(
     async (input: { apiKey?: string; model?: string; baseUrl?: string; providerName?: string }) => {
@@ -2237,7 +2358,15 @@ function ClioContentApp() {
     void loadProviderSettings();
     void loadSearchProviderSettings();
     void loadImageGenerationSettings();
-  }, [loadImageGenerationSettings, loadProviderSettings, loadSearchProviderSettings]);
+    void loadEmbeddingProviderSettings();
+    void loadActiveEmbeddingModel();
+  }, [
+    loadActiveEmbeddingModel,
+    loadEmbeddingProviderSettings,
+    loadImageGenerationSettings,
+    loadProviderSettings,
+    loadSearchProviderSettings,
+  ]);
 
   React.useEffect(() => {
     void getRailOwnerId()
@@ -3187,6 +3316,8 @@ function ClioContentApp() {
         collapsedSide={collapsedLauncherPosition.side}
         collapsedTopPx={collapsedTopPx}
         detail={detail}
+        activeEmbeddingModel={activeEmbeddingModel}
+        embeddingProviderSettings={embeddingProviderSettings}
         health={health}
         imageGenerationHistory={imageGenerationHistory}
         imageGenerationSettings={imageGenerationSettings}
@@ -3212,6 +3343,7 @@ function ClioContentApp() {
         }}
         onCollapsedKeyDown={handleCollapsedKeyDown}
         onCollapsedPointerDown={handleCollapsedPointerDown}
+        onAuthorizeEmbeddingReindex={authorizeEmbeddingReindex}
         onCancelImageGeneration={handleCancelImageGeneration}
         onCancelDialogue={handleCancelDialogue}
         onClearDialogue={handleClearDialogue}
@@ -3272,6 +3404,7 @@ function ClioContentApp() {
         onToggleCommandPalette={toggleCommandPalette}
         onToolboxSkill={handleToolboxSkill}
         onSaveGeminiProvider={saveGeminiProvider}
+        onSaveEmbeddingProviderSettings={saveEmbeddingProviderSettings}
         onSaveOpenAICompatibleProvider={saveOpenAICompatibleProvider}
         onSaveOpenAIProvider={saveOpenAIProvider}
         onSaveImageGenerationSettings={saveImageGenerationSettings}
@@ -3284,6 +3417,7 @@ function ClioContentApp() {
         onSubmitImageGeneration={handleSubmitImageGeneration}
         onSubmitWebSearch={handleSubmitWebSearch}
         onTestGeminiProvider={testGeminiProvider}
+        onTestEmbeddingProvider={testEmbeddingProvider}
         onTestOpenAICompatibleProvider={testOpenAICompatibleProvider}
         onTestOpenAIProvider={testOpenAIProvider}
         providerLoading={providerLoading}

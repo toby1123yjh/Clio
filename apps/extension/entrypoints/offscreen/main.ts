@@ -1,5 +1,6 @@
 import { AgentRunHost } from "@/src/agent-runtime/agent-run-host";
 import { PiAgentCompactionRuntime } from "@/src/agent-runtime/compaction-context";
+import { ClioEmbeddingProviderRuntime } from "@/src/agent-runtime/embedding-provider-runtime";
 import { ClioImageGenerationRuntime } from "@/src/agent-runtime/image-generation-runtime";
 import { PiAgentCoreRunAdapter } from "@/src/agent-runtime/pi-agent-core-run-adapter";
 import { type ProviderId, defaultActiveProvider } from "@/src/agent-runtime/provider-settings";
@@ -12,6 +13,7 @@ import {
   CLIO_AGENT_RUN_EVENT,
   CLIO_IMAGE_GENERATION_RUN_EVENT,
   CLIO_WEB_SEARCH_RUN_EVENT,
+  CLIO_WORKER_EMBEDDING_RESPONSE,
   CLIO_WORKER_REQUEST,
   type ClioImageGenerationEvent,
   type ClioWebSearchEvent,
@@ -25,6 +27,7 @@ import {
   isImageGenerationRunRequestMessage,
   isOffscreenRequestMessage,
   isWebSearchRunRequestMessage,
+  isWorkerEmbeddingRequestMessage,
   isWorkerResponseMessage,
   unwrapEngineResponse,
 } from "@/src/shared/rpc";
@@ -77,6 +80,25 @@ const imageGenerationRuntime = new ClioImageGenerationRuntime({
   loadActiveProviderConfig: () => requestProviderConfig(),
   ensureImageHostPermission: (baseUrl) =>
     requestProvider({ kind: "ensureImageGenerationHostPermission", baseUrl })
+      .then(() => true)
+      .catch(() => false),
+});
+const embeddingProviderRuntime = new ClioEmbeddingProviderRuntime({
+  loadEmbeddingProviderSettings: () => requestProvider({ kind: "getEmbeddingProviderSettings" }),
+  ensureOpenAIHostPermission: (baseUrl) =>
+    requestProvider({
+      kind: "ensureEmbeddingProviderHostPermission",
+      provider: "openai",
+      baseUrl,
+    })
+      .then(() => true)
+      .catch(() => false),
+  ensureOpenAICompatibleHostPermission: (baseUrl) =>
+    requestProvider({
+      kind: "ensureEmbeddingProviderHostPermission",
+      provider: "openai-compatible",
+      baseUrl,
+    })
       .then(() => true)
       .catch(() => false),
 });
@@ -311,6 +333,10 @@ function ensureWorker() {
     type: "module",
   });
   worker.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (isWorkerEmbeddingRequestMessage(event.data)) {
+      void handleWorkerEmbeddingRequest(worker as Worker, event.data);
+      return;
+    }
     if (!isWorkerResponseMessage(event.data)) return;
     const entry = pending.get(event.data.requestId);
     if (entry === undefined) return;
@@ -326,6 +352,32 @@ function ensureWorker() {
     }
   });
   return worker;
+}
+
+async function handleWorkerEmbeddingRequest(
+  engineWorker: Worker,
+  message: import("@/src/shared/rpc").WorkerEmbeddingRequestMessage,
+) {
+  try {
+    const vectors = await embeddingProviderRuntime.embedTexts(
+      message.request.modelId,
+      message.request.inputs,
+    );
+    engineWorker.postMessage({
+      type: CLIO_WORKER_EMBEDDING_RESPONSE,
+      requestId: message.requestId,
+      response: { ok: true, value: vectors },
+    });
+  } catch (error) {
+    engineWorker.postMessage({
+      type: CLIO_WORKER_EMBEDDING_RESPONSE,
+      requestId: message.requestId,
+      response: {
+        ok: false,
+        error: engineErrorFromUnknown(error, "EMBEDDING_PROVIDER_ERROR"),
+      },
+    });
+  }
 }
 
 function assertNever(value: never): never {

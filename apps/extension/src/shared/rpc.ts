@@ -1,5 +1,11 @@
 import { isCitationValidationResult } from "@/src/agent-runtime/citation-validator";
 import type {
+  EmbeddingProviderId,
+  EmbeddingProviderSettings,
+  EmbeddingProviderTestResult,
+  SaveEmbeddingProviderSettingsInput,
+} from "@/src/agent-runtime/embedding-provider-settings";
+import type {
   ImageGenerationSettings,
   SaveImageGenerationSettingsInput,
 } from "@/src/agent-runtime/image-generation-settings";
@@ -24,6 +30,8 @@ export const CLIO_ENGINE_REQUEST = "clio:engine:request";
 export const CLIO_OFFSCREEN_REQUEST = "clio:offscreen:request";
 export const CLIO_WORKER_REQUEST = "clio:worker:request";
 export const CLIO_WORKER_RESPONSE = "clio:worker:response";
+export const CLIO_WORKER_EMBEDDING_REQUEST = "clio:worker:embedding:request";
+export const CLIO_WORKER_EMBEDDING_RESPONSE = "clio:worker:embedding:response";
 export const CLIO_CONTENT_COMMAND = "clio:content:command";
 export const CLIO_PROVIDER_REQUEST = "clio:provider:request";
 export const CLIO_PROVIDER_CONFIG_REQUEST = "clio:provider-config:request";
@@ -52,7 +60,11 @@ export type EngineHealthStatus = "starting" | "ready" | "degraded" | "error";
 export type SourceKind = "page" | "selection";
 export type RepairAction = "retry_init" | "rebuild_fts" | "reset_library";
 export type JobStatus = "queued" | "running" | "done" | "failed";
-export type JobType = "reindex_fts" | "resolve_anchor" | "post_capture_hardening";
+export type JobType =
+  | "reindex_fts"
+  | "reindex_embeddings"
+  | "resolve_anchor"
+  | "post_capture_hardening";
 export type WikiCompileJobStatus = "queued" | "running" | "done" | "failed";
 export type WikiCompileEventLevel = "info" | "warning" | "error";
 export type WikiCompileEventKind =
@@ -75,7 +87,7 @@ export type GraphNodeKind =
   | "metric";
 export type GraphEdgeDimension = "metadata" | "citation" | "domain" | "technical";
 export type GraphEdgeCreatedBy = "adapter" | "graph_builder" | "user";
-export type ReindexScope = "fts";
+export type ReindexScope = "fts" | "embeddings";
 export type ChatMessageRole = "user" | "assistant" | "evidence";
 export type ChatMessageStatus =
   | "queued"
@@ -949,6 +961,24 @@ export interface UpdateChatMessagePayload {
   queueOrder?: number;
 }
 
+export interface EmbeddingReindexModelDescriptor {
+  id: string;
+  provider: EmbeddingProviderId;
+  label: string;
+  dimension: number;
+  metric: "cosine";
+}
+
+export interface ActiveEmbeddingModelSummary {
+  id: string;
+  provider: string;
+  label: string;
+  dimension: number;
+  metric: "cosine";
+  status: "active";
+  updatedAt: string;
+}
+
 export type EngineRequest =
   | { kind: "health" }
   | { kind: "capturePage"; payload: CaptureBasePayload }
@@ -985,9 +1015,11 @@ export type EngineRequest =
   | { kind: "queryGraphNeighbors"; payload: GraphNeighborsPayload }
   | { kind: "queryGraphSubgraph"; payload: GraphSubgraphPayload }
   | { kind: "repair"; action: RepairAction }
+  | { kind: "getActiveEmbeddingModel" }
   | { kind: "getJobStatus"; status?: JobStatus; limit?: number }
   | { kind: "runJob"; id: string }
-  | { kind: "reindex"; scope: ReindexScope }
+  | { kind: "reindex"; scope: "fts" }
+  | { kind: "reindex"; scope: "embeddings"; model: EmbeddingReindexModelDescriptor }
   | { kind: "resolveAnchor"; memoryId: string }
   | { kind: "createChatSession"; payload: CreateChatSessionPayload }
   | { kind: "listChatSessions"; limit?: number }
@@ -1078,106 +1110,110 @@ export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health
                                                   ? GraphQueryResult
                                                   : T extends { kind: "repair" }
                                                     ? RepairResult
-                                                    : T extends { kind: "getJobStatus" }
-                                                      ? GetJobStatusResult
-                                                      : T extends { kind: "runJob" }
-                                                        ? JobSummary
-                                                        : T extends { kind: "reindex" }
-                                                          ? ReindexResult
-                                                          : T extends { kind: "resolveAnchor" }
-                                                            ? AnchorResolveResult
-                                                            : T extends {
-                                                                  kind: "createChatSession";
-                                                                }
-                                                              ? ChatSessionSummary
+                                                    : T extends {
+                                                          kind: "getActiveEmbeddingModel";
+                                                        }
+                                                      ? ActiveEmbeddingModelSummary | null
+                                                      : T extends { kind: "getJobStatus" }
+                                                        ? GetJobStatusResult
+                                                        : T extends { kind: "runJob" }
+                                                          ? JobSummary
+                                                          : T extends { kind: "reindex" }
+                                                            ? ReindexResult
+                                                            : T extends { kind: "resolveAnchor" }
+                                                              ? AnchorResolveResult
                                                               : T extends {
-                                                                    kind: "listChatSessions";
+                                                                    kind: "createChatSession";
                                                                   }
-                                                                ? ListChatSessionsResult
+                                                                ? ChatSessionSummary
                                                                 : T extends {
-                                                                      kind:
-                                                                        | "loadChatSession"
-                                                                        | "recoverInterruptedChatSession";
+                                                                      kind: "listChatSessions";
                                                                     }
-                                                                  ? ChatSessionDetail | null
+                                                                  ? ListChatSessionsResult
                                                                   : T extends {
                                                                         kind:
-                                                                          | "claimChatSession"
-                                                                          | "heartbeatChatSession"
-                                                                          | "releaseChatSession";
+                                                                          | "loadChatSession"
+                                                                          | "recoverInterruptedChatSession";
                                                                       }
-                                                                    ? SessionLeaseResult
+                                                                    ? ChatSessionDetail | null
                                                                     : T extends {
-                                                                          kind: "appendSessionEvidence";
+                                                                          kind:
+                                                                            | "claimChatSession"
+                                                                            | "heartbeatChatSession"
+                                                                            | "releaseChatSession";
                                                                         }
-                                                                      ? SessionEvidenceRecord
+                                                                      ? SessionLeaseResult
                                                                       : T extends {
-                                                                            kind: "appendCompaction";
+                                                                            kind: "appendSessionEvidence";
                                                                           }
-                                                                        ? CompactionRecord
+                                                                        ? SessionEvidenceRecord
                                                                         : T extends {
-                                                                              kind: "listCompactions";
+                                                                              kind: "appendCompaction";
                                                                             }
-                                                                          ? {
-                                                                              items: CompactionRecord[];
-                                                                            }
+                                                                          ? CompactionRecord
                                                                           : T extends {
-                                                                                kind: "getLatestCompaction";
+                                                                                kind: "listCompactions";
                                                                               }
-                                                                            ? CompactionRecord | null
+                                                                            ? {
+                                                                                items: CompactionRecord[];
+                                                                              }
                                                                             : T extends {
-                                                                                  kind:
-                                                                                    | "upsertChatMessage"
-                                                                                    | "updateChatMessage";
+                                                                                  kind: "getLatestCompaction";
                                                                                 }
-                                                                              ? ChatMessageRecord
+                                                                              ? CompactionRecord | null
                                                                               : T extends {
-                                                                                    kind: "deleteChatMessage";
+                                                                                    kind:
+                                                                                      | "upsertChatMessage"
+                                                                                      | "updateChatMessage";
                                                                                   }
-                                                                                ? {
-                                                                                    deleted: boolean;
-                                                                                  }
+                                                                                ? ChatMessageRecord
                                                                                 : T extends {
-                                                                                      kind: "clearQueuedChatMessages";
+                                                                                      kind: "deleteChatMessage";
                                                                                     }
                                                                                   ? {
-                                                                                      cleared: number;
+                                                                                      deleted: boolean;
                                                                                     }
                                                                                   : T extends {
-                                                                                        kind: "listWebSearchHistory";
+                                                                                        kind: "clearQueuedChatMessages";
                                                                                       }
-                                                                                    ? ListWebSearchHistoryResult
+                                                                                    ? {
+                                                                                        cleared: number;
+                                                                                      }
                                                                                     : T extends {
-                                                                                          kind: "appendWebSearchHistory";
+                                                                                          kind: "listWebSearchHistory";
                                                                                         }
-                                                                                      ? WebSearchHistoryRecord
+                                                                                      ? ListWebSearchHistoryResult
                                                                                       : T extends {
-                                                                                            kind: "deleteWebSearchHistory";
+                                                                                            kind: "appendWebSearchHistory";
                                                                                           }
-                                                                                        ? {
-                                                                                            deleted: boolean;
-                                                                                          }
+                                                                                        ? WebSearchHistoryRecord
                                                                                         : T extends {
-                                                                                              kind: "clearWebSearchHistory";
+                                                                                              kind: "deleteWebSearchHistory";
                                                                                             }
                                                                                           ? {
-                                                                                              cleared: number;
+                                                                                              deleted: boolean;
                                                                                             }
                                                                                           : T extends {
-                                                                                                kind: "listImageGenerationHistory";
+                                                                                                kind: "clearWebSearchHistory";
                                                                                               }
-                                                                                            ? ListImageGenerationHistoryResult
+                                                                                            ? {
+                                                                                                cleared: number;
+                                                                                              }
                                                                                             : T extends {
-                                                                                                  kind: "appendImageGenerationHistory";
+                                                                                                  kind: "listImageGenerationHistory";
                                                                                                 }
-                                                                                              ? ImageGenerationHistoryRecord
+                                                                                              ? ListImageGenerationHistoryResult
                                                                                               : T extends {
-                                                                                                    kind: "deleteImageGenerationHistory";
+                                                                                                    kind: "appendImageGenerationHistory";
                                                                                                   }
-                                                                                                ? {
-                                                                                                    deleted: boolean;
-                                                                                                  }
-                                                                                                : never;
+                                                                                                ? ImageGenerationHistoryRecord
+                                                                                                : T extends {
+                                                                                                      kind: "deleteImageGenerationHistory";
+                                                                                                    }
+                                                                                                  ? {
+                                                                                                      deleted: boolean;
+                                                                                                    }
+                                                                                                  : never;
 
 export type EngineResponse<T = unknown> =
   | { ok: true; value: T }
@@ -1216,7 +1252,16 @@ export type ProviderRequest =
     }
   | { kind: "getImageGenerationSettings" }
   | { kind: "saveImageGenerationSettings"; settings: SaveImageGenerationSettingsInput }
-  | { kind: "ensureImageGenerationHostPermission"; baseUrl?: string };
+  | { kind: "ensureImageGenerationHostPermission"; baseUrl?: string }
+  | { kind: "getEmbeddingProviderSettings" }
+  | { kind: "saveEmbeddingProviderSettings"; settings: SaveEmbeddingProviderSettingsInput }
+  | { kind: "testEmbeddingProvider"; settings?: SaveEmbeddingProviderSettingsInput }
+  | { kind: "authorizeEmbeddingReindex" }
+  | {
+      kind: "ensureEmbeddingProviderHostPermission";
+      provider?: EmbeddingProviderId;
+      baseUrl?: string;
+    };
 
 export type ProviderConfigRequest = { kind: "readActiveProviderConfig" };
 
@@ -1249,10 +1294,24 @@ export type ProviderResultFor<T extends ProviderRequest> = T extends {
       : T extends { kind: "ensureImageGenerationHostPermission" }
         ? ProviderSettings
         : T extends {
-              kind: "testGeminiProvider" | "testOpenAIProvider" | "testOpenAICompatibleProvider";
+              kind:
+                | "getEmbeddingProviderSettings"
+                | "saveEmbeddingProviderSettings"
+                | "ensureEmbeddingProviderHostPermission";
             }
-          ? TestProviderResult
-          : never;
+          ? EmbeddingProviderSettings
+          : T extends { kind: "testEmbeddingProvider" }
+            ? EmbeddingProviderTestResult
+            : T extends { kind: "authorizeEmbeddingReindex" }
+              ? ReindexResult
+              : T extends {
+                    kind:
+                      | "testGeminiProvider"
+                      | "testOpenAIProvider"
+                      | "testOpenAICompatibleProvider";
+                  }
+                ? TestProviderResult
+                : never;
 
 export type ProviderResponse<T = unknown> = EngineResponse<T>;
 
@@ -1278,6 +1337,23 @@ export interface WorkerResponseMessage {
   type: typeof CLIO_WORKER_RESPONSE;
   requestId: string;
   response: EngineResponse;
+}
+
+export interface WorkerEmbeddingRequest {
+  modelId: string;
+  inputs: string[];
+}
+
+export interface WorkerEmbeddingRequestMessage {
+  type: typeof CLIO_WORKER_EMBEDDING_REQUEST;
+  requestId: string;
+  request: WorkerEmbeddingRequest;
+}
+
+export interface WorkerEmbeddingResponseMessage {
+  type: typeof CLIO_WORKER_EMBEDDING_RESPONSE;
+  requestId: string;
+  response: EngineResponse<number[][]>;
 }
 
 export type ContentCommand =
@@ -1471,6 +1547,28 @@ export function isWorkerResponseMessage(value: unknown): value is WorkerResponse
     value.type === CLIO_WORKER_RESPONSE &&
     typeof value.requestId === "string" &&
     isEngineResponse(value.response)
+  );
+}
+
+export function isWorkerEmbeddingRequestMessage(
+  value: unknown,
+): value is WorkerEmbeddingRequestMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_EMBEDDING_REQUEST &&
+    typeof value.requestId === "string" &&
+    isWorkerEmbeddingRequest(value.request)
+  );
+}
+
+export function isWorkerEmbeddingResponseMessage(
+  value: unknown,
+): value is WorkerEmbeddingResponseMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_EMBEDDING_RESPONSE &&
+    typeof value.requestId === "string" &&
+    isEmbeddingVectorBatchResponse(value.response)
   );
 }
 
@@ -1739,6 +1837,8 @@ function isEngineRequest(value: unknown): value is EngineRequest {
       return isGraphSubgraphPayload(value.payload);
     case "repair":
       return isRepairAction(value.action);
+    case "getActiveEmbeddingModel":
+      return true;
     case "getJobStatus":
       return (
         (value.status === undefined || isJobStatus(value.status)) &&
@@ -1747,7 +1847,9 @@ function isEngineRequest(value: unknown): value is EngineRequest {
     case "runJob":
       return typeof value.id === "string";
     case "reindex":
-      return value.scope === "fts";
+      if (value.scope === "fts") return true;
+      if (value.scope === "embeddings") return isEmbeddingReindexModelDescriptor(value.model);
+      return false;
     case "resolveAnchor":
       return typeof value.memoryId === "string";
     case "createChatSession":
@@ -2312,6 +2414,19 @@ function isProviderRequest(value: unknown): value is ProviderRequest {
       return isSaveImageGenerationSettingsInput(value.settings);
     case "ensureImageGenerationHostPermission":
       return value.baseUrl === undefined || typeof value.baseUrl === "string";
+    case "getEmbeddingProviderSettings":
+      return true;
+    case "saveEmbeddingProviderSettings":
+      return isSaveEmbeddingProviderSettingsInput(value.settings);
+    case "testEmbeddingProvider":
+      return value.settings === undefined || isSaveEmbeddingProviderSettingsInput(value.settings);
+    case "authorizeEmbeddingReindex":
+      return !("apiKey" in value);
+    case "ensureEmbeddingProviderHostPermission":
+      return (
+        (value.provider === undefined || isEmbeddingProviderId(value.provider)) &&
+        (value.baseUrl === undefined || typeof value.baseUrl === "string")
+      );
     default:
       return false;
   }
@@ -2683,6 +2798,41 @@ function isSaveImageGenerationSettingsInput(
   );
 }
 
+function isSaveEmbeddingProviderSettingsInput(
+  value: unknown,
+): value is SaveEmbeddingProviderSettingsInput {
+  return (
+    isRecord(value) &&
+    (value.activeProvider === undefined || isEmbeddingProviderId(value.activeProvider)) &&
+    (value.openai === undefined || isEmbeddingOpenAISettingsInput(value.openai)) &&
+    (value.openaiCompatible === undefined ||
+      isEmbeddingOpenAICompatibleSettingsInput(value.openaiCompatible))
+  );
+}
+
+function isEmbeddingOpenAISettingsInput(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    (value.apiKey === undefined || typeof value.apiKey === "string") &&
+    (value.model === undefined || typeof value.model === "string") &&
+    (value.baseUrl === undefined || typeof value.baseUrl === "string") &&
+    (value.dimension === undefined || typeof value.dimension === "number") &&
+    (value.lastTestAt === undefined || typeof value.lastTestAt === "string") &&
+    (value.lastError === undefined || typeof value.lastError === "string")
+  );
+}
+
+function isEmbeddingOpenAICompatibleSettingsInput(value: unknown) {
+  return (
+    isEmbeddingOpenAISettingsInput(value) &&
+    (value.providerName === undefined || typeof value.providerName === "string")
+  );
+}
+
+function isEmbeddingProviderId(value: unknown): value is EmbeddingProviderId {
+  return value === "openai" || value === "openai-compatible";
+}
+
 function isAgentToolTrace(value: unknown) {
   return (
     isRecord(value) &&
@@ -2726,6 +2876,58 @@ function isEngineResponse(value: unknown): value is EngineResponse {
     isRecord(value.error) &&
     typeof value.error.code === "string" &&
     typeof value.error.message === "string"
+  );
+}
+
+function isEmbeddingVectorBatchResponse(value: unknown): value is EngineResponse<number[][]> {
+  if (!isRecord(value) || typeof value.ok !== "boolean") return false;
+  if (value.ok) return isEmbeddingVectorBatch(value.value);
+  return (
+    isRecord(value.error) &&
+    typeof value.error.code === "string" &&
+    typeof value.error.message === "string" &&
+    (value.error.detail === undefined || typeof value.error.detail === "string")
+  );
+}
+
+function isWorkerEmbeddingRequest(value: unknown): value is WorkerEmbeddingRequest {
+  return (
+    isRecord(value) &&
+    typeof value.modelId === "string" &&
+    value.modelId.length > 0 &&
+    !("apiKey" in value) &&
+    Array.isArray(value.inputs) &&
+    value.inputs.length > 0 &&
+    value.inputs.every((input) => typeof input === "string")
+  );
+}
+
+function isEmbeddingReindexModelDescriptor(
+  value: unknown,
+): value is EmbeddingReindexModelDescriptor {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    isEmbeddingProviderId(value.provider) &&
+    typeof value.label === "string" &&
+    value.label.length > 0 &&
+    typeof value.dimension === "number" &&
+    Number.isInteger(value.dimension) &&
+    value.dimension > 0 &&
+    value.metric === "cosine"
+  );
+}
+
+function isEmbeddingVectorBatch(value: unknown): value is number[][] {
+  return Array.isArray(value) && value.every((vector) => isEmbeddingVector(vector));
+}
+
+function isEmbeddingVector(value: unknown): value is number[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => typeof item === "number" && Number.isFinite(item))
   );
 }
 

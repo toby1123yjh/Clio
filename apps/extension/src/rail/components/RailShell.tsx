@@ -1,5 +1,15 @@
 import { citationValidationWarningMessage } from "@/src/agent-runtime/citation-validator";
 import {
+  type EmbeddingOpenAICompatibleSlotSettings,
+  type EmbeddingOpenAISlotSettings,
+  type EmbeddingProviderId,
+  type EmbeddingProviderSettings,
+  type SaveEmbeddingProviderSettingsInput,
+  defaultEmbeddingProvider as defaultActiveEmbeddingProvider,
+  defaultOpenAICompatibleEmbeddingModel,
+  defaultOpenAIEmbeddingModel,
+} from "@/src/agent-runtime/embedding-provider-settings";
+import {
   type ImageGenerationSettings,
   type SaveImageGenerationSettingsInput,
   defaultImageGenerationModel,
@@ -93,6 +103,7 @@ import {
   toolboxSkills,
 } from "@/src/rail/app/toolbox-registry";
 import type {
+  ActiveEmbeddingModelSummary,
   ChatSessionSummary,
   ClioImageGenerationMode,
   ClioImageGenerationResult,
@@ -184,8 +195,10 @@ export interface RailShellProps {
   collapsedDragPoint: CollapsedLauncherDragPoint | null;
   collapsedSide: CollapsedLauncherSide;
   collapsedTopPx: number;
+  activeEmbeddingModel: ActiveEmbeddingModelSummary | null;
   providerSettings: ProviderSettings | null;
   searchProviderSettings: SearchProviderSettings | null;
+  embeddingProviderSettings: EmbeddingProviderSettings | null;
   imageGenerationSettings: ImageGenerationSettings | null;
   imageGenerationHistory: ImageGenerationHistoryRecord[];
   imageGenerationState: ImageGenerationDisplayState;
@@ -203,6 +216,7 @@ export interface RailShellProps {
   onCollapsedKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => void;
   onCollapsedPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => void;
   onCollapse: () => void;
+  onAuthorizeEmbeddingReindex: () => Promise<boolean>;
   onCloseCommandPalette: () => void;
   onCommandPaletteQueryChange: (query: string) => void;
   onComposerInputChange: () => void;
@@ -273,6 +287,8 @@ export interface RailShellProps {
   }) => Promise<boolean>;
   onSaveSearchProvider: (input: SaveSearchProviderInput) => Promise<boolean>;
   onSaveImageGenerationSettings: (input: SaveImageGenerationSettingsInput) => Promise<boolean>;
+  onSaveEmbeddingProviderSettings: (input: SaveEmbeddingProviderSettingsInput) => Promise<boolean>;
+  onTestEmbeddingProvider: (input: SaveEmbeddingProviderSettingsInput) => Promise<boolean>;
   onSubmitWebSearch: (query: string) => void;
   onSubmitImageGeneration: (input: ImageGenerationSubmitInput) => void;
   onCancelImageGeneration: () => void;
@@ -318,6 +334,36 @@ export interface ImageGenerationSubmitInput {
   mode: ClioImageGenerationMode;
   prompt: string;
   input?: ClioImageInput;
+}
+
+export interface EmbeddingProviderFormValues {
+  activeProvider: EmbeddingProviderId;
+  openAIApiKey: string;
+  openAIModel: string;
+  openAIBaseUrl: string;
+  compatibleApiKey: string;
+  compatibleModel: string;
+  compatibleBaseUrl: string;
+  compatibleProviderName: string;
+}
+
+export function buildEmbeddingProviderSettingsInput(
+  values: EmbeddingProviderFormValues,
+): SaveEmbeddingProviderSettingsInput {
+  return {
+    activeProvider: values.activeProvider,
+    openai: {
+      apiKey: values.openAIApiKey,
+      model: values.openAIModel,
+      baseUrl: values.openAIBaseUrl,
+    },
+    openaiCompatible: {
+      apiKey: values.compatibleApiKey,
+      model: values.compatibleModel,
+      baseUrl: values.compatibleBaseUrl,
+      providerName: values.compatibleProviderName,
+    },
+  };
 }
 
 export function RailShell(props: RailShellProps) {
@@ -2580,6 +2626,23 @@ function SettingsPanel(props: RailShellProps) {
   const [searchOpenAICompatibleApiKey, setSearchOpenAICompatibleApiKey] = React.useState("");
   const [searchOpenAICompatibleModel, setSearchOpenAICompatibleModel] = React.useState("");
   const [searchOpenAICompatibleBaseUrl, setSearchOpenAICompatibleBaseUrl] = React.useState("");
+  const [embeddingProvider, setEmbeddingProvider] = React.useState<EmbeddingProviderId>(
+    defaultActiveEmbeddingProvider,
+  );
+  const [embeddingOpenAIApiKey, setEmbeddingOpenAIApiKey] = React.useState("");
+  const [embeddingOpenAIModel, setEmbeddingOpenAIModel] = React.useState(
+    defaultOpenAIEmbeddingModel,
+  );
+  const [embeddingOpenAIBaseUrl, setEmbeddingOpenAIBaseUrl] = React.useState(defaultOpenAIBaseUrl);
+  const [embeddingOpenAICompatibleApiKey, setEmbeddingOpenAICompatibleApiKey] = React.useState("");
+  const [embeddingOpenAICompatibleModel, setEmbeddingOpenAICompatibleModel] = React.useState(
+    defaultOpenAICompatibleEmbeddingModel,
+  );
+  const [embeddingOpenAICompatibleBaseUrl, setEmbeddingOpenAICompatibleBaseUrl] = React.useState(
+    defaultOpenAICompatibleBaseUrl,
+  );
+  const [embeddingOpenAICompatibleProviderName, setEmbeddingOpenAICompatibleProviderName] =
+    React.useState(defaultOpenAICompatibleProviderName);
   const [imageGenerationApiKey, setImageGenerationApiKey] = React.useState("");
   const [imageGenerationModel, setImageGenerationModel] = React.useState("");
   const [imageGenerationBaseUrl, setImageGenerationBaseUrl] = React.useState("");
@@ -2610,6 +2673,22 @@ function SettingsPanel(props: RailShellProps) {
     setSearchOpenAICompatibleModel(props.searchProviderSettings.openaiCompatible.model ?? "");
     setSearchOpenAICompatibleBaseUrl(props.searchProviderSettings.openaiCompatible.baseUrl ?? "");
   }, [props.searchProviderSettings]);
+
+  React.useEffect(() => {
+    if (props.embeddingProviderSettings === null) return;
+    setEmbeddingProvider(props.embeddingProviderSettings.activeProvider);
+    setEmbeddingOpenAIApiKey(props.embeddingProviderSettings.openai.apiKey ?? "");
+    setEmbeddingOpenAIModel(props.embeddingProviderSettings.openai.model);
+    setEmbeddingOpenAIBaseUrl(props.embeddingProviderSettings.openai.baseUrl);
+    setEmbeddingOpenAICompatibleApiKey(
+      props.embeddingProviderSettings.openaiCompatible.apiKey ?? "",
+    );
+    setEmbeddingOpenAICompatibleModel(props.embeddingProviderSettings.openaiCompatible.model);
+    setEmbeddingOpenAICompatibleBaseUrl(props.embeddingProviderSettings.openaiCompatible.baseUrl);
+    setEmbeddingOpenAICompatibleProviderName(
+      props.embeddingProviderSettings.openaiCompatible.providerName,
+    );
+  }, [props.embeddingProviderSettings]);
 
   React.useEffect(() => {
     if (props.imageGenerationSettings === null) return;
@@ -2698,6 +2777,57 @@ function SettingsPanel(props: RailShellProps) {
           }
           provider={searchProvider}
           settings={props.searchProviderSettings}
+        />
+
+        <EmbeddingProviderSettingsCard
+          activeModel={props.activeEmbeddingModel}
+          compatibleApiKey={embeddingOpenAICompatibleApiKey}
+          compatibleBaseUrl={embeddingOpenAICompatibleBaseUrl}
+          compatibleModel={embeddingOpenAICompatibleModel}
+          compatibleProviderName={embeddingOpenAICompatibleProviderName}
+          loading={props.providerLoading}
+          openAIApiKey={embeddingOpenAIApiKey}
+          openAIBaseUrl={embeddingOpenAIBaseUrl}
+          openAIModel={embeddingOpenAIModel}
+          onAuthorizeReindex={props.onAuthorizeEmbeddingReindex}
+          onCompatibleApiKeyChange={setEmbeddingOpenAICompatibleApiKey}
+          onCompatibleBaseUrlChange={setEmbeddingOpenAICompatibleBaseUrl}
+          onCompatibleModelChange={setEmbeddingOpenAICompatibleModel}
+          onCompatibleProviderNameChange={setEmbeddingOpenAICompatibleProviderName}
+          onOpenAIApiKeyChange={setEmbeddingOpenAIApiKey}
+          onOpenAIBaseUrlChange={setEmbeddingOpenAIBaseUrl}
+          onOpenAIModelChange={setEmbeddingOpenAIModel}
+          onProviderChange={setEmbeddingProvider}
+          onSave={() =>
+            props.onSaveEmbeddingProviderSettings(
+              buildEmbeddingProviderSettingsInput({
+                activeProvider: embeddingProvider,
+                openAIApiKey: embeddingOpenAIApiKey,
+                openAIModel: embeddingOpenAIModel,
+                openAIBaseUrl: embeddingOpenAIBaseUrl,
+                compatibleApiKey: embeddingOpenAICompatibleApiKey,
+                compatibleModel: embeddingOpenAICompatibleModel,
+                compatibleBaseUrl: embeddingOpenAICompatibleBaseUrl,
+                compatibleProviderName: embeddingOpenAICompatibleProviderName,
+              }),
+            )
+          }
+          onTest={() =>
+            props.onTestEmbeddingProvider(
+              buildEmbeddingProviderSettingsInput({
+                activeProvider: embeddingProvider,
+                openAIApiKey: embeddingOpenAIApiKey,
+                openAIModel: embeddingOpenAIModel,
+                openAIBaseUrl: embeddingOpenAIBaseUrl,
+                compatibleApiKey: embeddingOpenAICompatibleApiKey,
+                compatibleModel: embeddingOpenAICompatibleModel,
+                compatibleBaseUrl: embeddingOpenAICompatibleBaseUrl,
+                compatibleProviderName: embeddingOpenAICompatibleProviderName,
+              }),
+            )
+          }
+          provider={embeddingProvider}
+          settings={props.embeddingProviderSettings}
         />
 
         <section
@@ -2869,6 +2999,21 @@ function SettingsSectionMenu() {
           <span className="block truncate text-sm font-semibold text-foreground">Search</span>
           <span className="block truncate text-[11px] text-muted-foreground">
             AI search provider
+          </span>
+        </span>
+      </button>
+      <button
+        aria-label="Embedding provider settings"
+        className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 text-left outline-none transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-primary"
+        type="button"
+      >
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
+          <Library size={16} />
+        </span>
+        <span className="min-w-0 leading-tight">
+          <span className="block truncate text-sm font-semibold text-foreground">Embeddings</span>
+          <span className="block truncate text-[11px] text-muted-foreground">
+            Knowledge vectors
           </span>
         </span>
       </button>
@@ -3224,6 +3369,258 @@ function SearchProviderSettingsCard(props: SearchProviderSettingsCardProps) {
   );
 }
 
+interface EmbeddingProviderSettingsCardProps {
+  provider: EmbeddingProviderId;
+  settings: EmbeddingProviderSettings | null;
+  activeModel: ActiveEmbeddingModelSummary | null;
+  openAIApiKey: string;
+  openAIModel: string;
+  openAIBaseUrl: string;
+  compatibleApiKey: string;
+  compatibleModel: string;
+  compatibleBaseUrl: string;
+  compatibleProviderName: string;
+  loading: boolean;
+  onProviderChange: (provider: EmbeddingProviderId) => void;
+  onOpenAIApiKeyChange: (value: string) => void;
+  onOpenAIModelChange: (value: string) => void;
+  onOpenAIBaseUrlChange: (value: string) => void;
+  onCompatibleApiKeyChange: (value: string) => void;
+  onCompatibleModelChange: (value: string) => void;
+  onCompatibleBaseUrlChange: (value: string) => void;
+  onCompatibleProviderNameChange: (value: string) => void;
+  onSave: () => Promise<boolean>;
+  onTest: () => Promise<boolean>;
+  onAuthorizeReindex: () => Promise<boolean>;
+}
+
+function EmbeddingProviderSettingsCard(props: EmbeddingProviderSettingsCardProps) {
+  const [apiKeyMasked, setApiKeyMasked] = React.useState(true);
+  const disabled = props.loading || props.settings === null;
+  const showingCompatible = props.provider === "openai-compatible";
+  const currentSettings:
+    | EmbeddingOpenAISlotSettings
+    | EmbeddingOpenAICompatibleSlotSettings
+    | undefined = showingCompatible ? props.settings?.openaiCompatible : props.settings?.openai;
+  const fieldIds = showingCompatible
+    ? {
+        key: "clio-rail-embedding-openai-compatible-key",
+        model: "clio-rail-embedding-openai-compatible-model",
+        baseUrl: "clio-rail-embedding-openai-compatible-base-url",
+        providerName: "clio-rail-embedding-openai-compatible-provider-name",
+      }
+    : {
+        key: "clio-rail-embedding-openai-key",
+        model: "clio-rail-embedding-openai-model",
+        baseUrl: "clio-rail-embedding-openai-base-url",
+        providerName: undefined,
+      };
+  const apiKey = showingCompatible ? props.compatibleApiKey : props.openAIApiKey;
+  const model = showingCompatible ? props.compatibleModel : props.openAIModel;
+  const baseUrl = showingCompatible ? props.compatibleBaseUrl : props.openAIBaseUrl;
+  const onApiKeyChange = showingCompatible
+    ? props.onCompatibleApiKeyChange
+    : props.onOpenAIApiKeyChange;
+  const onModelChange = showingCompatible
+    ? props.onCompatibleModelChange
+    : props.onOpenAIModelChange;
+  const onBaseUrlChange = showingCompatible
+    ? props.onCompatibleBaseUrlChange
+    : props.onOpenAIBaseUrlChange;
+  const defaultModel = showingCompatible
+    ? defaultOpenAICompatibleEmbeddingModel
+    : defaultOpenAIEmbeddingModel;
+  const defaultBaseUrl = showingCompatible ? defaultOpenAICompatibleBaseUrl : defaultOpenAIBaseUrl;
+  const configured = currentSettings?.apiKeyConfigured === true;
+  const hostReady = currentSettings?.hostPermissionGranted === true;
+  const canRebuild =
+    currentSettings?.dimension !== undefined && currentSettings.modelId !== undefined;
+  const apiKeyToggleLabel = apiKeyMasked
+    ? `Show ${embeddingProviderLabel(props.provider)} embedding API key`
+    : `Mask ${embeddingProviderLabel(props.provider)} embedding API key`;
+
+  return (
+    <section
+      className="rounded-xl border border-border bg-surface p-4"
+      data-clio-settings-section="embeddings"
+    >
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted text-primary">
+            <Library size={16} />
+          </span>
+          <div className="min-w-0 leading-tight">
+            <h4 className="truncate text-sm font-semibold">Embeddings</h4>
+            <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+              Knowledge Base semantic retrieval.
+            </p>
+          </div>
+        </div>
+        <Badge className="shrink-0 border-border bg-muted text-foreground-soft">
+          {props.settings === null ? "checking" : embeddingProviderLabel(props.provider)}
+        </Badge>
+      </div>
+
+      <div className="grid gap-3">
+        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-rail-embedding-provider">
+          <span className="font-medium text-foreground">Provider</span>
+          <select
+            className="h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+            disabled={disabled}
+            id="clio-rail-embedding-provider"
+            onChange={(event) => props.onProviderChange(event.target.value as EmbeddingProviderId)}
+            value={props.provider}
+          >
+            <option value="openai">OpenAI</option>
+            <option value="openai-compatible">OpenAI Compatible</option>
+          </select>
+        </label>
+
+        <div className="grid gap-1.5 text-[12px]">
+          <label className="font-medium text-foreground" htmlFor={fieldIds.key}>
+            API Key
+          </label>
+          <div className="flex gap-2">
+            <Input
+              autoComplete="off"
+              className="h-10 min-w-0 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+              disabled={disabled}
+              id={fieldIds.key}
+              onChange={(event) => onApiKeyChange(event.target.value)}
+              placeholder={`Paste ${embeddingProviderLabel(props.provider)} embedding key`}
+              type={apiKeyMasked ? "password" : "text"}
+              value={apiKey}
+            />
+            <Button
+              aria-label={apiKeyToggleLabel}
+              className="h-10 w-10 shrink-0 border border-border bg-surface px-0 text-muted-foreground hover:bg-muted hover:text-foreground"
+              disabled={disabled}
+              onClick={() => setApiKeyMasked((value) => !value)}
+              size="icon"
+              title={apiKeyToggleLabel}
+              type="button"
+              variant="subtle"
+            >
+              {apiKeyMasked ? <Eye size={15} /> : <EyeOff size={15} />}
+            </Button>
+          </div>
+        </div>
+
+        <label className="grid gap-1.5 text-[12px]" htmlFor={fieldIds.model}>
+          <span className="font-medium text-foreground">Model</span>
+          <Input
+            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+            disabled={disabled}
+            id={fieldIds.model}
+            onChange={(event) => onModelChange(event.target.value)}
+            placeholder={defaultModel}
+            value={model}
+          />
+        </label>
+
+        <label className="grid gap-1.5 text-[12px]" htmlFor={fieldIds.baseUrl}>
+          <span className="font-medium text-foreground">Base URL</span>
+          <Input
+            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+            disabled={disabled}
+            id={fieldIds.baseUrl}
+            onChange={(event) => onBaseUrlChange(event.target.value)}
+            placeholder={defaultBaseUrl}
+            value={baseUrl}
+          />
+        </label>
+
+        {showingCompatible ? (
+          <label className="grid gap-1.5 text-[12px]" htmlFor={fieldIds.providerName}>
+            <span className="font-medium text-foreground">Provider Name</span>
+            <Input
+              className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+              disabled={disabled}
+              id={fieldIds.providerName}
+              onChange={(event) => props.onCompatibleProviderNameChange(event.target.value)}
+              placeholder={defaultOpenAICompatibleProviderName}
+              value={props.compatibleProviderName}
+            />
+          </label>
+        ) : null}
+      </div>
+
+      <div className="mt-3 grid gap-2 rounded-lg border border-border bg-background p-3 text-[11px] leading-4">
+        <div className="grid min-w-0 gap-1">
+          <span className="text-muted-foreground">Active Model</span>
+          <span className="break-all font-mono text-[10.5px] text-foreground">
+            {props.activeModel === null
+              ? "unknown"
+              : `${props.activeModel.id} (${props.activeModel.dimension}d)`}
+          </span>
+        </div>
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <span className="text-muted-foreground">Config</span>
+          <span className="shrink-0 font-medium text-foreground">
+            {configured ? "configured" : "not set"}
+          </span>
+        </div>
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <span className="text-muted-foreground">Host</span>
+          <span className="shrink-0 font-medium text-foreground">
+            {hostReady ? "ready" : "not ready"}
+          </span>
+        </div>
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <span className="text-muted-foreground">Dimension</span>
+          <span className="shrink-0 font-medium text-foreground">
+            {currentSettings?.dimension === undefined
+              ? "test required"
+              : `${currentSettings.dimension}d`}
+          </span>
+        </div>
+        <div className="grid min-w-0 gap-1">
+          <span className="text-muted-foreground">Model ID</span>
+          <span className="break-all font-mono text-[10.5px] text-foreground">
+            {currentSettings?.modelId ?? "pending test"}
+          </span>
+        </div>
+      </div>
+
+      <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
+        Save and Test only update provider setup. Rebuild embeddings is the authorization step.
+      </p>
+
+      <div className="mt-3 grid gap-2">
+        <div className="grid grid-cols-2 gap-2">
+          <Button
+            className="border border-border bg-surface text-foreground hover:bg-muted"
+            disabled={disabled}
+            onClick={() => void props.onSave()}
+            variant="subtle"
+          >
+            <ShieldCheck size={15} />
+            Save
+          </Button>
+          <Button
+            className="border border-border bg-surface text-foreground hover:bg-muted"
+            disabled={disabled}
+            onClick={() => void props.onTest()}
+            variant="subtle"
+          >
+            <Wifi size={15} />
+            Test
+          </Button>
+        </div>
+        <Button
+          className="w-full border border-border bg-surface text-foreground hover:bg-muted"
+          disabled={disabled || !canRebuild}
+          onClick={() => void props.onAuthorizeReindex()}
+          variant="subtle"
+        >
+          <RefreshCw size={15} />
+          Rebuild embeddings
+        </Button>
+      </div>
+    </section>
+  );
+}
+
 function AppearanceSettingsCard({
   onThemeChange,
   theme,
@@ -3443,6 +3840,11 @@ function searchProviderLabel(provider: SearchProviderId) {
   if (provider === "openai") return "OpenAI";
   if (provider === "openai-compatible") return "OpenAI Compatible";
   return "Auto";
+}
+
+function embeddingProviderLabel(provider: EmbeddingProviderId) {
+  if (provider === "openai-compatible") return "OpenAI Compatible";
+  return "OpenAI";
 }
 
 function KnowledgeBasePanel(props: RailShellProps) {

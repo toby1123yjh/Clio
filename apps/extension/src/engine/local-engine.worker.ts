@@ -1,11 +1,13 @@
 import { buildMemoryVersionGroupKey } from "@/src/shared/reliability";
 import {
+  type ActiveEmbeddingModelSummary,
   type AnchorInfo,
   type AnchorResolveResult,
   type AppendSessionEvidencePayload,
   type BuildSourceContextPackPayload,
   type BuildSourceGraphPayload,
   type BuildSourceGraphResult,
+  CLIO_WORKER_EMBEDDING_REQUEST,
   CLIO_WORKER_RESPONSE,
   type CaptureBasePayload,
   type CaptureResult,
@@ -23,6 +25,7 @@ import {
   type CreateWikiCompileJobPayload,
   type DeleteMemoryResult,
   type DeleteTopicPageResult,
+  type EmbeddingReindexModelDescriptor,
   type EngineHealth,
   type EngineRequest,
   EngineRpcError,
@@ -87,7 +90,9 @@ import {
   type WikiCompileResultPayload,
   type WorkingSetLoadDepth,
   type WorkingSetStatusResult,
+  createRequestId,
   engineErrorFromUnknown,
+  isWorkerEmbeddingResponseMessage,
   isWorkerRequestMessage,
 } from "@/src/shared/rpc";
 import {
@@ -138,8 +143,16 @@ type LocalEngineDatabaseOpenResult = {
   opfs?: EngineHealth["opfs"];
 };
 type LocalEngineDatabaseOpener = () => Promise<LocalEngineDatabaseOpenResult>;
+export interface ActiveEmbeddingModel {
+  modelId: string;
+  provider: string;
+  dimension: number;
+}
+export type EmbeddingProviderFactory = (model: ActiveEmbeddingModel) => EmbeddingProvider | null;
 export interface LocalEngineOptions {
   openDatabase?: LocalEngineDatabaseOpener;
+  embeddingProvider?: EmbeddingProvider;
+  embeddingProviderFactory?: EmbeddingProviderFactory;
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
@@ -262,11 +275,11 @@ interface SqlWhereClause {
   bind: unknown[];
 }
 
-interface EmbeddingProvider {
+export interface EmbeddingProvider {
   readonly modelId: string;
   readonly provider: string;
   readonly dimension: number;
-  embed(input: string): number[];
+  embedTexts(inputs: string[]): Promise<number[][]>;
 }
 
 interface GraphNodeInput {
@@ -400,9 +413,13 @@ export class LocalEngine {
   private db: SqliteDb | null = null;
   private healthState: EngineHealth = startingHealth();
   private readonly openDatabase: LocalEngineDatabaseOpener;
+  private readonly embeddingProviderOverride?: EmbeddingProvider;
+  private readonly embeddingProviderFactory?: EmbeddingProviderFactory;
 
   constructor(options: LocalEngineOptions = {}) {
     this.openDatabase = options.openDatabase ?? openProductionDatabase;
+    this.embeddingProviderOverride = options.embeddingProvider;
+    this.embeddingProviderFactory = options.embeddingProviderFactory;
   }
 
   async handle(request: EngineRequest) {
@@ -487,12 +504,14 @@ export class LocalEngine {
         return await this.queryGraphSubgraph(request.payload);
       case "repair":
         return await this.repair(request.action);
+      case "getActiveEmbeddingModel":
+        return await this.getActiveEmbeddingModel();
       case "getJobStatus":
         return await this.getJobStatus(request.status, request.limit);
       case "runJob":
         return await this.runQueuedJob(request.id);
       case "reindex":
-        return await this.reindex(request.scope);
+        return await this.reindex(request);
       case "resolveAnchor":
         return await this.resolveAnchor(request.memoryId);
       case "createChatSession":
@@ -813,20 +832,24 @@ export class LocalEngine {
       limit: Math.max(limit * 2, limit),
       filter: filters,
     });
-    const vectorMetaResult = loadVectorMetaRetrievalHits(db, {
+    const vectorMetaResult = await loadVectorMetaRetrievalHits(db, {
       query,
       limit: Math.max(limit * 2, limit),
       filter: filters,
+      embeddingProviderOverride: this.embeddingProviderOverride,
+      embeddingProviderFactory: this.embeddingProviderFactory,
     });
     const ftsHits = loadFtsChunkRetrievalHits(db, {
       query,
       limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
       filter: filters,
     });
-    const vectorResult = loadVectorChunkRetrievalHits(db, {
+    const vectorResult = await loadVectorChunkRetrievalHits(db, {
       query,
       limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
       filter: filters,
+      embeddingProviderOverride: this.embeddingProviderOverride,
+      embeddingProviderFactory: this.embeddingProviderFactory,
     });
     const items = fuseSourceRetrievalHits(
       [...metaHits, ...vectorMetaResult.hits, ...ftsHits, ...vectorResult.hits],
@@ -1807,6 +1830,12 @@ export class LocalEngine {
     }
   }
 
+  private async getActiveEmbeddingModel(): Promise<ActiveEmbeddingModelSummary | null> {
+    const db = await this.ensureReady();
+    const row = getActiveEmbeddingModelRow(db);
+    return row === undefined ? null : activeEmbeddingModelSummaryFromRow(row);
+  }
+
   private async getJobStatus(status?: JobStatus, limit = 30): Promise<GetJobStatusResult> {
     const db = await this.ensureReady();
     const clampedLimit = clampLimit(limit, 100);
@@ -1834,16 +1863,27 @@ export class LocalEngine {
 
   private async runQueuedJob(id: string): Promise<JobSummary> {
     const db = await this.ensureReady();
-    return runJob(db, id);
+    return await runJob(db, id, this.embeddingProviderOverride, this.embeddingProviderFactory);
   }
 
-  private async reindex(scope: "fts"): Promise<ReindexResult> {
-    if (scope !== "fts") {
-      throw new EngineRpcError("UNSUPPORTED_REINDEX_SCOPE", `Unsupported reindex scope: ${scope}`);
-    }
+  private async reindex(
+    request: Extract<EngineRequest, { kind: "reindex" }>,
+  ): Promise<ReindexResult> {
     const db = await this.ensureReady();
-    const jobId = enqueueJob(db, "reindex_fts", { scope });
-    const job = runJob(db, jobId);
+    const jobId =
+      request.scope === "embeddings"
+        ? enqueueJob(db, "reindex_embeddings", {
+            scope: "embeddings",
+            model: request.model,
+            authorizedAt: new Date().toISOString(),
+          })
+        : enqueueJob(db, "reindex_fts", { scope: "fts" });
+    const job = await runJob(
+      db,
+      jobId,
+      this.embeddingProviderOverride,
+      this.embeddingProviderFactory,
+    );
     return {
       jobId,
       status: job.status,
@@ -2705,6 +2745,77 @@ type LocalEngineWorkerGlobal = typeof globalThis & {
   postMessage: (message: unknown) => void;
 };
 
+const embeddingBridgeTimeoutMs = 30_000;
+
+function createWorkerEmbeddingProviderFactory(
+  workerSelf: LocalEngineWorkerGlobal,
+): EmbeddingProviderFactory {
+  const pending = new Map<
+    string,
+    {
+      resolve: (vectors: number[][]) => void;
+      reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+
+  workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (!isWorkerEmbeddingResponseMessage(event.data)) return;
+    const entry = pending.get(event.data.requestId);
+    if (entry === undefined) return;
+    clearTimeout(entry.timer);
+    pending.delete(event.data.requestId);
+    if (event.data.response.ok) {
+      entry.resolve(event.data.response.value);
+      return;
+    }
+    entry.reject(
+      new EngineRpcError(
+        event.data.response.error.code,
+        event.data.response.error.message,
+        event.data.response.error.detail,
+      ),
+    );
+  });
+
+  return (model) => {
+    if (!isBridgeEmbeddingProvider(model.provider)) return null;
+    return {
+      modelId: model.modelId,
+      provider: model.provider,
+      dimension: model.dimension,
+      embedTexts(inputs: string[]) {
+        if (inputs.length === 0) return Promise.resolve([]);
+        const requestId = createRequestId();
+        return new Promise<number[][]>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            pending.delete(requestId);
+            reject(
+              new EngineRpcError(
+                "EMBEDDING_BRIDGE_TIMEOUT",
+                "Embedding provider request timed out.",
+              ),
+            );
+          }, embeddingBridgeTimeoutMs);
+          pending.set(requestId, { resolve, reject, timer });
+          workerSelf.postMessage({
+            type: CLIO_WORKER_EMBEDDING_REQUEST,
+            requestId,
+            request: {
+              modelId: model.modelId,
+              inputs,
+            },
+          });
+        });
+      },
+    };
+  };
+}
+
+function isBridgeEmbeddingProvider(provider: string) {
+  return provider === "openai" || provider === "openai-compatible";
+}
+
 function installWorkerMessageHandler(workerSelf: LocalEngineWorkerGlobal, engine: LocalEngine) {
   workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
     if (!isWorkerRequestMessage(event.data)) return;
@@ -2741,7 +2852,12 @@ function currentWorkerGlobal(): LocalEngineWorkerGlobal | null {
 
 const workerSelf = currentWorkerGlobal();
 if (workerSelf !== null) {
-  installWorkerMessageHandler(workerSelf, new LocalEngine());
+  installWorkerMessageHandler(
+    workerSelf,
+    new LocalEngine({
+      embeddingProviderFactory: createWorkerEmbeddingProviderFactory(workerSelf),
+    }),
+  );
 }
 
 function migrate(db: SqliteDb) {
@@ -4720,29 +4836,78 @@ function ensureDefaultEmbeddingModel(db: SqliteDb) {
   });
 }
 
-function getActiveEmbeddingProvider(db: SqliteDb): EmbeddingProvider | null {
-  const row = db.selectObject(
+function getActiveEmbeddingProvider(
+  db: SqliteDb,
+  embeddingProviderOverride?: EmbeddingProvider,
+  embeddingProviderFactory?: EmbeddingProviderFactory,
+): EmbeddingProvider | null {
+  const row = getActiveEmbeddingModelRow(db);
+  if (row === undefined) return null;
+  const modelId = stringField(row, "id");
+  const provider = stringField(row, "provider");
+  const dimension = numberField(row, "dimension");
+  return resolveEmbeddingProviderForModel(
+    { modelId, provider, dimension },
+    embeddingProviderOverride,
+    embeddingProviderFactory,
+  );
+}
+
+function getActiveEmbeddingModelRow(db: SqliteDb) {
+  return db.selectObject(
     `SELECT *
      FROM embedding_models
-     WHERE id = ?
-       AND provider = ?
-       AND status = 'active'
+     WHERE status = 'active'
        AND metric = 'cosine'
+     ORDER BY updated_at DESC
      LIMIT 1`,
-    [defaultEmbeddingProvider.modelId, defaultEmbeddingProvider.provider],
   );
-  if (row === undefined) return null;
-  const dimension = numberField(row, "dimension");
-  if (dimension !== defaultEmbeddingProvider.dimension) return null;
-  return localDeterministicEmbeddingProvider;
+}
+
+function activeEmbeddingModelSummaryFromRow(row: SqlRow): ActiveEmbeddingModelSummary {
+  return {
+    id: stringField(row, "id"),
+    provider: stringField(row, "provider"),
+    label: stringField(row, "label"),
+    dimension: numberField(row, "dimension"),
+    metric: "cosine",
+    status: "active",
+    updatedAt: stringField(row, "updated_at"),
+  };
+}
+
+function resolveEmbeddingProviderForModel(
+  model: ActiveEmbeddingModel,
+  embeddingProviderOverride?: EmbeddingProvider,
+  embeddingProviderFactory?: EmbeddingProviderFactory,
+): EmbeddingProvider | null {
+  if (embeddingProviderOverride !== undefined) {
+    if (
+      model.modelId === embeddingProviderOverride.modelId &&
+      model.provider === embeddingProviderOverride.provider &&
+      model.dimension === embeddingProviderOverride.dimension
+    ) {
+      return embeddingProviderOverride;
+    }
+  }
+  if (
+    model.modelId === defaultEmbeddingProvider.modelId &&
+    model.provider === defaultEmbeddingProvider.provider &&
+    model.dimension === defaultEmbeddingProvider.dimension
+  ) {
+    return localDeterministicEmbeddingProvider;
+  }
+  return embeddingProviderFactory?.(model) ?? null;
 }
 
 const localDeterministicEmbeddingProvider: EmbeddingProvider = {
   modelId: defaultEmbeddingProvider.modelId,
   provider: defaultEmbeddingProvider.provider,
   dimension: defaultEmbeddingProvider.dimension,
-  embed(input: string) {
-    return embedLocalDeterministic(input, defaultEmbeddingProvider.dimension);
+  async embedTexts(inputs: string[]) {
+    return inputs.map((input) =>
+      embedLocalDeterministic(input, defaultEmbeddingProvider.dimension),
+    );
   },
 };
 
@@ -4765,7 +4930,12 @@ function enqueueJob(db: SqliteDb, type: JobType, payload: Record<string, unknown
   return jobId;
 }
 
-function runJob(db: SqliteDb, jobId: string): JobSummary {
+async function runJob(
+  db: SqliteDb,
+  jobId: string,
+  embeddingProviderOverride?: EmbeddingProvider,
+  embeddingProviderFactory?: EmbeddingProviderFactory,
+): Promise<JobSummary> {
   const job = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [jobId]);
   if (job === undefined) {
     throw new EngineRpcError("JOB_NOT_FOUND", `Job not found: ${jobId}`);
@@ -4790,8 +4960,20 @@ function runJob(db: SqliteDb, jobId: string): JobSummary {
     let result: Record<string, unknown> = { ok: true };
     if (type === "reindex_fts") {
       rebuildFtsData(db);
+    } else if (type === "reindex_embeddings") {
+      result = await runEmbeddingReindexJob(
+        db,
+        stringField(job, "payload_json"),
+        embeddingProviderOverride,
+        embeddingProviderFactory,
+      );
     } else if (type === "post_capture_hardening") {
-      result = runPostCaptureHardeningJob(db, stringField(job, "payload_json"));
+      result = await runPostCaptureHardeningJob(
+        db,
+        stringField(job, "payload_json"),
+        embeddingProviderOverride,
+        embeddingProviderFactory,
+      );
     } else if (type === "resolve_anchor") {
       result = { ok: true, reserved: "resolve_anchor" };
     } else {
@@ -4896,7 +5078,152 @@ function rebuildFtsData(db: SqliteDb) {
   });
 }
 
-function runPostCaptureHardeningJob(db: SqliteDb, payloadJson: string): Record<string, unknown> {
+async function runEmbeddingReindexJob(
+  db: SqliteDb,
+  payloadJson: string,
+  embeddingProviderOverride?: EmbeddingProvider,
+  embeddingProviderFactory?: EmbeddingProviderFactory,
+): Promise<Record<string, unknown>> {
+  const payload = parseEmbeddingReindexPayload(payloadJson);
+  const provider = resolveEmbeddingProviderForModel(
+    {
+      modelId: payload.model.id,
+      provider: payload.model.provider,
+      dimension: payload.model.dimension,
+    },
+    embeddingProviderOverride,
+    embeddingProviderFactory,
+  );
+  if (provider === null) {
+    throw new EngineRpcError(
+      "EMBEDDING_MODEL_UNAVAILABLE",
+      "Requested embedding model is unavailable.",
+    );
+  }
+
+  upsertEmbeddingModel(db, payload.model, "disabled");
+  db.exec({
+    sql: "DELETE FROM source_embeddings WHERE model_id = ?",
+    bind: [payload.model.id],
+  });
+
+  const sources = db.selectObjects(
+    `SELECT id
+     FROM sources
+     WHERE lifecycle_status <> 'deleted'
+     ORDER BY captured_at ASC, id ASC`,
+  );
+  for (const source of sources) {
+    await runEmbeddingStageForSourceWithProvider(db, stringField(source, "id"), provider);
+  }
+
+  activateEmbeddingModel(db, payload.model.id);
+  const chunkCount = countEmbeddingsForModel(db, payload.model.id, "chunk");
+  const metaCount = countEmbeddingsForModel(db, payload.model.id, "meta");
+  return {
+    ok: true,
+    scope: "embeddings",
+    modelId: payload.model.id,
+    provider: payload.model.provider,
+    sourceCount: sources.length,
+    chunkCount,
+    metaCount,
+    targetKinds: ["chunk", "meta"],
+  };
+}
+
+function parseEmbeddingReindexPayload(payloadJson: string): {
+  model: EmbeddingReindexModelDescriptor;
+  authorizedAt?: string;
+} {
+  const payload = parseMetadata(payloadJson);
+  const model = isRecord(payload.model) ? payload.model : {};
+  const id = normalizeText(typeof model.id === "string" ? model.id : "");
+  const provider = typeof model.provider === "string" ? model.provider : "";
+  const label = normalizeText(typeof model.label === "string" ? model.label : "");
+  const dimension = typeof model.dimension === "number" ? model.dimension : Number.NaN;
+  if (
+    id.length === 0 ||
+    (provider !== "openai" && provider !== "openai-compatible") ||
+    label.length === 0 ||
+    !Number.isInteger(dimension) ||
+    dimension <= 0 ||
+    model.metric !== "cosine"
+  ) {
+    throw new EngineRpcError(
+      "INVALID_JOB_PAYLOAD",
+      "Embedding reindex job is missing a valid model descriptor.",
+    );
+  }
+  return {
+    model: {
+      id,
+      provider,
+      label,
+      dimension,
+      metric: "cosine",
+    },
+    ...(typeof payload.authorizedAt === "string" ? { authorizedAt: payload.authorizedAt } : {}),
+  };
+}
+
+function upsertEmbeddingModel(
+  db: SqliteDb,
+  model: EmbeddingReindexModelDescriptor,
+  status: "active" | "disabled",
+) {
+  const now = new Date().toISOString();
+  db.exec({
+    sql: `INSERT INTO embedding_models (
+      id,
+      provider,
+      label,
+      dimension,
+      metric,
+      status,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      provider = excluded.provider,
+      label = excluded.label,
+      dimension = excluded.dimension,
+      metric = excluded.metric,
+      status = excluded.status,
+      updated_at = excluded.updated_at`,
+    bind: [model.id, model.provider, model.label, model.dimension, model.metric, status, now, now],
+  });
+}
+
+function activateEmbeddingModel(db: SqliteDb, modelId: string) {
+  const now = new Date().toISOString();
+  transaction(db, () => {
+    db.exec({
+      sql: "UPDATE embedding_models SET status = 'disabled', updated_at = ? WHERE id <> ?",
+      bind: [now, modelId],
+    });
+    db.exec({
+      sql: "UPDATE embedding_models SET status = 'active', updated_at = ? WHERE id = ?",
+      bind: [now, modelId],
+    });
+  });
+}
+
+function countEmbeddingsForModel(db: SqliteDb, modelId: string, targetKind: "chunk" | "meta") {
+  return Number(
+    db.selectValue(
+      "SELECT COUNT(*) FROM source_embeddings WHERE model_id = ? AND target_kind = ?",
+      [modelId, targetKind],
+    ) ?? 0,
+  );
+}
+
+async function runPostCaptureHardeningJob(
+  db: SqliteDb,
+  payloadJson: string,
+  embeddingProviderOverride?: EmbeddingProvider,
+  embeddingProviderFactory?: EmbeddingProviderFactory,
+): Promise<Record<string, unknown>> {
   const payload = parsePostCaptureHardeningPayload(payloadJson);
   if (payload.sourceId.length === 0) {
     throw new EngineRpcError("INVALID_JOB_PAYLOAD", "Post-capture job is missing sourceId.");
@@ -4904,7 +5231,12 @@ function runPostCaptureHardeningJob(db: SqliteDb, payloadJson: string): Record<s
   const shouldRunEmbedding = payload.stages.length === 0 || payload.stages.includes("embedding");
   const shouldRunGraph = payload.stages.includes("graph");
   const result = shouldRunEmbedding
-    ? runEmbeddingStageForSource(db, payload.sourceId)
+    ? await runEmbeddingStageForSource(
+        db,
+        payload.sourceId,
+        embeddingProviderOverride,
+        embeddingProviderFactory,
+      )
     : { ok: true, embedding: { skipped: true, reason: "stage_not_requested" } };
   return {
     ...result,
@@ -4923,7 +5255,31 @@ function parsePostCaptureHardeningPayload(payloadJson: string) {
   return { sourceId, stages };
 }
 
-function runEmbeddingStageForSource(db: SqliteDb, sourceId: string): Record<string, unknown> {
+async function runEmbeddingStageForSource(
+  db: SqliteDb,
+  sourceId: string,
+  embeddingProviderOverride?: EmbeddingProvider,
+  embeddingProviderFactory?: EmbeddingProviderFactory,
+): Promise<Record<string, unknown>> {
+  const provider = getActiveEmbeddingProvider(
+    db,
+    embeddingProviderOverride,
+    embeddingProviderFactory,
+  );
+  if (provider === null) {
+    throw new EngineRpcError(
+      "EMBEDDING_MODEL_UNAVAILABLE",
+      "Active embedding model is unavailable.",
+    );
+  }
+  return runEmbeddingStageForSourceWithProvider(db, sourceId, provider);
+}
+
+async function runEmbeddingStageForSourceWithProvider(
+  db: SqliteDb,
+  sourceId: string,
+  provider: EmbeddingProvider,
+): Promise<Record<string, unknown>> {
   const source = db.selectObject("SELECT id FROM sources WHERE id = ? LIMIT 1", [sourceId]);
   if (source === undefined) {
     throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
@@ -4936,19 +5292,12 @@ function runEmbeddingStageForSource(db: SqliteDb, sourceId: string): Record<stri
     return {
       ok: true,
       embedding: {
-        modelId: defaultEmbeddingProvider.modelId,
+        modelId: provider.modelId,
         chunkCount: 0,
         skipped: true,
         reason: "source_deleted",
       },
     };
-  }
-  const provider = getActiveEmbeddingProvider(db);
-  if (provider === null) {
-    throw new EngineRpcError(
-      "EMBEDDING_MODEL_UNAVAILABLE",
-      "Active embedding model is unavailable.",
-    );
   }
   const chunks = db.selectObjects(
     `SELECT id, source_id, text, hash, meta_head_json
@@ -4958,13 +5307,11 @@ function runEmbeddingStageForSource(db: SqliteDb, sourceId: string): Record<stri
     [sourceId],
   );
   const now = new Date().toISOString();
-  for (const chunk of chunks) {
-    upsertSourceChunkEmbedding(db, provider, chunk, now);
-  }
+  await upsertSourceChunkEmbeddings(db, provider, chunks, now);
   const metaInput = loadSourceMetaEmbeddingInput(db, sourceId);
   const metaText = metaInput === undefined ? "" : buildSourceMetaEmbeddingText(metaInput);
   if (metaText.length > 0) {
-    upsertSourceMetaEmbedding(db, provider, { sourceId, text: metaText }, now);
+    await upsertSourceMetaEmbedding(db, provider, { sourceId, text: metaText }, now);
   } else {
     deleteSourceMetaEmbedding(db, provider.modelId, sourceId);
   }
@@ -5015,52 +5362,70 @@ function deleteSourceMetaEmbedding(db: SqliteDb, modelId: string, sourceId: stri
   });
 }
 
-function upsertSourceChunkEmbedding(
+async function upsertSourceChunkEmbeddings(
   db: SqliteDb,
   provider: EmbeddingProvider,
-  chunk: SqlRow,
+  chunks: SqlRow[],
   now: string,
 ) {
-  const embeddingInput = buildChunkEmbeddingInput(chunk);
-  const vector = provider.embed(embeddingInput);
-  if (vector.length !== provider.dimension) {
-    throw new EngineRpcError("EMBEDDING_DIMENSION_MISMATCH", "Embedding dimension mismatch.");
+  if (chunks.length === 0) return;
+  const inputs = chunks.map((chunk) => buildChunkEmbeddingInput(chunk));
+  const vectors = await provider.embedTexts(inputs);
+  if (vectors.length !== chunks.length) {
+    throw new EngineRpcError("EMBEDDING_VECTOR_COUNT_MISMATCH", "Embedding vector count mismatch.");
   }
-  db.exec({
-    sql: `INSERT INTO source_embeddings (
-      model_id,
-      target_kind,
-      target_id,
-      source_id,
-      vector_json,
-      text_hash,
-      created_at,
-      updated_at
-    ) VALUES (?, 'chunk', ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(model_id, target_kind, target_id) DO UPDATE SET
-      source_id = excluded.source_id,
-      vector_json = excluded.vector_json,
-      text_hash = excluded.text_hash,
-      updated_at = excluded.updated_at`,
-    bind: [
-      provider.modelId,
-      stringField(chunk, "id"),
-      stringField(chunk, "source_id"),
-      JSON.stringify(vector),
-      hashText(embeddingInput),
-      now,
-      now,
-    ],
-  });
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    const embeddingInput = inputs[index];
+    const vector = vectors[index];
+    if (chunk === undefined || embeddingInput === undefined || vector === undefined) {
+      throw new EngineRpcError(
+        "EMBEDDING_VECTOR_COUNT_MISMATCH",
+        "Embedding vector count mismatch.",
+      );
+    }
+    if (vector.length !== provider.dimension) {
+      throw new EngineRpcError("EMBEDDING_DIMENSION_MISMATCH", "Embedding dimension mismatch.");
+    }
+    db.exec({
+      sql: `INSERT INTO source_embeddings (
+        model_id,
+        target_kind,
+        target_id,
+        source_id,
+        vector_json,
+        text_hash,
+        created_at,
+        updated_at
+      ) VALUES (?, 'chunk', ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(model_id, target_kind, target_id) DO UPDATE SET
+        source_id = excluded.source_id,
+        vector_json = excluded.vector_json,
+        text_hash = excluded.text_hash,
+        updated_at = excluded.updated_at`,
+      bind: [
+        provider.modelId,
+        stringField(chunk, "id"),
+        stringField(chunk, "source_id"),
+        JSON.stringify(vector),
+        hashText(embeddingInput),
+        now,
+        now,
+      ],
+    });
+  }
 }
 
-function upsertSourceMetaEmbedding(
+async function upsertSourceMetaEmbedding(
   db: SqliteDb,
   provider: EmbeddingProvider,
   input: { sourceId: string; text: string },
   now: string,
 ) {
-  const vector = provider.embed(input.text);
+  const [vector] = await provider.embedTexts([input.text]);
+  if (vector === undefined) {
+    throw new EngineRpcError("EMBEDDING_VECTOR_COUNT_MISMATCH", "Embedding vector count mismatch.");
+  }
   if (vector.length !== provider.dimension) {
     throw new EngineRpcError("EMBEDDING_DIMENSION_MISMATCH", "Embedding dimension mismatch.");
   }
@@ -7674,10 +8039,16 @@ function loadFtsChunkRetrievalHits(
   }));
 }
 
-function loadVectorMetaRetrievalHits(
+async function loadVectorMetaRetrievalHits(
   db: SqliteDb,
-  input: { query: string; limit: number; filter: NormalizedRetrieveSourcesFilter },
-): { hits: SourceRetrievalHit[]; trace: RetrieveSourcesTraceTrack } {
+  input: {
+    query: string;
+    limit: number;
+    filter: NormalizedRetrieveSourcesFilter;
+    embeddingProviderOverride?: EmbeddingProvider;
+    embeddingProviderFactory?: EmbeddingProviderFactory;
+  },
+): Promise<{ hits: SourceRetrievalHit[]; trace: RetrieveSourcesTraceTrack }> {
   if (input.filter.hasImpossibleFilter) {
     return {
       hits: [],
@@ -7689,7 +8060,11 @@ function loadVectorMetaRetrievalHits(
       },
     };
   }
-  const provider = getActiveEmbeddingProvider(db);
+  const provider = getActiveEmbeddingProvider(
+    db,
+    input.embeddingProviderOverride,
+    input.embeddingProviderFactory,
+  );
   if (provider === null) {
     return {
       hits: [],
@@ -7701,7 +8076,8 @@ function loadVectorMetaRetrievalHits(
       },
     };
   }
-  const queryVector = provider.embed(input.query);
+  const queryVector = await embedRetrievalQuery(provider, input.query, "vector_meta");
+  if (queryVector.trace !== undefined) return { hits: [], trace: queryVector.trace };
   const sourceFilter = sourceFilterWhereClause(input.filter);
   const rows = db.selectObjects(
     `SELECT
@@ -7749,7 +8125,7 @@ function loadVectorMetaRetrievalHits(
       return [
         {
           row,
-          score: cosineSimilarity(queryVector, vector),
+          score: cosineSimilarity(queryVector.vector, vector),
         },
       ];
     })
@@ -7781,10 +8157,16 @@ function loadVectorMetaRetrievalHits(
   };
 }
 
-function loadVectorChunkRetrievalHits(
+async function loadVectorChunkRetrievalHits(
   db: SqliteDb,
-  input: { query: string; limit: number; filter: NormalizedRetrieveSourcesFilter },
-): { hits: SourceRetrievalHit[]; trace: RetrieveSourcesTraceTrack } {
+  input: {
+    query: string;
+    limit: number;
+    filter: NormalizedRetrieveSourcesFilter;
+    embeddingProviderOverride?: EmbeddingProvider;
+    embeddingProviderFactory?: EmbeddingProviderFactory;
+  },
+): Promise<{ hits: SourceRetrievalHit[]; trace: RetrieveSourcesTraceTrack }> {
   if (input.filter.hasImpossibleFilter) {
     return {
       hits: [],
@@ -7796,7 +8178,11 @@ function loadVectorChunkRetrievalHits(
       },
     };
   }
-  const provider = getActiveEmbeddingProvider(db);
+  const provider = getActiveEmbeddingProvider(
+    db,
+    input.embeddingProviderOverride,
+    input.embeddingProviderFactory,
+  );
   if (provider === null) {
     return {
       hits: [],
@@ -7808,7 +8194,8 @@ function loadVectorChunkRetrievalHits(
       },
     };
   }
-  const queryVector = provider.embed(input.query);
+  const queryVector = await embedRetrievalQuery(provider, input.query, "vector_chunks");
+  if (queryVector.trace !== undefined) return { hits: [], trace: queryVector.trace };
   const sourceFilter = sourceFilterWhereClause(input.filter);
   const rows = db.selectObjects(
     `SELECT
@@ -7857,7 +8244,7 @@ function loadVectorChunkRetrievalHits(
       return [
         {
           row,
-          score: cosineSimilarity(queryVector, vector),
+          score: cosineSimilarity(queryVector.vector, vector),
         },
       ];
     })
@@ -7894,6 +8281,49 @@ function loadVectorChunkRetrievalHits(
       itemCount: ranked.length,
     },
   };
+}
+
+async function embedRetrievalQuery(
+  provider: EmbeddingProvider,
+  query: string,
+  track: "vector_meta" | "vector_chunks",
+): Promise<
+  { vector: number[]; trace?: undefined } | { vector?: undefined; trace: RetrieveSourcesTraceTrack }
+> {
+  try {
+    const [vector] = await provider.embedTexts([query]);
+    if (vector === undefined || vector.length !== provider.dimension) {
+      return {
+        trace: {
+          name: track,
+          status: "unavailable",
+          itemCount: 0,
+          reason: "embedding_dimension_mismatch",
+        },
+      };
+    }
+    return { vector };
+  } catch (error) {
+    return {
+      trace: {
+        name: track,
+        status: "unavailable",
+        itemCount: 0,
+        reason: embeddingUnavailableReason(error),
+      },
+    };
+  }
+}
+
+function embeddingUnavailableReason(error: unknown) {
+  if (error instanceof EngineRpcError) {
+    if (error.code === "PROVIDER_PERMISSION_REQUIRED") return "embedding_permission_required";
+    if (error.code === "EMBEDDING_DIMENSION_MISMATCH") return "embedding_dimension_mismatch";
+    if (error.code === "EMBEDDING_MODEL_MISMATCH") return "embedding_model_mismatch";
+    if (error.code === "EMBEDDING_PROVIDER_CONFIG_REQUIRED")
+      return "embedding_provider_unconfigured";
+  }
+  return "embedding_provider_error";
 }
 
 function metaSourceQueryTerms(input: string) {
@@ -8621,6 +9051,7 @@ function topicGraphEdgeKindField(row: SqlRow, key: string): TopicGraphEdgeKind {
 
 function jobTypeField(row: SqlRow, key: string): JobType {
   const value = stringField(row, key);
+  if (value === "reindex_embeddings") return value;
   if (value === "resolve_anchor" || value === "post_capture_hardening") return value;
   return "reindex_fts";
 }

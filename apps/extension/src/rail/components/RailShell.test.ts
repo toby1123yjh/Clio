@@ -4,6 +4,7 @@ import {
   assistantThinkingDotCount,
   assistantThinkingIndicatorClassName,
 } from "../app/thinking-indicator";
+import { buildEmbeddingProviderSettingsInput } from "./RailShell";
 
 function keyEvent(input: {
   key: string;
@@ -42,5 +43,38 @@ describe("assistant thinking indicator", () => {
   it("uses exactly three animated dots instead of a static text-only placeholder", () => {
     expect(assistantThinkingIndicatorClassName).toBe("clio-thinking-indicator");
     expect(assistantThinkingDotCount).toBe(3);
+  });
+});
+
+describe("buildEmbeddingProviderSettingsInput", () => {
+  it("builds the dedicated embedding provider payload without reindex authorization fields", () => {
+    const input = buildEmbeddingProviderSettingsInput({
+      activeProvider: "openai-compatible",
+      openAIApiKey: "openai-key",
+      openAIModel: "text-embedding-3-small",
+      openAIBaseUrl: "https://api.openai.com/v1",
+      compatibleApiKey: "compatible-key",
+      compatibleModel: "embedding-model",
+      compatibleBaseUrl: "https://example.test/v1",
+      compatibleProviderName: "Example",
+    });
+
+    expect(input).toEqual({
+      activeProvider: "openai-compatible",
+      openai: {
+        apiKey: "openai-key",
+        model: "text-embedding-3-small",
+        baseUrl: "https://api.openai.com/v1",
+      },
+      openaiCompatible: {
+        apiKey: "compatible-key",
+        model: "embedding-model",
+        baseUrl: "https://example.test/v1",
+        providerName: "Example",
+      },
+    });
+    expect(input).not.toHaveProperty("scope");
+    expect(input).not.toHaveProperty("authorizedAt");
+    expect(input).not.toHaveProperty("reindex");
   });
 });

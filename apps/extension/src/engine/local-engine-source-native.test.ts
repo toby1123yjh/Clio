@@ -121,9 +121,9 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("private async runQueuedJob");
     expect(workerSource).toContain('case "runJob"');
     expect(workerSource).toContain("function parsePostCaptureHardeningPayload");
-    expect(workerSource).toContain("function upsertSourceChunkEmbedding");
+    expect(workerSource).toContain("function upsertSourceChunkEmbeddings");
     expect(workerSource).toContain("function upsertSourceMetaEmbedding");
-    expect(workerSource).toContain("result = runPostCaptureHardeningJob");
+    expect(workerSource).toContain("result = await runPostCaptureHardeningJob");
     expect(workerSource).toContain('reason: "explicit_build_required"');
     expect(workerSource).toContain('"EMBEDDING_MODEL_UNAVAILABLE"');
     expect(workerSource).not.toContain("Reserved job types are intentionally no-op");
@@ -228,7 +228,7 @@ describe("local engine source-native storage foundation", () => {
   it("rebuilds FTS from source chunks without changing embedding rows", () => {
     const rebuildSection = sourceSection(
       "function rebuildFtsData",
-      "function runPostCaptureHardeningJob",
+      "async function runEmbeddingReindexJob",
     );
     expect(rebuildSection).toContain("DELETE FROM source_fts");
     expect(rebuildSection).toContain("DELETE FROM source_metadata_fts");
@@ -365,7 +365,7 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("FROM source_embeddings se");
     expect(workerSource).toContain("se.target_kind = 'meta'");
     expect(workerSource).toContain("JOIN source_chunks c ON c.id = se.target_id");
-    expect(workerSource).toContain("cosineSimilarity(queryVector, vector)");
+    expect(workerSource).toContain("cosineSimilarity(queryVector.vector, vector)");
     expect(workerSource).toContain('name: "meta_sources"');
     expect(workerSource).toContain('name: "vector_meta"');
     expect(workerSource).toContain('name: "vector_chunks"');
@@ -381,7 +381,7 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("private async search"),
     );
     expect(retrieveSection).toContain("const metaHits = loadMetaSourceRetrievalHits");
-    expect(retrieveSection).toContain("const vectorMetaResult = loadVectorMetaRetrievalHits");
+    expect(retrieveSection).toContain("const vectorMetaResult = await loadVectorMetaRetrievalHits");
     expect(retrieveSection).toContain(
       "[...metaHits, ...vectorMetaResult.hits, ...ftsHits, ...vectorResult.hits]",
     );
@@ -429,9 +429,21 @@ describe("local engine source-native storage foundation", () => {
   it("keeps embedding jobs idempotent and model-scoped", () => {
     const jobSection = sourceSection("function runJob", "function rebuildFtsData");
     expect(jobSection).toContain('type === "post_capture_hardening"');
-    expect(jobSection).toContain("runPostCaptureHardeningJob(db");
+    expect(jobSection).toContain('type === "reindex_embeddings"');
+    expect(jobSection).toContain("await runPostCaptureHardeningJob");
     expect(jobSection).toContain("status = 'done'");
     expect(jobSection).toContain("status = ?");
+
+    const reindexSection = sourceSection(
+      "async function runEmbeddingReindexJob",
+      "async function runPostCaptureHardeningJob",
+    );
+    expect(reindexSection).toContain('upsertEmbeddingModel(db, payload.model, "disabled")');
+    expect(reindexSection).toContain("DELETE FROM source_embeddings WHERE model_id = ?");
+    expect(reindexSection).toContain("lifecycle_status <> 'deleted'");
+    expect(reindexSection).toContain("runEmbeddingStageForSourceWithProvider");
+    expect(reindexSection).toContain("activateEmbeddingModel(db, payload.model.id)");
+    expect(reindexSection).not.toContain("normalized_text");
 
     const embeddingStageSection = sourceSection(
       "function runEmbeddingStageForSource",
@@ -440,7 +452,9 @@ describe("local engine source-native storage foundation", () => {
     expect(embeddingStageSection).toContain("SOURCE_NOT_FOUND");
     expect(embeddingStageSection).toContain("lifecycle_status = 'deleted'");
     expect(embeddingStageSection).toContain("source_deleted");
-    expect(embeddingStageSection).toContain("getActiveEmbeddingProvider(db)");
+    expect(embeddingStageSection).toContain(
+      "getActiveEmbeddingProvider(\n    db,\n    embeddingProviderOverride,\n    embeddingProviderFactory,\n  )",
+    );
     expect(embeddingStageSection).toContain("EMBEDDING_MODEL_UNAVAILABLE");
     expect(embeddingStageSection).toContain("meta_head_json");
     expect(embeddingStageSection).toContain("ORDER BY ord ASC");
@@ -452,7 +466,7 @@ describe("local engine source-native storage foundation", () => {
     expect(embeddingStageSection).toContain("metaSkippedReason");
 
     const upsertSection = sourceSection(
-      "function upsertSourceChunkEmbedding",
+      "function upsertSourceChunkEmbeddings",
       "function insertSourceFtsRow",
     );
     expect(upsertSection).toContain("ON CONFLICT(model_id, target_kind, target_id) DO UPDATE");
@@ -460,7 +474,7 @@ describe("local engine source-native storage foundation", () => {
     expect(upsertSection).toContain("'chunk'");
     expect(upsertSection).toContain("'meta'");
     expect(upsertSection).toContain("buildChunkEmbeddingInput(chunk)");
-    expect(upsertSection).toContain("provider.embed(embeddingInput)");
+    expect(upsertSection).toContain("provider.embedTexts(inputs)");
     expect(upsertSection).toContain("hashText(embeddingInput)");
     expect(upsertSection).toContain("hashText(input.text)");
     expect(upsertSection).toContain("EMBEDDING_DIMENSION_MISMATCH");
