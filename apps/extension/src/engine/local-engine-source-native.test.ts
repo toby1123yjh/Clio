@@ -123,10 +123,13 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain('stages: ["embedding", "chunk_meta", "graph"]');
     expect(workerSource).toContain("function boundAuditPayload(payload: Record<string, unknown>)");
     expect(workerSource).toContain("function runPostCaptureHardeningJob");
+    expect(workerSource).toContain("function runChunkMetaStageForSource");
     expect(workerSource).toContain("function runEmbeddingStageForSource");
+    expect(workerSource).toContain("function runDeterministicGraphBuildForSource");
     expect(workerSource).toContain("private async runQueuedJob");
     expect(workerSource).toContain('case "runJob"');
     expect(workerSource).toContain("function parsePostCaptureHardeningPayload");
+    expect(workerSource).toContain('graphBuildMode === "deterministic"');
     expect(workerSource).toContain("function upsertSourceChunkEmbeddings");
     expect(workerSource).toContain("function upsertSourceMetaEmbedding");
     expect(workerSource).toContain("result = await runPostCaptureHardeningJob");
@@ -159,6 +162,26 @@ describe("local engine source-native storage foundation", () => {
     const adapterContract = sourceSection("interface SourceAdapter", "export class LocalEngine");
     expect(adapterContract).not.toContain("SqliteDb");
     expect(adapterContract).not.toContain("db:");
+  });
+
+  it("exposes public PDF and Markdown capture RPCs through the same capture path", () => {
+    const handleSection = sourceSection("async handle", "private async health");
+    const markdownSection = sourceSection(
+      "private async captureMarkdown",
+      "private async capturePdf",
+    );
+    const pdfSection = sourceSection("private async capturePdf", "private async capture(");
+
+    expect(handleSection).toContain('case "captureMarkdown"');
+    expect(handleSection).toContain("return await this.captureMarkdown(request.payload)");
+    expect(handleSection).toContain('case "capturePdf"');
+    expect(handleSection).toContain("return await this.capturePdf(request.payload)");
+    expect(markdownSection).toContain('source_type: "markdown"');
+    expect(markdownSection).toContain('adapter: "markdown"');
+    expect(markdownSection).toContain('return await this.capture("page"');
+    expect(pdfSection).toContain("const parsed = await this.pdfParser(payload.bytes)");
+    expect(pdfSection).toContain("pdfCapturePayloadFromParsedDocument");
+    expect(pdfSection).toContain("return await this.capture(");
   });
 
   it("keeps capture source-native and defers embedding work outside the capture transaction", () => {
@@ -490,6 +513,8 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("interface ChunkMetaHeadV1");
     expect(workerSource).toContain("const chunkMetaHeadVersion = 1");
     expect(workerSource).toContain("function buildChunkMetaHeadJson");
+    expect(workerSource).toContain("function buildChunkMetaHeadJsonFromSourceMetadata");
+    expect(workerSource).toContain("function runChunkMetaStageForSource");
     expect(workerSource).toContain('tier: "tier0"');
     expect(workerSource).toContain("docContext");
     expect(workerSource).toContain("chunkSummary: null");

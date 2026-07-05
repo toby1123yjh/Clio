@@ -17,6 +17,7 @@ import {
   type LocalEngineSqliteApi,
   type LocalEngineSqliteDb,
 } from "./local-engine.worker";
+import type { ParsedPdfDocument } from "./pdf-parser";
 
 let sqliteApi: LocalEngineSqliteApi;
 
@@ -69,10 +70,58 @@ describe("local engine behavior harness", () => {
     const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       queued.jobs[0]?.id ?? "",
     ]);
-    expect(String(finishedJob?.result_json ?? "")).toContain("explicit_build_required");
+    const defaultJobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
+      chunkMeta?: { chunkCount?: number; tier?: string };
+      graph?: { skipped?: boolean; reason?: string };
+    };
+    expect(defaultJobResult.chunkMeta?.tier).toBe("tier0");
+    expect(defaultJobResult.chunkMeta?.chunkCount ?? 0).toBeGreaterThan(0);
+    expect(defaultJobResult.graph).toMatchObject({
+      skipped: true,
+      reason: "explicit_build_required",
+    });
 
     expect(harness.count("graph_nodes")).toBe(0);
     expect(harness.count("graph_edges")).toBe(0);
+
+    const explicitGraphJobId = "job_explicit_graph_build";
+    const explicitGraphJobCreatedAt = "2026-07-05T00:00:00.000Z";
+    harness.exec(
+      `INSERT INTO jobs (
+        id,
+        type,
+        status,
+        attempts,
+        max_attempts,
+        run_after,
+        payload_json,
+        created_at
+      ) VALUES (?, 'post_capture_hardening', 'queued', 0, 3, ?, ?, ?)`,
+      [
+        explicitGraphJobId,
+        explicitGraphJobCreatedAt,
+        JSON.stringify({
+          sourceId,
+          stages: ["graph"],
+          graphBuildMode: "deterministic",
+        }),
+        explicitGraphJobCreatedAt,
+      ],
+    );
+    const graphJob = await harness.request({ kind: "runJob", id: explicitGraphJobId });
+    expect(graphJob.status).toBe("done");
+    const finishedGraphJob = harness.selectObject(
+      "SELECT result_json FROM jobs WHERE id = ? LIMIT 1",
+      [explicitGraphJobId],
+    );
+    const explicitGraphJobResult = JSON.parse(String(finishedGraphJob?.result_json ?? "{}")) as {
+      graph?: { nodeCount?: number; edgeCount?: number; evidenceChunkCount?: number };
+    };
+    expect(explicitGraphJobResult.graph?.nodeCount ?? 0).toBeGreaterThan(1);
+    expect(explicitGraphJobResult.graph?.edgeCount ?? 0).toBeGreaterThan(0);
+    expect(explicitGraphJobResult.graph?.evidenceChunkCount ?? 0).toBeGreaterThan(0);
+    expect(harness.count("graph_nodes")).toBeGreaterThan(1);
+    expect(harness.count("graph_edges")).toBeGreaterThan(0);
 
     const build = await harness.request({
       kind: "buildSourceGraph",
@@ -546,7 +595,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("keyword_index", "term = ?", ["degradation"])).toBe(1);
   });
 
-  it("falls back to raw chunk text when chunk meta head is missing or malformed", async () => {
+  it("repairs malformed chunk meta heads before post-capture embedding", async () => {
     const harness = createHarness();
     const capture = await harness.request({
       kind: "capturePage",
@@ -576,14 +625,36 @@ describe("local engine behavior harness", () => {
       String(chunk?.id ?? ""),
     ]);
     const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
-    await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+    const job = await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+    expect(job.status).toBe("done");
+
+    const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
+      queued.jobs[0]?.id ?? "",
+    ]);
+    const jobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
+      chunkMeta?: { tier?: string; chunkCount?: number };
+    };
+    expect(jobResult.chunkMeta?.tier).toBe("tier0");
+    expect(jobResult.chunkMeta?.chunkCount ?? 0).toBeGreaterThan(0);
+
+    const repairedChunk = harness.selectObject(
+      "SELECT text, hash, meta_head_json FROM source_chunks WHERE id = ? LIMIT 1",
+      [String(chunk?.id ?? "")],
+    );
+    const repairedMetaHead = JSON.parse(String(repairedChunk?.meta_head_json ?? "{}")) as {
+      docContext?: string;
+    };
+    expect(repairedMetaHead.docContext).toContain("Malformed Meta Head");
 
     const embedding = harness.selectObject(
       "SELECT text_hash FROM source_embeddings WHERE source_id = ? AND target_kind = 'chunk' ORDER BY target_id ASC LIMIT 1",
       [sourceId],
     );
-    expect(embedding?.text_hash).toBe(hashText(String(chunk?.text ?? "")));
-    expect(embedding?.text_hash).toBe(chunk?.hash);
+    const prefixedEmbeddingInput = `${repairedMetaHead.docContext}\n\n${String(
+      repairedChunk?.text ?? "",
+    )}`;
+    expect(embedding?.text_hash).toBe(hashText(prefixedEmbeddingInput));
+    expect(embedding?.text_hash).not.toBe(repairedChunk?.hash);
   });
 
   it("keeps duplicate, page version, and selection capture behavior distinct", async () => {
@@ -1045,6 +1116,45 @@ describe("local engine behavior harness", () => {
     );
   });
 
+  it("captures markdown sources through the public captureMarkdown RPC", async () => {
+    const harness = createHarness();
+    const markdownText = [
+      "---",
+      "title: Uploaded Markdown Notes",
+      "abstract: Markdown upload should use the public capture RPC.",
+      "---",
+      "# Uploaded Markdown Notes",
+      "",
+      "The upload path stores markdown as source-native evidence.",
+    ].join("\n");
+
+    const capture = await harness.request({
+      kind: "captureMarkdown",
+      payload: {
+        sourceUrl: "clio://upload/notes.md",
+        sourceTitle: "notes.md",
+        markdownText,
+        capturedAt: "2026-07-05T00:00:00.000Z",
+        metadata: {
+          file_name: "notes.md",
+          file_size: markdownText.length,
+        },
+      },
+    });
+
+    expect(capture.status).toBe("saved");
+    expect(capture.memory.sourceTitle).toBe("Uploaded Markdown Notes");
+    expect(
+      harness.count("sources", "id = ? AND source_type = 'markdown'", [capture.memory.id]),
+    ).toBe(1);
+
+    const detail = await harness.request({ kind: "getMemory", id: capture.memory.id });
+    expect(detail?.metadata.adapter).toBe("markdown");
+    expect(detail?.metadata.source_type).toBe("markdown");
+    expect(detail?.metadata.file_name).toBe("notes.md");
+    expect(detail?.normalizedText).not.toContain("file_size:");
+  });
+
   it("adapts markdown sources through the registered adapter boundary", async () => {
     const harness = createHarness();
     const markdownText = [
@@ -1246,6 +1356,78 @@ describe("local engine behavior harness", () => {
     expect(degradedDetail?.metadata.paper_source).toBe("arxiv");
     expect(degradedDetail?.metadata.arxiv_id).toBeUndefined();
     expect(degraded.memory.sourceTitle).toBe("Malformed Arxiv Metadata");
+  });
+
+  it("captures PDF bytes through the public capturePdf RPC", async () => {
+    const page1 = "Uploaded PDF page one covers parser-backed capture.";
+    const page2 = "Uploaded PDF page two keeps concrete page anchors.";
+    const text = `${page1}\n\n${page2}`;
+    const parsed: ParsedPdfDocument = {
+      text,
+      pages: [
+        { pageNumber: 1, text: page1, charStart: 0, charEnd: page1.length },
+        {
+          pageNumber: 2,
+          text: page2,
+          charStart: page1.length + 2,
+          charEnd: page1.length + 2 + page2.length,
+        },
+      ],
+      metadata: {
+        title: "Uploaded Parser PDF",
+        pageCount: 2,
+        parser: "pdfjs",
+        textHash: hashText(text),
+      },
+    };
+    const parserInputs: Array<Uint8Array | ArrayBuffer> = [];
+    const harness = createHarness({
+      pdfParser: async (bytes) => {
+        parserInputs.push(bytes);
+        return parsed;
+      },
+    });
+
+    const capture = await harness.request({
+      kind: "capturePdf",
+      payload: {
+        sourceUrl: "clio://upload/parser.pdf",
+        sourceTitle: "parser.pdf",
+        bytes: new Uint8Array([1, 2, 3]),
+        metadata: {
+          file_name: "parser.pdf",
+          file_size: 3,
+        },
+      },
+    });
+    const sourceId = capture.memory.id;
+
+    expect(parserInputs).toHaveLength(1);
+    expect(capture.status).toBe("saved");
+    expect(capture.memory.sourceTitle).toBe("Uploaded Parser PDF");
+    expect(harness.count("sources", "id = ? AND source_type = 'pdf'", [sourceId])).toBe(1);
+
+    const detail = await harness.request({ kind: "getMemory", id: sourceId });
+    expect(detail?.metadata.adapter).toBe("pdf");
+    expect(detail?.metadata.source_type).toBe("pdf");
+    expect(detail?.metadata.parser).toBe("pdfjs");
+    expect(detail?.metadata.pdf_page_count).toBe(2);
+    expect(detail?.metadata.file_name).toBe("parser.pdf");
+    expect(detail?.chunks[0]?.pageStart).toBe(1);
+    expect(detail?.chunks[0]?.pageEnd).toBe(2);
+
+    const retrieved = await harness.request({
+      kind: "retrieveSources",
+      payload: {
+        query: "parser-backed capture page anchors",
+        limit: 5,
+        includeChunks: 1,
+        filter: { sourceTypes: ["pdf"] },
+      },
+    });
+    expect(retrieved.items.map((item) => item.id)).toEqual([sourceId]);
+    expect(retrieved.items[0]?.hitChunks[0]?.pageStart).toBe(1);
+    expect(retrieved.items[0]?.hitChunks[0]?.pageEnd).toBe(2);
   });
 
   it("adapts ordinary PDF sources without classifying them as papers", async () => {

@@ -48,6 +48,80 @@ import {
 } from "./rpc";
 
 describe("session engine RPC guards", () => {
+  it("accepts typed PDF and Markdown capture requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "captureMarkdown",
+          payload: {
+            sourceUrl: "clio://upload/notes.md",
+            sourceTitle: "notes.md",
+            markdownText: "# Notes\n\nLocal markdown evidence.",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "capturePdf",
+          payload: {
+            sourceUrl: "clio://upload/paper.pdf",
+            sourceTitle: "paper.pdf",
+            bytes: new Uint8Array([1, 2, 3]),
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "capturePdf",
+          payload: {
+            sourceUrl: "clio://upload/paper.pdf",
+            sourceTitle: "paper.pdf",
+            bytes: new ArrayBuffer(4),
+          },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects malformed PDF and Markdown capture requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "captureMarkdown",
+          payload: {
+            sourceUrl: "clio://upload/notes.md",
+            sourceTitle: "notes.md",
+            normalizedText: "# Wrong field",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "capturePdf",
+          payload: {
+            sourceUrl: "clio://upload/paper.pdf",
+            sourceTitle: "paper.pdf",
+            bytes: "not bytes",
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts typed topic page requests", () => {
     expect(
       isEngineRequestMessage({

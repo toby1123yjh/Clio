@@ -10,6 +10,8 @@ import {
   CLIO_WORKER_EMBEDDING_REQUEST,
   CLIO_WORKER_RESPONSE,
   type CaptureBasePayload,
+  type CaptureMarkdownPayload,
+  type CapturePdfPayload,
   type CaptureResult,
   type CaptureSelectionPayload,
   type ChatMessageRecord,
@@ -110,6 +112,11 @@ import {
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import sqliteWasmUrl from "@sqlite.org/sqlite-wasm/sqlite3.wasm?url";
 import { compareChatMessagesForDisplay } from "./chat-message-order";
+import {
+  type ParsedPdfDocument,
+  parsePdfDocument,
+  pdfCapturePayloadFromParsedDocument,
+} from "./pdf-parser";
 
 type SqlValue = string | number | bigint | null | Uint8Array;
 type SqlRow = Record<string, SqlValue>;
@@ -152,10 +159,12 @@ export interface ActiveEmbeddingModel {
   dimension: number;
 }
 export type EmbeddingProviderFactory = (model: ActiveEmbeddingModel) => EmbeddingProvider | null;
+type PdfDocumentParser = (bytes: Uint8Array | ArrayBuffer) => Promise<ParsedPdfDocument>;
 export interface LocalEngineOptions {
   openDatabase?: LocalEngineDatabaseOpener;
   embeddingProvider?: EmbeddingProvider;
   embeddingProviderFactory?: EmbeddingProviderFactory;
+  pdfParser?: PdfDocumentParser;
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
@@ -257,6 +266,7 @@ type SourceAuditAction =
   | "source.stage_queued";
 
 type SourceRetrievalTrack = "meta_sources" | "vector_meta" | "fts_chunks" | "vector_chunks";
+type PostCaptureStageName = "embedding" | "chunk_meta" | "graph";
 
 interface SourceRetrievalHit {
   track: SourceRetrievalTrack;
@@ -418,11 +428,13 @@ export class LocalEngine {
   private readonly openDatabase: LocalEngineDatabaseOpener;
   private readonly embeddingProviderOverride?: EmbeddingProvider;
   private readonly embeddingProviderFactory?: EmbeddingProviderFactory;
+  private readonly pdfParser: PdfDocumentParser;
 
   constructor(options: LocalEngineOptions = {}) {
     this.openDatabase = options.openDatabase ?? openProductionDatabase;
     this.embeddingProviderOverride = options.embeddingProvider;
     this.embeddingProviderFactory = options.embeddingProviderFactory;
+    this.pdfParser = options.pdfParser ?? parsePdfDocument;
   }
 
   async handle(request: EngineRequest) {
@@ -431,6 +443,10 @@ export class LocalEngine {
         return await this.health();
       case "capturePage":
         return await this.capture("page", request.payload);
+      case "captureMarkdown":
+        return await this.captureMarkdown(request.payload);
+      case "capturePdf":
+        return await this.capturePdf(request.payload);
       case "captureSelection":
         return await this.capture("selection", request.payload);
       case "retrieveSources":
@@ -579,6 +595,34 @@ export class LocalEngine {
       }
     }
     return this.healthState;
+  }
+
+  private async captureMarkdown(payload: CaptureMarkdownPayload): Promise<CaptureResult> {
+    return await this.capture("page", {
+      sourceUrl: payload.sourceUrl,
+      sourceTitle: payload.sourceTitle,
+      normalizedText: payload.markdownText,
+      capturedAt: payload.capturedAt,
+      metadata: {
+        ...payload.metadata,
+        adapter: "markdown",
+        source_type: "markdown",
+      },
+    });
+  }
+
+  private async capturePdf(payload: CapturePdfPayload): Promise<CaptureResult> {
+    const parsed = await this.pdfParser(payload.bytes);
+    return await this.capture(
+      "page",
+      pdfCapturePayloadFromParsedDocument({
+        sourceUrl: payload.sourceUrl,
+        sourceTitle: payload.sourceTitle,
+        capturedAt: payload.capturedAt,
+        metadata: payload.metadata,
+        parsed,
+      }),
+    );
   }
 
   private async capture(kind: SourceKind, payload: CaptureBasePayload): Promise<CaptureResult> {
@@ -1724,89 +1768,7 @@ export class LocalEngine {
     if (payload.mode !== undefined && payload.mode !== "deterministic") {
       throw new EngineRpcError("INVALID_GRAPH_MODE", `Unsupported graph mode: ${payload.mode}`);
     }
-
-    const source = db.selectObject(
-      `SELECT id
-       FROM sources
-       WHERE id = ?
-         AND lifecycle_status <> 'deleted'
-       LIMIT 1`,
-      [sourceId],
-    );
-    if (source === undefined) {
-      throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
-    }
-
-    let result: BuildSourceGraphResult = {
-      sourceId,
-      nodeCount: 0,
-      edgeCount: 0,
-      evidenceChunkCount: 0,
-    };
-    transaction(db, () => {
-      deleteGraphForSource(db, sourceId);
-      const build = buildDeterministicGraphForSource(db, sourceId);
-      if (build.nodes.length === 0) {
-        result = {
-          sourceId,
-          nodeCount: 0,
-          edgeCount: 0,
-          evidenceChunkCount: 0,
-          skipped: true,
-          reason: "no_graph_candidates",
-        };
-        return;
-      }
-
-      const now = new Date().toISOString();
-      const nodeIdsByCanonicalId = new Map<string, string>();
-      for (const node of build.nodes) {
-        const nodeId = upsertGraphNode(db, node, now);
-        nodeIdsByCanonicalId.set(node.canonicalId, nodeId);
-      }
-
-      const sourceNodeId = nodeIdsByCanonicalId.get(`source:${sourceId}`);
-      if (sourceNodeId === undefined) {
-        throw new EngineRpcError("GRAPH_BUILD_FAILED", `Source graph node missing: ${sourceId}`);
-      }
-
-      let edgeCount = 0;
-      for (const edge of build.edges) {
-        const targetNodeId = nodeIdsByCanonicalId.get(edge.targetCanonicalId);
-        if (targetNodeId === undefined) continue;
-        insertGraphEdge(
-          db,
-          {
-            sourceNodeId,
-            targetNodeId,
-            dimension: edge.dimension,
-            edgeType: edge.edgeType,
-            evidenceSourceId: edge.evidenceSourceId,
-            evidenceChunkIds: edge.evidenceChunkIds,
-            weight: edge.weight,
-            createdBy: edge.createdBy,
-          },
-          now,
-        );
-        edgeCount += 1;
-      }
-
-      db.exec({
-        sql: `UPDATE sources
-              SET analysis_level = 'analyzed',
-                  updated_at = ?
-              WHERE id = ?`,
-        bind: [now, sourceId],
-      });
-
-      result = {
-        sourceId,
-        nodeCount: build.nodes.length,
-        edgeCount,
-        evidenceChunkCount: build.evidenceChunkIds.length,
-      };
-    });
-    return result;
+    return runDeterministicGraphBuildForSource(db, sourceId);
   }
 
   private async queryGraphNeighbors(payload: GraphNeighborsPayload): Promise<GraphQueryResult> {
@@ -3687,6 +3649,24 @@ function locateChunkTextRanges(
     ranges.set(chunk.ord, { charStart, charEnd: charEndOffset + 1 });
     cursor = Math.max(cursor, compactStart + 1);
   }
+  if (ranges.size === chunks.length) return ranges;
+
+  const whitespaceInsensitive = compactTextWithoutWhitespaceWithOriginalOffsets(normalizedText);
+  const whitespaceInsensitiveRanges = new Map<number, { charStart: number; charEnd: number }>();
+  cursor = 0;
+  for (const chunk of chunks) {
+    const compactChunk = normalizeText(chunk.text).replace(/\s+/g, "");
+    if (compactChunk.length === 0) continue;
+    const compactStart = whitespaceInsensitive.text.indexOf(compactChunk, cursor);
+    if (compactStart < 0) continue;
+    const compactEnd = compactStart + compactChunk.length;
+    const charStart = whitespaceInsensitive.offsets[compactStart];
+    const charEndOffset = whitespaceInsensitive.offsets[Math.max(compactStart, compactEnd - 1)];
+    if (charStart === undefined || charEndOffset === undefined) continue;
+    whitespaceInsensitiveRanges.set(chunk.ord, { charStart, charEnd: charEndOffset + 1 });
+    cursor = Math.max(cursor, compactStart + 1);
+  }
+  if (whitespaceInsensitiveRanges.size > ranges.size) return whitespaceInsensitiveRanges;
   return ranges;
 }
 
@@ -3716,6 +3696,18 @@ function compactTextWithOriginalOffsets(input: string) {
   return { text: chars.join(""), offsets };
 }
 
+function compactTextWithoutWhitespaceWithOriginalOffsets(input: string) {
+  const chars: string[] = [];
+  const offsets: number[] = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (char === undefined || /\s/.test(char)) continue;
+    chars.push(char);
+    offsets.push(index);
+  }
+  return { text: chars.join(""), offsets };
+}
+
 function pageRangeForChunk(
   chunkRange: { charStart: number; charEnd: number } | undefined,
   pages: PdfPageTextRange[],
@@ -3736,13 +3728,25 @@ function pageRangeForChunk(
 }
 
 function buildChunkMetaHeadJson(draft: DocumentDraft) {
-  const metadata = parseMetadata(draft.metadataJson);
+  return buildChunkMetaHeadJsonFromSourceMetadata({
+    sourceTitle: draft.sourceTitle,
+    sourceType: draft.kind,
+    metadataJson: draft.metadataJson,
+  });
+}
+
+function buildChunkMetaHeadJsonFromSourceMetadata(input: {
+  sourceTitle: string;
+  sourceType: string;
+  metadataJson: string;
+}) {
+  const metadata = parseMetadata(input.metadataJson);
   const title = boundedNormalizedText(
-    stringMetadataField(metadata, "title") ?? draft.sourceTitle,
+    stringMetadataField(metadata, "title") ?? input.sourceTitle,
     chunkMetaTitleMaxChars,
   );
   const sourceType = boundedNormalizedText(
-    stringMetadataField(metadata, "source_type") ?? draft.kind,
+    stringMetadataField(metadata, "source_type") ?? input.sourceType,
     chunkMetaSourceTypeMaxChars,
   );
   const abstract = stringMetadataField(metadata, "abstract");
@@ -5245,9 +5249,14 @@ async function runPostCaptureHardeningJob(
   if (payload.sourceId.length === 0) {
     throw new EngineRpcError("INVALID_JOB_PAYLOAD", "Post-capture job is missing sourceId.");
   }
+  const shouldRunChunkMeta = payload.stages.includes("chunk_meta");
   const shouldRunEmbedding = payload.stages.length === 0 || payload.stages.includes("embedding");
   const shouldRunGraph = payload.stages.includes("graph");
-  const result = shouldRunEmbedding
+
+  const chunkMeta = shouldRunChunkMeta
+    ? runChunkMetaStageForSource(db, payload.sourceId)
+    : { skipped: true, reason: "stage_not_requested" };
+  const embeddingResult = shouldRunEmbedding
     ? await runEmbeddingStageForSource(
         db,
         payload.sourceId,
@@ -5255,11 +5264,19 @@ async function runPostCaptureHardeningJob(
         embeddingProviderFactory,
       )
     : { ok: true, embedding: { skipped: true, reason: "stage_not_requested" } };
+
+  const graph =
+    shouldRunGraph && payload.graphBuildMode === "deterministic"
+      ? runDeterministicGraphBuildForSource(db, payload.sourceId)
+      : shouldRunGraph
+        ? { skipped: true, reason: "explicit_build_required" }
+        : { skipped: true, reason: "stage_not_requested" };
+
   return {
-    ...result,
-    graph: shouldRunGraph
-      ? { skipped: true, reason: "explicit_build_required" }
-      : { skipped: true, reason: "stage_not_requested" },
+    ok: true,
+    embedding: embeddingResult.embedding,
+    chunkMeta,
+    graph,
   };
 }
 
@@ -5267,9 +5284,64 @@ function parsePostCaptureHardeningPayload(payloadJson: string) {
   const payload = parseMetadata(payloadJson);
   const sourceId = typeof payload.sourceId === "string" ? normalizeText(payload.sourceId) : "";
   const stages = Array.isArray(payload.stages)
-    ? payload.stages.flatMap((stage) => (typeof stage === "string" ? [stage] : []))
+    ? payload.stages.flatMap((stage) => (isPostCaptureStageName(stage) ? [stage] : []))
     : [];
-  return { sourceId, stages };
+  const graphBuildMode = payload.graphBuildMode === "deterministic" ? "deterministic" : undefined;
+  return { sourceId, stages, graphBuildMode };
+}
+
+function isPostCaptureStageName(value: unknown): value is PostCaptureStageName {
+  return value === "embedding" || value === "chunk_meta" || value === "graph";
+}
+
+function runChunkMetaStageForSource(db: SqliteDb, sourceId: string): Record<string, unknown> {
+  const source = db.selectObject(
+    `SELECT
+       s.id,
+       s.source_kind,
+       s.source_title,
+       s.source_type,
+       s.lifecycle_status,
+       sm.title AS meta_title,
+       sm.source_type AS meta_source_type,
+       sm.metadata_json
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.id = ?
+     LIMIT 1`,
+    [sourceId],
+  );
+  if (source === undefined) {
+    throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
+  }
+  if (stringField(source, "lifecycle_status") === "deleted") {
+    return {
+      tier: "tier0",
+      chunkCount: 0,
+      skipped: true,
+      reason: "source_deleted",
+    };
+  }
+
+  const metaHeadJson = buildChunkMetaHeadJsonFromSourceMetadata({
+    sourceTitle: stringField(source, "meta_title") || stringField(source, "source_title"),
+    sourceType:
+      stringField(source, "meta_source_type") ||
+      stringField(source, "source_type") ||
+      sourceKindField(source, "source_kind"),
+    metadataJson: stringField(source, "metadata_json"),
+  });
+  const chunkCount = Number(
+    db.selectValue("SELECT COUNT(*) FROM source_chunks WHERE source_id = ?", [sourceId]) ?? 0,
+  );
+  db.exec({
+    sql: "UPDATE source_chunks SET meta_head_json = ? WHERE source_id = ?",
+    bind: [metaHeadJson, sourceId],
+  });
+  return {
+    tier: "tier0",
+    chunkCount,
+  };
 }
 
 async function runEmbeddingStageForSource(
@@ -5535,6 +5607,94 @@ function insertSourceMetadataFtsRow(
       input.url,
     ],
   });
+}
+
+function runDeterministicGraphBuildForSource(
+  db: SqliteDb,
+  sourceId: string,
+): BuildSourceGraphResult {
+  const source = db.selectObject(
+    `SELECT id
+     FROM sources
+     WHERE id = ?
+       AND lifecycle_status <> 'deleted'
+     LIMIT 1`,
+    [sourceId],
+  );
+  if (source === undefined) {
+    throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
+  }
+
+  let result: BuildSourceGraphResult = {
+    sourceId,
+    nodeCount: 0,
+    edgeCount: 0,
+    evidenceChunkCount: 0,
+  };
+  transaction(db, () => {
+    deleteGraphForSource(db, sourceId);
+    const build = buildDeterministicGraphForSource(db, sourceId);
+    if (build.nodes.length === 0) {
+      result = {
+        sourceId,
+        nodeCount: 0,
+        edgeCount: 0,
+        evidenceChunkCount: 0,
+        skipped: true,
+        reason: "no_graph_candidates",
+      };
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const nodeIdsByCanonicalId = new Map<string, string>();
+    for (const node of build.nodes) {
+      const nodeId = upsertGraphNode(db, node, now);
+      nodeIdsByCanonicalId.set(node.canonicalId, nodeId);
+    }
+
+    const sourceNodeId = nodeIdsByCanonicalId.get(`source:${sourceId}`);
+    if (sourceNodeId === undefined) {
+      throw new EngineRpcError("GRAPH_BUILD_FAILED", `Source graph node missing: ${sourceId}`);
+    }
+
+    let edgeCount = 0;
+    for (const edge of build.edges) {
+      const targetNodeId = nodeIdsByCanonicalId.get(edge.targetCanonicalId);
+      if (targetNodeId === undefined) continue;
+      insertGraphEdge(
+        db,
+        {
+          sourceNodeId,
+          targetNodeId,
+          dimension: edge.dimension,
+          edgeType: edge.edgeType,
+          evidenceSourceId: edge.evidenceSourceId,
+          evidenceChunkIds: edge.evidenceChunkIds,
+          weight: edge.weight,
+          createdBy: edge.createdBy,
+        },
+        now,
+      );
+      edgeCount += 1;
+    }
+
+    db.exec({
+      sql: `UPDATE sources
+            SET analysis_level = 'analyzed',
+                updated_at = ?
+            WHERE id = ?`,
+      bind: [now, sourceId],
+    });
+
+    result = {
+      sourceId,
+      nodeCount: build.nodes.length,
+      edgeCount,
+      evidenceChunkCount: build.evidenceChunkIds.length,
+    };
+  });
+  return result;
 }
 
 function buildDeterministicGraphForSource(db: SqliteDb, sourceId: string): DeterministicGraphBuild {

@@ -226,6 +226,67 @@ const defaultSuggestionCooldown: SuggestionCooldownState = {
   completedUserTurnsSinceLastSuggestion: 3,
 };
 
+type KnowledgeUploadKind = "markdown" | "pdf";
+
+function knowledgeUploadKindForFile(file: File): KnowledgeUploadKind | null {
+  const name = file.name.toLowerCase();
+  const mime = file.type.toLowerCase();
+  if (mime === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+  if (
+    mime === "text/markdown" ||
+    mime === "text/x-markdown" ||
+    name.endsWith(".md") ||
+    name.endsWith(".markdown")
+  ) {
+    return "markdown";
+  }
+  return null;
+}
+
+function uploadSourceUrlForFile(file: File) {
+  const safeName = encodeURIComponent(file.name.trim() || "untitled");
+  return `clio://upload/${safeName}`;
+}
+
+function uploadSourceTitleForFile(file: File, kind: KnowledgeUploadKind) {
+  const fallback = kind === "pdf" ? "Uploaded PDF" : "Uploaded Markdown";
+  return file.name.trim() || fallback;
+}
+
+function uploadMetadataForFile(file: File, kind: KnowledgeUploadKind): Record<string, unknown> {
+  return {
+    file_name: file.name,
+    file_size: file.size,
+    mime_type: file.type.trim() || (kind === "pdf" ? "application/pdf" : "text/markdown"),
+    source_origin: "file_upload",
+    upload_last_modified: Number.isFinite(file.lastModified)
+      ? new Date(file.lastModified).toISOString()
+      : undefined,
+  };
+}
+
+function uploadSummaryMessage(input: {
+  savedCount: number;
+  duplicateCount: number;
+  unsupportedCount: number;
+  failedCount: number;
+}) {
+  const parts: string[] = [];
+  if (input.savedCount > 0) {
+    parts.push(`${input.savedCount} saved`);
+  }
+  if (input.duplicateCount > 0) {
+    parts.push(`${input.duplicateCount} already in Clio`);
+  }
+  if (input.unsupportedCount > 0) {
+    parts.push(`${input.unsupportedCount} unsupported`);
+  }
+  if (input.failedCount > 0) {
+    parts.push(`${input.failedCount} failed`);
+  }
+  return parts.length === 0 ? "No files imported." : `Import complete: ${parts.join(", ")}.`;
+}
+
 function selectionSnapshotToCapturePayload(snapshot: SelectionSnapshot): CaptureSelectionPayload {
   return {
     sourceUrl: snapshot.sourceUrl,
@@ -1612,6 +1673,112 @@ function ClioContentApp() {
       dispatch({ type: "SET_LOADING", loading: false });
     }
   }, [loadLibrary, showToast]);
+
+  const uploadKnowledgeFiles = React.useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return;
+
+      const uploadItems = files.flatMap((file) => {
+        const kind = knowledgeUploadKindForFile(file);
+        return kind === null ? [] : [{ file, kind }];
+      });
+      const unsupportedCount = files.length - uploadItems.length;
+
+      if (uploadItems.length === 0) {
+        showToast({
+          tone: "warning",
+          message: "Choose PDF or Markdown files to import.",
+        });
+        return;
+      }
+
+      dispatch({ type: "SET_LOADING", loading: true });
+      let savedCount = 0;
+      let duplicateCount = 0;
+      let failedCount = 0;
+      let firstFailure: string | undefined;
+      let highlightedMemoryId: string | undefined;
+
+      try {
+        for (const { file, kind } of uploadItems) {
+          try {
+            const capturedAt = new Date().toISOString();
+            const sourceUrl = uploadSourceUrlForFile(file);
+            const sourceTitle = uploadSourceTitleForFile(file, kind);
+            const metadata = uploadMetadataForFile(file, kind);
+            const result =
+              kind === "pdf"
+                ? await requestEngine({
+                    kind: "capturePdf",
+                    payload: {
+                      sourceUrl,
+                      sourceTitle,
+                      bytes: await file.arrayBuffer(),
+                      capturedAt,
+                      metadata,
+                    },
+                  })
+                : await requestEngine({
+                    kind: "captureMarkdown",
+                    payload: {
+                      sourceUrl,
+                      sourceTitle,
+                      markdownText: await file.text(),
+                      capturedAt,
+                      metadata,
+                    },
+                  });
+
+            highlightedMemoryId = result.memory.id;
+            if (result.status === "duplicate") {
+              duplicateCount += 1;
+            } else {
+              savedCount += 1;
+            }
+          } catch (error) {
+            failedCount += 1;
+            if (firstFailure === undefined) {
+              firstFailure =
+                error instanceof Error
+                  ? `${file.name}: ${error.message}`
+                  : `${file.name}: import failed`;
+            }
+          }
+        }
+
+        if (highlightedMemoryId !== undefined) {
+          setDetail(null);
+          dispatch({
+            type: "SHOW_KNOWLEDGE_BASE",
+            query: "",
+            highlightedMemoryId,
+          });
+          await loadLibrary("");
+        }
+
+        if (savedCount === 0 && duplicateCount === 0 && failedCount > 0) {
+          showToast({
+            tone: "error",
+            message: firstFailure ?? "File import failed.",
+          });
+          return;
+        }
+
+        showToast({
+          tone: failedCount > 0 || unsupportedCount > 0 ? "warning" : "success",
+          message: uploadSummaryMessage({
+            savedCount,
+            duplicateCount,
+            unsupportedCount,
+            failedCount,
+          }),
+        });
+      } finally {
+        dispatch({ type: "SET_LOADING", loading: false });
+      }
+    },
+    [loadLibrary, showToast],
+  );
 
   const searchSelection = React.useCallback(async () => {
     const selectedText = normalizeText(
@@ -3414,6 +3581,7 @@ function ClioContentApp() {
         onSavePage={() => void savePage()}
         onSaveSelection={() => void saveSelection()}
         onSaveSelectionFromHome={() => void saveSelectionFromAgentHome()}
+        onUploadKnowledgeFiles={(files) => void uploadKnowledgeFiles(files)}
         onSearchSelection={() => void searchSelection()}
         onAskSelection={askSelection}
         onNoteSelection={noteSelection}

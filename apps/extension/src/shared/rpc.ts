@@ -630,6 +630,22 @@ export interface CaptureBasePayload {
   metadata?: Record<string, unknown>;
 }
 
+export interface CaptureMarkdownPayload {
+  sourceUrl: string;
+  sourceTitle: string;
+  markdownText: string;
+  capturedAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CapturePdfPayload {
+  sourceUrl: string;
+  sourceTitle: string;
+  bytes: ArrayBuffer | Uint8Array;
+  capturedAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
 export interface CaptureSelectionPayload extends CaptureBasePayload {
   contextBefore?: string;
   contextAfter?: string;
@@ -1006,6 +1022,8 @@ export interface ActiveEmbeddingModelSummary {
 export type EngineRequest =
   | { kind: "health" }
   | { kind: "capturePage"; payload: CaptureBasePayload }
+  | { kind: "captureMarkdown"; payload: CaptureMarkdownPayload }
+  | { kind: "capturePdf"; payload: CapturePdfPayload }
   | { kind: "captureSelection"; payload: CaptureSelectionPayload }
   | { kind: "retrieveSources"; payload: RetrieveSourcesPayload }
   | { kind: "searchKnowledgeBase"; payload: SearchKnowledgeBasePayload }
@@ -1072,7 +1090,7 @@ export type EngineRequest =
 
 export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health" }
   ? EngineHealth
-  : T extends { kind: "capturePage" | "captureSelection" }
+  : T extends { kind: "capturePage" | "captureMarkdown" | "capturePdf" | "captureSelection" }
     ? CaptureResult
     : T extends { kind: "retrieveSources" }
       ? RetrieveSourcesResult
@@ -1783,6 +1801,10 @@ function isEngineRequest(value: unknown): value is EngineRequest {
       return true;
     case "capturePage":
       return isCapturePayload(value.payload);
+    case "captureMarkdown":
+      return isCaptureMarkdownPayload(value.payload);
+    case "capturePdf":
+      return isCapturePdfPayload(value.payload);
     case "captureSelection":
       return isCapturePayload(value.payload);
     case "retrieveSources":
@@ -1943,6 +1965,32 @@ function isCapturePayload(value: unknown): value is CaptureBasePayload {
     typeof value.sourceUrl === "string" &&
     typeof value.sourceTitle === "string" &&
     typeof value.normalizedText === "string"
+  );
+}
+
+function isCaptureMarkdownPayload(value: unknown): value is CaptureMarkdownPayload {
+  return (
+    isRecord(value) &&
+    typeof value.sourceUrl === "string" &&
+    typeof value.sourceTitle === "string" &&
+    typeof value.markdownText === "string"
+  );
+}
+
+function isCapturePdfPayload(value: unknown): value is CapturePdfPayload {
+  return (
+    isRecord(value) &&
+    typeof value.sourceUrl === "string" &&
+    typeof value.sourceTitle === "string" &&
+    isPdfBytes(value.bytes)
+  );
+}
+
+function isPdfBytes(value: unknown): value is ArrayBuffer | Uint8Array {
+  return (
+    value instanceof Uint8Array ||
+    value instanceof ArrayBuffer ||
+    Object.prototype.toString.call(value) === "[object ArrayBuffer]"
   );
 }
 

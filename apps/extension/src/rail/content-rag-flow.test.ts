@@ -6,6 +6,10 @@ const contentSource = readFileSync(
   fileURLToPath(new URL("../../entrypoints/content.tsx", import.meta.url)),
   "utf8",
 );
+const railShellSource = readFileSync(
+  fileURLToPath(new URL("./components/RailShell.tsx", import.meta.url)),
+  "utf8",
+);
 
 describe("content local RAG flow", () => {
   it("selects retrieval candidates before loading bounded evidence windows", () => {
@@ -54,6 +58,28 @@ describe("content local RAG flow", () => {
     expect(loadLibrarySection).toContain("toKnowledgeBaseSearchItem");
     expect(loadLibrarySection).not.toContain('kind: "searchMemory"');
     expect(loadLibrarySection).not.toContain('kind: "listMemories"');
+  });
+
+  it("routes Knowledge Base uploads through public file capture RPCs", () => {
+    const uploadSection = contentSource.slice(
+      contentSource.indexOf("const uploadKnowledgeFiles = React.useCallback"),
+      contentSource.indexOf("const searchSelection = React.useCallback"),
+    );
+    const knowledgePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function TopicKnowledgePanel"),
+    );
+
+    expect(uploadSection).toContain('kind: "capturePdf"');
+    expect(uploadSection).toContain('kind: "captureMarkdown"');
+    expect(uploadSection).toContain("file.arrayBuffer()");
+    expect(uploadSection).toContain("file.text()");
+    expect(uploadSection).not.toContain('kind: "capturePage"');
+    expect(knowledgePanelSection).toContain('type="file"');
+    expect(knowledgePanelSection).toContain(
+      'accept="application/pdf,text/markdown,.pdf,.md,.markdown"',
+    );
+    expect(knowledgePanelSection).toContain("props.onUploadKnowledgeFiles(files)");
   });
 
   it("keeps source context packs behind explicit research mode", () => {

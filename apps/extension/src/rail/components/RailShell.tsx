@@ -261,6 +261,7 @@ export interface RailShellProps {
   onSavePage: () => void;
   onSaveSelection: () => void;
   onSaveSelectionFromHome: () => void;
+  onUploadKnowledgeFiles: (files: File[]) => void;
   onSearchSelection: () => void;
   onSubmitDialogue: (content: string, attachment?: ComposerContextAttachmentKind) => void;
   onSwitchToLatestPage: () => void;
@@ -3849,10 +3850,19 @@ function embeddingProviderLabel(provider: EmbeddingProviderId) {
 
 function KnowledgeBasePanel(props: RailShellProps) {
   const [section, setSection] = React.useState<"memories" | "topics">("memories");
+  const uploadInputRef = React.useRef<HTMLInputElement | null>(null);
   const topicCountLabel =
     props.topicPages.length === 0 ? "No topic pages" : `${props.topicPages.length} topic pages`;
   const memoryCountLabel =
     props.items.length === 0 ? "Local memory" : `${props.items.length} local items`;
+  const handleUploadFiles = React.useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files ?? []);
+      event.target.value = "";
+      if (files.length > 0) props.onUploadKnowledgeFiles(files);
+    },
+    [props.onUploadKnowledgeFiles],
+  );
   return (
     <div className="relative z-10 flex min-h-0 flex-1 flex-col" data-clio-panel="knowledge-base">
       <div className="flex h-[62px] shrink-0 items-center justify-between border-b border-border px-5">
@@ -3914,7 +3924,15 @@ function KnowledgeBasePanel(props: RailShellProps) {
             Topics
           </button>
         </div>
-        <div className="grid grid-cols-2 gap-2">
+        <input
+          ref={uploadInputRef}
+          accept="application/pdf,text/markdown,.pdf,.md,.markdown"
+          className="hidden"
+          multiple
+          onChange={handleUploadFiles}
+          type="file"
+        />
+        <div className="grid grid-cols-3 gap-2">
           <Button
             className="border border-border bg-surface text-foreground hover:bg-muted"
             disabled={props.state.loading}
@@ -3932,6 +3950,15 @@ function KnowledgeBasePanel(props: RailShellProps) {
           >
             <BookmarkPlus size={15} />
             Save selection
+          </Button>
+          <Button
+            className="border border-border bg-surface text-foreground hover:bg-muted"
+            disabled={props.state.loading}
+            onClick={() => uploadInputRef.current?.click()}
+            variant="subtle"
+          >
+            <Upload size={15} />
+            Upload
           </Button>
         </div>
         {section === "topics" ? (
