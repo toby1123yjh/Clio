@@ -109,6 +109,32 @@ describe("local engine behavior harness", () => {
       ),
     ).toBe(true);
 
+    const methodNode = neighbors.nodes.find((node) => node.kind === "method");
+    expect(methodNode).toBeDefined();
+    const path = await harness.request({
+      kind: "queryGraphPath",
+      payload: {
+        from: { sourceId },
+        to: { nodeId: methodNode?.id ?? "" },
+        limit: 40,
+        maxDepth: 3,
+      },
+    });
+    expect(path.edges.length).toBeGreaterThan(0);
+    expect(path.nodes[0]?.kind).toBe("source");
+    expect(path.nodes[0]?.refId).toBe(sourceId);
+    expect(path.nodes[path.nodes.length - 1]?.id).toBe(methodNode?.id);
+    expect(path.evidence.some((anchor) => anchor.sourceId === sourceId)).toBe(true);
+
+    const timeline = await harness.request({
+      kind: "queryGraphTimeline",
+      payload: { sourceIds: [sourceId], kind: "method", order: "asc", limit: 20 },
+    });
+    expect(timeline.edges.length).toBeGreaterThan(0);
+    expect(timeline.edges.length).toBeLessThanOrEqual(20);
+    expect(timeline.nodes.some((node) => node.id === methodNode?.id)).toBe(true);
+    expect(timeline.evidence.some((anchor) => anchor.sourceId === sourceId)).toBe(true);
+
     const subgraph = await harness.request({
       kind: "queryGraphSubgraph",
       payload: { sourceIds: [sourceId], dimension: "domain", limit: 20 },

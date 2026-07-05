@@ -58,9 +58,13 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain('case "buildSourceGraph"');
     expect(workerSource).toContain('case "queryGraphNeighbors"');
     expect(workerSource).toContain('case "queryGraphSubgraph"');
+    expect(workerSource).toContain('case "queryGraphPath"');
+    expect(workerSource).toContain('case "queryGraphTimeline"');
     expect(workerSource).toContain("private async buildSourceGraph");
     expect(workerSource).toContain("private async queryGraphNeighbors");
     expect(workerSource).toContain("private async queryGraphSubgraph");
+    expect(workerSource).toContain("private async queryGraphPath");
+    expect(workerSource).toContain("private async queryGraphTimeline");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS graph_nodes");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS graph_edges");
     expect(workerSource).toContain(
@@ -79,6 +83,8 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("function buildDeterministicGraphForSource");
     expect(workerSource).toContain("function queryGraphNeighbors");
     expect(workerSource).toContain("function queryGraphSubgraph");
+    expect(workerSource).toContain("function queryGraphPath");
+    expect(workerSource).toContain("function queryGraphTimeline");
     expect(workerSource).not.toContain(
       "INSERT INTO topic_graph_edges (\n            id,\n            from_topic_id",
     );

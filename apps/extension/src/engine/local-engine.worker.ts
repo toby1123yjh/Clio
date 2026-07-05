@@ -40,8 +40,11 @@ import {
   type GraphNeighborsPayload,
   type GraphNode,
   type GraphNodeKind,
+  type GraphNodeRef,
+  type GraphPathPayload,
   type GraphQueryResult,
   type GraphSubgraphPayload,
+  type GraphTimelinePayload,
   type ImageGenerationHistoryRecord,
   type JobStatus,
   type JobSummary,
@@ -502,6 +505,10 @@ export class LocalEngine {
         return await this.queryGraphNeighbors(request.payload);
       case "queryGraphSubgraph":
         return await this.queryGraphSubgraph(request.payload);
+      case "queryGraphPath":
+        return await this.queryGraphPath(request.payload);
+      case "queryGraphTimeline":
+        return await this.queryGraphTimeline(request.payload);
       case "repair":
         return await this.repair(request.action);
       case "getActiveEmbeddingModel":
@@ -1810,6 +1817,16 @@ export class LocalEngine {
   private async queryGraphSubgraph(payload: GraphSubgraphPayload): Promise<GraphQueryResult> {
     const db = await this.ensureReady();
     return queryGraphSubgraph(db, payload);
+  }
+
+  private async queryGraphPath(payload: GraphPathPayload): Promise<GraphQueryResult> {
+    const db = await this.ensureReady();
+    return queryGraphPath(db, payload);
+  }
+
+  private async queryGraphTimeline(payload: GraphTimelinePayload): Promise<GraphQueryResult> {
+    const db = await this.ensureReady();
+    return queryGraphTimeline(db, payload);
   }
 
   private async repair(action: RepairAction): Promise<RepairResult> {
@@ -5842,30 +5859,132 @@ function queryGraphSubgraph(db: SqliteDb, payload: GraphSubgraphPayload): GraphQ
   };
 }
 
+interface GraphPathSearchState {
+  nodeId: string;
+  nodeIds: string[];
+  edgeIds: string[];
+}
+
+function queryGraphPath(db: SqliteDb, payload: GraphPathPayload): GraphQueryResult {
+  const startNodes = resolveGraphNodeRef(db, payload.from, 8);
+  const targetNodes = resolveGraphNodeRef(db, payload.to, 20);
+  if (startNodes.length === 0 || targetNodes.length === 0) return emptyGraphQueryResult();
+
+  const targetIds = new Set(targetNodes.map((node) => node.id));
+  const sameEndpointNodes = startNodes.filter((node) => targetIds.has(node.id));
+  if (sameEndpointNodes.length > 0) {
+    return { nodes: sameEndpointNodes, edges: [], evidence: [] };
+  }
+
+  const maxDepth = clampOptionalLimit(payload.maxDepth, 3, 4);
+  const limit = clampOptionalLimit(payload.limit, 80, 200);
+  const dimension = normalizeGraphDimension(payload.dimension);
+  const visitedNodeIds = new Set(startNodes.map((node) => node.id));
+  const edgesById = new Map<string, GraphEdge>();
+  let expandedEdgeCount = 0;
+  let frontier: GraphPathSearchState[] = startNodes.map((node) => ({
+    nodeId: node.id,
+    nodeIds: [node.id],
+    edgeIds: [],
+  }));
+
+  for (
+    let depth = 0;
+    depth < maxDepth && frontier.length > 0 && expandedEdgeCount < limit;
+    depth += 1
+  ) {
+    const nextFrontier: GraphPathSearchState[] = [];
+    for (const state of frontier) {
+      if (expandedEdgeCount >= limit) break;
+      const rows = loadGraphEdgesAdjacentToNodes(
+        db,
+        [state.nodeId],
+        dimension,
+        Math.min(40, limit - expandedEdgeCount),
+      );
+      for (const row of rows) {
+        if (expandedEdgeCount >= limit) break;
+        expandedEdgeCount += 1;
+        const edge = graphEdgeFromRow(row);
+        edgesById.set(edge.id, edge);
+        const nextNodeId =
+          edge.sourceNodeId === state.nodeId ? edge.targetNodeId : edge.sourceNodeId;
+        if (state.nodeIds.includes(nextNodeId)) continue;
+
+        const nextState: GraphPathSearchState = {
+          nodeId: nextNodeId,
+          nodeIds: [...state.nodeIds, nextNodeId],
+          edgeIds: [...state.edgeIds, edge.id],
+        };
+        if (targetIds.has(nextNodeId)) return graphPathResult(db, nextState, edgesById);
+        if (visitedNodeIds.has(nextNodeId)) continue;
+        visitedNodeIds.add(nextNodeId);
+        nextFrontier.push(nextState);
+      }
+    }
+    frontier = nextFrontier;
+  }
+
+  return emptyGraphQueryResult();
+}
+
+function queryGraphTimeline(db: SqliteDb, payload: GraphTimelinePayload): GraphQueryResult {
+  const limit = clampOptionalLimit(payload.limit, 80, 200);
+  const rows = loadGraphTimelineEdges(db, payload, limit);
+  const edges = rows.map(graphEdgeFromRow);
+  return {
+    nodes: loadGraphNodesForEdges(db, edges),
+    edges,
+    evidence: loadGraphEvidenceAnchors(db, edges),
+  };
+}
+
+function graphPathResult(
+  db: SqliteDb,
+  state: GraphPathSearchState,
+  edgesById: Map<string, GraphEdge>,
+): GraphQueryResult {
+  const edges = state.edgeIds.flatMap((edgeId) => {
+    const edge = edgesById.get(edgeId);
+    return edge === undefined ? [] : [edge];
+  });
+  return {
+    nodes: loadGraphNodesByIds(db, state.nodeIds),
+    edges,
+    evidence: loadGraphEvidenceAnchors(db, edges),
+  };
+}
+
 function resolveGraphStartNodes(db: SqliteDb, payload: GraphNeighborsPayload): GraphNode[] {
-  if (payload.nodeId !== undefined) {
-    const node = loadGraphNode(db, normalizeText(payload.nodeId));
+  return resolveGraphNodeRef(db, payload, 20);
+}
+
+function resolveGraphNodeRef(db: SqliteDb, ref: GraphNodeRef, maxRows: number): GraphNode[] {
+  const limit = clampLimit(maxRows, 80);
+  if (ref.nodeId !== undefined) {
+    const node = loadGraphNode(db, normalizeText(ref.nodeId));
     return node === undefined ? [] : [node];
   }
-  if (payload.sourceId !== undefined) {
+  if (ref.sourceId !== undefined) {
     const rows = db.selectObjects(
-      "SELECT * FROM graph_nodes WHERE kind = 'source' AND ref_id = ? ORDER BY updated_at DESC LIMIT 5",
-      [normalizeText(payload.sourceId)],
+      "SELECT * FROM graph_nodes WHERE kind = 'source' AND ref_id = ? ORDER BY updated_at DESC LIMIT ?",
+      [normalizeText(ref.sourceId), limit],
     );
     return rows.map(graphNodeFromRow);
   }
-  if (payload.canonicalId !== undefined) {
-    const canonicalId = normalizeText(payload.canonicalId);
-    const kind = normalizeGraphNodeKind(payload.kind);
+  if (ref.canonicalId !== undefined) {
+    const canonicalId = normalizeText(ref.canonicalId);
+    if (canonicalId.length === 0) return [];
+    const kind = normalizeGraphNodeKind(ref.kind);
     const rows =
       kind === undefined
         ? db.selectObjects(
-            "SELECT * FROM graph_nodes WHERE canonical_id = ? ORDER BY updated_at DESC LIMIT 20",
-            [canonicalId],
+            "SELECT * FROM graph_nodes WHERE canonical_id = ? ORDER BY updated_at DESC LIMIT ?",
+            [canonicalId, limit],
           )
         : db.selectObjects(
-            "SELECT * FROM graph_nodes WHERE kind = ? AND canonical_id = ? ORDER BY updated_at DESC LIMIT 20",
-            [kind, canonicalId],
+            "SELECT * FROM graph_nodes WHERE kind = ? AND canonical_id = ? ORDER BY updated_at DESC LIMIT ?",
+            [kind, canonicalId, limit],
           );
     return rows.map(graphNodeFromRow);
   }
@@ -5924,16 +6043,7 @@ function loadGraphEdgesForSources(
   dimension: GraphEdgeDimension | undefined,
   limit: number,
 ) {
-  const sourceNodes = db.selectObjects(
-    `SELECT id
-     FROM graph_nodes
-     WHERE kind = 'source'
-       AND ref_id IN (${sourceIds.map(() => "?").join(", ")})`,
-    sourceIds,
-  );
-  const sourceNodeIds = sourceNodes
-    .map((row) => stringField(row, "id"))
-    .filter((id) => id.length > 0);
+  const sourceNodeIds = loadGraphSourceNodeIds(db, sourceIds, 80);
   const nodeSql =
     sourceNodeIds.length === 0
       ? ""
@@ -5957,9 +6067,120 @@ function loadGraphEdgesForSources(
   );
 }
 
+function loadGraphTimelineEdges(
+  db: SqliteDb,
+  payload: GraphTimelinePayload,
+  limit: number,
+): SqlRow[] {
+  const sourceIds = boundedUniqueStrings(payload.sourceIds, 40);
+  const sourceNodeIds = sourceIds.length > 0 ? loadGraphSourceNodeIds(db, sourceIds, 80) : [];
+  const timelineNodeIds = resolveGraphTimelineNodeIds(db, payload);
+  if (timelineNodeIds !== undefined && timelineNodeIds.length === 0) return [];
+
+  const conditions: string[] = [];
+  const bind: unknown[] = [];
+  if (sourceIds.length > 0) {
+    const sourceConditions = [`evidence_source_id IN (${sourceIds.map(() => "?").join(", ")})`];
+    bind.push(...sourceIds);
+    if (sourceNodeIds.length > 0) {
+      sourceConditions.push(`source_node_id IN (${sourceNodeIds.map(() => "?").join(", ")})`);
+      sourceConditions.push(`target_node_id IN (${sourceNodeIds.map(() => "?").join(", ")})`);
+      bind.push(...sourceNodeIds, ...sourceNodeIds);
+    }
+    conditions.push(`(${sourceConditions.join(" OR ")})`);
+  }
+  if (timelineNodeIds !== undefined) {
+    conditions.push(
+      `(source_node_id IN (${timelineNodeIds.map(() => "?").join(", ")})
+        OR target_node_id IN (${timelineNodeIds.map(() => "?").join(", ")}))`,
+    );
+    bind.push(...timelineNodeIds, ...timelineNodeIds);
+  }
+
+  const dimension = normalizeGraphDimension(payload.dimension);
+  if (dimension !== undefined) {
+    conditions.push("dimension = ?");
+    bind.push(dimension);
+  }
+
+  const whereSql = conditions.length === 0 ? "" : `WHERE ${conditions.join(" AND ")}`;
+  const orderSql = payload.order === "asc" ? "ASC" : "DESC";
+  return db.selectObjects(
+    `SELECT *
+     FROM graph_edges
+     ${whereSql}
+     ORDER BY created_at ${orderSql}, weight DESC
+     LIMIT ?`,
+    [...bind, limit],
+  );
+}
+
+function resolveGraphTimelineNodeIds(
+  db: SqliteDb,
+  payload: GraphTimelinePayload,
+): string[] | undefined {
+  const kind = normalizeGraphNodeKind(payload.kind);
+  const canonicalId =
+    payload.canonicalId === undefined ? undefined : normalizeText(payload.canonicalId);
+  if (payload.kind === undefined && canonicalId === undefined) return undefined;
+  if (payload.kind !== undefined && kind === undefined) return [];
+  if (canonicalId !== undefined && canonicalId.length === 0) return [];
+
+  const conditions: string[] = [];
+  const bind: unknown[] = [];
+  if (kind !== undefined) {
+    conditions.push("kind = ?");
+    bind.push(kind);
+  }
+  if (canonicalId !== undefined) {
+    conditions.push("canonical_id = ?");
+    bind.push(canonicalId);
+  }
+  const rows = db.selectObjects(
+    `SELECT id
+     FROM graph_nodes
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY updated_at DESC
+     LIMIT ?`,
+    [...bind, 80],
+  );
+  return rows.map((row) => stringField(row, "id")).filter((id) => id.length > 0);
+}
+
+function loadGraphSourceNodeIds(db: SqliteDb, sourceIds: string[], maxRows: number) {
+  const boundedSourceIds = boundedUniqueStrings(sourceIds, maxRows);
+  if (boundedSourceIds.length === 0) return [];
+  const rows = db.selectObjects(
+    `SELECT id
+     FROM graph_nodes
+     WHERE kind = 'source'
+       AND ref_id IN (${boundedSourceIds.map(() => "?").join(", ")})
+     ORDER BY updated_at DESC
+     LIMIT ?`,
+    [...boundedSourceIds, clampLimit(maxRows, 120)],
+  );
+  return rows.map((row) => stringField(row, "id")).filter((id) => id.length > 0);
+}
+
 function loadGraphNode(db: SqliteDb, nodeId: string): GraphNode | undefined {
   const row = db.selectObject("SELECT * FROM graph_nodes WHERE id = ? LIMIT 1", [nodeId]);
   return row === undefined ? undefined : graphNodeFromRow(row);
+}
+
+function loadGraphNodesByIds(db: SqliteDb, nodeIds: string[]) {
+  const boundedNodeIds = boundedUniqueStrings(nodeIds, 240);
+  if (boundedNodeIds.length === 0) return [];
+  const rows = db.selectObjects(
+    `SELECT *
+     FROM graph_nodes
+     WHERE id IN (${boundedNodeIds.map(() => "?").join(", ")})`,
+    boundedNodeIds,
+  );
+  const nodesById = new Map(rows.map((row) => [stringField(row, "id"), graphNodeFromRow(row)]));
+  return boundedNodeIds.flatMap((nodeId) => {
+    const node = nodesById.get(nodeId);
+    return node === undefined ? [] : [node];
+  });
 }
 
 function loadGraphNodesForEdges(db: SqliteDb, edges: GraphEdge[]) {

@@ -592,6 +592,30 @@ export interface GraphSubgraphPayload {
   limit?: number;
 }
 
+export interface GraphNodeRef {
+  nodeId?: string;
+  sourceId?: string;
+  canonicalId?: string;
+  kind?: GraphNodeKind;
+}
+
+export interface GraphPathPayload {
+  from: GraphNodeRef;
+  to: GraphNodeRef;
+  dimension?: GraphEdgeDimension;
+  maxDepth?: number;
+  limit?: number;
+}
+
+export interface GraphTimelinePayload {
+  sourceIds?: string[];
+  canonicalId?: string;
+  kind?: GraphNodeKind;
+  dimension?: GraphEdgeDimension;
+  limit?: number;
+  order?: "asc" | "desc";
+}
+
 export interface GraphQueryResult {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -1014,6 +1038,8 @@ export type EngineRequest =
   | { kind: "buildSourceGraph"; payload: BuildSourceGraphPayload }
   | { kind: "queryGraphNeighbors"; payload: GraphNeighborsPayload }
   | { kind: "queryGraphSubgraph"; payload: GraphSubgraphPayload }
+  | { kind: "queryGraphPath"; payload: GraphPathPayload }
+  | { kind: "queryGraphTimeline"; payload: GraphTimelinePayload }
   | { kind: "repair"; action: RepairAction }
   | { kind: "getActiveEmbeddingModel" }
   | { kind: "getJobStatus"; status?: JobStatus; limit?: number }
@@ -1105,7 +1131,9 @@ export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health
                                                 : T extends {
                                                       kind:
                                                         | "queryGraphNeighbors"
-                                                        | "queryGraphSubgraph";
+                                                        | "queryGraphSubgraph"
+                                                        | "queryGraphPath"
+                                                        | "queryGraphTimeline";
                                                     }
                                                   ? GraphQueryResult
                                                   : T extends { kind: "repair" }
@@ -1835,6 +1863,10 @@ function isEngineRequest(value: unknown): value is EngineRequest {
       return isGraphNeighborsPayload(value.payload);
     case "queryGraphSubgraph":
       return isGraphSubgraphPayload(value.payload);
+    case "queryGraphPath":
+      return isGraphPathPayload(value.payload);
+    case "queryGraphTimeline":
+      return isGraphTimelinePayload(value.payload);
     case "repair":
       return isRepairAction(value.action);
     case "getActiveEmbeddingModel":
@@ -2158,6 +2190,46 @@ function isGraphSubgraphPayload(value: unknown): value is GraphSubgraphPayload {
         value.sourceIds.every((item) => typeof item === "string"))) &&
     (value.dimension === undefined || isGraphEdgeDimension(value.dimension)) &&
     (value.limit === undefined || typeof value.limit === "number")
+  );
+}
+
+function isGraphNodeRef(value: unknown): value is GraphNodeRef {
+  if (!isRecord(value)) return false;
+  const hasLocator =
+    typeof value.nodeId === "string" ||
+    typeof value.sourceId === "string" ||
+    typeof value.canonicalId === "string";
+  return (
+    hasLocator &&
+    (value.nodeId === undefined || typeof value.nodeId === "string") &&
+    (value.sourceId === undefined || typeof value.sourceId === "string") &&
+    (value.canonicalId === undefined || typeof value.canonicalId === "string") &&
+    (value.kind === undefined || isGraphNodeKind(value.kind))
+  );
+}
+
+function isGraphPathPayload(value: unknown): value is GraphPathPayload {
+  return (
+    isRecord(value) &&
+    isGraphNodeRef(value.from) &&
+    isGraphNodeRef(value.to) &&
+    (value.dimension === undefined || isGraphEdgeDimension(value.dimension)) &&
+    (value.maxDepth === undefined || typeof value.maxDepth === "number") &&
+    (value.limit === undefined || typeof value.limit === "number")
+  );
+}
+
+function isGraphTimelinePayload(value: unknown): value is GraphTimelinePayload {
+  return (
+    isRecord(value) &&
+    (value.sourceIds === undefined ||
+      (Array.isArray(value.sourceIds) &&
+        value.sourceIds.every((item) => typeof item === "string"))) &&
+    (value.canonicalId === undefined || typeof value.canonicalId === "string") &&
+    (value.kind === undefined || isGraphNodeKind(value.kind)) &&
+    (value.dimension === undefined || isGraphEdgeDimension(value.dimension)) &&
+    (value.limit === undefined || typeof value.limit === "number") &&
+    (value.order === undefined || value.order === "asc" || value.order === "desc")
   );
 }
 

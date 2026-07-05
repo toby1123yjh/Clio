@@ -294,6 +294,38 @@ describe("session engine RPC guards", () => {
         },
       }),
     ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphPath",
+          payload: {
+            from: { sourceId: "source-1" },
+            to: { canonicalId: "method:retrieval", kind: "method" },
+            dimension: "technical",
+            maxDepth: 3,
+            limit: 80,
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphTimeline",
+          payload: {
+            sourceIds: ["source-1", "source-2"],
+            kind: "method",
+            dimension: "domain",
+            order: "asc",
+            limit: 80,
+          },
+        },
+      }),
+    ).toBe(true);
   });
 
   it("rejects invalid graph build and query payloads", () => {
@@ -333,6 +365,36 @@ describe("session engine RPC guards", () => {
         request: {
           kind: "queryGraphSubgraph",
           payload: { sourceIds: ["source-1", 42] },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphPath",
+          payload: { from: {}, to: { sourceId: "source-1" } },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphPath",
+          payload: { from: { sourceId: "source-1" }, to: { canonicalId: "x" }, maxDepth: "3" },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "queryGraphTimeline",
+          payload: { sourceIds: ["source-1"], order: "latest" },
         },
       }),
     ).toBe(false);
