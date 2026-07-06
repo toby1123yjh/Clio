@@ -34,8 +34,28 @@ export interface ProviderContext {
   evidence: EvidenceItem[];
 }
 
+export type SourceContextPackMode = "research" | "auto";
+
+export type SourceContextPlannerKind = "source_context_planner_v1";
+
+export interface SourceContextPackMapReduceOptions {
+  enabled: boolean;
+  maxGroups?: number;
+  perGroupTokenBudget?: number;
+}
+
 export interface SourceContextPackRequestOptions {
-  mode: "research";
+  mode: SourceContextPackMode;
+  planner?: SourceContextPlannerKind;
+  triggerReason?: string;
+  maxTotalTokens?: number;
+  maxGroups?: number;
+  maxGroupTokens?: number;
+  maxSources?: number;
+  maxWindowsPerSource?: number;
+  contextChunksBefore?: number;
+  contextChunksAfter?: number;
+  mapReduce?: SourceContextPackMapReduceOptions;
 }
 
 export interface AgentChatRequest {

@@ -82,7 +82,11 @@ describe("content local RAG flow", () => {
     expect(knowledgePanelSection).toContain("props.onUploadKnowledgeFiles(files)");
   });
 
-  it("keeps source context packs behind explicit research mode", () => {
+  it("plans source context packs through controlled auto or explicit research mode", () => {
+    const planSection = contentSource.slice(
+      contentSource.indexOf("function planDefaultSourceContextPack"),
+      contentSource.indexOf("function buildAttachedEvidence"),
+    );
     const startRunSection = contentSource.slice(
       contentSource.indexOf("const startAgentRun = React.useCallback"),
       contentSource.indexOf("const handleCancelDialogue = React.useCallback"),
@@ -92,11 +96,17 @@ describe("content local RAG flow", () => {
       contentSource.indexOf("const handleExecuteCommand = React.useCallback"),
     );
 
-    expect(startRunSection).toContain(
-      'scope === "general" && options.sourceContextPack === undefined',
-    );
-    expect(startRunSection).toContain("sourceContextPack: options.sourceContextPack");
-    expect(slashSection).toContain('sourceContextPack: { mode: "research" }');
+    expect(planSection).toContain("planLocalRagRetrieval(normalizedQuery)");
+    expect(planSection).toContain("defaultSourceContextPackIntentNeedles");
+    expect(planSection).toContain('mode: "auto"');
+    expect(planSection).toContain('planner: "source_context_planner_v1"');
+    expect(planSection).toContain("sourceContextPackAutoBudgetDefaults");
+    expect(startRunSection).toContain("const effectiveSourceContextPack");
+    expect(startRunSection).toContain("planDefaultSourceContextPack(providerQuestion)");
+    expect(startRunSection).toContain("effectiveSourceContextPack === undefined");
+    expect(startRunSection).toContain("sourceContextPack: effectiveSourceContextPack");
+    expect(slashSection).toContain('mode: "research"');
+    expect(slashSection).toContain("sourceContextPackResearchBudgetDefaults");
     expect(slashSection).toContain("research: handleResearchCommand");
     expect(startRunSection).not.toContain('kind: "buildSourceContextPack"');
   });

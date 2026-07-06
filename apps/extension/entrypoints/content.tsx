@@ -32,6 +32,10 @@ import type {
   SearchProviderSettings,
 } from "@/src/agent-runtime/search-provider-settings";
 import {
+  sourceContextPackAutoBudgetDefaults,
+  sourceContextPackResearchBudgetDefaults,
+} from "@/src/agent-runtime/source-context-pack-options";
+import {
   type AgentStreamController,
   openAgentStream,
   openManualCompactStream,
@@ -189,6 +193,35 @@ import { createRoot } from "react-dom/client";
 
 const commandEventName = "clio:content-command";
 const relatedSearchLimit = 12;
+const defaultSourceContextPackIntentNeedles = [
+  "research",
+  "paper",
+  "papers",
+  "compare",
+  "comparison",
+  "synthesize",
+  "synthesis",
+  "literature",
+  "method",
+  "methods",
+  "evidence",
+  "knowledge base",
+  "knowledge-base",
+  "source context",
+  "long context",
+  "\u77e5\u8bc6\u5e93",
+  "\u8bba\u6587",
+  "\u5bf9\u6bd4",
+  "\u7efc\u8ff0",
+  "\u5206\u6790",
+  "\u8bc1\u636e",
+  "\u6587\u732e",
+  "\u65b9\u6cd5",
+  "\u79d1\u7814",
+  "\u7814\u7a76",
+  "\u957f\u6587",
+  "\u8d44\u6599\u5e93",
+] as const;
 
 interface WebSearchViewState {
   running: boolean;
@@ -625,6 +658,28 @@ async function loadMultiSourceRagEvidencePack(query: string): Promise<MultiSourc
     },
     localEvidence,
   });
+}
+
+function planDefaultSourceContextPack(
+  query: string,
+): AgentChatRequest["sourceContextPack"] | undefined {
+  const normalizedQuery = normalizeText(query);
+  if (!planLocalRagRetrieval(normalizedQuery).shouldRetrieve) return undefined;
+  const lowerQuery = normalizedQuery.toLowerCase();
+  if (!defaultSourceContextPackIntentNeedles.some((needle) => lowerQuery.includes(needle))) {
+    return undefined;
+  }
+  return {
+    mode: "auto",
+    planner: "source_context_planner_v1",
+    triggerReason: "default_chat_long_context_intent",
+    ...sourceContextPackAutoBudgetDefaults,
+    mapReduce: {
+      enabled: true,
+      maxGroups: sourceContextPackAutoBudgetDefaults.maxGroups,
+      perGroupTokenBudget: sourceContextPackAutoBudgetDefaults.maxGroupTokens,
+    },
+  };
 }
 
 function buildAttachedEvidence(
@@ -2967,6 +3022,9 @@ function ClioContentApp() {
       const skillRequest = buildSkillRequestDisplay({ content, attachmentKind, skillMode });
       const providerQuestion = buildSkillQuestion({ content, attachmentKind, skillMode });
       const displayContent = buildDisplayContent({ content, attachmentKind, skillMode });
+      const effectiveSourceContextPack =
+        options.sourceContextPack ??
+        (scope === "general" ? planDefaultSourceContextPack(providerQuestion) : undefined);
       if (activeAgentStreamRef.current === null && hasUnresolvedInterruptedAnswer(railState)) {
         showToast({ tone: "warning", message: "Use Retry, Stop, or Clear before continuing." });
         return;
@@ -3010,9 +3068,9 @@ function ClioContentApp() {
             selectionText: attachmentKind === "selection" ? selectionSnapshot?.text : undefined,
             attachedEvidence,
             skillRequest,
-            ...(options.sourceContextPack === undefined
+            ...(effectiveSourceContextPack === undefined
               ? {}
-              : { sourceContextPack: options.sourceContextPack }),
+              : { sourceContextPack: effectiveSourceContextPack }),
             createdAt: now,
             runId,
           });
@@ -3047,7 +3105,7 @@ function ClioContentApp() {
       const targetSessionId = existingSession === null ? undefined : sessionId;
       const previousEvidence = existingSession?.evidence.map(evidenceRecordToAgentEvidence) ?? [];
       const multiSourceRag =
-        scope === "general" && options.sourceContextPack === undefined
+        scope === "general" && effectiveSourceContextPack === undefined
           ? await loadMultiSourceRagEvidencePack(providerQuestion)
           : undefined;
       const localRagEvidence = multiSourceRag?.evidence ?? [];
@@ -3071,9 +3129,9 @@ function ClioContentApp() {
           evidence,
           attachedEvidence,
           skillRequest,
-          ...(options.sourceContextPack === undefined
+          ...(effectiveSourceContextPack === undefined
             ? {}
-            : { sourceContextPack: options.sourceContextPack }),
+            : { sourceContextPack: effectiveSourceContextPack }),
           createdAt: now,
           runId,
         });
@@ -3108,9 +3166,9 @@ function ClioContentApp() {
         pageTitle: pageContext.title,
         evidence,
         currentTurnEvidenceRefs: turn.evidenceRecord === undefined ? [] : [turn.evidenceRecord.id],
-        ...(options.sourceContextPack === undefined
+        ...(effectiveSourceContextPack === undefined
           ? {}
-          : { sourceContextPack: options.sourceContextPack }),
+          : { sourceContextPack: effectiveSourceContextPack }),
         createdAt: now,
       };
 
@@ -3166,7 +3224,16 @@ function ClioContentApp() {
         return;
       }
       void startAgentRun(normalizedQuestion, undefined, "general", undefined, {
-        sourceContextPack: { mode: "research" },
+        sourceContextPack: {
+          mode: "research",
+          planner: "source_context_planner_v1",
+          ...sourceContextPackResearchBudgetDefaults,
+          mapReduce: {
+            enabled: true,
+            maxGroups: sourceContextPackResearchBudgetDefaults.maxGroups,
+            perGroupTokenBudget: sourceContextPackResearchBudgetDefaults.maxGroupTokens,
+          },
+        },
       });
     },
     [startAgentRun],

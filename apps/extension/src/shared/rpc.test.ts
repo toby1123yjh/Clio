@@ -647,7 +647,23 @@ describe("session engine RPC guards", () => {
             pageTitle: "Example",
             evidence: [],
             currentTurnEvidenceRefs: ["ev-1"],
-            sourceContextPack: { mode: "research" },
+            sourceContextPack: {
+              mode: "research",
+              planner: "source_context_planner_v1",
+              triggerReason: "explicit_research_command",
+              maxTotalTokens: 10_000,
+              maxGroups: 3,
+              maxGroupTokens: 4_000,
+              maxSources: 8,
+              maxWindowsPerSource: 2,
+              contextChunksBefore: 1,
+              contextChunksAfter: 1,
+              mapReduce: {
+                enabled: true,
+                maxGroups: 3,
+                perGroupTokenBudget: 4_000,
+              },
+            },
             createdAt: "2026-05-22T00:00:00.000Z",
           },
         },
@@ -666,7 +682,61 @@ describe("session engine RPC guards", () => {
             pageUrl: "https://example.com/a",
             pageTitle: "Example",
             evidence: [],
-            sourceContextPack: { mode: "auto" },
+            sourceContextPack: {
+              mode: "auto",
+              planner: "source_context_planner_v1",
+              triggerReason: "default_chat_long_context_intent",
+              maxTotalTokens: 6_000,
+              maxGroups: 2,
+              maxGroupTokens: 3_000,
+              maxSources: 4,
+              maxWindowsPerSource: 2,
+              contextChunksBefore: 1,
+              contextChunksAfter: 1,
+              mapReduce: {
+                enabled: true,
+                maxGroups: 2,
+                perGroupTokenBudget: 3_000,
+              },
+            },
+            createdAt: "2026-05-22T00:00:00.000Z",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isAgentRunRequestMessage({
+        type: CLIO_AGENT_RUN_REQUEST,
+        request: {
+          kind: "start",
+          request: {
+            runId: "run-1",
+            question: "Explain persistence",
+            scope: "general",
+            pageUrl: "https://example.com/a",
+            pageTitle: "Example",
+            evidence: [],
+            sourceContextPack: { mode: "automatic" },
+            createdAt: "2026-05-22T00:00:00.000Z",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isAgentRunRequestMessage({
+        type: CLIO_AGENT_RUN_REQUEST,
+        request: {
+          kind: "start",
+          request: {
+            runId: "run-1",
+            question: "Explain persistence",
+            scope: "general",
+            pageUrl: "https://example.com/a",
+            pageTitle: "Example",
+            evidence: [],
+            sourceContextPack: { mode: "auto", maxTotalTokens: "6000" },
             createdAt: "2026-05-22T00:00:00.000Z",
           },
         },

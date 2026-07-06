@@ -16,6 +16,7 @@ import type {
   SearchProviderId,
   SearchProviderSettings,
 } from "@/src/agent-runtime/search-provider-settings";
+import { isSourceContextPackRequestOptions } from "@/src/agent-runtime/source-context-pack-options";
 import type {
   AgentChatRequest,
   AgentErrorInfo,
@@ -2641,10 +2642,6 @@ function isAgentChatRequest(value: unknown): value is AgentChatRequest {
     (value.assistantMessageId === undefined || typeof value.assistantMessageId === "string") &&
     (value.evidenceRevision === undefined || typeof value.evidenceRevision === "number")
   );
-}
-
-function isSourceContextPackRequestOptions(value: unknown) {
-  return isRecord(value) && value.mode === "research";
 }
 
 function isProviderContext(value: unknown) {

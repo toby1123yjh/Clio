@@ -1,4 +1,5 @@
 import type {
+  BuildSourceContextPackPayload,
   ChatMessageRecord,
   ChatSessionDetail,
   CompactionRecord,
@@ -13,6 +14,11 @@ import {
   buildRequestWithProviderContext,
   estimateProviderContextTokens,
 } from "./compaction-context";
+import {
+  readSourceContextPackRequestOptions,
+  sourceContextPackAutoBudgetDefaults,
+  sourceContextPackResearchBudgetDefaults,
+} from "./source-context-pack-options";
 import type {
   AgentChatRequest,
   AgentStreamEvent,
@@ -21,16 +27,6 @@ import type {
   IAgentRuntime,
   LocalCitation,
 } from "./types";
-
-const sourceContextPackPayloadDefaults = {
-  maxTotalTokens: 10_000,
-  maxGroups: 3,
-  maxGroupTokens: 4_000,
-  maxSources: 8,
-  maxWindowsPerSource: 2,
-  contextChunksBefore: 1,
-  contextChunksAfter: 1,
-} as const;
 
 export interface AgentRunHostOptions {
   runtime: IAgentRuntime;
@@ -316,7 +312,8 @@ export class AgentRunHost {
   }
 
   private async buildSourceContextPackRequest(run: HostedAgentRun): Promise<AgentChatRequest> {
-    if (run.request.sourceContextPack?.mode !== "research") return run.request;
+    const sourceContextPackOptions = run.request.sourceContextPack;
+    if (sourceContextPackOptions === undefined) return run.request;
 
     this.emitEvent({
       type: "runtime_status",
@@ -328,11 +325,7 @@ export class AgentRunHost {
     try {
       const pack = await this.requestEngine<SourceContextPackResult>({
         kind: "buildSourceContextPack",
-        payload: {
-          query: run.request.question,
-          useWorkingSet: true,
-          ...sourceContextPackPayloadDefaults,
-        },
+        payload: sourceContextPackPayload(run.request),
       });
       const packEvidence = sourceContextPackToEvidence(pack);
       if (packEvidence.length === 0) {
@@ -349,6 +342,13 @@ export class AgentRunHost {
         runId: run.request.runId,
         message: sourceContextPackStatusMessage(pack, packEvidence.length),
       });
+      if (sourceContextPackOptions.mapReduce?.enabled === true) {
+        this.emitEvent({
+          type: "runtime_status",
+          runId: run.request.runId,
+          message: sourceContextPackMapReducePlanMessage(pack, sourceContextPackOptions),
+        });
+      }
 
       return {
         ...run.request,
@@ -746,6 +746,28 @@ function citationEvidenceForRequest(request: AgentChatRequest) {
   return request.providerContext?.evidence ?? request.evidence;
 }
 
+function sourceContextPackPayload(request: AgentChatRequest): BuildSourceContextPackPayload {
+  const options = request.sourceContextPack;
+  const defaults = sourceContextPackBudgetDefaults(options);
+  return {
+    query: request.question,
+    useWorkingSet: true,
+    maxTotalTokens: options?.maxTotalTokens ?? defaults.maxTotalTokens,
+    maxGroups: options?.maxGroups ?? defaults.maxGroups,
+    maxGroupTokens: options?.maxGroupTokens ?? defaults.maxGroupTokens,
+    maxSources: options?.maxSources ?? defaults.maxSources,
+    maxWindowsPerSource: options?.maxWindowsPerSource ?? defaults.maxWindowsPerSource,
+    contextChunksBefore: options?.contextChunksBefore ?? defaults.contextChunksBefore,
+    contextChunksAfter: options?.contextChunksAfter ?? defaults.contextChunksAfter,
+  };
+}
+
+function sourceContextPackBudgetDefaults(options: AgentChatRequest["sourceContextPack"]) {
+  return options?.mode === "auto"
+    ? sourceContextPackAutoBudgetDefaults
+    : sourceContextPackResearchBudgetDefaults;
+}
+
 function sourceContextPackToEvidence(pack: SourceContextPackResult): EvidenceItem[] {
   const seen = new Set<string>();
   return pack.groups.flatMap((group) =>
@@ -806,6 +828,25 @@ function sourceContextPackStatusMessage(pack: SourceContextPackResult, evidenceC
   return `${prefix}; groups ${groupIds}; depths ${depths}; adjusted ${reasons}.`;
 }
 
+function sourceContextPackMapReducePlanMessage(
+  pack: SourceContextPackResult,
+  options: NonNullable<AgentChatRequest["sourceContextPack"]>,
+) {
+  const defaults = sourceContextPackBudgetDefaults(options);
+  const groupLimit = options.mapReduce?.maxGroups ?? options.maxGroups ?? defaults.maxGroups;
+  const tokenBudget =
+    options.mapReduce?.perGroupTokenBudget ?? options.maxGroupTokens ?? defaults.maxGroupTokens;
+  const groupSummaries = pack.groups
+    .slice(0, groupLimit)
+    .map(
+      (group) =>
+        `${group.id || "group"}: ${group.sourceIds.length} source(s), ` +
+        `${group.tokenEstimate} token(s), ${group.windows.length} window(s)`,
+    );
+  const suffix = groupSummaries.length === 0 ? "no groups" : groupSummaries.join("; ");
+  return `Map-reduce plan: ${pack.groups.length} group(s), ${tokenBudget} token(s)/group; ${suffix}.`;
+}
+
 function sourceContextPackGroupIdSummary(pack: SourceContextPackResult) {
   const groupIds = pack.groups.map((group) => group.id).filter((id) => id.length > 0);
   if (groupIds.length === 0) return "none";
@@ -853,9 +894,7 @@ function providerQuestionFromMessage(message: ChatMessageRecord) {
 function sourceContextPackFromMessage(
   message: ChatMessageRecord,
 ): AgentChatRequest["sourceContextPack"] | undefined {
-  const value = message.piAgentMessageJson?.clioSourceContextPack;
-  if (!isRecord(value) || value.mode !== "research") return undefined;
-  return { mode: "research" };
+  return readSourceContextPackRequestOptions(message.piAgentMessageJson?.clioSourceContextPack);
 }
 
 function sessionEvidenceToAgentEvidence(record: SessionEvidenceRecord): EvidenceItem {
@@ -876,8 +915,4 @@ function isTerminalAgentEvent(event: AgentStreamEvent) {
     event.type === "run_cancelled" ||
     event.type === "run_resolved"
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

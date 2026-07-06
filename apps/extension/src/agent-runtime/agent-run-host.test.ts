@@ -106,6 +106,24 @@ const emptySourceContextPack = {
   },
 } satisfies SourceContextPackResult;
 
+const queuedSourceContextPack = {
+  mode: "auto",
+  planner: "source_context_planner_v1",
+  triggerReason: "default_chat_long_context_intent",
+  maxTotalTokens: 6_000,
+  maxGroups: 2,
+  maxGroupTokens: 3_000,
+  maxSources: 4,
+  maxWindowsPerSource: 2,
+  contextChunksBefore: 1,
+  contextChunksAfter: 1,
+  mapReduce: {
+    enabled: true,
+    maxGroups: 2,
+    perGroupTokenBudget: 3_000,
+  },
+} satisfies NonNullable<AgentChatRequest["sourceContextPack"]>;
+
 function runtimeFrom(events: AgentStreamEvent[]): IAgentRuntime {
   return {
     streamChat: async function* () {
@@ -339,6 +357,10 @@ describe("AgentRunHost", () => {
         payload: expect.objectContaining({
           query: "Explain persistence",
           useWorkingSet: true,
+          maxTotalTokens: 10_000,
+          maxGroups: 3,
+          maxGroupTokens: 4_000,
+          maxSources: 8,
           maxWindowsPerSource: 2,
           contextChunksBefore: 1,
           contextChunksAfter: 1,
@@ -366,6 +388,128 @@ describe("AgentRunHost", () => {
         memoryEvidenceCount: 1,
       },
     });
+  });
+
+  it("builds source context pack evidence for controlled auto runs", async () => {
+    const calls: EngineRequest[] = [];
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          providerRequests.push(agentRequest);
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
+        if (engineRequest.kind === "buildSourceContextPack") return sourceContextPack as T;
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: {
+          mode: "auto",
+          planner: "source_context_planner_v1",
+          triggerReason: "default_chat_long_context_intent",
+          mapReduce: { enabled: true },
+        },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(calls).toContainEqual(
+      expect.objectContaining({
+        kind: "buildSourceContextPack",
+        payload: expect.objectContaining({
+          query: "Explain persistence",
+          useWorkingSet: true,
+          maxTotalTokens: 6_000,
+          maxGroups: 2,
+          maxGroupTokens: 3_000,
+          maxSources: 4,
+          maxWindowsPerSource: 2,
+          contextChunksBefore: 1,
+          contextChunksAfter: 1,
+        }),
+      }),
+    );
+    expect(providerRequests[0]?.evidence).toEqual([
+      expect.objectContaining({
+        id: "memory:source-1:chunk:chunk-1",
+        sourceKind: "memory",
+        sourceTitle: "Persistence Paper",
+        text: "Bounded source context text.",
+      }),
+    ]);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "runtime_status",
+        message:
+          "Map-reduce plan: 1 group(s), 3000 token(s)/group; " +
+          "group-1: 1 source(s), 24 token(s), 1 window(s).",
+      }),
+    );
+  });
+
+  it("passes explicit source context pack budget overrides to the Engine", async () => {
+    const calls: EngineRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
+        if (engineRequest.kind === "buildSourceContextPack") return emptySourceContextPack as T;
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: {
+          mode: "research",
+          maxTotalTokens: 1_234,
+          maxGroups: 1,
+          maxGroupTokens: 567,
+          maxSources: 2,
+          maxWindowsPerSource: 1,
+          contextChunksBefore: 0,
+          contextChunksAfter: 0,
+        },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(calls).toContainEqual(
+      expect.objectContaining({
+        kind: "buildSourceContextPack",
+        payload: {
+          query: "Explain persistence",
+          useWorkingSet: true,
+          maxTotalTokens: 1_234,
+          maxGroups: 1,
+          maxGroupTokens: 567,
+          maxSources: 2,
+          maxWindowsPerSource: 1,
+          contextChunksBefore: 0,
+          contextChunksAfter: 0,
+        },
+      }),
+    );
   });
 
   it("continues research runs when the source context pack is empty", async () => {
@@ -838,7 +982,7 @@ describe("AgentRunHost", () => {
           role: "user",
           content: "Translate page",
           clioProviderQuestion: "Translate the attached page.\n\nSource: Page.",
-          clioSourceContextPack: { mode: "research" },
+          clioSourceContextPack: queuedSourceContextPack,
           timestamp: Date.parse("2026-05-22T00:00:01.000Z"),
         },
       },
@@ -854,6 +998,9 @@ describe("AgentRunHost", () => {
       requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
         if (engineRequest.kind === "loadChatSession") {
           return session({ messages, messageCount: messages.length }) as T;
+        }
+        if (engineRequest.kind === "buildSourceContextPack") {
+          return emptySourceContextPack as T;
         }
         if (engineRequest.kind === "updateChatMessage") {
           messages = messages.map((message) =>
@@ -912,11 +1059,11 @@ describe("AgentRunHost", () => {
       "Explain persistence",
       "Translate the attached page.\n\nSource: Page.",
     ]);
-    expect(sourceContextOptions).toEqual([undefined, { mode: "research" }]);
+    expect(sourceContextOptions).toEqual([undefined, queuedSourceContextPack]);
     expect(assistantRetries).toContainEqual(
       expect.objectContaining({
         question: "Translate the attached page.\n\nSource: Page.",
-        sourceContextPack: { mode: "research" },
+        sourceContextPack: queuedSourceContextPack,
       }),
     );
   });

@@ -1,3 +1,4 @@
+import { readSourceContextPackRequestOptions } from "@/src/agent-runtime/source-context-pack-options";
 import type { AgentChatRequest, AgentScope, EvidenceItem } from "@/src/agent-runtime/types";
 import type { PageContext, RailSkillRequestDisplay } from "@/src/rail/app/rail-state";
 import { requestEngine } from "@/src/shared/chrome-client";
@@ -645,9 +646,7 @@ function readSourceContextPack(
   key: string,
 ): AgentChatRequest["sourceContextPack"] | undefined {
   if (!isPlainRecord(value)) return undefined;
-  const field = value[key];
-  if (!isPlainRecord(field) || field.mode !== "research") return undefined;
-  return { mode: "research" };
+  return readSourceContextPackRequestOptions(value[key]);
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
