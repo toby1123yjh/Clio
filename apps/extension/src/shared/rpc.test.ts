@@ -22,6 +22,8 @@ import {
   CLIO_WEB_SEARCH_STREAM_REQUEST,
   CLIO_WORKER_EMBEDDING_REQUEST,
   CLIO_WORKER_EMBEDDING_RESPONSE,
+  CLIO_WORKER_VISION_ANALYSIS_REQUEST,
+  CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
   type RetrieveSourceHitChunk,
   type RetrieveSourceItem,
   isAgentRunEventMessage,
@@ -45,6 +47,8 @@ import {
   isWebSearchStreamRequestMessage,
   isWorkerEmbeddingRequestMessage,
   isWorkerEmbeddingResponseMessage,
+  isWorkerVisionAnalysisRequestMessage,
+  isWorkerVisionAnalysisResponseMessage,
 } from "./rpc";
 
 describe("session engine RPC guards", () => {
@@ -118,6 +122,22 @@ describe("session engine RPC guards", () => {
             bytes: "not bytes",
           },
         },
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts raw PDF file read requests by memory id", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "getPdfRawFile", id: "source-pdf-1" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "getPdfRawFile", id: 42 },
       }),
     ).toBe(false);
   });
@@ -978,6 +998,11 @@ describe("session engine RPC guards", () => {
             filter: {
               sourceTypes: ["webpage", "research-note"],
               lifecycleStatuses: ["fresh", "stale", "archived"],
+              doi: "10.7777/clio.2026",
+              arxivIds: ["2501.01234"],
+              years: [2026],
+              venues: ["Clio Metadata Symposium"],
+              authors: ["Katherine Johnson"],
             },
           },
         },
@@ -1038,6 +1063,36 @@ describe("session engine RPC guards", () => {
         },
       }),
     ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "retrieveSources",
+          payload: {
+            query: "context window retrieval",
+            filter: {
+              years: ["2026"],
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "retrieveSources",
+          payload: {
+            query: "context window retrieval",
+            filter: {
+              arxivIds: [2501],
+            },
+          },
+        },
+      }),
+    ).toBe(false);
   });
 
   it("accepts knowledge base search requests", () => {
@@ -1053,6 +1108,11 @@ describe("session engine RPC guards", () => {
             filter: {
               sourceTypes: ["paper", "pdf"],
               lifecycleStatuses: ["fresh", "stale"],
+              doi: "10.5555/clio.pdf",
+              arxivIds: ["2601.01234"],
+              years: [2026],
+              venues: ["Local RAG Symposium"],
+              authors: ["Ada Lovelace"],
             },
           },
         },
@@ -1332,6 +1392,22 @@ describe("session engine RPC guards", () => {
                 reason: "missing_memory_citation",
               },
             ],
+            evidenceQuality: "weak",
+            qualityReason: "Only a short memory excerpt was available.",
+            supportCheck: "judge_unavailable",
+            semanticJudge: {
+              status: "unavailable",
+              checkedClaimCount: 1,
+              unsupportedClaimCount: 0,
+              providerKind: "chat",
+              reason: "Provider config is unavailable.",
+            },
+            retry: {
+              attempted: true,
+              count: 1,
+              exhausted: true,
+              reason: "semantic_judge_unavailable",
+            },
             message: "Source citation could not be verified.",
           },
         },
@@ -1379,6 +1455,46 @@ describe("session engine RPC guards", () => {
             status: "warning",
             reason: "missing_memory_citation",
           },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isAgentStreamEventMessage({
+        type: CLIO_AGENT_STREAM_EVENT,
+        requestId: "request-1",
+        event: {
+          type: "citation_repair_started",
+          runId: "run-1",
+          reason: "unsupported_memory_claim",
+          attempt: 1,
+          message: "Repairing unsupported memory citations.",
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isAgentRunEventMessage({
+        type: CLIO_AGENT_RUN_EVENT,
+        event: {
+          type: "citation_repair_started",
+          runId: "run-1",
+          reason: "not_a_reason",
+          attempt: 1,
+          message: "Repairing unsupported memory citations.",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isAgentRunEventMessage({
+        type: CLIO_AGENT_RUN_EVENT,
+        event: {
+          type: "citation_repair_started",
+          runId: "run-1",
+          reason: "unsupported_memory_claim",
+          attempt: Number.NaN,
+          message: "Repairing unsupported memory citations.",
         },
       }),
     ).toBe(false);
@@ -1478,6 +1594,51 @@ describe("session engine RPC guards", () => {
       isProviderRequestMessage({
         type: CLIO_PROVIDER_REQUEST,
         request: { kind: "setActiveProvider", provider: "openai-compatible" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: { kind: "getVisionProviderSettings" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "saveVisionProviderSettings",
+          settings: {
+            provider: "openai-compatible",
+            gemini: {
+              apiKey: "gemini-vision",
+              model: "gemini-2.5-pro",
+            },
+            openai: {
+              apiKey: "sk-vision",
+              model: "gpt-vision",
+              baseUrl: "https://api.openai.example.test/v1",
+            },
+            openaiCompatible: {
+              apiKey: "sk-compatible-vision",
+              model: "vision-custom",
+              baseUrl: "https://vision.example.test/v1",
+              providerName: "custom",
+            },
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "ensureVisionProviderHostPermission",
+          provider: "openai-compatible",
+          baseUrl: "https://vision.example.test/v1",
+        },
       }),
     ).toBe(true);
 
@@ -1603,6 +1764,99 @@ describe("session engine RPC guards", () => {
           error: {
             code: "PROVIDER_AUTH_ERROR",
             message: "Embedding provider auth failed.",
+          },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts bounded worker figure vision bridge messages and rejects prompt boundary leaks", () => {
+    const request = {
+      type: CLIO_WORKER_VISION_ANALYSIS_REQUEST,
+      requestId: "vision-request-1",
+      request: {
+        analysisId: "figure-analysis:1",
+        imageId: "image:1",
+        pageNumber: 3,
+        label: "Figure 1",
+        caption: "Bounded chart caption.",
+        pageContext: "A short page-local context window.",
+        image: {
+          base64: "QUJD",
+          mimeType: "image/png",
+          byteLength: 3,
+        },
+      },
+    };
+
+    expect(isWorkerVisionAnalysisRequestMessage(request)).toBe(true);
+
+    expect(
+      isWorkerVisionAnalysisRequestMessage({
+        ...request,
+        request: {
+          ...request.request,
+          apiKey: "sk-leak",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerVisionAnalysisRequestMessage({
+        ...request,
+        request: {
+          ...request.request,
+          pdfBytes: new Uint8Array([1, 2, 3]),
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerVisionAnalysisRequestMessage({
+        ...request,
+        request: {
+          ...request.request,
+          fullText: "This field must never cross into the vision request.",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerVisionAnalysisResponseMessage({
+        type: CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
+        requestId: "vision-request-1",
+        response: {
+          ok: true,
+          value: {
+            status: "analyzed",
+            analysisId: "figure-analysis:1",
+            imageId: "image:1",
+            providerKind: "chat",
+            summary: "The chart compares bounded evidence quality.",
+            chartType: "bar",
+            extractedLabels: ["Precision"],
+            extractedValues: ["0.91"],
+            claims: [
+              {
+                claimId: "claim:0",
+                text: "Precision is 0.91.",
+                confidence: "high",
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isWorkerVisionAnalysisResponseMessage({
+        type: CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
+        requestId: "vision-request-1",
+        response: {
+          ok: false,
+          error: {
+            code: "FIGURE_VISION_PROVIDER_ERROR",
+            message: "Vision provider failed.",
           },
         },
       }),
@@ -1953,6 +2207,43 @@ describe("session engine RPC guards", () => {
         request: {
           kind: "saveSearchProviderSettings",
           provider: "perplexity",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "saveVisionProviderSettings",
+          settings: {
+            provider: "anthropic",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "saveVisionProviderSettings",
+          settings: {
+            provider: "openai",
+            openai: {
+              apiKey: 42,
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "ensureVisionProviderHostPermission",
+          provider: "anthropic",
         },
       }),
     ).toBe(false);

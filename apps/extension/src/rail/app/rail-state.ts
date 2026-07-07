@@ -841,6 +841,17 @@ function reduceAssistantMessage(
         ...message,
         citationValidation: event.validation,
       };
+    case "citation_repair_started":
+      return {
+        ...message,
+        status: "streaming",
+        content: "",
+        citations: [],
+        citationValidation: undefined,
+        error: undefined,
+        thinkingTrace: undefined,
+        toolTraces: [],
+      };
     case "world_knowledge":
       if (message.worldKnowledge.includes(event.note)) return message;
       return {

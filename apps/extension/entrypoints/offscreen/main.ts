@@ -1,9 +1,11 @@
 import { AgentRunHost } from "@/src/agent-runtime/agent-run-host";
 import { PiAgentCompactionRuntime } from "@/src/agent-runtime/compaction-context";
 import { ClioEmbeddingProviderRuntime } from "@/src/agent-runtime/embedding-provider-runtime";
+import { ProviderBackedFigureVisionAnalyzer } from "@/src/agent-runtime/figure-vision-analyzer";
 import { ClioImageGenerationRuntime } from "@/src/agent-runtime/image-generation-runtime";
 import { PiAgentCoreRunAdapter } from "@/src/agent-runtime/pi-agent-core-run-adapter";
 import { type ProviderId, defaultActiveProvider } from "@/src/agent-runtime/provider-settings";
+import { ProviderBackedSemanticCitationJudge } from "@/src/agent-runtime/semantic-citation-judge";
 import { ClioWebToolRuntime } from "@/src/agent-runtime/web-search-runtime";
 import engineWorkerUrl from "@/src/engine/local-engine.worker.ts?worker&url";
 import { installPhase0PocHost } from "@/src/phase0/poc-host";
@@ -15,6 +17,7 @@ import {
   CLIO_WEB_SEARCH_RUN_EVENT,
   CLIO_WORKER_EMBEDDING_RESPONSE,
   CLIO_WORKER_REQUEST,
+  CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
   type ClioImageGenerationEvent,
   type ClioWebSearchEvent,
   type EngineRequest,
@@ -29,6 +32,7 @@ import {
   isWebSearchRunRequestMessage,
   isWorkerEmbeddingRequestMessage,
   isWorkerResponseMessage,
+  isWorkerVisionAnalysisRequestMessage,
   unwrapEngineResponse,
 } from "@/src/shared/rpc";
 
@@ -39,6 +43,11 @@ installPhase0PocHost("offscreen");
 let worker: Worker | null = null;
 const agentRunHost = new AgentRunHost({
   runtime: new PiAgentCoreRunAdapter({
+    loadConfig: () => requestProviderConfig(),
+    loadProviderId: async () => (await requestProviderConfig())?.provider ?? defaultActiveProvider,
+    ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
+  }),
+  semanticCitationJudge: new ProviderBackedSemanticCitationJudge({
     loadConfig: () => requestProviderConfig(),
     loadProviderId: async () => (await requestProviderConfig())?.provider ?? defaultActiveProvider,
     ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
@@ -102,6 +111,11 @@ const embeddingProviderRuntime = new ClioEmbeddingProviderRuntime({
       .then(() => true)
       .catch(() => false),
 });
+const figureVisionAnalyzer = new ProviderBackedFigureVisionAnalyzer({
+  loadVisionProviderSettings: () => requestProvider({ kind: "getVisionProviderSettings" }),
+  loadActiveProviderConfig: () => requestProviderConfig(),
+  ensureProviderPermission: (provider, config) => hasVisionProviderHostPermission(provider, config),
+});
 const activeImageGenerationRuns = new Map<string, AbortController>();
 
 function hasProviderHostPermission(
@@ -125,6 +139,25 @@ function hasProviderHostPermission(
       .catch(() => false);
   }
   return requestProvider({ kind: "ensureGeminiHostPermission" })
+    .then(() => true)
+    .catch(() => false);
+}
+
+function hasVisionProviderHostPermission(
+  provider: ProviderId,
+  config?: Awaited<ReturnType<typeof requestProviderConfig>>,
+) {
+  const baseUrl =
+    provider === "openai" && config?.provider === "openai"
+      ? config.baseUrl
+      : provider === "openai-compatible" && config?.provider === "openai-compatible"
+        ? config.baseUrl
+        : undefined;
+  return requestProvider({
+    kind: "ensureVisionProviderHostPermission",
+    provider,
+    ...(baseUrl === undefined ? {} : { baseUrl }),
+  })
     .then(() => true)
     .catch(() => false);
 }
@@ -337,6 +370,10 @@ function ensureWorker() {
       void handleWorkerEmbeddingRequest(worker as Worker, event.data);
       return;
     }
+    if (isWorkerVisionAnalysisRequestMessage(event.data)) {
+      void handleWorkerVisionAnalysisRequest(worker as Worker, event.data);
+      return;
+    }
     if (!isWorkerResponseMessage(event.data)) return;
     const entry = pending.get(event.data.requestId);
     if (entry === undefined) return;
@@ -375,6 +412,29 @@ async function handleWorkerEmbeddingRequest(
       response: {
         ok: false,
         error: engineErrorFromUnknown(error, "EMBEDDING_PROVIDER_ERROR"),
+      },
+    });
+  }
+}
+
+async function handleWorkerVisionAnalysisRequest(
+  engineWorker: Worker,
+  message: import("@/src/shared/rpc").WorkerVisionAnalysisRequestMessage,
+) {
+  try {
+    const result = await figureVisionAnalyzer.analyze(message.request);
+    engineWorker.postMessage({
+      type: CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
+      requestId: message.requestId,
+      response: { ok: true, value: result },
+    });
+  } catch (error) {
+    engineWorker.postMessage({
+      type: CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
+      requestId: message.requestId,
+      response: {
+        ok: false,
+        error: engineErrorFromUnknown(error, "FIGURE_VISION_PROVIDER_ERROR"),
       },
     });
   }

@@ -46,6 +46,10 @@ import {
 } from "@/src/agent-runtime/search-provider-settings";
 import type { AgentStreamEvent } from "@/src/agent-runtime/types";
 import {
+  readVisionProviderSettings,
+  saveVisionProviderSettings,
+} from "@/src/agent-runtime/vision-provider-settings";
+import {
   type AgentRunRequest,
   type AgentStreamEventMessage,
   CLIO_AGENT_RUN_REQUEST,
@@ -786,6 +790,34 @@ async function routeProviderRequest(request: ProviderRequest) {
       await requireOpenAIHostPermission(
         baseUrl,
         "Image provider host access is unavailable in this build.",
+      );
+      return getProviderSettings();
+    }
+    case "getVisionProviderSettings":
+      return readVisionProviderSettings();
+    case "saveVisionProviderSettings":
+      return saveVisionProviderSettings(request.settings);
+    case "ensureVisionProviderHostPermission": {
+      const provider = request.provider ?? (await readActiveProviderConfig())?.provider;
+      if (provider === "gemini") {
+        await requireGeminiHostPermission(
+          "Vision provider host access is unavailable in this build.",
+        );
+        return getProviderSettings();
+      }
+      if (provider === "openai-compatible") {
+        const baseUrl =
+          normalizeOpenAICompatibleBaseUrl(request.baseUrl) ?? defaultOpenAICompatibleBaseUrl;
+        await requireOpenAICompatibleHostPermission(
+          baseUrl,
+          "Vision provider host access is unavailable in this build.",
+        );
+        return getProviderSettings();
+      }
+      const baseUrl = normalizeOpenAIBaseUrl(request.baseUrl) ?? defaultOpenAIBaseUrl;
+      await requireOpenAIHostPermission(
+        baseUrl,
+        "Vision provider host access is unavailable in this build.",
       );
       return getProviderSettings();
     }

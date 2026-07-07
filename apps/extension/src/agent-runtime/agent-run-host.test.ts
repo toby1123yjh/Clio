@@ -9,7 +9,7 @@ import type {
 import { describe, expect, it } from "vitest";
 import { AgentRunHost } from "./agent-run-host";
 import type { IClioCompactionRuntime } from "./compaction-context";
-import type { AgentChatRequest, AgentStreamEvent, IAgentRuntime } from "./types";
+import type { AgentChatRequest, AgentStreamEvent, IAgentRuntime, LocalCitation } from "./types";
 
 function request(overrides: Partial<AgentChatRequest> = {}): AgentChatRequest {
   return {
@@ -35,6 +35,19 @@ const memoryEvidence = {
   text: "Bounded memory evidence",
   excerpt: "Bounded memory evidence",
 } satisfies AgentChatRequest["evidence"][number];
+
+function memoryCitation(overrides: Partial<LocalCitation> = {}): LocalCitation {
+  return {
+    id: "run-1:citation:memory-1",
+    evidenceId: memoryEvidence.id,
+    label: "Saved Memory",
+    sourceKind: "memory",
+    sourceUrl: memoryEvidence.sourceUrl,
+    sourceTitle: memoryEvidence.sourceTitle,
+    excerpt: memoryEvidence.excerpt,
+    ...overrides,
+  };
+}
 
 const sourceContextPack = {
   query: "Explain persistence",
@@ -242,7 +255,7 @@ describe("AgentRunHost", () => {
     );
   });
 
-  it("emits and persists citation validation before completing local memory answers", async () => {
+  it("repairs citation warnings once before completing local memory answers", async () => {
     const engine = engineRecorder();
     const emitted: AgentStreamEvent[] = [];
     const host = new AgentRunHost({
@@ -271,9 +284,16 @@ describe("AgentRunHost", () => {
     expect(emitted.map((event) => event.type)).toEqual([
       "run_started",
       "text_delta",
+      "citation_repair_started",
+      "run_started",
+      "text_delta",
       "citation_validation",
       "run_completed",
     ]);
+    expect(emitted.find((event) => event.type === "citation_repair_started")).toMatchObject({
+      reason: "missing_memory_claim_citation",
+      attempt: 1,
+    });
     expect(emitted.find((event) => event.type === "citation_validation")).toMatchObject({
       validation: {
         status: "warning",
@@ -282,10 +302,30 @@ describe("AgentRunHost", () => {
         citationCount: 0,
         claimCount: 1,
         uncoveredClaimCount: 1,
+        retry: {
+          attempted: true,
+          count: 1,
+          exhausted: true,
+          reason: "missing_memory_claim_citation",
+        },
       },
     });
     expect(engine.calls).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({
+          kind: "updateChatMessage",
+          payload: expect.objectContaining({
+            id: "run-1:assistant",
+            sessionId: "session-1",
+            content: "",
+            citations: [],
+            status: "streaming",
+            clearError: true,
+            piAgentMessageJson: expect.not.objectContaining({
+              clioCitationValidation: expect.anything(),
+            }),
+          }),
+        }),
         expect.objectContaining({
           kind: "updateChatMessage",
           payload: expect.objectContaining({
@@ -296,6 +336,7 @@ describe("AgentRunHost", () => {
                 status: "warning",
                 reason: "missing_memory_claim_citation",
                 claimCount: 1,
+                retry: expect.objectContaining({ exhausted: true }),
               }),
             }),
           }),
@@ -320,6 +361,136 @@ describe("AgentRunHost", () => {
     expect(
       engine.calls.some((engineRequest) => engineRequest.kind === "buildSourceContextPack"),
     ).toBe(false);
+  });
+
+  it("clears the first answer and completes without warning after a successful citation repair", async () => {
+    const engine = engineRecorder();
+    const emitted: AgentStreamEvent[] = [];
+    const providerQuestions: string[] = [];
+    const semanticClaimCounts: number[] = [];
+    let callCount = 0;
+    const repairedAnswer = "The saved memory preserves bounded evidence.";
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          callCount += 1;
+          providerQuestions.push(agentRequest.question);
+          yield { type: "run_started", runId: agentRequest.runId } satisfies AgentStreamEvent;
+          if (callCount === 1) {
+            yield {
+              type: "text_delta",
+              runId: agentRequest.runId,
+              delta: "The saved memory preserves bounded evidence.",
+            } satisfies AgentStreamEvent;
+            yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+            return;
+          }
+          yield {
+            type: "text_delta",
+            runId: agentRequest.runId,
+            delta: repairedAnswer,
+          } satisfies AgentStreamEvent;
+          yield {
+            type: "citation",
+            runId: agentRequest.runId,
+            citation: memoryCitation({ outputOffset: repairedAnswer.length }),
+          } satisfies AgentStreamEvent;
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      semanticCitationJudge: {
+        judge: async (input) => {
+          semanticClaimCounts.push(input.claims.length);
+          return {
+            status: "supported",
+            checkedClaimCount: input.claims.length,
+            unsupportedClaimIds: [],
+            providerKind: "chat",
+          };
+        },
+      },
+      requestEngine: engine.requestEngine,
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        evidence: [memoryEvidence],
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(providerQuestions).toHaveLength(2);
+    expect(providerQuestions[1]).toContain("Repair the previous answer");
+    expect(semanticClaimCounts).toEqual([1]);
+    expect(emitted.map((event) => event.type)).toEqual([
+      "run_started",
+      "text_delta",
+      "citation_repair_started",
+      "run_started",
+      "text_delta",
+      "citation",
+      "citation_validation",
+      "run_completed",
+    ]);
+    expect(emitted.find((event) => event.type === "citation_validation")).toMatchObject({
+      validation: {
+        status: "valid",
+        reason: "valid_memory_claims",
+        supportCheck: "semantic_supported",
+        retry: {
+          attempted: true,
+          count: 1,
+          exhausted: false,
+          reason: "missing_memory_claim_citation",
+        },
+      },
+    });
+  });
+
+  it("does not retry validator errors", async () => {
+    const engine = engineRecorder();
+    const emitted: AgentStreamEvent[] = [];
+    const answer = "The saved memory preserves bounded evidence.";
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          yield { type: "run_started", runId: agentRequest.runId } satisfies AgentStreamEvent;
+          yield {
+            type: "text_delta",
+            runId: agentRequest.runId,
+            delta: answer,
+          } satisfies AgentStreamEvent;
+          yield {
+            type: "citation",
+            runId: agentRequest.runId,
+            citation: memoryCitation({ outputOffset: answer.length }),
+          } satisfies AgentStreamEvent;
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      semanticCitationJudge: {
+        judge: async () => {
+          throw new Error("judge exploded");
+        },
+      },
+      requestEngine: engine.requestEngine,
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(request({ scope: "general", evidence: [memoryEvidence] }));
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(emitted.some((event) => event.type === "citation_repair_started")).toBe(false);
+    expect(emitted.find((event) => event.type === "citation_validation")).toMatchObject({
+      validation: {
+        status: "warning",
+        reason: "validator_error",
+      },
+    });
   });
 
   it("builds source context pack evidence for explicit research runs", async () => {

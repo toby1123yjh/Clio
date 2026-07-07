@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildSemanticCitationJudgeInput,
   citationValidationWarningMessage,
+  formatCitationValidationWarning,
   isCitationValidationResult,
   readClioCitationValidation,
   validateCitationCoverage,
@@ -83,6 +85,152 @@ describe("validateCitationCoverage", () => {
       coveredClaimCount: 1,
       uncoveredClaimCount: 0,
       uncoveredClaims: [],
+    });
+  });
+
+  it("accepts memory claims when semantic judge supports cited evidence", () => {
+    const claim = "The local store preserves bounded memory evidence.";
+
+    expect(
+      validateCitationCoverage({
+        evidence: [memoryEvidence],
+        citations: [citation(memoryEvidence, { outputOffset: claim.length })],
+        content: claim,
+        semanticJudgeRequired: true,
+        semanticJudge: {
+          status: "supported",
+          checkedClaimCount: 1,
+          unsupportedClaimIds: [],
+          providerKind: "chat",
+        },
+      }),
+    ).toMatchObject({
+      status: "valid",
+      reason: "valid_memory_claims",
+      supportCheck: "semantic_supported",
+      semanticJudge: {
+        status: "supported",
+        checkedClaimCount: 1,
+        unsupportedClaimCount: 0,
+        providerKind: "chat",
+      },
+    });
+  });
+
+  it("warns when semantic judge rejects a cited claim", () => {
+    const claim = "The local store preserves bounded memory evidence.";
+
+    expect(
+      validateCitationCoverage({
+        evidence: [memoryEvidence],
+        citations: [citation(memoryEvidence, { outputOffset: claim.length })],
+        content: claim,
+        semanticJudgeRequired: true,
+        semanticJudge: {
+          status: "unsupported",
+          checkedClaimCount: 1,
+          unsupportedClaimIds: ["claim:0"],
+          providerKind: "chat",
+          reason: "not stated",
+        },
+      }),
+    ).toMatchObject({
+      status: "warning",
+      reason: "unsupported_memory_claim",
+      supportCheck: "semantic_unsupported",
+      uncoveredClaims: [
+        {
+          text: claim,
+          reason: "semantic_unsupported",
+        },
+      ],
+      semanticJudge: {
+        status: "unsupported",
+        unsupportedClaimCount: 1,
+        reason: "not stated",
+      },
+    });
+  });
+
+  it("warns when semantic judge is unavailable for cited claims", () => {
+    const claim = "The local store preserves bounded memory evidence.";
+    const result = validateCitationCoverage({
+      evidence: [memoryEvidence],
+      citations: [citation(memoryEvidence, { outputOffset: claim.length })],
+      content: claim,
+      semanticJudgeRequired: true,
+      semanticJudge: {
+        status: "unavailable",
+        checkedClaimCount: 1,
+        unsupportedClaimIds: [],
+        providerKind: "chat",
+        reason: "missing config",
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "warning",
+      reason: "semantic_judge_unavailable",
+      supportCheck: "judge_unavailable",
+      uncoveredClaimCount: 1,
+      semanticJudge: {
+        status: "unavailable",
+        checkedClaimCount: 1,
+        reason: "missing config",
+      },
+    });
+    expect(formatCitationValidationWarning(result)).toContain("Semantic citation judge");
+  });
+
+  it("warns when cited memory evidence is too short to verify", () => {
+    const shortEvidence = {
+      ...memoryEvidence,
+      text: "tiny",
+      excerpt: "tiny",
+    };
+    const claim = "The local store preserves bounded memory evidence.";
+
+    expect(
+      validateCitationCoverage({
+        evidence: [shortEvidence],
+        citations: [citation(shortEvidence, { outputOffset: claim.length })],
+        content: claim,
+      }),
+    ).toMatchObject({
+      status: "warning",
+      reason: "insufficient_memory_evidence",
+      supportCheck: "insufficient_evidence",
+      uncoveredClaims: [
+        {
+          reason: "insufficient_memory_evidence",
+        },
+      ],
+    });
+  });
+
+  it("builds bounded semantic judge inputs from cited memory claims", () => {
+    const claim = "The local store preserves bounded memory evidence.";
+    const semanticInput = buildSemanticCitationJudgeInput({
+      evidence: [memoryEvidence],
+      citations: [citation(memoryEvidence, { outputOffset: claim.length })],
+      content: claim,
+      question: "Explain the local store",
+    });
+
+    expect(semanticInput).toEqual({
+      question: "Explain the local store",
+      claims: [
+        {
+          claimId: "claim:0",
+          claimPreview: claim,
+          citations: [
+            expect.objectContaining({
+              evidenceId: memoryEvidence.id,
+              evidenceExcerpt: memoryEvidence.excerpt,
+            }),
+          ],
+        },
+      ],
     });
   });
 
@@ -280,5 +428,34 @@ describe("validateCitationCoverage", () => {
         uncoveredClaims: [{ text: "Claim", position: -1, reason: "missing_memory_citation" }],
       }),
     ).toBe(false);
+  });
+
+  it("accepts extended validation metadata through the shared guard", () => {
+    expect(
+      isCitationValidationResult({
+        status: "warning",
+        reason: "semantic_judge_error",
+        evidenceCount: 1,
+        memoryEvidenceCount: 1,
+        citationCount: 1,
+        validCitationCount: 1,
+        validMemoryCitationCount: 1,
+        evidenceQuality: "weak",
+        supportCheck: "judge_error",
+        semanticJudge: {
+          status: "error",
+          checkedClaimCount: 1,
+          unsupportedClaimCount: 0,
+          providerKind: "chat",
+          reason: "malformed json",
+        },
+        retry: {
+          attempted: true,
+          count: 1,
+          exhausted: true,
+          reason: "unsupported_memory_claim",
+        },
+      }),
+    ).toBe(true);
   });
 });

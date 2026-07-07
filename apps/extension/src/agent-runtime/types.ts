@@ -96,9 +96,44 @@ export type CitationValidationReason =
   | "missing_memory_citation"
   | "missing_memory_claim_citation"
   | "invalid_citation"
+  | "unsupported_memory_claim"
+  | "insufficient_memory_evidence"
+  | "semantic_judge_unavailable"
+  | "semantic_judge_error"
   | "validator_error";
 
-export type CitationValidationClaimPreviewReason = "missing_memory_citation";
+export type CitationValidationClaimPreviewReason =
+  | "missing_memory_citation"
+  | "unsupported_memory_citation"
+  | "insufficient_memory_evidence"
+  | "semantic_unsupported"
+  | "semantic_judge_unavailable";
+
+export type CitationEvidenceQuality = "none" | "weak" | "strong";
+
+export type CitationSupportCheck =
+  | "not_checked"
+  | "deterministic_supported"
+  | "semantic_supported"
+  | "semantic_unsupported"
+  | "insufficient_evidence"
+  | "judge_unavailable"
+  | "judge_error";
+
+export interface CitationSemanticJudgeSummary {
+  status: "not_run" | "supported" | "unsupported" | "unavailable" | "error";
+  checkedClaimCount: number;
+  unsupportedClaimCount: number;
+  providerKind?: "chat" | "embedding";
+  reason?: string;
+}
+
+export interface CitationValidationRetrySummary {
+  attempted: boolean;
+  count: number;
+  exhausted: boolean;
+  reason?: string;
+}
 
 export interface CitationValidationClaimPreview {
   text: string;
@@ -118,6 +153,11 @@ export interface CitationValidationResult {
   coveredClaimCount?: number;
   uncoveredClaimCount?: number;
   uncoveredClaims?: CitationValidationClaimPreview[];
+  evidenceQuality?: CitationEvidenceQuality;
+  qualityReason?: string;
+  supportCheck?: CitationSupportCheck;
+  semanticJudge?: CitationSemanticJudgeSummary;
+  retry?: CitationValidationRetrySummary;
   message?: string;
 }
 
@@ -160,6 +200,13 @@ export type AgentStreamEvent =
   | { type: "text_delta"; runId: string; delta: string }
   | { type: "citation"; runId: string; citation: LocalCitation }
   | { type: "citation_validation"; runId: string; validation: CitationValidationResult }
+  | {
+      type: "citation_repair_started";
+      runId: string;
+      reason: CitationValidationReason;
+      attempt: number;
+      message: string;
+    }
   | { type: "world_knowledge"; runId: string; note: string }
   | { type: "run_completed"; runId: string }
   | { type: "run_failed"; runId: string; error: AgentErrorInfo }

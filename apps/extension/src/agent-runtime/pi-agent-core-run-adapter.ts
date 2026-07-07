@@ -30,7 +30,7 @@ export interface PiAgentCoreRunAdapterOptions {
   streamFn?: StreamFn;
 }
 
-const defaultStreamFn: StreamFn = (model, context, options) => {
+export const defaultClioProviderStreamFn: StreamFn = (model, context, options) => {
   const streamOptions = {
     ...options,
     maxRetries: 0,
@@ -68,7 +68,7 @@ export class PiAgentCoreRunAdapter implements IAgentRuntime {
     this.loadConfig = options.loadConfig;
     this.loadProviderId = options.loadProviderId ?? (async () => defaultActiveProvider);
     this.ensureProviderPermission = options.ensureProviderPermission;
-    this.streamFn = options.streamFn ?? defaultStreamFn;
+    this.streamFn = options.streamFn ?? defaultClioProviderStreamFn;
   }
 
   async *streamChat(

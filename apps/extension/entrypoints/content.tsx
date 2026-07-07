@@ -42,6 +42,10 @@ import {
   subscribeAgentStream,
 } from "@/src/agent-runtime/stream-client";
 import type { AgentChatRequest, AgentStreamEvent, EvidenceItem } from "@/src/agent-runtime/types";
+import type {
+  SaveVisionProviderSettingsInput,
+  VisionProviderSettings,
+} from "@/src/agent-runtime/vision-provider-settings";
 import {
   type WebSearchStreamController,
   openWebSearchStream,
@@ -119,6 +123,8 @@ import { type ToolboxSkill, toolboxSkills } from "@/src/rail/app/toolbox-registr
 import {
   type ImageGenerationDisplayState,
   type ImageGenerationSubmitInput,
+  type KnowledgeBaseFilterState,
+  type PdfReaderPreviewState,
   RailShell,
 } from "@/src/rail/components/RailShell";
 import { SelectionMiniUi } from "@/src/rail/components/SelectionMiniUi";
@@ -165,6 +171,7 @@ import {
   type MemoryDetail,
   type MemoryEvidenceWindow,
   type RetrieveSourceItem,
+  type RetrieveSourcesFilter,
   type RetrieveSourcesResult,
   type SearchMemoryItem,
   type TopicGraphEdge,
@@ -173,6 +180,8 @@ import {
   type WebSearchHistoryRecord,
   type WikiCompileJobEvent,
   type WikiCompileJobSummary,
+  type WorkingSetLoadDepth,
+  type WorkingSetStatusResult,
   isContentCommandMessage,
 } from "@/src/shared/rpc";
 import { excerpt, hashText, normalizeText } from "@/src/shared/text";
@@ -250,6 +259,34 @@ const emptyImageGenerationState: ImageGenerationDisplayState = {
   prompt: "",
 };
 
+function memoryHasPersistedPdfRawFile(detail: MemoryDetail | null) {
+  const rawFile = metadataRecord(detail?.metadata.pdf_raw_file);
+  if (rawFile?.status !== "persisted") return false;
+  const contentType = rawFile.contentType;
+  return contentType === undefined || contentType === "application/pdf";
+}
+
+function metadataRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function pdfRawBytesToBlobPart(bytes: unknown): BlobPart {
+  if (bytes instanceof ArrayBuffer) return bytes;
+  if (bytes instanceof Uint8Array) return copyUint8ArrayToArrayBuffer(bytes);
+  if (Array.isArray(bytes) && bytes.every((item) => Number.isInteger(item))) {
+    return copyUint8ArrayToArrayBuffer(new Uint8Array(bytes));
+  }
+  throw new Error("Raw PDF bytes were not returned in a browser-readable format.");
+}
+
+function copyUint8ArrayToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+
 interface SessionSuggestionCooldown {
   completedUserTurnCount: number;
   lastSuggestedTurnCount: number;
@@ -259,7 +296,29 @@ const defaultSuggestionCooldown: SuggestionCooldownState = {
   completedUserTurnsSinceLastSuggestion: 3,
 };
 
+const defaultKnowledgeBaseFilter: KnowledgeBaseFilterState = {
+  sourceType: "all",
+  lifecycleStatus: "all",
+};
+
 type KnowledgeUploadKind = "markdown" | "pdf";
+
+function retrieveFilterForKnowledgeBase(
+  filter: KnowledgeBaseFilterState,
+): RetrieveSourcesFilter | undefined {
+  const sourceTypes =
+    filter.sourceType === "all"
+      ? undefined
+      : filter.sourceType === "webpage"
+        ? ["webpage", "page", "selection"]
+        : [filter.sourceType];
+  const lifecycleStatuses = filter.lifecycleStatus === "all" ? undefined : [filter.lifecycleStatus];
+  if (sourceTypes === undefined && lifecycleStatuses === undefined) return undefined;
+  return {
+    ...(sourceTypes === undefined ? {} : { sourceTypes }),
+    ...(lifecycleStatuses === undefined ? {} : { lifecycleStatuses }),
+  };
+}
 
 function knowledgeUploadKindForFile(file: File): KnowledgeUploadKind | null {
   const name = file.name.toLowerCase();
@@ -874,6 +933,12 @@ function ClioContentApp() {
   );
   const [selection, setSelection] = React.useState<SelectionState | null>(null);
   const [items, setItems] = React.useState<SearchMemoryItem[]>([]);
+  const [knowledgeBaseFilter, setKnowledgeBaseFilter] = React.useState<KnowledgeBaseFilterState>(
+    defaultKnowledgeBaseFilter,
+  );
+  const [workingSetStatus, setWorkingSetStatus] = React.useState<WorkingSetStatusResult | null>(
+    null,
+  );
   const [topicPages, setTopicPages] = React.useState<TopicPageSummary[]>([]);
   const [topicDetail, setTopicDetail] = React.useState<TopicPageDetail | null>(null);
   const [topicForm, setTopicForm] = React.useState<TopicPageFormState>(emptyTopicPageForm);
@@ -887,6 +952,7 @@ function ClioContentApp() {
   const [relatedItems, setRelatedItems] = React.useState<SearchMemoryItem[]>([]);
   const [chatSessions, setChatSessions] = React.useState<ChatSessionSummary[]>([]);
   const [detail, setDetail] = React.useState<MemoryDetail | null>(null);
+  const [pdfPreview, setPdfPreview] = React.useState<PdfReaderPreviewState | null>(null);
   const [health, setHealth] = React.useState<EngineHealth | null>(null);
   const [providerSettings, setProviderSettings] = React.useState<ProviderSettings | null>(null);
   const [searchProviderSettings, setSearchProviderSettings] =
@@ -897,6 +963,8 @@ function ClioContentApp() {
     React.useState<ActiveEmbeddingModelSummary | null>(null);
   const [imageGenerationSettings, setImageGenerationSettings] =
     React.useState<ImageGenerationSettings | null>(null);
+  const [visionProviderSettings, setVisionProviderSettings] =
+    React.useState<VisionProviderSettings | null>(null);
   const [imageGenerationHistory, setImageGenerationHistory] = React.useState<
     ImageGenerationHistoryRecord[]
   >([]);
@@ -914,6 +982,8 @@ function ClioContentApp() {
     React.useState<CollapsedLauncherPosition>(defaultCollapsedLauncherPosition);
   const [collapsedLauncherDragPoint, setCollapsedLauncherDragPoint] =
     React.useState<CollapsedLauncherDragPoint | null>(null);
+  const pdfPreviewObjectUrlRef = React.useRef<string | null>(null);
+  const detailLoadSequenceRef = React.useRef(0);
   const [viewport, setViewport] = React.useState(() => ({
     width: window.innerWidth,
     height: window.innerHeight,
@@ -926,6 +996,14 @@ function ClioContentApp() {
   const activeImageGenerationStreamRef = React.useRef<ImageGenerationStreamController | null>(null);
   const ownerIdRef = React.useRef<string | null>(null);
   const suggestionCooldownRef = React.useRef<Record<string, SessionSuggestionCooldown>>({});
+
+  const clearPdfPreview = React.useCallback(() => {
+    if (pdfPreviewObjectUrlRef.current !== null) {
+      URL.revokeObjectURL(pdfPreviewObjectUrlRef.current);
+      pdfPreviewObjectUrlRef.current = null;
+    }
+    setPdfPreview(null);
+  }, []);
 
   React.useEffect(() => {
     railWidthRef.current = railWidth;
@@ -941,6 +1019,10 @@ function ClioContentApp() {
       activeWikiCompileStreamRef.current?.close();
       activeWebSearchStreamRef.current?.close();
       activeImageGenerationStreamRef.current?.close();
+      if (pdfPreviewObjectUrlRef.current !== null) {
+        URL.revokeObjectURL(pdfPreviewObjectUrlRef.current);
+        pdfPreviewObjectUrlRef.current = null;
+      }
     };
   }, []);
 
@@ -1005,6 +1087,23 @@ function ClioContentApp() {
     } catch (error) {
       setProviderMessage(
         error instanceof Error ? error.message : "Unable to read Image Gen settings.",
+      );
+      return false;
+    } finally {
+      setProviderLoading(false);
+    }
+  }, []);
+
+  const loadVisionProviderSettings = React.useCallback(async () => {
+    setProviderLoading(true);
+    setProviderMessage(null);
+    try {
+      const settings = await requestProvider({ kind: "getVisionProviderSettings" });
+      setVisionProviderSettings(settings);
+      return true;
+    } catch (error) {
+      setProviderMessage(
+        error instanceof Error ? error.message : "Unable to read Vision provider setup.",
       );
       return false;
     } finally {
@@ -1101,6 +1200,7 @@ function ClioContentApp() {
     async (nextQuery = railState.query) => {
       dispatch({ type: "SET_LOADING", loading: true });
       try {
+        const retrieveFilter = retrieveFilterForKnowledgeBase(knowledgeBaseFilter);
         const topicResult = await requestEngine({
           kind: "listTopicPages",
           query: nextQuery.trim().length > 0 ? nextQuery : undefined,
@@ -1116,10 +1216,13 @@ function ClioContentApp() {
             query: nextQuery,
             limit: 40,
             includeChunks: 2,
+            ...(retrieveFilter === undefined ? {} : { filter: retrieveFilter }),
           },
         });
+        const workingSet = await requestEngine({ kind: "getWorkingSetStatus" });
         setTopicPages(topicResult.items);
         setWikiCompileJobs(wikiJobsResult.jobs);
+        setWorkingSetStatus(workingSet);
         if (wikiJobsResult.jobs[0] !== undefined) {
           await loadWikiCompileJobEvents(wikiJobsResult.jobs[0].id);
         } else {
@@ -1132,7 +1235,67 @@ function ClioContentApp() {
         dispatch({ type: "SET_LOADING", loading: false });
       }
     },
-    [loadWikiCompileJobEvents, railState.query, showToast],
+    [knowledgeBaseFilter, loadWikiCompileJobEvents, railState.query, showToast],
+  );
+
+  const pinWorkingSetSource = React.useCallback(
+    async (sourceId: string, loadDepth: WorkingSetLoadDepth = "meta") => {
+      try {
+        const next = await requestEngine({
+          kind: "pinWorkingSetSource",
+          payload: { sourceId, loadDepth },
+        });
+        setWorkingSetStatus(next);
+      } catch (error) {
+        showToast(errorToast(error));
+      }
+    },
+    [showToast],
+  );
+
+  const evictWorkingSetSource = React.useCallback(
+    async (sourceId: string) => {
+      try {
+        const next = await requestEngine({
+          kind: "evictWorkingSetSource",
+          payload: { sourceId, reason: "user" },
+        });
+        setWorkingSetStatus(next);
+      } catch (error) {
+        showToast(errorToast(error));
+      }
+    },
+    [showToast],
+  );
+
+  const setWorkingSetSourceDepth = React.useCallback(
+    async (sourceId: string, loadDepth: WorkingSetLoadDepth) => {
+      try {
+        const next = await requestEngine({
+          kind: "setWorkingSetSourceDepth",
+          payload: { sourceId, loadDepth },
+        });
+        setWorkingSetStatus(next);
+      } catch (error) {
+        showToast(errorToast(error));
+      }
+    },
+    [showToast],
+  );
+
+  const reloadWorkingSetSource = React.useCallback(
+    async (sourceId: string, loadDepth?: WorkingSetLoadDepth) => {
+      try {
+        const next = await requestEngine({
+          kind: "reloadWorkingSetSource",
+          payload: { sourceId, ...(loadDepth === undefined ? {} : { loadDepth }) },
+        });
+        setWorkingSetStatus(next);
+      } catch (error) {
+        showToast(errorToast(error));
+      }
+    },
+    [showToast],
   );
 
   const loadChatHistory = React.useCallback(async () => {
@@ -1308,6 +1471,7 @@ function ClioContentApp() {
     void loadProviderSettings();
     void loadSearchProviderSettings();
     void loadImageGenerationSettings();
+    void loadVisionProviderSettings();
     void loadEmbeddingProviderSettings();
     void loadActiveEmbeddingModel();
   }, [
@@ -1316,21 +1480,24 @@ function ClioContentApp() {
     loadImageGenerationSettings,
     loadProviderSettings,
     loadSearchProviderSettings,
+    loadVisionProviderSettings,
   ]);
 
   const refreshSettingsProviders = React.useCallback(async () => {
     const providerOk = await loadProviderSettings();
     const searchOk = await loadSearchProviderSettings();
     const imageOk = await loadImageGenerationSettings();
+    const visionOk = await loadVisionProviderSettings();
     const embeddingOk = await loadEmbeddingProviderSettings();
     const activeEmbeddingOk = await loadActiveEmbeddingModel();
-    return providerOk && searchOk && imageOk && embeddingOk && activeEmbeddingOk;
+    return providerOk && searchOk && imageOk && visionOk && embeddingOk && activeEmbeddingOk;
   }, [
     loadActiveEmbeddingModel,
     loadEmbeddingProviderSettings,
     loadImageGenerationSettings,
     loadProviderSettings,
     loadSearchProviderSettings,
+    loadVisionProviderSettings,
   ]);
 
   const changeRailTheme = React.useCallback((theme: RailTheme) => {
@@ -1509,6 +1676,30 @@ function ClioContentApp() {
       } catch (error) {
         setProviderMessage(
           error instanceof Error ? error.message : "Unable to save Image Gen settings.",
+        );
+        return false;
+      } finally {
+        setProviderLoading(false);
+      }
+    },
+    [],
+  );
+
+  const saveVisionProviderSettings = React.useCallback(
+    async (input: SaveVisionProviderSettingsInput) => {
+      setProviderLoading(true);
+      setProviderMessage(null);
+      try {
+        const settings = await requestProvider({
+          kind: "saveVisionProviderSettings",
+          settings: input,
+        });
+        setVisionProviderSettings(settings);
+        setProviderMessage("Vision provider saved.");
+        return true;
+      } catch (error) {
+        setProviderMessage(
+          error instanceof Error ? error.message : "Unable to save Vision provider.",
         );
         return false;
       } finally {
@@ -1929,18 +2120,55 @@ function ClioContentApp() {
 
   const openDetail = React.useCallback(
     async (id: string) => {
+      const loadSequence = detailLoadSequenceRef.current + 1;
+      detailLoadSequenceRef.current = loadSequence;
+      clearPdfPreview();
       dispatch({ type: "SET_LOADING", loading: true });
       try {
         const next = await requestEngine({ kind: "getMemory", id });
+        if (detailLoadSequenceRef.current !== loadSequence) return;
         setDetail(next);
         dispatch({ type: "SHOW_DETAIL", memoryId: id });
+        dispatch({ type: "SET_LOADING", loading: false });
+        if (!memoryHasPersistedPdfRawFile(next)) return;
+
+        setPdfPreview({ memoryId: id, status: "loading" });
+        try {
+          const raw = await requestEngine({ kind: "getPdfRawFile", id });
+          if (detailLoadSequenceRef.current !== loadSequence) return;
+          const objectUrl = URL.createObjectURL(
+            new Blob([pdfRawBytesToBlobPart(raw.bytes)], { type: raw.contentType }),
+          );
+          if (pdfPreviewObjectUrlRef.current !== null) {
+            URL.revokeObjectURL(pdfPreviewObjectUrlRef.current);
+          }
+          pdfPreviewObjectUrlRef.current = objectUrl;
+          setPdfPreview({
+            memoryId: raw.memoryId,
+            status: "ready",
+            objectUrl,
+            byteLength: raw.byteLength,
+            contentType: raw.contentType,
+          });
+        } catch (error) {
+          if (detailLoadSequenceRef.current !== loadSequence) return;
+          const toast = errorToast(error);
+          setPdfPreview({
+            memoryId: id,
+            status: toast.tone === "warning" ? "unavailable" : "error",
+            message: toast.message,
+          });
+        }
       } catch (error) {
+        if (detailLoadSequenceRef.current !== loadSequence) return;
         showToast(errorToast(error));
       } finally {
-        dispatch({ type: "SET_LOADING", loading: false });
+        if (detailLoadSequenceRef.current === loadSequence) {
+          dispatch({ type: "SET_LOADING", loading: false });
+        }
       }
     },
-    [showToast],
+    [clearPdfPreview, showToast],
   );
 
   const openTopicDetail = React.useCallback(
@@ -2598,6 +2826,7 @@ function ClioContentApp() {
     void loadProviderSettings();
     void loadSearchProviderSettings();
     void loadImageGenerationSettings();
+    void loadVisionProviderSettings();
     void loadEmbeddingProviderSettings();
     void loadActiveEmbeddingModel();
   }, [
@@ -2606,6 +2835,7 @@ function ClioContentApp() {
     loadImageGenerationSettings,
     loadProviderSettings,
     loadSearchProviderSettings,
+    loadVisionProviderSettings,
   ]);
 
   React.useEffect(() => {
@@ -3569,6 +3799,7 @@ function ClioContentApp() {
         collapsedSide={collapsedLauncherPosition.side}
         collapsedTopPx={collapsedTopPx}
         detail={detail}
+        pdfPreview={pdfPreview}
         activeEmbeddingModel={activeEmbeddingModel}
         embeddingProviderSettings={embeddingProviderSettings}
         health={health}
@@ -3576,6 +3807,8 @@ function ClioContentApp() {
         imageGenerationSettings={imageGenerationSettings}
         imageGenerationState={imageGenerationState}
         items={items}
+        knowledgeBaseFilter={knowledgeBaseFilter}
+        workingSetStatus={workingSetStatus}
         topicDetail={topicDetail}
         topicForm={topicForm}
         topicFormOpen={topicFormOpen}
@@ -3587,10 +3820,14 @@ function ClioContentApp() {
         wikiCompileRunning={wikiCompileRunning}
         onAcceptPageChange={handleAcceptPageChange}
         onBackToHome={() => {
+          detailLoadSequenceRef.current += 1;
+          clearPdfPreview();
           setDetail(null);
           dispatch({ type: "OPEN_HOME" });
         }}
         onBackToKnowledgeBase={() => {
+          detailLoadSequenceRef.current += 1;
+          clearPdfPreview();
           setDetail(null);
           dispatch({ type: "SHOW_KNOWLEDGE_BASE" });
         }}
@@ -3622,6 +3859,9 @@ function ClioContentApp() {
           dispatch({ type: "SHOW_MARKDOWN_PREVIEW", messageId })
         }
         onReplySuggestion={handleReplySuggestion}
+        onToggleCitationExcerpt={(messageId, citationId) =>
+          dispatch({ type: "TOGGLE_CITATION_EXCERPT", messageId, citationId })
+        }
         onCloseMarkdownPreview={() => dispatch({ type: "CLOSE_MARKDOWN_PREVIEW" })}
         onCopyMarkdownPreview={(content) => void handleCopyMarkdownPreview(content)}
         onCopyMarkdownText={(content) => void handleCopyMarkdownText(content)}
@@ -3630,6 +3870,17 @@ function ClioContentApp() {
         onOpenSettings={openSettings}
         onImagePromptPrefillConsumed={() => dispatch({ type: "CLEAR_IMAGE_PROMPT_PREFILL" })}
         onOpenSource={(memory) => void openSource(memory)}
+        onKnowledgeBaseFilterChange={setKnowledgeBaseFilter}
+        onPinWorkingSetSource={(sourceId, loadDepth) =>
+          void pinWorkingSetSource(sourceId, loadDepth)
+        }
+        onEvictWorkingSetSource={(sourceId) => void evictWorkingSetSource(sourceId)}
+        onSetWorkingSetSourceDepth={(sourceId, loadDepth) =>
+          void setWorkingSetSourceDepth(sourceId, loadDepth)
+        }
+        onReloadWorkingSetSource={(sourceId, loadDepth) =>
+          void reloadWorkingSetSource(sourceId, loadDepth)
+        }
         onOpenTopicPage={(id) => void openTopicDetail(id)}
         onCreateTopicPage={() => void createTopicPage()}
         onCancelTopicForm={() => setTopicFormOpen(false)}
@@ -3663,6 +3914,7 @@ function ClioContentApp() {
         onSaveOpenAIProvider={saveOpenAIProvider}
         onSaveImageGenerationSettings={saveImageGenerationSettings}
         onSaveSearchProvider={saveSearchProvider}
+        onSaveVisionProviderSettings={saveVisionProviderSettings}
         onSelectProvider={selectProvider}
         onClearWebSearchHistory={handleClearWebSearchHistory}
         onDeleteWebSearchHistory={(id) => void handleDeleteWebSearchHistory(id)}
@@ -3688,6 +3940,7 @@ function ClioContentApp() {
         onThemeChange={changeRailTheme}
         webSearchHistory={webSearchHistory}
         webSearchState={webSearchState}
+        visionProviderSettings={visionProviderSettings}
       />
       {toast !== null ? <Toast toast={toast} /> : null}
     </div>

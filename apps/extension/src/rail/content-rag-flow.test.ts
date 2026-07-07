@@ -49,6 +49,10 @@ describe("content local RAG flow", () => {
   });
 
   it("routes Knowledge Base page search through source-level KB search", () => {
+    const retrieveFilterSection = contentSource.slice(
+      contentSource.indexOf("function retrieveFilterForKnowledgeBase"),
+      contentSource.indexOf("function knowledgeUploadKindForFile"),
+    );
     const loadLibrarySection = contentSource.slice(
       contentSource.indexOf("const loadLibrary = React.useCallback"),
       contentSource.indexOf("const loadChatHistory = React.useCallback"),
@@ -56,8 +60,71 @@ describe("content local RAG flow", () => {
 
     expect(loadLibrarySection).toContain('kind: "searchKnowledgeBase"');
     expect(loadLibrarySection).toContain("toKnowledgeBaseSearchItem");
+    expect(loadLibrarySection).toContain("retrieveFilterForKnowledgeBase(knowledgeBaseFilter)");
+    expect(retrieveFilterSection).toContain('["webpage", "page", "selection"]');
+    expect(loadLibrarySection).toContain("filter: retrieveFilter");
     expect(loadLibrarySection).not.toContain('kind: "searchMemory"');
     expect(loadLibrarySection).not.toContain('kind: "listMemories"');
+  });
+
+  it("exposes Knowledge Base source filters without bypassing searchKnowledgeBase", () => {
+    const contentStateSection = contentSource.slice(
+      contentSource.indexOf("function ClioContentApp()"),
+      contentSource.indexOf("React.useEffect(() => {"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const knowledgePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function TopicKnowledgePanel"),
+    );
+
+    expect(contentStateSection).toContain("defaultKnowledgeBaseFilter");
+    expect(railPropsSection).toContain("knowledgeBaseFilter={knowledgeBaseFilter}");
+    expect(railPropsSection).toContain("onKnowledgeBaseFilterChange={setKnowledgeBaseFilter}");
+    expect(knowledgePanelSection).toContain('data-clio-knowledge-filters="true"');
+    expect(knowledgePanelSection).toContain('id="clio-kb-source-type-filter"');
+    expect(knowledgePanelSection).toContain('id="clio-kb-lifecycle-filter"');
+    expect(knowledgePanelSection).not.toContain('kind: "searchMemory"');
+    expect(knowledgePanelSection).not.toContain('kind: "listMemories"');
+  });
+
+  it("exposes Working Set controls without loading full memories in the Rail", () => {
+    const loadLibrarySection = contentSource.slice(
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+      contentSource.indexOf("const loadChatHistory = React.useCallback"),
+    );
+    const contentWorkingSetSection = contentSource.slice(
+      contentSource.indexOf("const pinWorkingSetSource = React.useCallback"),
+      contentSource.indexOf("const loadChatHistory = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const workingSetPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBaseWorkingSetPanel"),
+      railShellSource.indexOf("function TopicKnowledgePanel"),
+    );
+    const memoryListSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryList"),
+      railShellSource.indexOf("function MemoryDetailPanel"),
+    );
+
+    expect(loadLibrarySection).toContain('kind: "getWorkingSetStatus"');
+    expect(contentWorkingSetSection).toContain('kind: "pinWorkingSetSource"');
+    expect(contentWorkingSetSection).toContain('kind: "evictWorkingSetSource"');
+    expect(contentWorkingSetSection).toContain('kind: "setWorkingSetSourceDepth"');
+    expect(contentWorkingSetSection).toContain('kind: "reloadWorkingSetSource"');
+    expect(railPropsSection).toContain("workingSetStatus={workingSetStatus}");
+    expect(railPropsSection).toContain("onPinWorkingSetSource=");
+    expect(workingSetPanelSection).toContain('data-clio-working-set="true"');
+    expect(workingSetPanelSection).toContain("workingSetLoadDepthOptions");
+    expect(memoryListSection).toContain('onPinWorkingSetSource(item.id, "meta")');
+    expect(workingSetPanelSection).not.toContain('kind: "getMemory"');
+    expect(memoryListSection).not.toContain('kind: "getMemory"');
   });
 
   it("routes Knowledge Base uploads through public file capture RPCs", () => {
@@ -80,6 +147,36 @@ describe("content local RAG flow", () => {
       'accept="application/pdf,text/markdown,.pdf,.md,.markdown"',
     );
     expect(knowledgePanelSection).toContain("props.onUploadKnowledgeFiles(files)");
+  });
+
+  it("keeps raw PDF reader loading in content and renders preview in Rail", () => {
+    const openDetailSection = contentSource.slice(
+      contentSource.indexOf("const openDetail = React.useCallback"),
+      contentSource.indexOf("const openTopicDetail = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const detailPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryDetailPanel"),
+      railShellSource.indexOf("function ChatHistoryPanel"),
+    );
+
+    expect(openDetailSection).toContain('kind: "getMemory"');
+    expect(openDetailSection).toContain('kind: "getPdfRawFile"');
+    expect(openDetailSection).toContain("URL.createObjectURL");
+    expect(contentSource).toContain("URL.revokeObjectURL");
+    expect(railPropsSection).toContain("pdfPreview={pdfPreview}");
+    expect(detailPanelSection).toContain("PdfReaderPreview");
+    expect(detailPanelSection).toContain('data-clio-pdf-preview="true"');
+    expect(detailPanelSection).toContain('data-clio-pdf-bbox-overlay="true"');
+    expect(detailPanelSection).toContain('data-clio-pdf-bbox-highlight="true"');
+    expect(detailPanelSection).toContain("metadataBoundingBox(record.bbox)");
+    expect(detailPanelSection).toContain("pdfPageSize(detail, pageNumber)");
+    expect(detailPanelSection).toContain("pdf_figure_analysis_results");
+    expect(detailPanelSection).toContain("pdfFigureAnalysisResultDetail");
+    expect(detailPanelSection).not.toContain("requestEngine");
   });
 
   it("plans source context packs through controlled auto or explicit research mode", () => {

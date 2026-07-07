@@ -1,4 +1,4 @@
-import { citationValidationWarningMessage } from "@/src/agent-runtime/citation-validator";
+import { formatCitationValidationWarning } from "@/src/agent-runtime/citation-validator";
 import {
   type EmbeddingOpenAICompatibleSlotSettings,
   type EmbeddingOpenAISlotSettings,
@@ -40,7 +40,12 @@ import type {
   SearchProviderId,
   SearchProviderSettings,
 } from "@/src/agent-runtime/search-provider-settings";
-import type { AgentToolTrace } from "@/src/agent-runtime/types";
+import type { AgentToolTrace, LocalCitation } from "@/src/agent-runtime/types";
+import type {
+  SaveVisionProviderSettingsInput,
+  VisionProviderId,
+  VisionProviderSettings,
+} from "@/src/agent-runtime/vision-provider-settings";
 import type { ComposerContextAttachmentKind } from "@/src/rail/api/chat-session";
 import { formatDate } from "@/src/rail/api/local-memory";
 import {
@@ -112,6 +117,7 @@ import type {
   EngineHealth,
   ImageGenerationHistoryRecord,
   MemoryDetail,
+  RetrieveSourceLifecycleFilter,
   SearchMemoryItem,
   TopicGraphEdge,
   TopicPageDetail,
@@ -119,6 +125,8 @@ import type {
   WebSearchHistoryRecord,
   WikiCompileJobEvent,
   WikiCompileJobSummary,
+  WorkingSetLoadDepth,
+  WorkingSetStatusResult,
 } from "@/src/shared/rpc";
 import type { ReplyActionSuggestion } from "@/src/suggestions/suggestion-types";
 import {
@@ -151,12 +159,14 @@ import {
   KeyRound,
   Library,
   Loader2,
+  Maximize2,
   MessageSquare,
   Mic,
   Moon,
   PanelRightClose,
   Paperclip,
   Pencil,
+  Pin,
   Plus,
   RefreshCw,
   Save,
@@ -175,10 +185,21 @@ import {
 import * as React from "react";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 
+export interface PdfReaderPreviewState {
+  memoryId: string;
+  status: "loading" | "ready" | "unavailable" | "error";
+  objectUrl?: string;
+  byteLength?: number;
+  contentType?: "application/pdf";
+  message?: string;
+}
+
 export interface RailShellProps {
   state: RailState;
   health: EngineHealth | null;
   items: SearchMemoryItem[];
+  knowledgeBaseFilter: KnowledgeBaseFilterState;
+  workingSetStatus: WorkingSetStatusResult | null;
   topicPages: TopicPageSummary[];
   relatedItems: SearchMemoryItem[];
   chatSessions: ChatSessionSummary[];
@@ -186,6 +207,7 @@ export interface RailShellProps {
   slashCommands: SlashCommand[];
   slashContext: SlashCommandContext;
   detail: MemoryDetail | null;
+  pdfPreview: PdfReaderPreviewState | null;
   topicDetail: TopicPageDetail | null;
   topicForm: TopicPageFormState;
   topicFormOpen: boolean;
@@ -200,6 +222,7 @@ export interface RailShellProps {
   searchProviderSettings: SearchProviderSettings | null;
   embeddingProviderSettings: EmbeddingProviderSettings | null;
   imageGenerationSettings: ImageGenerationSettings | null;
+  visionProviderSettings: VisionProviderSettings | null;
   imageGenerationHistory: ImageGenerationHistoryRecord[];
   imageGenerationState: ImageGenerationDisplayState;
   webSearchHistory: WebSearchHistoryRecord[];
@@ -242,6 +265,7 @@ export interface RailShellProps {
   onOpenTopicSource: (memoryId: string) => void;
   onOpenMarkdownPreview: (messageId: string) => void;
   onReplySuggestion: (suggestion: ReplyActionSuggestion) => void;
+  onToggleCitationExcerpt: (messageId: string, citationId: string) => void;
   onCloseMarkdownPreview: () => void;
   onCopyMarkdownPreview: (content: string) => void;
   onCopyMarkdownText: (content: string) => void;
@@ -249,6 +273,11 @@ export interface RailShellProps {
   onOpenRelatedMemory: (id: string) => void;
   onOpenSettings: () => void;
   onOpenSource: (memory: MemoryDetail) => void;
+  onKnowledgeBaseFilterChange: (filter: KnowledgeBaseFilterState) => void;
+  onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
+  onEvictWorkingSetSource: (sourceId: string) => void;
+  onSetWorkingSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
+  onReloadWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onQueryChange: (query: string) => void;
   onRefresh: () => void;
   onRefreshProvider: () => Promise<boolean>;
@@ -288,6 +317,7 @@ export interface RailShellProps {
   }) => Promise<boolean>;
   onSaveSearchProvider: (input: SaveSearchProviderInput) => Promise<boolean>;
   onSaveImageGenerationSettings: (input: SaveImageGenerationSettingsInput) => Promise<boolean>;
+  onSaveVisionProviderSettings: (input: SaveVisionProviderSettingsInput) => Promise<boolean>;
   onSaveEmbeddingProviderSettings: (input: SaveEmbeddingProviderSettingsInput) => Promise<boolean>;
   onTestEmbeddingProvider: (input: SaveEmbeddingProviderSettingsInput) => Promise<boolean>;
   onSubmitWebSearch: (query: string) => void;
@@ -337,6 +367,15 @@ export interface ImageGenerationSubmitInput {
   input?: ClioImageInput;
 }
 
+export type KnowledgeBaseSourceTypeFilter = "all" | "webpage" | "markdown" | "pdf" | "paper";
+
+export interface KnowledgeBaseFilterState {
+  sourceType: KnowledgeBaseSourceTypeFilter;
+  lifecycleStatus: "all" | RetrieveSourceLifecycleFilter;
+}
+
+const workingSetLoadDepthOptions: WorkingSetLoadDepth[] = ["meta", "outline", "chunks", "full"];
+
 export interface EmbeddingProviderFormValues {
   activeProvider: EmbeddingProviderId;
   openAIApiKey: string;
@@ -365,6 +404,107 @@ export function buildEmbeddingProviderSettingsInput(
       providerName: values.compatibleProviderName,
     },
   };
+}
+
+export interface CitationDetailMetric {
+  label: string;
+  value: string;
+}
+
+export interface CitationGraphNode {
+  id: string;
+  label: string;
+  kind: "claim" | "citation";
+  x: number;
+  y: number;
+  citationId?: string;
+}
+
+export interface CitationGraphModel {
+  claimNodes: CitationGraphNode[];
+  citationNodes: CitationGraphNode[];
+  omittedClaimCount: number;
+  omittedCitationCount: number;
+}
+
+export function buildCitationDetailMetrics(
+  validation: RailDialogueMessage["citationValidation"],
+): CitationDetailMetric[] {
+  if (validation === undefined) return [];
+  return [
+    {
+      label: "Evidence",
+      value: `${validation.memoryEvidenceCount}/${validation.evidenceCount}`,
+    },
+    {
+      label: "Claims",
+      value:
+        validation.claimCount === undefined
+          ? "not checked"
+          : `${validation.coveredClaimCount ?? 0}/${validation.claimCount}`,
+    },
+    {
+      label: "Citations",
+      value: `${validation.validMemoryCitationCount}/${validation.citationCount}`,
+    },
+    {
+      label: "Quality",
+      value: validation.evidenceQuality ?? "unknown",
+    },
+    {
+      label: "Judge",
+      value: validation.semanticJudge?.status ?? validation.supportCheck ?? "not checked",
+    },
+    {
+      label: "Retry",
+      value:
+        validation.retry === undefined
+          ? "not attempted"
+          : `${validation.retry.count}${validation.retry.exhausted ? " exhausted" : ""}`,
+    },
+  ];
+}
+
+export function buildCitationGraphModel(message: RailDialogueMessage): CitationGraphModel | null {
+  if (message.role !== "assistant" || message.citationValidation === undefined) return null;
+  const claims = (message.citationValidation.uncoveredClaims ?? []).slice(0, 3);
+  const citations = uniqueCitationsByEvidence(message.citations).slice(0, 4);
+  if (claims.length === 0 && citations.length === 0) return null;
+  return {
+    claimNodes: claims.map((claim, index) => ({
+      id: `claim:${claim.position}:${index}`,
+      label: claim.text,
+      kind: "claim",
+      x: 18,
+      y: citationGraphNodeY(index, claims.length),
+    })),
+    citationNodes: citations.map((citation, index) => ({
+      id: `citation:${citation.id}`,
+      label: citation.sourceTitle || citation.evidenceId,
+      kind: "citation",
+      x: 82,
+      y: citationGraphNodeY(index, citations.length),
+      citationId: citation.id,
+    })),
+    omittedClaimCount: Math.max(0, (message.citationValidation.uncoveredClaims?.length ?? 0) - 3),
+    omittedCitationCount: Math.max(0, uniqueCitationsByEvidence(message.citations).length - 4),
+  };
+}
+
+function uniqueCitationsByEvidence(citations: LocalCitation[]) {
+  const seenEvidenceIds = new Set<string>();
+  const unique: LocalCitation[] = [];
+  for (const citation of citations) {
+    if (seenEvidenceIds.has(citation.evidenceId)) continue;
+    seenEvidenceIds.add(citation.evidenceId);
+    unique.push(citation);
+  }
+  return unique;
+}
+
+function citationGraphNodeY(index: number, count: number) {
+  if (count <= 1) return 50;
+  return 20 + (index * 60) / (count - 1);
 }
 
 export function RailShell(props: RailShellProps) {
@@ -833,6 +973,7 @@ function renderMode(props: RailShellProps) {
         }
         onDelete={props.onDelete}
         onOpenSource={props.onOpenSource}
+        pdfPreview={props.pdfPreview}
       />
     );
   }
@@ -893,6 +1034,7 @@ function AgentHomePanel(props: RailShellProps) {
             onOpenMarkdownPreview={props.onOpenMarkdownPreview}
             onReplySuggestion={props.onReplySuggestion}
             onSourceActivate={props.onOpenMarkdownSource}
+            onToggleCitationExcerpt={props.onToggleCitationExcerpt}
             onRetry={props.onRetryDialogue}
             onStop={props.onStopInterruptedDialogue}
           />
@@ -949,6 +1091,7 @@ function ConversationStream({
   onOpenMarkdownPreview,
   onReplySuggestion,
   onSourceActivate,
+  onToggleCitationExcerpt,
   onRetry,
   onStop,
 }: {
@@ -958,6 +1101,7 @@ function ConversationStream({
   onOpenMarkdownPreview: (messageId: string) => void;
   onReplySuggestion: (suggestion: ReplyActionSuggestion) => void;
   onSourceActivate: (source: MarkdownSource) => void;
+  onToggleCitationExcerpt: (messageId: string, citationId: string) => void;
   onRetry: (messageId: string) => void;
   onStop: (messageId: string) => void;
 }) {
@@ -983,6 +1127,7 @@ function ConversationStream({
             onOpenMarkdownPreview={onOpenMarkdownPreview}
             onReplySuggestion={onReplySuggestion}
             onSourceActivate={onSourceActivate}
+            onToggleCitationExcerpt={onToggleCitationExcerpt}
             onRetry={onRetry}
             onStop={onStop}
           />
@@ -1198,6 +1343,7 @@ function DialogueMessage({
   onOpenMarkdownPreview,
   onReplySuggestion,
   onSourceActivate,
+  onToggleCitationExcerpt,
   onRetry,
   onStop,
 }: {
@@ -1206,6 +1352,7 @@ function DialogueMessage({
   onOpenMarkdownPreview: (messageId: string) => void;
   onReplySuggestion: (suggestion: ReplyActionSuggestion) => void;
   onSourceActivate: (source: MarkdownSource) => void;
+  onToggleCitationExcerpt: (messageId: string, citationId: string) => void;
   onRetry: (messageId: string) => void;
   onStop: (messageId: string) => void;
 }) {
@@ -1262,10 +1409,10 @@ function DialogueMessage({
             </div>
           ) : null}
           {message.citationValidation?.status === "warning" ? (
-            <div className="mt-2.5 flex items-start gap-1.5 rounded-md border border-warning-border bg-warning-background px-2.5 py-1.5 text-[11px] leading-4 text-warning-foreground">
-              <ShieldAlert className="mt-0.5 shrink-0" size={12} />
-              <span>{message.citationValidation.message ?? citationValidationWarningMessage}</span>
-            </div>
+            <CitationValidationDetail
+              message={message}
+              onToggleCitationExcerpt={onToggleCitationExcerpt}
+            />
           ) : null}
           {message.error !== undefined && message.status !== "cancelled" ? (
             <div className="mt-2.5 rounded-md border border-warning-border bg-warning-background px-2.5 py-1.5 text-[11px] leading-4 text-warning-foreground">
@@ -1326,6 +1473,302 @@ function DialogueMessage({
       </div>
     </div>
   );
+}
+
+function CitationValidationDetail({
+  message,
+  onToggleCitationExcerpt,
+}: {
+  message: RailDialogueMessage;
+  onToggleCitationExcerpt: (messageId: string, citationId: string) => void;
+}) {
+  const validation = message.citationValidation;
+  if (validation === undefined || validation.status !== "warning") return null;
+
+  const metrics = buildCitationDetailMetrics(validation);
+  const claims = (validation.uncoveredClaims ?? []).slice(0, 3);
+  const citations = uniqueCitationsByEvidence(message.citations).slice(0, 4);
+  const omittedClaimCount = Math.max(0, (validation.uncoveredClaims?.length ?? 0) - claims.length);
+  const omittedCitationCount = Math.max(
+    0,
+    uniqueCitationsByEvidence(message.citations).length - citations.length,
+  );
+
+  return (
+    <div
+      className="mt-2.5 overflow-hidden rounded-lg border border-warning-border bg-warning-background text-warning-foreground"
+      data-clio-citation-detail="true"
+    >
+      <div className="flex items-start gap-2 px-3 py-2.5">
+        <ShieldAlert className="mt-0.5 shrink-0" size={15} />
+        <div className="min-w-0 flex-1">
+          <div className="text-[12px] font-semibold leading-5">Citation check needs review</div>
+          <div className="break-words text-[11px] leading-4 opacity-90">
+            {formatCitationValidationWarning(validation)}
+          </div>
+        </div>
+      </div>
+
+      <div className="border-t border-warning-border/80 px-3 py-2.5">
+        <dl className="grid grid-cols-2 gap-2">
+          {metrics.map((metric) => (
+            <div
+              className="min-h-[44px] rounded-md bg-background/70 px-2.5 py-1.5"
+              key={metric.label}
+            >
+              <dt className="truncate text-[10px] font-medium uppercase leading-4 text-muted-foreground">
+                {metric.label}
+              </dt>
+              <dd className="truncate text-[12px] font-semibold leading-5 text-foreground">
+                {metric.value}
+              </dd>
+            </div>
+          ))}
+        </dl>
+
+        {claims.length > 0 ? (
+          <div className="mt-2.5">
+            <div className="mb-1.5 text-[10px] font-semibold uppercase leading-4 text-muted-foreground">
+              Unresolved claims
+            </div>
+            <div className="flex flex-col gap-1.5">
+              {claims.map((claim, index) => (
+                <div
+                  className="rounded-md bg-background/70 px-2.5 py-2 text-[11px] leading-4 text-foreground"
+                  key={`${claim.position}:${index}`}
+                >
+                  <div className="mb-1 flex min-w-0 items-center gap-1.5">
+                    <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                      Claim {index + 1}
+                    </span>
+                    <span className="truncate text-[10px] text-muted-foreground">
+                      {citationPreviewReasonLabel(claim.reason)}
+                    </span>
+                  </div>
+                  <div className="break-words">{compactCitationDetailText(claim.text, 180)}</div>
+                </div>
+              ))}
+              {omittedClaimCount > 0 ? (
+                <div className="px-1 text-[10.5px] leading-4 text-muted-foreground">
+                  +{omittedClaimCount} more claim(s)
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+
+        {citations.length > 0 ? (
+          <div className="mt-2.5">
+            <div className="mb-1.5 text-[10px] font-semibold uppercase leading-4 text-muted-foreground">
+              Citation evidence
+            </div>
+            <div className="flex flex-col gap-1.5">
+              {citations.map((citation) => {
+                const expanded = message.expandedCitationId === citation.id;
+                return (
+                  <div className="overflow-hidden rounded-md bg-background/70" key={citation.id}>
+                    <button
+                      aria-expanded={expanded}
+                      className="flex min-h-9 w-full min-w-0 items-center gap-2 px-2.5 py-1.5 text-left text-[11px] leading-4 text-foreground outline-none transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-primary"
+                      onClick={() => onToggleCitationExcerpt(message.id, citation.id)}
+                      type="button"
+                    >
+                      {expanded ? (
+                        <ChevronDown className="shrink-0 text-muted-foreground" size={13} />
+                      ) : (
+                        <ChevronRight className="shrink-0 text-muted-foreground" size={13} />
+                      )}
+                      <span className="min-w-0 flex-1 truncate">
+                        {citation.sourceTitle || citation.evidenceId}
+                      </span>
+                      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                        {citationSourceKindLabel(citation.sourceKind)}
+                      </span>
+                    </button>
+                    {expanded ? (
+                      <div className="border-t border-border px-3 py-2 text-[11px] leading-4 text-muted-foreground">
+                        <div className="mb-1 truncate font-mono text-[10px]">
+                          {citation.evidenceId}
+                        </div>
+                        <div className="break-words text-foreground">
+                          {compactCitationDetailText(citation.excerpt, 360) || "No excerpt"}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+              {omittedCitationCount > 0 ? (
+                <div className="px-1 text-[10.5px] leading-4 text-muted-foreground">
+                  +{omittedCitationCount} more citation(s)
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+
+        <CitationGraphMap message={message} onToggleCitationExcerpt={onToggleCitationExcerpt} />
+      </div>
+    </div>
+  );
+}
+
+function CitationGraphMap({
+  message,
+  onToggleCitationExcerpt,
+}: {
+  message: RailDialogueMessage;
+  onToggleCitationExcerpt: (messageId: string, citationId: string) => void;
+}) {
+  const model = buildCitationGraphModel(message);
+  if (model === null) return null;
+
+  const lines = citationGraphLines(model);
+
+  return (
+    <div className="mt-2.5" data-clio-citation-graph="true">
+      <div className="mb-1.5 flex items-center justify-between gap-2">
+        <div className="text-[10px] font-semibold uppercase leading-4 text-muted-foreground">
+          Citation graph
+        </div>
+        {model.omittedClaimCount > 0 || model.omittedCitationCount > 0 ? (
+          <div className="truncate text-[10px] text-muted-foreground">
+            +{model.omittedClaimCount + model.omittedCitationCount} hidden
+          </div>
+        ) : null}
+      </div>
+      <div className="relative h-44 overflow-hidden rounded-md border border-warning-border/80 bg-background">
+        <svg
+          aria-hidden="true"
+          className="absolute inset-0 h-full w-full"
+          preserveAspectRatio="none"
+          viewBox="0 0 100 100"
+        >
+          {lines.map((line) => (
+            <line
+              key={line.id}
+              stroke="currentColor"
+              strokeOpacity="0.18"
+              strokeWidth="0.7"
+              x1={line.x1}
+              x2={line.x2}
+              y1={line.y1}
+              y2={line.y2}
+            />
+          ))}
+        </svg>
+        {model.claimNodes.map((node) => (
+          <span
+            className="absolute flex h-8 w-[118px] -translate-x-1/2 -translate-y-1/2 items-center rounded-md border border-border bg-surface px-2 text-[10.5px] leading-3 text-foreground shadow-sm"
+            key={node.id}
+            style={{ left: `${node.x}%`, top: `${node.y}%` }}
+            title={node.label}
+          >
+            <span className="truncate">{compactCitationDetailText(node.label, 90)}</span>
+          </span>
+        ))}
+        {model.citationNodes.map((node, index) => {
+          const expanded =
+            node.citationId !== undefined && message.expandedCitationId === node.citationId;
+          return (
+            <button
+              aria-label={`Show citation ${index + 1} excerpt`}
+              className={[
+                "absolute flex h-8 w-[118px] -translate-x-1/2 -translate-y-1/2 items-center rounded-md border px-2 text-left text-[10.5px] leading-3 shadow-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary",
+                expanded
+                  ? "border-primary bg-surface-hover text-foreground"
+                  : "border-border bg-surface text-foreground hover:bg-surface-hover",
+              ].join(" ")}
+              key={node.id}
+              onClick={() => {
+                if (node.citationId !== undefined) {
+                  onToggleCitationExcerpt(message.id, node.citationId);
+                }
+              }}
+              style={{ left: `${node.x}%`, top: `${node.y}%` }}
+              title={node.label}
+              type="button"
+            >
+              <BookOpen className="mr-1.5 shrink-0 text-primary" size={12} />
+              <span className="truncate">{compactCitationDetailText(node.label, 90)}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function citationGraphLines(model: CitationGraphModel) {
+  if (model.claimNodes.length > 0 && model.citationNodes.length > 0) {
+    return model.claimNodes.flatMap((claim) =>
+      model.citationNodes.map((citation) => ({
+        id: `${claim.id}:${citation.id}`,
+        x1: claim.x + 10,
+        y1: claim.y,
+        x2: citation.x - 10,
+        y2: citation.y,
+      })),
+    );
+  }
+  if (model.claimNodes.length > 0) {
+    return model.claimNodes.map((claim) => ({
+      id: `${claim.id}:missing-citation`,
+      x1: claim.x + 10,
+      y1: claim.y,
+      x2: 72,
+      y2: claim.y,
+    }));
+  }
+  return model.citationNodes.map((citation) => ({
+    id: `missing-claim:${citation.id}`,
+    x1: 28,
+    y1: citation.y,
+    x2: citation.x - 10,
+    y2: citation.y,
+  }));
+}
+
+function citationPreviewReasonLabel(
+  reason: NonNullable<
+    NonNullable<RailDialogueMessage["citationValidation"]>["uncoveredClaims"]
+  >[number]["reason"],
+) {
+  switch (reason) {
+    case "missing_memory_citation":
+      return "missing citation";
+    case "unsupported_memory_citation":
+      return "unsupported citation";
+    case "insufficient_memory_evidence":
+      return "insufficient evidence";
+    case "semantic_unsupported":
+      return "semantic unsupported";
+    case "semantic_judge_unavailable":
+      return "judge unavailable";
+    default:
+      return reason;
+  }
+}
+
+function citationSourceKindLabel(kind: LocalCitation["sourceKind"]) {
+  switch (kind) {
+    case "memory":
+      return "memory";
+    case "page":
+      return "page";
+    case "selection":
+      return "selection";
+    case "web":
+      return "web";
+    default:
+      return kind;
+  }
+}
+
+function compactCitationDetailText(input: string, maxLength: number) {
+  const compact = normalizePreview(input);
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
 function AssistantActivity({ message }: { message: RailDialogueMessage }) {
@@ -2627,6 +3070,17 @@ function SettingsPanel(props: RailShellProps) {
   const [searchOpenAICompatibleApiKey, setSearchOpenAICompatibleApiKey] = React.useState("");
   const [searchOpenAICompatibleModel, setSearchOpenAICompatibleModel] = React.useState("");
   const [searchOpenAICompatibleBaseUrl, setSearchOpenAICompatibleBaseUrl] = React.useState("");
+  const [visionProvider, setVisionProvider] = React.useState<VisionProviderId>("auto");
+  const [visionGeminiApiKey, setVisionGeminiApiKey] = React.useState("");
+  const [visionGeminiModel, setVisionGeminiModel] = React.useState("");
+  const [visionOpenAIApiKey, setVisionOpenAIApiKey] = React.useState("");
+  const [visionOpenAIModel, setVisionOpenAIModel] = React.useState("");
+  const [visionOpenAIBaseUrl, setVisionOpenAIBaseUrl] = React.useState("");
+  const [visionOpenAICompatibleApiKey, setVisionOpenAICompatibleApiKey] = React.useState("");
+  const [visionOpenAICompatibleModel, setVisionOpenAICompatibleModel] = React.useState("");
+  const [visionOpenAICompatibleBaseUrl, setVisionOpenAICompatibleBaseUrl] = React.useState("");
+  const [visionOpenAICompatibleProviderName, setVisionOpenAICompatibleProviderName] =
+    React.useState(defaultOpenAICompatibleProviderName);
   const [embeddingProvider, setEmbeddingProvider] = React.useState<EmbeddingProviderId>(
     defaultActiveEmbeddingProvider,
   );
@@ -2674,6 +3128,23 @@ function SettingsPanel(props: RailShellProps) {
     setSearchOpenAICompatibleModel(props.searchProviderSettings.openaiCompatible.model ?? "");
     setSearchOpenAICompatibleBaseUrl(props.searchProviderSettings.openaiCompatible.baseUrl ?? "");
   }, [props.searchProviderSettings]);
+
+  React.useEffect(() => {
+    if (props.visionProviderSettings === null) return;
+    setVisionProvider(props.visionProviderSettings.provider);
+    setVisionGeminiApiKey(props.visionProviderSettings.gemini.apiKey ?? "");
+    setVisionGeminiModel(props.visionProviderSettings.gemini.model ?? "");
+    setVisionOpenAIApiKey(props.visionProviderSettings.openai.apiKey ?? "");
+    setVisionOpenAIModel(props.visionProviderSettings.openai.model ?? "");
+    setVisionOpenAIBaseUrl(props.visionProviderSettings.openai.baseUrl ?? "");
+    setVisionOpenAICompatibleApiKey(props.visionProviderSettings.openaiCompatible.apiKey ?? "");
+    setVisionOpenAICompatibleModel(props.visionProviderSettings.openaiCompatible.model ?? "");
+    setVisionOpenAICompatibleBaseUrl(props.visionProviderSettings.openaiCompatible.baseUrl ?? "");
+    setVisionOpenAICompatibleProviderName(
+      props.visionProviderSettings.openaiCompatible.providerName ??
+        defaultOpenAICompatibleProviderName,
+    );
+  }, [props.visionProviderSettings]);
 
   React.useEffect(() => {
     if (props.embeddingProviderSettings === null) return;
@@ -2724,6 +3195,51 @@ function SettingsPanel(props: RailShellProps) {
         <SettingsSectionMenu />
 
         <AppearanceSettingsCard theme={props.railTheme} onThemeChange={props.onThemeChange} />
+
+        <VisionProviderSettingsCard
+          compatibleApiKey={visionOpenAICompatibleApiKey}
+          compatibleBaseUrl={visionOpenAICompatibleBaseUrl}
+          compatibleModel={visionOpenAICompatibleModel}
+          compatibleProviderName={visionOpenAICompatibleProviderName}
+          geminiApiKey={visionGeminiApiKey}
+          geminiModel={visionGeminiModel}
+          loading={props.providerLoading}
+          openAIApiKey={visionOpenAIApiKey}
+          openAIBaseUrl={visionOpenAIBaseUrl}
+          openAIModel={visionOpenAIModel}
+          onCompatibleApiKeyChange={setVisionOpenAICompatibleApiKey}
+          onCompatibleBaseUrlChange={setVisionOpenAICompatibleBaseUrl}
+          onCompatibleModelChange={setVisionOpenAICompatibleModel}
+          onCompatibleProviderNameChange={setVisionOpenAICompatibleProviderName}
+          onGeminiApiKeyChange={setVisionGeminiApiKey}
+          onGeminiModelChange={setVisionGeminiModel}
+          onOpenAIApiKeyChange={setVisionOpenAIApiKey}
+          onOpenAIBaseUrlChange={setVisionOpenAIBaseUrl}
+          onOpenAIModelChange={setVisionOpenAIModel}
+          onProviderChange={setVisionProvider}
+          onSave={() =>
+            props.onSaveVisionProviderSettings({
+              provider: visionProvider,
+              gemini: {
+                apiKey: visionGeminiApiKey,
+                model: visionGeminiModel,
+              },
+              openai: {
+                apiKey: visionOpenAIApiKey,
+                model: visionOpenAIModel,
+                baseUrl: visionOpenAIBaseUrl,
+              },
+              openaiCompatible: {
+                apiKey: visionOpenAICompatibleApiKey,
+                model: visionOpenAICompatibleModel,
+                baseUrl: visionOpenAICompatibleBaseUrl,
+                providerName: visionOpenAICompatibleProviderName,
+              },
+            })
+          }
+          provider={visionProvider}
+          settings={props.visionProviderSettings}
+        />
 
         <ImageGenerationSettingsCard
           apiKey={imageGenerationApiKey}
@@ -3019,6 +3535,21 @@ function SettingsSectionMenu() {
         </span>
       </button>
       <button
+        aria-label="Vision analysis settings"
+        className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 text-left outline-none transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-primary"
+        type="button"
+      >
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
+          <Sparkles size={16} />
+        </span>
+        <span className="min-w-0 leading-tight">
+          <span className="block truncate text-sm font-semibold text-foreground">Vision</span>
+          <span className="block truncate text-[11px] text-muted-foreground">
+            Image understanding
+          </span>
+        </span>
+      </button>
+      <button
         aria-label="Image generation settings"
         className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 text-left outline-none transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-primary"
         type="button"
@@ -3047,6 +3578,233 @@ function SettingsSectionMenu() {
         </span>
       </button>
     </nav>
+  );
+}
+
+interface VisionProviderSettingsCardProps {
+  provider: VisionProviderId;
+  settings: VisionProviderSettings | null;
+  geminiApiKey: string;
+  geminiModel: string;
+  openAIApiKey: string;
+  openAIModel: string;
+  openAIBaseUrl: string;
+  compatibleApiKey: string;
+  compatibleModel: string;
+  compatibleBaseUrl: string;
+  compatibleProviderName: string;
+  loading: boolean;
+  onProviderChange: (provider: VisionProviderId) => void;
+  onGeminiApiKeyChange: (value: string) => void;
+  onGeminiModelChange: (value: string) => void;
+  onOpenAIApiKeyChange: (value: string) => void;
+  onOpenAIModelChange: (value: string) => void;
+  onOpenAIBaseUrlChange: (value: string) => void;
+  onCompatibleApiKeyChange: (value: string) => void;
+  onCompatibleModelChange: (value: string) => void;
+  onCompatibleBaseUrlChange: (value: string) => void;
+  onCompatibleProviderNameChange: (value: string) => void;
+  onSave: () => Promise<boolean>;
+}
+
+function VisionProviderSettingsCard(props: VisionProviderSettingsCardProps) {
+  const [apiKeyMasked, setApiKeyMasked] = React.useState(true);
+  const disabled = props.loading || props.settings === null;
+  const provider = props.provider === "auto" ? "openai" : props.provider;
+  const showingGemini = provider === "gemini";
+  const showingCompatible = provider === "openai-compatible";
+  const apiKey = showingGemini
+    ? props.geminiApiKey
+    : showingCompatible
+      ? props.compatibleApiKey
+      : props.openAIApiKey;
+  const model = showingGemini
+    ? props.geminiModel
+    : showingCompatible
+      ? props.compatibleModel
+      : props.openAIModel;
+  const baseUrl = showingCompatible ? props.compatibleBaseUrl : props.openAIBaseUrl;
+  const defaultModel = showingGemini
+    ? defaultGeminiModel
+    : showingCompatible
+      ? defaultOpenAICompatibleModel
+      : defaultOpenAIModel;
+  const defaultBaseUrl = showingCompatible ? defaultOpenAICompatibleBaseUrl : defaultOpenAIBaseUrl;
+  const onApiKeyChange = showingGemini
+    ? props.onGeminiApiKeyChange
+    : showingCompatible
+      ? props.onCompatibleApiKeyChange
+      : props.onOpenAIApiKeyChange;
+  const onModelChange = showingGemini
+    ? props.onGeminiModelChange
+    : showingCompatible
+      ? props.onCompatibleModelChange
+      : props.onOpenAIModelChange;
+  const onBaseUrlChange = showingCompatible
+    ? props.onCompatibleBaseUrlChange
+    : props.onOpenAIBaseUrlChange;
+  const fieldPrefix = showingGemini ? "gemini" : showingCompatible ? "openai-compatible" : "openai";
+  const label = visionProviderLabel(props.provider);
+  const apiKeyToggleLabel = apiKeyMasked ? `Show ${label} Vision key` : `Mask ${label} Vision key`;
+
+  return (
+    <section
+      className="rounded-xl border border-border bg-surface p-4"
+      data-clio-settings-section="vision"
+    >
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted text-primary">
+            <Sparkles size={16} />
+          </span>
+          <div className="min-w-0 leading-tight">
+            <h4 className="truncate text-sm font-semibold">Vision analysis</h4>
+            <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+              Figure and image understanding.
+            </p>
+          </div>
+        </div>
+        <Badge className="shrink-0 border-border bg-muted text-foreground-soft">
+          {props.settings === null ? "checking" : label}
+        </Badge>
+      </div>
+
+      <div className="mb-4 grid gap-1.5 text-[12px]">
+        <label className="font-medium text-foreground" htmlFor="clio-rail-vision-provider">
+          Provider
+        </label>
+        <select
+          className="h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+          disabled={disabled}
+          id="clio-rail-vision-provider"
+          onChange={(event) => props.onProviderChange(event.target.value as VisionProviderId)}
+          value={props.provider}
+        >
+          <option value="auto">Auto</option>
+          <option value="gemini">Gemini</option>
+          <option value="openai">OpenAI</option>
+          <option value="openai-compatible">OpenAI Compatible</option>
+        </select>
+      </div>
+
+      <section className="rounded-lg border border-border bg-background p-3.5">
+        <div className="mb-3 flex min-w-0 items-center gap-2">
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-muted text-primary">
+            <Bot size={15} />
+          </span>
+          <div className="min-w-0 leading-tight">
+            <h5 className="truncate text-sm font-semibold">
+              {props.provider === "auto" ? "Auto Vision fallback" : `${label} Vision override`}
+            </h5>
+            <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
+              {props.provider === "auto"
+                ? "Blank fields inherit the active vision-capable main model."
+                : "Used for PDF figures and other image-understanding tasks."}
+            </p>
+          </div>
+        </div>
+
+        <div className="grid gap-3">
+          <div className="grid gap-1.5 text-[12px]">
+            <label
+              className="font-medium text-foreground"
+              htmlFor={`clio-rail-vision-${fieldPrefix}-key`}
+            >
+              API Key
+            </label>
+            <div className="flex gap-2">
+              <Input
+                autoComplete="off"
+                className="h-10 min-w-0 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                disabled={disabled}
+                id={`clio-rail-vision-${fieldPrefix}-key`}
+                onChange={(event) => onApiKeyChange(event.target.value)}
+                placeholder={`Use main ${label} key`}
+                type={apiKeyMasked ? "password" : "text"}
+                value={apiKey}
+              />
+              <Button
+                aria-label={apiKeyToggleLabel}
+                className="h-10 w-10 shrink-0 border border-border bg-surface px-0 text-muted-foreground hover:bg-muted hover:text-foreground"
+                disabled={disabled}
+                onClick={() => setApiKeyMasked((value) => !value)}
+                size="icon"
+                title={apiKeyToggleLabel}
+                type="button"
+                variant="subtle"
+              >
+                {apiKeyMasked ? <Eye size={15} /> : <EyeOff size={15} />}
+              </Button>
+            </div>
+          </div>
+          <label
+            className="grid gap-1.5 text-[12px]"
+            htmlFor={`clio-rail-vision-${fieldPrefix}-model`}
+          >
+            <span className="font-medium text-foreground">Model</span>
+            <Input
+              className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+              disabled={disabled}
+              id={`clio-rail-vision-${fieldPrefix}-model`}
+              onChange={(event) => onModelChange(event.target.value)}
+              placeholder={props.provider === "auto" ? `Use main ${label} model` : defaultModel}
+              value={model}
+            />
+          </label>
+          {showingGemini ? null : (
+            <label
+              className="grid gap-1.5 text-[12px]"
+              htmlFor={`clio-rail-vision-${fieldPrefix}-base-url`}
+            >
+              <span className="font-medium text-foreground">Base URL</span>
+              <Input
+                className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                disabled={disabled}
+                id={`clio-rail-vision-${fieldPrefix}-base-url`}
+                onChange={(event) => onBaseUrlChange(event.target.value)}
+                placeholder={
+                  props.provider === "auto" ? `Use main ${label} Base URL` : defaultBaseUrl
+                }
+                value={baseUrl}
+              />
+            </label>
+          )}
+          {showingCompatible ? (
+            <label
+              className="grid gap-1.5 text-[12px]"
+              htmlFor="clio-rail-vision-openai-compatible-provider-name"
+            >
+              <span className="font-medium text-foreground">Provider name</span>
+              <Input
+                className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                disabled={disabled}
+                id="clio-rail-vision-openai-compatible-provider-name"
+                onChange={(event) => props.onCompatibleProviderNameChange(event.target.value)}
+                placeholder={defaultOpenAICompatibleProviderName}
+                value={props.compatibleProviderName}
+              />
+            </label>
+          ) : null}
+        </div>
+
+        <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
+          PDF parsing does not require this model. Without a configured vision-capable model, image
+          analysis waits while text, tables, citations, and preview still work.
+        </p>
+
+        <div className="mt-3">
+          <Button
+            className="w-full border border-border bg-surface text-foreground hover:bg-muted"
+            disabled={disabled}
+            onClick={() => void props.onSave()}
+            variant="subtle"
+          >
+            <ShieldCheck size={15} />
+            Save Vision
+          </Button>
+        </div>
+      </section>
+    </section>
   );
 }
 
@@ -3843,6 +4601,13 @@ function searchProviderLabel(provider: SearchProviderId) {
   return "Auto";
 }
 
+function visionProviderLabel(provider: VisionProviderId) {
+  if (provider === "gemini") return "Gemini";
+  if (provider === "openai") return "OpenAI";
+  if (provider === "openai-compatible") return "OpenAI Compatible";
+  return "Auto";
+}
+
 function embeddingProviderLabel(provider: EmbeddingProviderId) {
   if (provider === "openai-compatible") return "OpenAI Compatible";
   return "OpenAI";
@@ -3851,6 +4616,28 @@ function embeddingProviderLabel(provider: EmbeddingProviderId) {
 function KnowledgeBasePanel(props: RailShellProps) {
   const [section, setSection] = React.useState<"memories" | "topics">("memories");
   const uploadInputRef = React.useRef<HTMLInputElement | null>(null);
+  const workingSetSourceIds = React.useMemo(
+    () => new Set(props.workingSetStatus?.entries.map((entry) => entry.source.id) ?? []),
+    [props.workingSetStatus],
+  );
+  const updateSourceTypeFilter = React.useCallback(
+    (sourceType: KnowledgeBaseSourceTypeFilter) => {
+      props.onKnowledgeBaseFilterChange({
+        ...props.knowledgeBaseFilter,
+        sourceType,
+      });
+    },
+    [props.knowledgeBaseFilter, props.onKnowledgeBaseFilterChange],
+  );
+  const updateLifecycleFilter = React.useCallback(
+    (lifecycleStatus: KnowledgeBaseFilterState["lifecycleStatus"]) => {
+      props.onKnowledgeBaseFilterChange({
+        ...props.knowledgeBaseFilter,
+        lifecycleStatus,
+      });
+    },
+    [props.knowledgeBaseFilter, props.onKnowledgeBaseFilterChange],
+  );
   const topicCountLabel =
     props.topicPages.length === 0 ? "No topic pages" : `${props.topicPages.length} topic pages`;
   const memoryCountLabel =
@@ -3985,6 +4772,14 @@ function KnowledgeBasePanel(props: RailShellProps) {
             value={props.state.query}
           />
         </div>
+        {section === "memories" ? (
+          <KnowledgeBaseFilterControls
+            disabled={props.state.loading}
+            filter={props.knowledgeBaseFilter}
+            onLifecycleStatusChange={updateLifecycleFilter}
+            onSourceTypeChange={updateSourceTypeFilter}
+          />
+        ) : null}
         {section === "topics" ? (
           <TopicKnowledgePanel
             detail={props.topicDetail}
@@ -4009,16 +4804,202 @@ function KnowledgeBasePanel(props: RailShellProps) {
             onSave={props.onSaveTopicPage}
           />
         ) : (
-          <MemoryList
-            highlightedId={props.state.highlightedMemoryId}
-            items={props.items}
-            loading={props.state.loading}
-            onOpenDetail={props.onOpenDetail}
-          />
+          <div className="grid gap-3">
+            <KnowledgeBaseWorkingSetPanel
+              disabled={props.state.loading}
+              status={props.workingSetStatus}
+              onEvict={props.onEvictWorkingSetSource}
+              onReload={props.onReloadWorkingSetSource}
+              onSetDepth={props.onSetWorkingSetSourceDepth}
+            />
+            <MemoryList
+              highlightedId={props.state.highlightedMemoryId}
+              items={props.items}
+              loading={props.state.loading}
+              workingSetSourceIds={workingSetSourceIds}
+              onOpenDetail={props.onOpenDetail}
+              onPinWorkingSetSource={props.onPinWorkingSetSource}
+            />
+          </div>
         )}
       </div>
     </div>
   );
+}
+
+function KnowledgeBaseFilterControls({
+  disabled,
+  filter,
+  onLifecycleStatusChange,
+  onSourceTypeChange,
+}: {
+  disabled: boolean;
+  filter: KnowledgeBaseFilterState;
+  onLifecycleStatusChange: (status: KnowledgeBaseFilterState["lifecycleStatus"]) => void;
+  onSourceTypeChange: (sourceType: KnowledgeBaseSourceTypeFilter) => void;
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-2" data-clio-knowledge-filters="true">
+      <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-source-type-filter">
+        <span className="font-medium text-muted-foreground">Type</span>
+        <select
+          className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+          disabled={disabled}
+          id="clio-kb-source-type-filter"
+          onChange={(event) =>
+            onSourceTypeChange(event.target.value as KnowledgeBaseSourceTypeFilter)
+          }
+          value={filter.sourceType}
+        >
+          <option value="all">All types</option>
+          <option value="webpage">Web pages</option>
+          <option value="markdown">Markdown</option>
+          <option value="pdf">PDF</option>
+          <option value="paper">Papers</option>
+        </select>
+      </label>
+      <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-lifecycle-filter">
+        <span className="font-medium text-muted-foreground">Status</span>
+        <select
+          className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+          disabled={disabled}
+          id="clio-kb-lifecycle-filter"
+          onChange={(event) =>
+            onLifecycleStatusChange(
+              event.target.value as KnowledgeBaseFilterState["lifecycleStatus"],
+            )
+          }
+          value={filter.lifecycleStatus}
+        >
+          <option value="all">Searchable</option>
+          <option value="fresh">Fresh</option>
+          <option value="stale">Stale</option>
+          <option value="archived">Archived</option>
+        </select>
+      </label>
+    </div>
+  );
+}
+
+function KnowledgeBaseWorkingSetPanel({
+  disabled,
+  status,
+  onEvict,
+  onReload,
+  onSetDepth,
+}: {
+  disabled: boolean;
+  status: WorkingSetStatusResult | null;
+  onEvict: (sourceId: string) => void;
+  onReload: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
+  onSetDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
+}) {
+  const entries = status?.entries ?? [];
+  const totalTokens = status?.totalTokenEstimate ?? 0;
+  const budget = status?.budget ?? 0;
+  const budgetPercent = budget > 0 ? Math.min(100, Math.round((totalTokens / budget) * 100)) : 0;
+  return (
+    <section
+      className="rounded-lg border border-border bg-surface px-4 py-3"
+      data-clio-working-set="true"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">Working set</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {formatWorkingSetTokenCount(totalTokens)} / {formatWorkingSetTokenCount(budget)} tokens
+          </p>
+        </div>
+        <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+          {entries.length}
+        </Badge>
+      </div>
+      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-muted">
+        <div className="h-full rounded-full bg-primary" style={{ width: `${budgetPercent}%` }} />
+      </div>
+      {status === null ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">Status unavailable.</p>
+      ) : entries.length === 0 ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No working set sources.</p>
+      ) : (
+        <ul className="mt-3 divide-y divide-border">
+          {entries.map((entry) => (
+            <li className="grid gap-2 py-3 first:pt-0 last:pb-0" key={entry.source.id}>
+              <div className="flex min-w-0 items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <h4 className="line-clamp-1 text-[12.5px] font-semibold leading-5">
+                    {entry.source.sourceTitle}
+                  </h4>
+                  <p className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <span>{entry.source.sourceType}</span>
+                    <span>{entry.source.chunkCount} chunks</span>
+                    <span>{formatWorkingSetTokenCount(entry.tokenEstimate)} tokens</span>
+                  </p>
+                </div>
+                <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+                  {workingSetPinStatusLabel(entry.pinStatus)}
+                </Badge>
+              </div>
+              <div className="flex items-center gap-2">
+                <select
+                  aria-label={`Working set depth for ${entry.source.sourceTitle}`}
+                  className="h-8 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-[12px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+                  disabled={disabled}
+                  onChange={(event) =>
+                    onSetDepth(entry.source.id, event.target.value as WorkingSetLoadDepth)
+                  }
+                  value={entry.loadDepth}
+                >
+                  {workingSetLoadDepthOptions.map((depth) => (
+                    <option key={depth} value={depth}>
+                      {workingSetLoadDepthLabel(depth)}
+                    </option>
+                  ))}
+                </select>
+                <Button
+                  aria-label={`Reload ${entry.source.sourceTitle} in working set`}
+                  disabled={disabled}
+                  onClick={() => onReload(entry.source.id, entry.loadDepth)}
+                  size="icon"
+                  title="Reload"
+                  variant="ghost"
+                >
+                  <RefreshCw size={14} />
+                </Button>
+                <Button
+                  aria-label={`Evict ${entry.source.sourceTitle} from working set`}
+                  disabled={disabled}
+                  onClick={() => onEvict(entry.source.id)}
+                  size="icon"
+                  title="Evict"
+                  variant="ghost"
+                >
+                  <X size={14} />
+                </Button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function formatWorkingSetTokenCount(value: number) {
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
+}
+
+function workingSetLoadDepthLabel(depth: WorkingSetLoadDepth) {
+  if (depth === "meta") return "Meta";
+  if (depth === "outline") return "Outline";
+  if (depth === "chunks") return "Chunks";
+  return "Full";
+}
+
+function workingSetPinStatusLabel(status: WorkingSetStatusResult["entries"][number]["pinStatus"]) {
+  if (status === "pinned") return "Pinned";
+  if (status === "evicted") return "Evicted";
+  return "Auto";
 }
 
 function TopicKnowledgePanel({
@@ -4614,12 +5595,16 @@ function MemoryList({
   highlightedId,
   items,
   loading,
+  workingSetSourceIds,
   onOpenDetail,
+  onPinWorkingSetSource,
 }: {
   highlightedId?: string;
   items: SearchMemoryItem[];
   loading: boolean;
+  workingSetSourceIds: ReadonlySet<string>;
   onOpenDetail: (id: string) => void;
+  onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
 }) {
   if (loading) {
     return (
@@ -4638,40 +5623,55 @@ function MemoryList({
   }
   return (
     <ul className="flex flex-col gap-2">
-      {items.map((item) => (
-        <li key={item.id}>
-          <button
-            className={[
-              "relative flex w-full flex-col gap-2 overflow-hidden rounded-lg border bg-surface p-3.5 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
-              highlightedId === item.id ? "border-primary/70" : "border-border",
-            ].join(" ")}
-            onClick={() => onOpenDetail(item.id)}
-            type="button"
-          >
-            {highlightedId === item.id ? (
-              <span className="absolute bottom-3 left-0 top-3 w-[2px] rounded-r bg-primary" />
-            ) : null}
-            <div className="flex items-start gap-2.5">
-              <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-surface-subtle text-primary">
-                <FileText size={15} />
-              </span>
-              <div className="min-w-0 flex-1">
-                <h3 className="line-clamp-2 text-sm font-semibold leading-5">{item.sourceTitle}</h3>
-                <p className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-                  <span className="truncate">{item.sourceUrl}</span>
-                  <span>{formatDate(item.capturedAt)}</span>
-                </p>
+      {items.map((item) => {
+        const isInWorkingSet = workingSetSourceIds.has(item.id);
+        return (
+          <li className="relative" key={item.id}>
+            <button
+              className={[
+                "relative flex w-full flex-col gap-2 overflow-hidden rounded-lg border bg-surface p-3.5 pr-12 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
+                highlightedId === item.id ? "border-primary/70" : "border-border",
+              ].join(" ")}
+              onClick={() => onOpenDetail(item.id)}
+              type="button"
+            >
+              {highlightedId === item.id ? (
+                <span className="absolute bottom-3 left-0 top-3 w-[2px] rounded-r bg-primary" />
+              ) : null}
+              <div className="flex items-start gap-2.5">
+                <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-surface-subtle text-primary">
+                  <FileText size={15} />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <h3 className="line-clamp-2 text-sm font-semibold leading-5">
+                    {item.sourceTitle}
+                  </h3>
+                  <p className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <span className="truncate">{item.sourceUrl}</span>
+                    <span>{formatDate(item.capturedAt)}</span>
+                  </p>
+                </div>
+                <Badge className="border-border bg-surface-subtle text-muted-foreground">
+                  {item.sourceKind}
+                </Badge>
               </div>
-              <Badge className="border-border bg-surface-subtle text-muted-foreground">
-                {item.sourceKind}
-              </Badge>
-            </div>
-            <p className="line-clamp-3 pl-9 text-[12.5px] leading-5 text-muted-foreground">
-              {item.snippet || item.excerpt}
-            </p>
-          </button>
-        </li>
-      ))}
+              <p className="line-clamp-3 pl-9 text-[12.5px] leading-5 text-muted-foreground">
+                {item.snippet || item.excerpt}
+              </p>
+            </button>
+            <button
+              aria-label={`${isInWorkingSet ? "Already pinned" : "Pin"} ${item.sourceTitle} to working set`}
+              className="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
+              disabled={loading || isInWorkingSet}
+              onClick={() => onPinWorkingSetSource(item.id, "meta")}
+              title={isInWorkingSet ? "In working set" : "Pin to working set"}
+              type="button"
+            >
+              <Pin size={14} />
+            </button>
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -4682,12 +5682,14 @@ function MemoryDetailPanel({
   onBack,
   onDelete,
   onOpenSource,
+  pdfPreview,
 }: {
   detail: MemoryDetail | null;
   loading: boolean;
   onBack: () => void;
   onDelete: (id: string) => void;
   onOpenSource: (memory: MemoryDetail) => void;
+  pdfPreview: PdfReaderPreviewState | null;
 }) {
   if (detail === null) {
     return (
@@ -4740,12 +5742,562 @@ function MemoryDetailPanel({
           {detail.version.versionNo > 1 ? <Badge>v{detail.version.versionNo}</Badge> : null}
           {!detail.version.isCurrent ? <Badge>superseded</Badge> : null}
         </div>
+        <PdfReaderPreview detail={detail} preview={pdfPreview} />
         <p className="whitespace-pre-wrap text-sm leading-6 text-foreground">
           {detail.normalizedText}
         </p>
       </article>
     </div>
   );
+}
+
+interface PdfPreviewArtifact {
+  id: string;
+  label: string;
+  detail?: string;
+  pageNumber?: number;
+  bbox?: PdfPreviewBoundingBox;
+  source?: "citation" | "figure" | "page" | "table";
+}
+
+interface PdfPreviewBoundingBox {
+  xMin: number;
+  yMin: number;
+  xMax: number;
+  yMax: number;
+  unit: "pdf_user_space";
+}
+
+function PdfReaderPreview({
+  detail,
+  preview,
+}: {
+  detail: MemoryDetail;
+  preview: PdfReaderPreviewState | null;
+}) {
+  const [selectedPageState, setSelectedPageState] = React.useState<{
+    memoryId: string;
+    objectUrl?: string;
+    pageNumber: number;
+  } | null>(null);
+  const [selectedArtifactState, setSelectedArtifactState] = React.useState<{
+    memoryId: string;
+    objectUrl?: string;
+    artifact: PdfPreviewArtifact;
+  } | null>(null);
+
+  if (!isPdfMemoryDetail(detail)) return null;
+
+  const pageItems = pdfPageArtifacts(detail);
+  const firstPage = pageItems[0]?.pageNumber ?? 1;
+  const objectUrl =
+    preview?.status === "ready" && preview.objectUrl !== undefined ? preview.objectUrl : undefined;
+  const selectedPage =
+    selectedPageState?.memoryId === detail.id && selectedPageState.objectUrl === objectUrl
+      ? selectedPageState.pageNumber
+      : null;
+  const activePage = selectedPage ?? firstPage;
+  const iframeSrc = objectUrl === undefined ? undefined : pdfPreviewUrl(objectUrl, activePage);
+  const statusMessage = pdfPreviewStatusMessage(detail, preview);
+  const citationItems = pdfCitationArtifacts(detail);
+  const tableItems = pdfTableArtifacts(detail);
+  const imageItems = pdfImageArtifacts(detail);
+  const selectedArtifact =
+    selectedArtifactState?.memoryId === detail.id && selectedArtifactState.objectUrl === objectUrl
+      ? selectedArtifactState.artifact
+      : undefined;
+  const activeOverlay =
+    selectedArtifact?.bbox !== undefined && selectedArtifact.pageNumber === activePage
+      ? selectedArtifact
+      : undefined;
+  const selectArtifact = (item: PdfPreviewArtifact) => {
+    if (item.pageNumber !== undefined) {
+      setSelectedPageState({ memoryId: detail.id, objectUrl, pageNumber: item.pageNumber });
+    }
+    setSelectedArtifactState({ memoryId: detail.id, objectUrl, artifact: item });
+  };
+
+  return (
+    <section
+      className="mb-5 overflow-hidden rounded-lg border border-border bg-surface"
+      data-clio-pdf-preview="true"
+    >
+      <div className="flex min-h-12 items-center justify-between gap-3 border-b border-border px-4 py-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <FileText className="shrink-0 text-primary" size={16} />
+            <h4 className="truncate text-sm font-semibold">PDF preview</h4>
+          </div>
+          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+            {preview?.byteLength === undefined
+              ? statusMessage
+              : `${formatByteLength(preview.byteLength)} · ${statusMessage}`}
+          </p>
+        </div>
+        {objectUrl === undefined ? null : (
+          <a
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-[11px] font-medium text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
+            href={pdfPreviewUrl(objectUrl, activePage)}
+            rel="noreferrer"
+            target="_blank"
+          >
+            <ExternalLink size={13} />
+            Open page
+          </a>
+        )}
+      </div>
+      <div className="grid gap-0 lg:grid-cols-[minmax(0,1fr)_180px]">
+        <div className="min-h-[360px] border-b border-border bg-background lg:border-b-0 lg:border-r">
+          {iframeSrc === undefined ? (
+            <div className="flex h-[360px] flex-col items-center justify-center px-6 text-center text-sm text-muted-foreground">
+              {preview?.status === "loading" ? (
+                <Loader2 className="mb-3 animate-spin" size={20} />
+              ) : (
+                <FileText className="mb-3" size={22} />
+              )}
+              <p className="max-w-[260px]">{statusMessage}</p>
+            </div>
+          ) : (
+            <>
+              <iframe
+                className="h-[360px] w-full bg-background"
+                data-clio-pdf-preview-frame="true"
+                src={iframeSrc}
+                title={`PDF preview for ${detail.sourceTitle}`}
+              />
+              <PdfBBoxOverlay artifact={activeOverlay} detail={detail} pageNumber={activePage} />
+            </>
+          )}
+        </div>
+        <div className="flex min-h-[360px] flex-col gap-3 p-3">
+          <PdfArtifactGroup
+            icon={<BookOpen size={14} />}
+            items={pageItems}
+            objectUrl={objectUrl}
+            onSelectArtifact={selectArtifact}
+            title="Pages"
+          />
+          <PdfArtifactGroup
+            icon={<FileText size={14} />}
+            items={citationItems}
+            objectUrl={objectUrl}
+            onSelectArtifact={selectArtifact}
+            title="Citations"
+          />
+          <PdfArtifactGroup
+            icon={<Library size={14} />}
+            items={tableItems}
+            objectUrl={objectUrl}
+            onSelectArtifact={selectArtifact}
+            title="Tables"
+          />
+          <PdfArtifactGroup
+            icon={<ImageIcon size={14} />}
+            items={imageItems}
+            objectUrl={objectUrl}
+            onSelectArtifact={selectArtifact}
+            title="Figures"
+          />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function PdfArtifactGroup({
+  icon,
+  items,
+  objectUrl,
+  onSelectArtifact,
+  title,
+}: {
+  icon: React.ReactNode;
+  items: PdfPreviewArtifact[];
+  objectUrl?: string;
+  onSelectArtifact: (item: PdfPreviewArtifact) => void;
+  title: string;
+}) {
+  if (items.length === 0) return null;
+  return (
+    <div className="min-w-0">
+      <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase text-muted-foreground">
+        {icon}
+        {title}
+      </div>
+      <ul className="flex flex-col gap-1">
+        {items.slice(0, 8).map((item) => {
+          const hasPage = item.pageNumber !== undefined;
+          return (
+            <li key={item.id}>
+              <button
+                className="flex min-h-8 w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-60"
+                disabled={!hasPage}
+                onClick={() => {
+                  if (item.pageNumber !== undefined) onSelectArtifact(item);
+                }}
+                type="button"
+              >
+                <span className="min-w-0">
+                  <span className="block truncate font-medium text-foreground">{item.label}</span>
+                  {item.detail === undefined ? null : (
+                    <span className="block truncate text-[11px] text-muted-foreground">
+                      {item.detail}
+                    </span>
+                  )}
+                </span>
+                {hasPage ? (
+                  <span className="shrink-0 text-[11px] text-muted-foreground">
+                    p.{item.pageNumber}
+                  </span>
+                ) : null}
+              </button>
+              {objectUrl !== undefined && item.pageNumber !== undefined ? (
+                <a
+                  className="sr-only"
+                  href={pdfPreviewUrl(objectUrl, item.pageNumber)}
+                  rel="noreferrer"
+                  target="_blank"
+                >
+                  Open {item.label}
+                </a>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function PdfBBoxOverlay({
+  artifact,
+  detail,
+  pageNumber,
+}: {
+  artifact: PdfPreviewArtifact | undefined;
+  detail: MemoryDetail;
+  pageNumber: number;
+}) {
+  if (artifact?.bbox === undefined) return null;
+  const pageSize = pdfPageSize(detail, pageNumber);
+  const rect = pageSize === undefined ? undefined : pdfBBoxOverlayRect(artifact.bbox, pageSize);
+  if (pageSize === undefined || rect === undefined) return null;
+  return (
+    <div
+      className="flex items-center gap-3 border-t border-border bg-surface-subtle px-3 py-2"
+      data-clio-pdf-bbox-overlay="true"
+    >
+      <div
+        className="relative h-[104px] shrink-0 overflow-hidden rounded-md border border-border bg-background"
+        style={{ aspectRatio: `${pageSize.width} / ${pageSize.height}` }}
+      >
+        <div
+          aria-label={`${artifact.label} location on page ${pageNumber}`}
+          className="absolute rounded-[3px] border-2 border-primary bg-primary/20 shadow-sm"
+          data-clio-pdf-bbox-highlight="true"
+          style={{
+            left: `${rect.left}%`,
+            top: `${rect.top}%`,
+            width: `${rect.width}%`,
+            height: `${rect.height}%`,
+          }}
+        />
+      </div>
+      <div className="min-w-0">
+        <div className="flex items-center gap-1.5 text-[11px] font-semibold text-foreground">
+          <Maximize2 className="shrink-0 text-primary" size={13} />
+          <span className="truncate">{artifact.label}</span>
+        </div>
+        <p className="mt-1 truncate text-[11px] text-muted-foreground">
+          Page {pageNumber} - {artifact.source ?? "artifact"}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function isPdfMemoryDetail(detail: MemoryDetail) {
+  const sourceType = metadataString(detail.metadata.source_type);
+  const adapter = metadataString(detail.metadata.adapter);
+  return (
+    sourceType === "pdf" ||
+    adapter === "pdf" ||
+    detail.sourceUrl.toLowerCase().endsWith(".pdf") ||
+    metadataNumber(detail.metadata.pdf_page_count) !== undefined ||
+    Array.isArray(detail.metadata.pdf_page_labels)
+  );
+}
+
+function pdfPreviewStatusMessage(
+  detail: MemoryDetail,
+  preview: PdfReaderPreviewState | null,
+): string {
+  if (preview?.status === "loading") return "Loading raw PDF";
+  if (preview?.status === "ready") return "Raw PDF ready";
+  if (preview?.message !== undefined) return preview.message;
+  const rawFile = metadataRecord(detail.metadata.pdf_raw_file);
+  if (rawFile?.status === "persist_failed") return "Raw PDF persistence failed";
+  if (rawFile?.status === "not_persisted") return "Raw PDF was not persisted";
+  return "Raw PDF preview unavailable";
+}
+
+function pdfPageArtifacts(detail: MemoryDetail): PdfPreviewArtifact[] {
+  const labels = metadataRecordArray(detail.metadata.pdf_page_labels)
+    .map((record, index): PdfPreviewArtifact | undefined => {
+      const pageNumber = metadataNumber(record.pageNumber);
+      if (pageNumber === undefined) return undefined;
+      return {
+        id: `page-${pageNumber}-${index}`,
+        label: metadataString(record.label) ?? `Page ${pageNumber}`,
+        pageNumber,
+        source: "page" as const,
+      };
+    })
+    .filter(isPdfPreviewArtifact);
+  if (labels.length > 0) return labels.slice(0, 12);
+
+  const pageCount =
+    metadataNumber(detail.metadata.pdf_page_count) ??
+    metadataNumber(metadataRecord(detail.metadata.pdf_parse_profile)?.pageCount);
+  if (pageCount === undefined) return [];
+  return Array.from({ length: Math.min(pageCount, 12) }, (_, index) => ({
+    id: `page-${index + 1}`,
+    label: `Page ${index + 1}`,
+    pageNumber: index + 1,
+    source: "page" as const,
+  }));
+}
+
+function pdfCitationArtifacts(detail: MemoryDetail): PdfPreviewArtifact[] {
+  return metadataRecordArray(detail.metadata.pdf_citation_links)
+    .map((record, index): PdfPreviewArtifact | undefined => {
+      const marker = metadataString(record.marker);
+      const pageNumber = metadataNumber(record.pageNumber);
+      if (marker === undefined) return undefined;
+      return {
+        id: `citation-${marker}-${index}`,
+        label: marker,
+        detail:
+          metadataString(record.targetReferenceLabel) ??
+          metadataString(record.normalizedTargetLabel) ??
+          referenceIndexLabel(record.targetReferenceIndex),
+        ...(pageNumber === undefined ? {} : { pageNumber }),
+        source: "citation" as const,
+      };
+    })
+    .filter(isPdfPreviewArtifact);
+}
+
+function isPdfPreviewArtifact(
+  artifact: PdfPreviewArtifact | undefined,
+): artifact is PdfPreviewArtifact {
+  return artifact !== undefined;
+}
+
+function pdfTableArtifacts(detail: MemoryDetail): PdfPreviewArtifact[] {
+  const structured = metadataRecordArray(detail.metadata.pdf_table_structures).map(
+    (record, index) => {
+      const pageNumber = metadataNumber(record.pageNumber);
+      const bbox = metadataBoundingBox(record.bbox);
+      return {
+        id: metadataString(record.id) ?? `table-structure-${index}`,
+        label:
+          metadataString(record.captionLabel) ?? metadataString(record.id) ?? `Table ${index + 1}`,
+        detail: tableShapeLabel(record),
+        ...(pageNumber === undefined ? {} : { pageNumber }),
+        ...(bbox === undefined ? {} : { bbox }),
+        source: "table" as const,
+      };
+    },
+  );
+  const captions = metadataRecordArray(detail.metadata.pdf_tables).map((record, index) => {
+    const pageNumber = metadataNumber(record.pageNumber);
+    const bbox = metadataBoundingBox(record.bbox);
+    return {
+      id: metadataString(record.id) ?? `table-caption-${index}`,
+      label: metadataString(record.label) ?? `Table ${index + 1}`,
+      detail: metadataString(record.caption),
+      ...(pageNumber === undefined ? {} : { pageNumber }),
+      ...(bbox === undefined ? {} : { bbox }),
+      source: "table" as const,
+    };
+  });
+  return [...structured, ...captions].slice(0, 8);
+}
+
+function pdfImageArtifacts(detail: MemoryDetail): PdfPreviewArtifact[] {
+  const resultRecords = metadataRecordArray(detail.metadata.pdf_figure_analysis_results);
+  const resultByImageId = new Map(
+    resultRecords.flatMap((record) => {
+      const imageId = metadataString(record.imageId);
+      return imageId === undefined ? [] : [[imageId, record] as const];
+    }),
+  );
+  const imageIds = new Set<string>();
+  const images = metadataRecordArray(detail.metadata.pdf_images).map((record, index) => {
+    const pageNumber = metadataNumber(record.pageNumber);
+    const imageId = metadataString(record.id) ?? `image-${index}`;
+    imageIds.add(imageId);
+    const result = resultByImageId.get(imageId);
+    const resultCrop = metadataRecord(result?.crop);
+    const bbox = metadataBoundingBox(record.bbox) ?? metadataBoundingBox(resultCrop?.bbox);
+    return {
+      id: imageId,
+      label:
+        metadataString(record.label) ?? metadataString(record.objectRef) ?? `Image ${index + 1}`,
+      detail:
+        pdfFigureAnalysisResultDetail(result) ??
+        metadataString(record.caption) ??
+        metadataString(record.extractionStatus),
+      ...(pageNumber === undefined ? {} : { pageNumber }),
+      ...(bbox === undefined ? {} : { bbox }),
+      source: "figure" as const,
+    };
+  });
+  const standaloneResults = resultRecords.flatMap((record, index): PdfPreviewArtifact[] => {
+    const imageId = metadataString(record.imageId);
+    if (imageId !== undefined && imageIds.has(imageId)) return [];
+    const pageNumber = metadataNumber(record.pageNumber);
+    const bbox = metadataBoundingBox(metadataRecord(record.crop)?.bbox);
+    return [
+      {
+        id: metadataString(record.analysisId) ?? `figure-analysis-${index}`,
+        label:
+          metadataString(record.label) ??
+          metadataString(record.analysisId) ??
+          `Figure analysis ${index + 1}`,
+        detail: pdfFigureAnalysisResultDetail(record),
+        ...(pageNumber === undefined ? {} : { pageNumber }),
+        ...(bbox === undefined ? {} : { bbox }),
+        source: "figure" as const,
+      },
+    ];
+  });
+  const captions = metadataRecordArray(detail.metadata.pdf_figures).map((record, index) => {
+    const pageNumber = metadataNumber(record.pageNumber);
+    const bbox = metadataBoundingBox(record.bbox);
+    return {
+      id: metadataString(record.id) ?? `figure-${index}`,
+      label: metadataString(record.label) ?? `Figure ${index + 1}`,
+      detail: metadataString(record.caption),
+      ...(pageNumber === undefined ? {} : { pageNumber }),
+      ...(bbox === undefined ? {} : { bbox }),
+      source: "figure" as const,
+    };
+  });
+  return [...images, ...standaloneResults, ...captions].slice(0, 8);
+}
+
+function pdfPreviewUrl(objectUrl: string, pageNumber: number) {
+  return `${objectUrl}#page=${pageNumber}`;
+}
+
+function pdfPageSize(detail: MemoryDetail, pageNumber: number) {
+  const records = [
+    ...metadataRecordArray(detail.metadata.pdf_pages),
+    ...metadataRecordArray(detail.metadata.pdf_page_labels),
+  ];
+  for (const record of records) {
+    if (metadataNumber(record.pageNumber) !== pageNumber) continue;
+    const width = metadataNumber(record.pageWidth);
+    const height = metadataNumber(record.pageHeight);
+    if (width !== undefined && height !== undefined && width > 0 && height > 0) {
+      return { width, height };
+    }
+  }
+  return undefined;
+}
+
+function pdfBBoxOverlayRect(
+  bbox: PdfPreviewBoundingBox,
+  pageSize: { width: number; height: number },
+) {
+  if (bbox.unit !== "pdf_user_space") return undefined;
+  const values = [bbox.xMin, bbox.yMin, bbox.xMax, bbox.yMax];
+  if (!values.every((value) => Number.isFinite(value))) return undefined;
+  const xMin = Math.max(0, Math.min(pageSize.width, Math.min(bbox.xMin, bbox.xMax)));
+  const xMax = Math.max(0, Math.min(pageSize.width, Math.max(bbox.xMin, bbox.xMax)));
+  const yMin = Math.max(0, Math.min(pageSize.height, Math.min(bbox.yMin, bbox.yMax)));
+  const yMax = Math.max(0, Math.min(pageSize.height, Math.max(bbox.yMin, bbox.yMax)));
+  if (xMax <= xMin || yMax <= yMin) return undefined;
+  return {
+    left: (xMin / pageSize.width) * 100,
+    top: ((pageSize.height - yMax) / pageSize.height) * 100,
+    width: ((xMax - xMin) / pageSize.width) * 100,
+    height: ((yMax - yMin) / pageSize.height) * 100,
+  };
+}
+
+function metadataBoundingBox(value: unknown): PdfPreviewBoundingBox | undefined {
+  const record = metadataRecord(value);
+  const xMin = metadataNumber(record?.xMin);
+  const yMin = metadataNumber(record?.yMin);
+  const xMax = metadataNumber(record?.xMax);
+  const yMax = metadataNumber(record?.yMax);
+  if (
+    record === undefined ||
+    xMin === undefined ||
+    yMin === undefined ||
+    xMax === undefined ||
+    yMax === undefined ||
+    record.unit !== "pdf_user_space" ||
+    xMax === xMin ||
+    yMax === yMin
+  ) {
+    return undefined;
+  }
+  return { xMin, yMin, xMax, yMax, unit: "pdf_user_space" };
+}
+
+function metadataRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function metadataRecordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.flatMap((item) => {
+        const record = metadataRecord(item);
+        return record === undefined ? [] : [record];
+      })
+    : [];
+}
+
+function metadataString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function metadataNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function referenceIndexLabel(value: unknown): string | undefined {
+  const index = metadataNumber(value);
+  return index === undefined ? undefined : `Reference ${index + 1}`;
+}
+
+function tableShapeLabel(record: Record<string, unknown>): string | undefined {
+  const rowCount = metadataNumber(record.rowCount);
+  const columnCount = metadataNumber(record.columnCount);
+  if (rowCount === undefined || columnCount === undefined) return metadataString(record.caption);
+  return `${rowCount} x ${columnCount}`;
+}
+
+function pdfFigureAnalysisResultDetail(record: Record<string, unknown> | undefined) {
+  if (record === undefined) return undefined;
+  const status = metadataString(record.status);
+  const summary = metadataString(record.summary);
+  if (status === "analyzed" && summary !== undefined) return `Analyzed: ${summary}`;
+  const reason = metadataString(record.reason);
+  if (status === undefined) return summary ?? reason;
+  return reason === undefined ? status : `${status}: ${reason}`;
+}
+
+function formatByteLength(byteLength: number) {
+  if (byteLength < 1024) return `${byteLength} B`;
+  if (byteLength < 1024 * 1024) return `${Math.round(byteLength / 102.4) / 10} KB`;
+  return `${Math.round(byteLength / 1024 / 102.4) / 10} MB`;
 }
 
 function ChatHistoryPanel({

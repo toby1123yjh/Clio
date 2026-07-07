@@ -1,3 +1,8 @@
+import type {
+  FigureVisionAnalysisInput,
+  FigureVisionAnalysisResult,
+  FigureVisionAnalyzer,
+} from "@/src/agent-runtime/figure-vision-analyzer";
 import { buildMemoryVersionGroupKey } from "@/src/shared/reliability";
 import {
   type ActiveEmbeddingModelSummary,
@@ -9,6 +14,7 @@ import {
   type BuildSourceGraphResult,
   CLIO_WORKER_EMBEDDING_REQUEST,
   CLIO_WORKER_RESPONSE,
+  CLIO_WORKER_VISION_ANALYSIS_REQUEST,
   type CaptureBasePayload,
   type CaptureMarkdownPayload,
   type CapturePdfPayload,
@@ -55,6 +61,7 @@ import {
   type MemoryDetail,
   type MemoryEvidenceWindow,
   type MemorySummary,
+  type PdfRawFileResult,
   type ReindexResult,
   type RepairAction,
   type RepairResult,
@@ -99,8 +106,10 @@ import {
   engineErrorFromUnknown,
   isWorkerEmbeddingResponseMessage,
   isWorkerRequestMessage,
+  isWorkerVisionAnalysisResponseMessage,
 } from "@/src/shared/rpc";
 import {
+  type TextChunk,
   buildFtsQuery,
   chunkText,
   excerpt,
@@ -114,6 +123,10 @@ import sqliteWasmUrl from "@sqlite.org/sqlite-wasm/sqlite3.wasm?url";
 import { compareChatMessagesForDisplay } from "./chat-message-order";
 import {
   type ParsedPdfDocument,
+  type ParsedPdfImageArtifact,
+  type PdfFigureVisionImageExtractionInput,
+  type PdfFigureVisionImageExtractionResult,
+  extractPdfFigureVisionImageInput,
   parsePdfDocument,
   pdfCapturePayloadFromParsedDocument,
 } from "./pdf-parser";
@@ -153,6 +166,120 @@ type LocalEngineDatabaseOpenResult = {
   opfs?: EngineHealth["opfs"];
 };
 type LocalEngineDatabaseOpener = () => Promise<LocalEngineDatabaseOpenResult>;
+export interface PdfRawFileStoreWriteInput {
+  sourceId: string;
+  sourceUrl: string;
+  sourceTitle: string;
+  bytes: Uint8Array;
+  capturedAt: string;
+}
+export interface PdfRawFileStoreWriteResult {
+  storage: "opfs";
+  path: string;
+  byteLength: number;
+  contentType: "application/pdf";
+  persistedAt: string;
+}
+export interface PdfRawFileStore {
+  write(input: PdfRawFileStoreWriteInput): Promise<PdfRawFileStoreWriteResult>;
+  read(sourceId: string): Promise<Uint8Array>;
+  delete(sourceId: string): Promise<void>;
+  clear(): Promise<void>;
+}
+
+interface OpfsWritableFile {
+  write(data: Uint8Array | ArrayBuffer | string): Promise<void>;
+  close(): Promise<void>;
+}
+
+interface OpfsFileHandle {
+  createWritable(): Promise<OpfsWritableFile>;
+  getFile(): Promise<{ arrayBuffer(): Promise<ArrayBuffer> }>;
+}
+
+interface OpfsDirectoryHandle {
+  getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<OpfsDirectoryHandle>;
+  getFileHandle(name: string, options?: { create?: boolean }): Promise<OpfsFileHandle>;
+  removeEntry(name: string, options?: { recursive?: boolean }): Promise<void>;
+}
+
+interface OpfsNavigator {
+  storage?: {
+    getDirectory?: () => Promise<OpfsDirectoryHandle>;
+  };
+}
+
+class OpfsPdfRawFileStore implements PdfRawFileStore {
+  async write(input: PdfRawFileStoreWriteInput): Promise<PdfRawFileStoreWriteResult> {
+    const directory = await this.directory(true);
+    const fileName = this.fileName(input.sourceId);
+    const handle = await directory.getFileHandle(fileName, { create: true });
+    const writable = await handle.createWritable();
+    try {
+      await writable.write(input.bytes);
+    } finally {
+      await writable.close();
+    }
+    return {
+      storage: "opfs",
+      path: `${pdfRawFileDirectoryName}/${fileName}`,
+      byteLength: input.bytes.byteLength,
+      contentType: "application/pdf",
+      persistedAt: new Date().toISOString(),
+    };
+  }
+
+  async read(sourceId: string): Promise<Uint8Array> {
+    const directory = await this.directory(false);
+    const handle = await directory.getFileHandle(this.fileName(sourceId));
+    const file = await handle.getFile();
+    return new Uint8Array(await file.arrayBuffer());
+  }
+
+  async delete(sourceId: string): Promise<void> {
+    const directory = await this.directory(false);
+    try {
+      await directory.removeEntry(this.fileName(sourceId));
+    } catch {
+      // Raw file cleanup is best-effort; a missing blob should not block source deletion.
+    }
+  }
+
+  async clear(): Promise<void> {
+    const root = await this.root();
+    try {
+      await root.removeEntry(pdfRawFileDirectoryName, { recursive: true });
+    } catch {
+      // Raw file cleanup is best-effort; a missing directory should not block library reset.
+    }
+  }
+
+  private async root(): Promise<OpfsDirectoryHandle> {
+    const navigatorWithStorage = globalThis.navigator as OpfsNavigator | undefined;
+    const getDirectory = navigatorWithStorage?.storage?.getDirectory;
+    if (typeof getDirectory !== "function") {
+      throw new EngineRpcError(
+        "PDF_RAW_FILE_STORE_UNAVAILABLE",
+        "Browser raw PDF storage is unavailable.",
+      );
+    }
+    return await getDirectory();
+  }
+
+  private async directory(create: boolean): Promise<OpfsDirectoryHandle> {
+    const root = await this.root();
+    return await root.getDirectoryHandle(pdfRawFileDirectoryName, { create });
+  }
+
+  private fileName(sourceId: string): string {
+    return `${encodeURIComponent(sourceId)}.pdf`;
+  }
+}
+
+function normalizePdfBytes(bytes: Uint8Array | ArrayBuffer): Uint8Array {
+  return bytes instanceof Uint8Array ? new Uint8Array(bytes) : new Uint8Array(bytes.slice(0));
+}
+
 export interface ActiveEmbeddingModel {
   modelId: string;
   provider: string;
@@ -160,14 +287,23 @@ export interface ActiveEmbeddingModel {
 }
 export type EmbeddingProviderFactory = (model: ActiveEmbeddingModel) => EmbeddingProvider | null;
 type PdfDocumentParser = (bytes: Uint8Array | ArrayBuffer) => Promise<ParsedPdfDocument>;
+type PdfFigureVisionImageExtractor = (
+  input: PdfFigureVisionImageExtractionInput,
+) => Promise<PdfFigureVisionImageExtractionResult>;
+export type FigureVisionAnalyzerFactory = () => FigureVisionAnalyzer | null;
 export interface LocalEngineOptions {
   openDatabase?: LocalEngineDatabaseOpener;
   embeddingProvider?: EmbeddingProvider;
   embeddingProviderFactory?: EmbeddingProviderFactory;
+  figureVisionAnalyzer?: FigureVisionAnalyzer;
+  figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory;
   pdfParser?: PdfDocumentParser;
+  pdfFigureVisionImageExtractor?: PdfFigureVisionImageExtractor;
+  pdfRawFileStore?: PdfRawFileStore;
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
+const pdfRawFileDirectoryName = "clio-pdf-raw-files";
 const schemaVersion = 18;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
@@ -188,7 +324,14 @@ const chunkMetaTitleMaxChars = 500;
 const chunkMetaSourceTypeMaxChars = 100;
 const chunkMetaDocContextMaxChars = 1_600;
 const chunkMetaAbstractMaxChars = 1_200;
+const chunkMetaSectionPathMaxChars = 500;
+const chunkMetaSectionSummaryMaxChars = 500;
+const chunkMetaChunkSummaryMaxChars = 360;
+const chunkMetaRelationLabelMaxChars = 160;
+const chunkMetaMaxRelations = 12;
 const chunkMetaEmbeddingPrefixMaxChars = 2_000;
+const parentChunkTextMaxChars = 24_000;
+const parentChunkOrdBase = 1_000_000;
 const defaultWorkingSetBudgetTokens = 32_000;
 const workingSetExcerptMaxChars = 280;
 const defaultSourceContextPackTotalTokens = 12_000;
@@ -205,6 +348,10 @@ const sourceContextPackMetaMaxTokens = 600;
 const sourceContextPackOutlineMaxItems = 40;
 const sourceContextPackOutlineMaxTokens = 800;
 const sourceContextPackWindowSearchLimitMultiplier = 4;
+const sourceContextPackParentWindowMaxChars = 900;
+const figureVisionBridgeTimeoutMs = 60_000;
+const figureVisionMaxPageContextChars = 1_200;
+const figureVisionMaxAnalysesPerJob = 8;
 const defaultEmbeddingProvider = {
   modelId: "clio-local-hash-v1",
   provider: "local-deterministic",
@@ -266,7 +413,12 @@ type SourceAuditAction =
   | "source.stage_queued";
 
 type SourceRetrievalTrack = "meta_sources" | "vector_meta" | "fts_chunks" | "vector_chunks";
-type PostCaptureStageName = "embedding" | "chunk_meta" | "graph";
+type PostCaptureStageName =
+  | "paper_metadata"
+  | "embedding"
+  | "chunk_meta"
+  | "graph"
+  | "figure_vision";
 
 interface SourceRetrievalHit {
   track: SourceRetrievalTrack;
@@ -276,10 +428,26 @@ interface SourceRetrievalHit {
   fallbackExcerpt?: string;
 }
 
+interface CaptureAfterSaveContext {
+  db: SqliteDb;
+  sourceId: string;
+  draft: DocumentDraft;
+}
+
+interface CaptureOptions {
+  afterSave?: (context: CaptureAfterSaveContext) => Promise<void>;
+}
+
 interface NormalizedRetrieveSourcesFilter {
   sourceTypes: string[];
   lifecycleStatuses: SearchableSourceLifecycleStatus[];
+  doi?: string;
+  arxivIds: string[];
+  years: number[];
+  venues: string[];
+  authors: string[];
   hasSourceTypeFilter: boolean;
+  hasPaperMetadataFilter: boolean;
   hasImpossibleFilter: boolean;
 }
 
@@ -361,6 +529,7 @@ interface SourceContextSourceState {
 
 interface InternalSourceContextWindow extends SourceContextPackWindow {
   tokenEstimate: number;
+  childChunkIds: string[];
 }
 
 interface SourceContextSourcePack {
@@ -382,6 +551,7 @@ interface DocumentDraft {
   metadataJson: string;
   versionGroupKey: string;
   pdfPages: PdfPageTextRange[];
+  sectionHeadings: SectionHeadingRange[];
 }
 
 interface PdfPageTextRange {
@@ -395,9 +565,65 @@ interface ChunkPageRange {
   pageEnd: number | null;
 }
 
+interface ChunkTextRange {
+  charStart: number;
+  charEnd: number;
+}
+
+interface SectionHeadingRange {
+  level: number;
+  text: string;
+  charStart: number;
+  path: string;
+}
+
+interface SectionOutlineItem {
+  level: number;
+  text: string;
+}
+
+interface TextLineRange {
+  text: string;
+  charStart: number;
+  charEnd: number;
+}
+
+interface DocumentChunkSegment {
+  text: string;
+  charStart: number;
+  charEnd: number;
+  sectionPath: string | null;
+}
+
+interface MaterializedChildChunk {
+  id: string;
+  chunk: TextChunk;
+  range?: ChunkTextRange;
+  pageRange: ChunkPageRange;
+  sectionPath: string | null;
+  metaHeadJson: string;
+  parentChunkId: string | null;
+}
+
+interface MaterializedParentChunk {
+  id: string;
+  ord: number;
+  text: string;
+  tokenCount: number;
+  hash: string;
+  sectionPath: string;
+  charStart: number | null;
+  charEnd: number | null;
+  pageRange: ChunkPageRange;
+  metaHeadJson: string;
+}
+
 interface ChunkMetaHeadV1 {
   version: typeof chunkMetaHeadVersion;
-  tier: "tier0";
+  tier: ChunkMetaTierV1;
+  summarySource: ChunkMetaSummarySourceV1;
+  selectedTier: ChunkMetaTierV1;
+  tiers: Record<ChunkMetaTierV1, ChunkMetaTierStateV1>;
   source: {
     title: string;
     type: string;
@@ -405,9 +631,43 @@ interface ChunkMetaHeadV1 {
   };
   docContext: string;
   sectionPath: string | null;
+  sectionSummary: string | null;
   chunkSummary: string | null;
   roleHint: string | null;
-  relations: string[];
+  relations: ChunkMetaRelationV1[];
+  semanticRelations: ChunkMetaSemanticRelationV1[];
+}
+
+type ChunkMetaTierV1 = "tier0" | "tier1" | "tier2";
+type ChunkMetaSummarySourceV1 = "deterministic" | "local_extractive" | "remote_llm" | "unavailable";
+type ChunkMetaTierStatusV1 = "available" | "disabled" | "unavailable";
+
+interface ChunkMetaTierStateV1 {
+  status: ChunkMetaTierStatusV1;
+  summarySource: ChunkMetaSummarySourceV1;
+  reason?: string;
+  fallbackTier?: ChunkMetaTierV1;
+  sectionSummary: string | null;
+  chunkSummary: string | null;
+  relations: ChunkMetaRelationV1[];
+  semanticRelations: ChunkMetaSemanticRelationV1[];
+}
+
+type ChunkMetaRelationKindV1 = "parent" | "previous" | "next" | "section";
+type ChunkMetaSemanticRelationKindV1 = ChunkMetaRelationKindV1 | "role" | "citation_hint";
+
+interface ChunkMetaRelationV1 {
+  kind: ChunkMetaRelationKindV1;
+  target: string;
+  label: string | null;
+}
+
+interface ChunkMetaSemanticRelationV1 {
+  kind: ChunkMetaSemanticRelationKindV1;
+  target: string;
+  label: string | null;
+  confidence: number;
+  source: "deterministic" | "local_extractive";
 }
 
 interface SourceAdapterInput {
@@ -428,13 +688,23 @@ export class LocalEngine {
   private readonly openDatabase: LocalEngineDatabaseOpener;
   private readonly embeddingProviderOverride?: EmbeddingProvider;
   private readonly embeddingProviderFactory?: EmbeddingProviderFactory;
+  private readonly figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory;
   private readonly pdfParser: PdfDocumentParser;
+  private readonly pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor;
+  private readonly pdfRawFileStore: PdfRawFileStore;
 
   constructor(options: LocalEngineOptions = {}) {
     this.openDatabase = options.openDatabase ?? openProductionDatabase;
     this.embeddingProviderOverride = options.embeddingProvider;
     this.embeddingProviderFactory = options.embeddingProviderFactory;
+    this.figureVisionAnalyzerFactory =
+      options.figureVisionAnalyzer === undefined
+        ? options.figureVisionAnalyzerFactory
+        : () => options.figureVisionAnalyzer ?? null;
     this.pdfParser = options.pdfParser ?? parsePdfDocument;
+    this.pdfFigureVisionImageExtractor =
+      options.pdfFigureVisionImageExtractor ?? extractPdfFigureVisionImageInput;
+    this.pdfRawFileStore = options.pdfRawFileStore ?? new OpfsPdfRawFileStore();
   }
 
   async handle(request: EngineRequest) {
@@ -476,6 +746,8 @@ export class LocalEngine {
         return await this.list(request.limit);
       case "getMemory":
         return await this.get(request.id);
+      case "getPdfRawFile":
+        return await this.getPdfRawFile(request.id);
       case "getMemoryEvidenceWindows":
         return await this.getMemoryEvidenceWindows(request.payload);
       case "buildSourceContextPack":
@@ -612,7 +884,8 @@ export class LocalEngine {
   }
 
   private async capturePdf(payload: CapturePdfPayload): Promise<CaptureResult> {
-    const parsed = await this.pdfParser(payload.bytes);
+    const pdfBytes = normalizePdfBytes(payload.bytes);
+    const parsed = await this.pdfParser(pdfBytes);
     return await this.capture(
       "page",
       pdfCapturePayloadFromParsedDocument({
@@ -622,10 +895,25 @@ export class LocalEngine {
         metadata: payload.metadata,
         parsed,
       }),
+      {
+        afterSave: async ({ db, sourceId, draft }) => {
+          await this.persistPdfRawFile(db, {
+            sourceId,
+            sourceUrl: draft.sourceUrl,
+            sourceTitle: draft.sourceTitle,
+            bytes: pdfBytes,
+            capturedAt: draft.capturedAt,
+          });
+        },
+      },
     );
   }
 
-  private async capture(kind: SourceKind, payload: CaptureBasePayload): Promise<CaptureResult> {
+  private async capture(
+    kind: SourceKind,
+    payload: CaptureBasePayload,
+    options: CaptureOptions = {},
+  ): Promise<CaptureResult> {
     const db = await this.ensureReady();
     const adapter = defaultSourceAdapterRegistry.resolve({ kind, payload });
     const draft = adapter.adapt({ kind, payload });
@@ -646,13 +934,14 @@ export class LocalEngine {
       };
     }
 
-    const chunks = chunkText(draft.normalizedText);
+    const chunks = chunkTextForDocument(draft);
     if (chunks.length === 0) {
       throw new EngineRpcError("EMPTY_CAPTURE", "Nothing readable was found to save.");
     }
     const chunkRanges = locateChunkTextRanges(draft.normalizedText, chunks);
 
     const sourceId = createId("src");
+    const materializedChunks = materializeSourceChunks(sourceId, draft, chunks, chunkRanges);
     const previousVersion =
       draft.kind === "page" ? findCurrentPageVersion(db, draft.versionGroupKey) : undefined;
     const versionNo =
@@ -661,7 +950,6 @@ export class LocalEngine {
         : Math.max(1, numberField(previousVersion, "version_no")) + 1;
     const supersedesSourceId =
       previousVersion === undefined ? undefined : stringField(previousVersion, "id");
-    const chunkMetaHeadJson = buildChunkMetaHeadJson(draft);
 
     transaction(db, () => {
       insertSourceRow(db, {
@@ -707,9 +995,7 @@ export class LocalEngine {
         });
       }
 
-      for (const chunk of chunks) {
-        const chunkId = `${sourceId}:${chunk.ord}`;
-        const pageRange = pageRangeForChunk(chunkRanges.get(chunk.ord), draft.pdfPages);
+      for (const parent of materializedChunks.parents) {
         db.exec({
           sql: `INSERT INTO source_chunks (
             id,
@@ -727,25 +1013,64 @@ export class LocalEngine {
             page_start,
             page_end,
             meta_head_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'child', NULL, NULL, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, '', 'parent', NULL, ?, ?, ?, ?, ?, ?)`,
           bind: [
-            chunkId,
+            parent.id,
+            sourceId,
+            parent.ord,
+            parent.text,
+            parent.tokenCount,
+            parent.hash,
+            parent.sectionPath,
+            parent.charStart,
+            parent.charEnd,
+            parent.pageRange.pageStart,
+            parent.pageRange.pageEnd,
+            parent.metaHeadJson,
+          ],
+        });
+      }
+
+      for (const materialized of materializedChunks.children) {
+        const chunk = materialized.chunk;
+        db.exec({
+          sql: `INSERT INTO source_chunks (
+            id,
+            source_id,
+            ord,
+            text,
+            token_count,
+            hash,
+            fts_text,
+            role,
+            parent_chunk_id,
+            section_path,
+            char_start,
+            char_end,
+            page_start,
+            page_end,
+            meta_head_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'child', ?, ?, ?, ?, ?, ?, ?)`,
+          bind: [
+            materialized.id,
             sourceId,
             chunk.ord,
             chunk.text,
             chunk.tokenCount,
             chunk.hash,
             expandChineseBigrams(chunk.text),
-            chunkRanges.get(chunk.ord)?.charStart ?? null,
-            chunkRanges.get(chunk.ord)?.charEnd ?? null,
-            pageRange.pageStart,
-            pageRange.pageEnd,
-            chunkMetaHeadJson,
+            materialized.parentChunkId,
+            materialized.sectionPath,
+            materialized.range?.charStart ?? null,
+            materialized.range?.charEnd ?? null,
+            materialized.pageRange.pageStart,
+            materialized.pageRange.pageEnd,
+            materialized.metaHeadJson,
           ],
         });
         insertSourceFtsRow(db, {
           sourceId,
-          chunkId,
+          chunkId: materialized.id,
           sourceKind: draft.kind,
           title: draft.sourceTitle,
           text: chunk.text,
@@ -763,9 +1088,16 @@ export class LocalEngine {
         );
       }
 
+      const postCaptureStages: PostCaptureStageName[] = [
+        "paper_metadata",
+        "chunk_meta",
+        "figure_vision",
+        "embedding",
+        "graph",
+      ];
       const jobId = enqueueJob(db, "post_capture_hardening", {
         sourceId,
-        stages: ["embedding", "chunk_meta", "graph"],
+        stages: postCaptureStages,
       });
       insertSourceAuditLog(db, {
         action: "source.stage_queued",
@@ -776,10 +1108,12 @@ export class LocalEngine {
         createdAt: draft.capturedAt,
         payload: {
           jobType: "post_capture_hardening",
-          stages: ["embedding", "chunk_meta", "graph"],
+          stages: postCaptureStages,
         },
       });
     });
+
+    await options.afterSave?.({ db, sourceId, draft });
 
     const saved = db.selectObject("SELECT * FROM sources WHERE id = ? LIMIT 1", [sourceId]);
     return {
@@ -802,6 +1136,38 @@ export class LocalEngine {
             }
           : memorySummaryFromRow(saved),
     };
+  }
+
+  private async persistPdfRawFile(db: SqliteDb, input: PdfRawFileStoreWriteInput): Promise<void> {
+    let rawFileMetadata: Record<string, unknown>;
+    try {
+      const stored = await this.pdfRawFileStore.write(input);
+      rawFileMetadata = {
+        status: "persisted",
+        storage: stored.storage,
+        path: stored.path,
+        byteLength: stored.byteLength,
+        contentType: stored.contentType,
+        persistedAt: stored.persistedAt,
+      };
+    } catch (error) {
+      const engineError = engineErrorFromUnknown(error, "PDF_RAW_FILE_PERSIST_FAILED");
+      rawFileMetadata = {
+        status: "persist_failed",
+        reason: engineError.code,
+        message: engineError.message,
+        byteLength: input.bytes.byteLength,
+      };
+    }
+
+    try {
+      updateSourceMetadataJson(db, input.sourceId, (metadata) => ({
+        ...metadata,
+        pdf_raw_file: rawFileMetadata,
+      }));
+    } catch {
+      // Raw file status is diagnostic metadata and must not fail the capture.
+    }
   }
 
   private async retrieveSources(payload: RetrieveSourcesPayload): Promise<RetrieveSourcesResult> {
@@ -834,6 +1200,7 @@ export class LocalEngine {
           s.superseded_by_source_id,
           s.is_current
          FROM sources s
+         LEFT JOIN source_metadata sm ON sm.source_id = s.id
          WHERE ${sourceFilter.sql}
          ORDER BY s.captured_at DESC
          LIMIT ?`,
@@ -1064,6 +1431,7 @@ export class LocalEngine {
        JOIN sources s ON s.id = source_fts.source_id
        JOIN source_chunks c ON c.id = source_fts.chunk_id
        WHERE source_fts MATCH ?
+         AND c.role = 'child'
          AND s.lifecycle_status <> 'deleted'
        ORDER BY score ASC
        LIMIT ?`,
@@ -1115,6 +1483,7 @@ export class LocalEngine {
       `SELECT id, ord, text, token_count, page_start, page_end
        FROM source_chunks
        WHERE source_id = ?
+         AND role = 'child'
        ORDER BY ord ASC`,
       [id],
     );
@@ -1136,6 +1505,46 @@ export class LocalEngine {
         tokenCount: numberField(chunk, "token_count"),
         ...optionalPageRangeFromRow(chunk),
       })),
+    };
+  }
+
+  private async getPdfRawFile(id: string): Promise<PdfRawFileResult> {
+    const db = await this.ensureReady();
+    const row = db.selectObject(
+      "SELECT * FROM sources WHERE id = ? AND lifecycle_status <> 'deleted' LIMIT 1",
+      [id],
+    );
+    if (row === undefined) {
+      throw new EngineRpcError("PDF_RAW_FILE_NOT_FOUND", `PDF source not found: ${id}`);
+    }
+    const metadataRow = db.selectObject(
+      "SELECT metadata_json FROM source_metadata WHERE source_id = ? LIMIT 1",
+      [id],
+    );
+    const metadata = parseMetadata(stringField(metadataRow ?? {}, "metadata_json"));
+    const rawFile = metadata.pdf_raw_file;
+    if (!isRecord(rawFile) || rawFile.status !== "persisted") {
+      throw new EngineRpcError("PDF_RAW_FILE_NOT_AVAILABLE", "Raw PDF file is not persisted.");
+    }
+    if (rawFile.contentType !== undefined && rawFile.contentType !== "application/pdf") {
+      throw new EngineRpcError("PDF_RAW_FILE_NOT_AVAILABLE", "Raw file is not a PDF.");
+    }
+
+    let bytes: Uint8Array;
+    try {
+      bytes = await this.pdfRawFileStore.read(id);
+    } catch (error) {
+      const engineError = engineErrorFromUnknown(error, "PDF_RAW_FILE_READ_FAILED");
+      throw new EngineRpcError(engineError.code, engineError.message, engineError.detail);
+    }
+
+    return {
+      memoryId: id,
+      sourceTitle: stringField(row, "source_title"),
+      sourceUrl: stringField(row, "source_url"),
+      bytes,
+      byteLength: bytes.byteLength,
+      contentType: "application/pdf",
     };
   }
 
@@ -1197,6 +1606,7 @@ export class LocalEngine {
          JOIN sources s ON s.id = source_fts.source_id
          JOIN source_chunks c ON c.id = source_fts.chunk_id
          WHERE source_fts MATCH ?
+           AND c.role = 'child'
            AND s.lifecycle_status <> 'deleted'
            ${sourceFilter}
          ORDER BY bm25(source_fts) ASC
@@ -1216,6 +1626,7 @@ export class LocalEngine {
          FROM sources s
          JOIN source_chunks c ON c.source_id = s.id
          WHERE s.lifecycle_status <> 'deleted'
+           AND c.role = 'child'
            AND s.id IN (${sourceIds.map(() => "?").join(", ")})
          GROUP BY s.id
          ORDER BY s.captured_at DESC
@@ -1361,6 +1772,9 @@ export class LocalEngine {
       });
       deleted = true;
     });
+    if (deleted) {
+      await this.pdfRawFileStore.delete(id).catch(() => undefined);
+    }
     return {
       deleted,
       id,
@@ -1842,7 +2256,15 @@ export class LocalEngine {
 
   private async runQueuedJob(id: string): Promise<JobSummary> {
     const db = await this.ensureReady();
-    return await runJob(db, id, this.embeddingProviderOverride, this.embeddingProviderFactory);
+    return await runJob(
+      db,
+      id,
+      this.embeddingProviderOverride,
+      this.embeddingProviderFactory,
+      this.figureVisionAnalyzerFactory,
+      this.pdfRawFileStore,
+      this.pdfFigureVisionImageExtractor,
+    );
   }
 
   private async reindex(
@@ -1862,6 +2284,9 @@ export class LocalEngine {
       jobId,
       this.embeddingProviderOverride,
       this.embeddingProviderFactory,
+      this.figureVisionAnalyzerFactory,
+      this.pdfRawFileStore,
+      this.pdfFigureVisionImageExtractor,
     );
     return {
       jobId,
@@ -2640,6 +3065,7 @@ export class LocalEngine {
       db.exec("DELETE FROM source_chunks");
       db.exec("DELETE FROM sources");
     });
+    await this.pdfRawFileStore.clear().catch(() => undefined);
     this.healthState = readyHealth(this.healthState.sqliteVersion);
   }
 
@@ -2795,6 +3221,61 @@ function isBridgeEmbeddingProvider(provider: string) {
   return provider === "openai" || provider === "openai-compatible";
 }
 
+function createWorkerFigureVisionAnalyzer(
+  workerSelf: LocalEngineWorkerGlobal,
+): FigureVisionAnalyzer {
+  const pending = new Map<
+    string,
+    {
+      resolve: (result: FigureVisionAnalysisResult) => void;
+      reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+
+  workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (!isWorkerVisionAnalysisResponseMessage(event.data)) return;
+    const entry = pending.get(event.data.requestId);
+    if (entry === undefined) return;
+    clearTimeout(entry.timer);
+    pending.delete(event.data.requestId);
+    if (event.data.response.ok) {
+      entry.resolve(event.data.response.value);
+      return;
+    }
+    entry.reject(
+      new EngineRpcError(
+        event.data.response.error.code,
+        event.data.response.error.message,
+        event.data.response.error.detail,
+      ),
+    );
+  });
+
+  return {
+    analyze(input: FigureVisionAnalysisInput) {
+      const requestId = createRequestId();
+      return new Promise<FigureVisionAnalysisResult>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(requestId);
+          reject(
+            new EngineRpcError(
+              "FIGURE_VISION_BRIDGE_TIMEOUT",
+              "Figure vision analysis request timed out.",
+            ),
+          );
+        }, figureVisionBridgeTimeoutMs);
+        pending.set(requestId, { resolve, reject, timer });
+        workerSelf.postMessage({
+          type: CLIO_WORKER_VISION_ANALYSIS_REQUEST,
+          requestId,
+          request: input,
+        });
+      });
+    },
+  };
+}
+
 function installWorkerMessageHandler(workerSelf: LocalEngineWorkerGlobal, engine: LocalEngine) {
   workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
     if (!isWorkerRequestMessage(event.data)) return;
@@ -2835,6 +3316,7 @@ if (workerSelf !== null) {
     workerSelf,
     new LocalEngine({
       embeddingProviderFactory: createWorkerEmbeddingProviderFactory(workerSelf),
+      figureVisionAnalyzer: createWorkerFigureVisionAnalyzer(workerSelf),
     }),
   );
 }
@@ -3491,7 +3973,7 @@ const paperSourceAdapter: SourceAdapter = {
       source_type: "paper",
     };
 
-    normalizePaperMetadata(metadata, inputMetadata, extraction);
+    normalizePaperMetadata(metadata, inputMetadata, extraction, sourceUrl);
     const sourceTitle =
       metadataDisplayString(metadata, "title") ?? extraction.title ?? payload.sourceTitle;
     setMetadataIfMissing(metadata, "title", sourceTitle);
@@ -3522,7 +4004,7 @@ const pdfSourceAdapter: SourceAdapter = {
 
     setMetadataIfMissing(metadata, "mime_type", "application/pdf");
     setMetadataIfMissing(metadata, "parser", "pdfjs");
-    normalizePaperMetadata(metadata, inputMetadata, extraction);
+    normalizePaperMetadata(metadata, inputMetadata, extraction, sourceUrl);
 
     const sourceTitle =
       metadataDisplayString(metadata, "title") ?? extraction.title ?? payload.sourceTitle;
@@ -3576,6 +4058,7 @@ function buildDocumentDraft(
   const sourceTitle =
     (overrides.sourceTitle ?? payload.sourceTitle).trim() || fallbackTitle(sourceUrl);
   const textHash = hashText(normalizedText);
+  const metadata = overrides.metadata ?? payload.metadata ?? {};
   return {
     kind,
     sourceUrl,
@@ -3584,9 +4067,10 @@ function buildDocumentDraft(
     normalizedText,
     textHash,
     capturedAt: overrides.capturedAt ?? payload.capturedAt ?? new Date().toISOString(),
-    metadataJson: JSON.stringify(overrides.metadata ?? payload.metadata ?? {}),
+    metadataJson: JSON.stringify(metadata),
     versionGroupKey: buildMemoryVersionGroupKey(kind, normalizedSourceUrl, textHash),
-    pdfPages: pdfPageTextRanges(overrides.metadata ?? payload.metadata ?? {}),
+    pdfPages: pdfPageTextRanges(metadata),
+    sectionHeadings: sectionHeadingRanges(normalizedText, sectionOutlineFromMetadata(metadata)),
   };
 }
 
@@ -3709,7 +4193,7 @@ function compactTextWithoutWhitespaceWithOriginalOffsets(input: string) {
 }
 
 function pageRangeForChunk(
-  chunkRange: { charStart: number; charEnd: number } | undefined,
+  chunkRange: ChunkTextRange | undefined,
   pages: PdfPageTextRange[],
 ): ChunkPageRange {
   if (chunkRange === undefined || pages.length === 0) {
@@ -3727,11 +4211,342 @@ function pageRangeForChunk(
   };
 }
 
-function buildChunkMetaHeadJson(draft: DocumentDraft) {
+function chunkTextForDocument(draft: DocumentDraft): TextChunk[] {
+  const segments = chunkSegmentsForDocument(draft);
+  if (segments.length <= 1 && segments[0]?.charStart === 0) return chunkText(draft.normalizedText);
+
+  const chunks: TextChunk[] = [];
+  for (const segment of segments) {
+    const segmentChunks = chunkText(segment.text, 900, 120, chunks.length);
+    chunks.push(...segmentChunks);
+  }
+  return chunks;
+}
+
+function chunkSegmentsForDocument(draft: DocumentDraft): DocumentChunkSegment[] {
+  if (draft.sectionHeadings.length === 0) {
+    return [
+      {
+        text: draft.normalizedText,
+        charStart: 0,
+        charEnd: draft.normalizedText.length,
+        sectionPath: null,
+      },
+    ];
+  }
+
+  const segments: DocumentChunkSegment[] = [];
+  for (let index = 0; index < draft.sectionHeadings.length; index += 1) {
+    const heading = draft.sectionHeadings[index];
+    const nextHeading = draft.sectionHeadings[index + 1];
+    if (heading === undefined) continue;
+    const charStart = heading.charStart;
+    const charEnd = nextHeading?.charStart ?? draft.normalizedText.length;
+    const text = normalizeText(draft.normalizedText.slice(charStart, charEnd));
+    if (text.length === 0) continue;
+    segments.push({
+      text,
+      charStart,
+      charEnd,
+      sectionPath: heading.path,
+    });
+  }
+
+  if (segments.length === 0) {
+    return [
+      {
+        text: draft.normalizedText,
+        charStart: 0,
+        charEnd: draft.normalizedText.length,
+        sectionPath: null,
+      },
+    ];
+  }
+  const firstSectionStart = segments[0]?.charStart ?? 0;
+  if (firstSectionStart > 0) {
+    const prefaceText = normalizeText(draft.normalizedText.slice(0, firstSectionStart));
+    if (prefaceText.length > 0) {
+      segments.unshift({
+        text: prefaceText,
+        charStart: 0,
+        charEnd: firstSectionStart,
+        sectionPath: null,
+      });
+    }
+  }
+  return segments;
+}
+
+function materializeSourceChunks(
+  sourceId: string,
+  draft: DocumentDraft,
+  chunks: TextChunk[],
+  chunkRanges: Map<number, ChunkTextRange>,
+): { parents: MaterializedParentChunk[]; children: MaterializedChildChunk[] } {
+  const children = chunks.map((chunk): MaterializedChildChunk => {
+    const range = chunkRanges.get(chunk.ord);
+    const sectionPath = sectionPathForChunk(range, draft.sectionHeadings);
+    return {
+      id: `${sourceId}:${chunk.ord}`,
+      chunk,
+      range,
+      pageRange: pageRangeForChunk(range, draft.pdfPages),
+      sectionPath,
+      metaHeadJson: buildChunkMetaHeadJson(draft, {
+        chunkText: chunk.text,
+        sectionPath,
+        roleHint: "child",
+      }),
+      parentChunkId: null,
+    };
+  });
+  const parentGroups = parentChunkGroupsForChildren(children);
+  const parents = parentGroups.map((group, index): MaterializedParentChunk => {
+    const parentRange = parentChunkRange(group.children);
+    const text = boundedParentChunkText(
+      group.children.map((child) => child.chunk.text).join("\n\n"),
+    );
+    return {
+      id: `${sourceId}:parent:${index}`,
+      ord: parentChunkOrdBase + index,
+      text,
+      tokenCount: estimateTokens(text),
+      hash: hashText(text),
+      sectionPath: group.sectionPath,
+      charStart: parentRange?.charStart ?? null,
+      charEnd: parentRange?.charEnd ?? null,
+      pageRange: pageRangeForChunk(parentRange, draft.pdfPages),
+      metaHeadJson: buildChunkMetaHeadJson(draft, {
+        chunkText: text,
+        sectionPath: group.sectionPath,
+        roleHint: "parent",
+      }),
+    };
+  });
+  for (let index = 0; index < parentGroups.length; index += 1) {
+    const parent = parents[index];
+    const group = parentGroups[index];
+    if (parent === undefined || group === undefined) continue;
+    for (const child of group.children) {
+      child.parentChunkId = parent.id;
+      child.metaHeadJson = buildChunkMetaHeadJson(draft, {
+        chunkText: child.chunk.text,
+        sectionPath: child.sectionPath,
+        roleHint: "child",
+        relations: [
+          {
+            kind: "parent",
+            target: parent.id,
+            label: child.sectionPath,
+          },
+        ],
+      });
+    }
+  }
+  for (let index = 0; index < children.length; index += 1) {
+    const child = children[index];
+    if (child === undefined) continue;
+    const relations = parseChunkMetaRelations(child.metaHeadJson);
+    const previous = children[index - 1];
+    const next = children[index + 1];
+    if (previous !== undefined) {
+      relations.push({ kind: "previous", target: previous.id, label: previous.sectionPath });
+    }
+    if (next !== undefined) {
+      relations.push({ kind: "next", target: next.id, label: next.sectionPath });
+    }
+    child.metaHeadJson = buildChunkMetaHeadJson(draft, {
+      chunkText: child.chunk.text,
+      sectionPath: child.sectionPath,
+      roleHint: "child",
+      relations,
+    });
+  }
+  return { parents, children };
+}
+
+function parentChunkGroupsForChildren(children: MaterializedChildChunk[]) {
+  const groups: Array<{ sectionPath: string; children: MaterializedChildChunk[] }> = [];
+  const bySectionPath = new Map<
+    string,
+    { sectionPath: string; children: MaterializedChildChunk[] }
+  >();
+  for (const child of children) {
+    if (child.sectionPath === null || child.sectionPath.length === 0) continue;
+    const group = bySectionPath.get(child.sectionPath) ?? {
+      sectionPath: child.sectionPath,
+      children: [],
+    };
+    group.children.push(child);
+    if (!bySectionPath.has(child.sectionPath)) {
+      bySectionPath.set(child.sectionPath, group);
+      groups.push(group);
+    }
+  }
+  return groups.filter((group) => group.children.length > 0);
+}
+
+function parentChunkRange(children: MaterializedChildChunk[]): ChunkTextRange | undefined {
+  const ranges = children.flatMap((child) => (child.range === undefined ? [] : [child.range]));
+  if (ranges.length === 0) return undefined;
+  return {
+    charStart: Math.min(...ranges.map((range) => range.charStart)),
+    charEnd: Math.max(...ranges.map((range) => range.charEnd)),
+  };
+}
+
+function boundedParentChunkText(input: string) {
+  return boundedNormalizedText(input, parentChunkTextMaxChars);
+}
+
+function sectionOutlineFromMetadata(metadata: Record<string, unknown>): SectionOutlineItem[] {
+  return sectionOutlineFromUnknown(metadata.sectionOutline);
+}
+
+function sectionOutlineFromJson(input: string): SectionOutlineItem[] {
+  return sectionOutlineFromUnknown(parseJsonArray(input));
+}
+
+function sectionOutlineFromUnknown(input: unknown): SectionOutlineItem[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .flatMap((item): SectionOutlineItem[] => {
+      if (!isRecord(item)) return [];
+      const level = metadataNumber(item.level);
+      const text = typeof item.text === "string" ? normalizeText(item.text) : "";
+      if (level === undefined || text.length === 0) return [];
+      return [{ level: Math.max(1, Math.min(6, Math.floor(level))), text }];
+    })
+    .slice(0, 200);
+}
+
+function sectionHeadingRanges(
+  normalizedText: string,
+  outline: SectionOutlineItem[],
+): SectionHeadingRange[] {
+  if (outline.length === 0) return [];
+  const lines = textLineRanges(normalizedText);
+  const headings: SectionHeadingRange[] = [];
+  const stack: SectionHeadingRange[] = [];
+  let lineCursor = 0;
+
+  for (const item of outline) {
+    const lineIndex = findSectionHeadingLine(lines, item, lineCursor);
+    if (lineIndex < 0) continue;
+    lineCursor = lineIndex + 1;
+    const line = lines[lineIndex];
+    if (line === undefined) continue;
+    while (stack.length > 0 && (stack[stack.length - 1]?.level ?? 0) >= item.level) {
+      stack.pop();
+    }
+    const path = boundedNormalizedText(
+      [...stack.map((heading) => heading.text), item.text].join(" > "),
+      chunkMetaSectionPathMaxChars,
+    );
+    const heading = {
+      level: item.level,
+      text: item.text,
+      charStart: line.charStart,
+      path,
+    };
+    headings.push(heading);
+    stack.push(heading);
+  }
+
+  return headings;
+}
+
+function textLineRanges(input: string): TextLineRange[] {
+  const lines: TextLineRange[] = [];
+  let start = 0;
+  for (let index = 0; index <= input.length; index += 1) {
+    if (index < input.length && input[index] !== "\n") continue;
+    const rawLine = input.slice(start, index);
+    const text = normalizeText(rawLine);
+    if (text.length > 0) {
+      lines.push({ text, charStart: start, charEnd: index });
+    }
+    start = index + 1;
+  }
+  return lines;
+}
+
+function findSectionHeadingLine(
+  lines: TextLineRange[],
+  item: SectionOutlineItem,
+  startIndex: number,
+) {
+  const target = normalizeSectionHeadingText(item.text);
+  if (target.length === 0) return -1;
+  for (let index = startIndex; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line === undefined) continue;
+    if (normalizeSectionHeadingText(line.text) === target) return index;
+  }
+  for (let index = startIndex; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line === undefined) continue;
+    if (normalizeSectionHeadingText(stripSectionHeadingMarker(line.text)) === target) return index;
+  }
+  return -1;
+}
+
+function stripSectionHeadingMarker(input: string) {
+  return normalizeText(input)
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^\d+(?:\.\d+)*\.?\s+/, "")
+    .replace(/\s*#+$/, "");
+}
+
+function normalizeSectionHeadingText(input: string) {
+  return stripSectionHeadingMarker(input).toLowerCase();
+}
+
+function sectionPathForChunk(
+  chunkRange: ChunkTextRange | undefined,
+  headings: SectionHeadingRange[],
+) {
+  if (chunkRange === undefined || headings.length === 0) return null;
+  let active: SectionHeadingRange | undefined;
+  for (const heading of headings) {
+    if (heading.charStart > chunkRange.charStart) break;
+    active = heading;
+  }
+  return active === undefined ? null : active.path;
+}
+
+function chunkTextRangeFromRow(row: SqlRow): ChunkTextRange | undefined {
+  if (row.char_start === null || row.char_start === undefined) return undefined;
+  if (row.char_end === null || row.char_end === undefined) return undefined;
+  const charStart = metadataNumber(row.char_start);
+  const charEnd = metadataNumber(row.char_end);
+  if (charStart === undefined || charEnd === undefined) return undefined;
+  if (charStart < 0 || charEnd < charStart) return undefined;
+  return {
+    charStart: Math.floor(charStart),
+    charEnd: Math.floor(charEnd),
+  };
+}
+
+function buildChunkMetaHeadJson(
+  draft: DocumentDraft,
+  input: {
+    chunkText: string;
+    sectionPath?: string | null;
+    roleHint?: string | null;
+    relations?: ChunkMetaRelationV1[];
+    selectedTier?: ChunkMetaTierV1;
+  },
+) {
   return buildChunkMetaHeadJsonFromSourceMetadata({
     sourceTitle: draft.sourceTitle,
     sourceType: draft.kind,
     metadataJson: draft.metadataJson,
+    chunkText: input.chunkText,
+    sectionPath: input.sectionPath,
+    roleHint: input.roleHint,
+    relations: input.relations,
+    selectedTier: input.selectedTier,
   });
 }
 
@@ -3739,6 +4554,11 @@ function buildChunkMetaHeadJsonFromSourceMetadata(input: {
   sourceTitle: string;
   sourceType: string;
   metadataJson: string;
+  chunkText: string;
+  sectionPath?: string | null;
+  roleHint?: string | null;
+  relations?: ChunkMetaRelationV1[];
+  selectedTier?: ChunkMetaTierV1;
 }) {
   const metadata = parseMetadata(input.metadataJson);
   const title = boundedNormalizedText(
@@ -3762,21 +4582,296 @@ function buildChunkMetaHeadJsonFromSourceMetadata(input: {
       .join("\n"),
     chunkMetaDocContextMaxChars,
   );
+  const sectionPath =
+    input.sectionPath === null || input.sectionPath === undefined
+      ? null
+      : boundedNormalizedText(input.sectionPath, chunkMetaSectionPathMaxChars);
+  const normalizedSectionPath = sectionPath !== null && sectionPath.length > 0 ? sectionPath : null;
+  const sectionRelation: ChunkMetaRelationV1[] =
+    normalizedSectionPath === null
+      ? []
+      : [
+          {
+            kind: "section",
+            target: normalizedSectionPath,
+            label: normalizedSectionPath,
+          },
+        ];
+  const relations = normalizeChunkMetaRelations([...sectionRelation, ...(input.relations ?? [])]);
+  const roleHint = normalizeChunkMetaRoleHint(input.roleHint);
+  const tier0SectionSummary = deterministicSectionSummary(normalizedSectionPath);
+  const tier0ChunkSummary = deterministicChunkSummary(input.chunkText);
+  const tier0SemanticRelations = normalizeChunkMetaSemanticRelations([]);
+  const tier1SectionSummary = localExtractiveSectionSummary({
+    sectionPath: normalizedSectionPath,
+    chunkText: input.chunkText,
+  });
+  const tier1ChunkSummary = localExtractiveChunkSummary(input.chunkText);
+  const tier1SemanticRelations = buildLocalChunkMetaSemanticRelations({
+    roleHint,
+    sectionPath: normalizedSectionPath,
+    relations,
+    chunkText: input.chunkText,
+  });
+  const selectedTier = selectChunkMetaTier(input.selectedTier);
+  const selected =
+    selectedTier === "tier1"
+      ? {
+          summarySource: "local_extractive" as const,
+          sectionSummary: tier1SectionSummary,
+          chunkSummary: tier1ChunkSummary,
+          semanticRelations: tier1SemanticRelations,
+        }
+      : {
+          summarySource: "deterministic" as const,
+          sectionSummary: tier0SectionSummary,
+          chunkSummary: tier0ChunkSummary,
+          semanticRelations: tier0SemanticRelations,
+        };
   const metaHead: ChunkMetaHeadV1 = {
     version: chunkMetaHeadVersion,
-    tier: "tier0",
+    tier: selectedTier,
+    summarySource: selected.summarySource,
+    selectedTier,
+    tiers: {
+      tier0: {
+        status: "available",
+        summarySource: "deterministic",
+        sectionSummary: tier0SectionSummary,
+        chunkSummary: tier0ChunkSummary,
+        relations,
+        semanticRelations: tier0SemanticRelations,
+      },
+      tier1:
+        selectedTier === "tier1"
+          ? {
+              status: "available",
+              summarySource: "local_extractive",
+              fallbackTier: "tier0",
+              sectionSummary: tier1SectionSummary,
+              chunkSummary: tier1ChunkSummary,
+              relations,
+              semanticRelations: tier1SemanticRelations,
+            }
+          : {
+              status: "unavailable",
+              summarySource: "unavailable",
+              reason: "chunk_meta_stage_not_run",
+              fallbackTier: "tier0",
+              sectionSummary: null,
+              chunkSummary: null,
+              relations: [],
+              semanticRelations: [],
+            },
+      tier2: {
+        status: "disabled",
+        summarySource: "unavailable",
+        reason: "explicit_llm_chunk_meta_not_configured",
+        fallbackTier: selectedTier,
+        sectionSummary: null,
+        chunkSummary: null,
+        relations: [],
+        semanticRelations: [],
+      },
+    },
     source: {
       title,
       type: sourceType,
       abstract: boundedAbstract,
     },
     docContext,
-    sectionPath: null,
-    chunkSummary: null,
-    roleHint: null,
-    relations: [],
+    sectionPath: normalizedSectionPath,
+    sectionSummary: selected.sectionSummary,
+    chunkSummary: selected.chunkSummary,
+    roleHint,
+    relations,
+    semanticRelations: selected.semanticRelations,
   };
   return JSON.stringify(metaHead);
+}
+
+function selectChunkMetaTier(input: ChunkMetaTierV1 | undefined): ChunkMetaTierV1 {
+  return input === "tier1" ? "tier1" : "tier0";
+}
+
+function deterministicChunkSummary(input: string): string | null {
+  const summary = excerpt(input, chunkMetaChunkSummaryMaxChars);
+  return summary.length === 0 ? null : summary;
+}
+
+function localExtractiveChunkSummary(input: string): string | null {
+  const normalized = normalizeText(input);
+  if (normalized.length === 0) return null;
+  const sentences = normalized
+    .split(/(?<=[.!?])\s+/u)
+    .map((sentence) => normalizeText(sentence))
+    .filter((sentence) => sentence.length > 0);
+  const selected = sentences.length === 0 ? normalized : sentences.slice(0, 2).join(" ");
+  return boundedNormalizedText(selected, chunkMetaChunkSummaryMaxChars);
+}
+
+function deterministicSectionSummary(sectionPath?: string | null): string | null {
+  if (sectionPath === null || sectionPath === undefined) return null;
+  const parts = sectionPath
+    .split(">")
+    .map((part) => normalizeText(part))
+    .filter((part) => part.length > 0);
+  const sectionName = parts[parts.length - 1] ?? normalizeText(sectionPath);
+  if (sectionName.length === 0) return null;
+  return boundedNormalizedText(`Section: ${sectionName}`, chunkMetaSectionSummaryMaxChars);
+}
+
+function localExtractiveSectionSummary(input: {
+  sectionPath: string | null;
+  chunkText: string;
+}): string | null {
+  const sectionSummary = deterministicSectionSummary(input.sectionPath);
+  const chunkSummary = localExtractiveChunkSummary(input.chunkText);
+  if (sectionSummary === null) return chunkSummary;
+  if (chunkSummary === null) return sectionSummary;
+  return boundedNormalizedText(
+    `${sectionSummary}. ${chunkSummary}`,
+    chunkMetaSectionSummaryMaxChars,
+  );
+}
+
+function normalizeChunkMetaRoleHint(input?: string | null): string | null {
+  if (input === null || input === undefined) return null;
+  const roleHint = boundedNormalizedText(input, 80);
+  return roleHint.length === 0 ? null : roleHint;
+}
+
+function parseChunkMetaRelations(metaHeadJson: string): ChunkMetaRelationV1[] {
+  const metaHead = parseMetadata(metaHeadJson);
+  const relations = metaHead.relations;
+  if (!Array.isArray(relations)) return [];
+  const parsed = relations.flatMap((relation): ChunkMetaRelationV1[] => {
+    if (!isRecord(relation)) return [];
+    if (!isChunkMetaRelationKind(relation.kind)) return [];
+    if (typeof relation.target !== "string") return [];
+    const target = boundedNormalizedText(relation.target, chunkMetaSectionPathMaxChars);
+    if (target.length === 0) return [];
+    const label =
+      typeof relation.label === "string"
+        ? boundedNormalizedText(relation.label, chunkMetaRelationLabelMaxChars)
+        : "";
+    return [
+      {
+        kind: relation.kind,
+        target,
+        label: label.length === 0 ? null : label,
+      },
+    ];
+  });
+  return normalizeChunkMetaRelations(parsed);
+}
+
+function normalizeChunkMetaRelations(input?: ChunkMetaRelationV1[]): ChunkMetaRelationV1[] {
+  if (input === undefined) return [];
+  const seen = new Set<string>();
+  const relations: ChunkMetaRelationV1[] = [];
+  for (const relation of input) {
+    if (!isChunkMetaRelationKind(relation.kind)) continue;
+    const target = boundedNormalizedText(relation.target, chunkMetaSectionPathMaxChars);
+    if (target.length === 0) continue;
+    const key = `${relation.kind}:${target}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const label =
+      relation.label === null || relation.label === undefined
+        ? null
+        : boundedNormalizedText(relation.label, chunkMetaRelationLabelMaxChars);
+    relations.push({
+      kind: relation.kind,
+      target,
+      label: label !== null && label.length > 0 ? label : null,
+    });
+    if (relations.length >= chunkMetaMaxRelations) break;
+  }
+  return relations;
+}
+
+function isChunkMetaRelationKind(value: unknown): value is ChunkMetaRelationKindV1 {
+  return value === "parent" || value === "previous" || value === "next" || value === "section";
+}
+
+function buildLocalChunkMetaSemanticRelations(input: {
+  roleHint: string | null;
+  sectionPath: string | null;
+  relations: ChunkMetaRelationV1[];
+  chunkText: string;
+}): ChunkMetaSemanticRelationV1[] {
+  const semanticRelations: ChunkMetaSemanticRelationV1[] = input.relations.map((relation) => ({
+    kind: relation.kind,
+    target: relation.target,
+    label: relation.label,
+    confidence: 0.8,
+    source: "local_extractive",
+  }));
+  if (input.roleHint !== null) {
+    semanticRelations.push({
+      kind: "role",
+      target: input.roleHint,
+      label: input.sectionPath,
+      confidence: 0.7,
+      source: "local_extractive",
+    });
+  }
+  const citationHints = extractChunkMetaCitationHints(input.chunkText);
+  for (const hint of citationHints) {
+    semanticRelations.push({
+      kind: "citation_hint",
+      target: hint,
+      label: "citation-like reference",
+      confidence: 0.55,
+      source: "local_extractive",
+    });
+  }
+  return normalizeChunkMetaSemanticRelations(semanticRelations);
+}
+
+function extractChunkMetaCitationHints(input: string): string[] {
+  const text = normalizeText(input);
+  const hints = new Set<string>();
+  for (const match of text.matchAll(/\b(?:doi|DOI)\s*:\s*([^\s,;]+)|\b10\.\d{4,9}\/[^\s,;]+/g)) {
+    const hint = normalizeText(match[1] ?? match[0] ?? "");
+    if (hint.length > 0 && hints.size < 4) hints.add(hint);
+  }
+  return [...hints];
+}
+
+function normalizeChunkMetaSemanticRelations(
+  input?: ChunkMetaSemanticRelationV1[],
+): ChunkMetaSemanticRelationV1[] {
+  if (input === undefined) return [];
+  const seen = new Set<string>();
+  const relations: ChunkMetaSemanticRelationV1[] = [];
+  for (const relation of input) {
+    if (!isChunkMetaSemanticRelationKind(relation.kind)) continue;
+    const target = boundedNormalizedText(relation.target, chunkMetaSectionPathMaxChars);
+    if (target.length === 0) continue;
+    const key = `${relation.kind}:${target}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const label =
+      relation.label === null || relation.label === undefined
+        ? null
+        : boundedNormalizedText(relation.label, chunkMetaRelationLabelMaxChars);
+    const confidence = Math.max(0, Math.min(1, relation.confidence));
+    relations.push({
+      kind: relation.kind,
+      target,
+      label: label !== null && label.length > 0 ? label : null,
+      confidence,
+      source: relation.source === "deterministic" ? "deterministic" : "local_extractive",
+    });
+    if (relations.length >= chunkMetaMaxRelations) break;
+  }
+  return relations;
+}
+
+function isChunkMetaSemanticRelationKind(value: unknown): value is ChunkMetaSemanticRelationKindV1 {
+  return isChunkMetaRelationKind(value) || value === "role" || value === "citation_hint";
 }
 
 function buildChunkEmbeddingInput(chunk: SqlRow) {
@@ -3787,14 +4882,67 @@ function buildChunkEmbeddingInput(chunk: SqlRow) {
 
 function buildChunkMetaEmbeddingPrefix(metaHeadJson: string) {
   const metaHead = parseMetadata(metaHeadJson);
+  const selectedTier =
+    stringMetadataField(metaHead, "selectedTier") ?? stringMetadataField(metaHead, "tier");
+  const selectedTierState = selectedChunkMetaTierState(metaHead, selectedTier);
   const docContext = stringMetadataField(metaHead, "docContext") ?? "";
-  const chunkSummary = stringMetadataField(metaHead, "chunkSummary") ?? "";
+  const sectionPath = stringMetadataField(metaHead, "sectionPath") ?? "";
+  const sectionSummary =
+    stringMetadataField(selectedTierState, "sectionSummary") ??
+    stringMetadataField(metaHead, "sectionSummary") ??
+    "";
+  const chunkSummary =
+    stringMetadataField(selectedTierState, "chunkSummary") ??
+    stringMetadataField(metaHead, "chunkSummary") ??
+    "";
+  const roleHint = stringMetadataField(metaHead, "roleHint") ?? "";
+  const relationHints = chunkMetaRelationHintsForEmbedding(metaHead, selectedTierState);
   return boundedNormalizedText(
-    [docContext, chunkSummary.length > 0 ? `Chunk summary: ${chunkSummary}` : ""]
+    [
+      docContext,
+      sectionPath.length > 0 ? `Section: ${sectionPath}` : "",
+      sectionSummary.length > 0 ? `Section summary: ${sectionSummary}` : "",
+      chunkSummary.length > 0 ? `Chunk summary: ${chunkSummary}` : "",
+      roleHint.length > 0 ? `Role: ${roleHint}` : "",
+      relationHints.length > 0 ? `Relations: ${relationHints.join("; ")}` : "",
+    ]
       .filter((part) => part.length > 0)
       .join("\n"),
     chunkMetaEmbeddingPrefixMaxChars,
   );
+}
+
+function selectedChunkMetaTierState(
+  metaHead: Record<string, unknown>,
+  selectedTier: string | null,
+): Record<string, unknown> {
+  const tiers = metaHead.tiers;
+  if (!isRecord(tiers)) return {};
+  const preferred = typeof selectedTier === "string" ? tiers[selectedTier] : undefined;
+  if (isRecord(preferred) && preferred.status === "available") return preferred;
+  const tier1 = tiers.tier1;
+  if (isRecord(tier1) && tier1.status === "available") return tier1;
+  const tier0 = tiers.tier0;
+  return isRecord(tier0) ? tier0 : {};
+}
+
+function chunkMetaRelationHintsForEmbedding(
+  metaHead: Record<string, unknown>,
+  selectedTierState: Record<string, unknown>,
+): string[] {
+  const semanticRelations = Array.isArray(selectedTierState.semanticRelations)
+    ? selectedTierState.semanticRelations
+    : Array.isArray(metaHead.semanticRelations)
+      ? metaHead.semanticRelations
+      : [];
+  const hints = semanticRelations.flatMap((relation): string[] => {
+    if (!isRecord(relation)) return [];
+    const kind = typeof relation.kind === "string" ? normalizeText(relation.kind) : "";
+    const target = typeof relation.target === "string" ? normalizeText(relation.target) : "";
+    if (kind.length === 0 || target.length === 0) return [];
+    return [`${kind}:${target}`];
+  });
+  return hints.slice(0, 6);
 }
 
 function boundedNormalizedText(input: string, maxLength: number) {
@@ -3965,8 +5113,44 @@ interface PaperMetadataExtraction extends ArxivParseResult {
   abstract?: string;
   authors: string[];
   doi?: string;
+  venue?: string;
   categories: string[];
+  referenceList: PaperMetadataReferenceEntry[];
   sectionOutline: Array<{ level: number; text: string }>;
+}
+
+type PaperMetadataSourceTrust = "high" | "medium" | "low";
+
+interface PaperMetadataFieldConfidence {
+  source: string;
+  confidence: number;
+}
+
+interface PaperMetadataReferenceEntry {
+  index: number;
+  raw: string;
+  doi?: string;
+  arxivId?: string;
+  title?: string;
+  year?: number;
+}
+
+interface PaperMetadataContractV1 {
+  version: 1;
+  doi?: string;
+  arxivId?: string;
+  arxivVersion?: string;
+  authors: string[];
+  year?: number;
+  venue?: string;
+  referenceList: PaperMetadataReferenceEntry[];
+  alternateUrls: string[];
+  sourceTrust: PaperMetadataSourceTrust;
+  fields: Record<string, PaperMetadataFieldConfidence>;
+  remote: {
+    status: "disabled";
+    reason: "explicit_remote_enrichment_not_configured";
+  };
 }
 
 function isPdfAdapterInput(input: SourceAdapterInput) {
@@ -4030,10 +5214,15 @@ function normalizePaperMetadata(
   metadata: Record<string, unknown>,
   inputMetadata: Record<string, unknown>,
   extraction: PaperMetadataExtraction,
+  sourceUrl: string,
 ) {
   const explicitAuthors = parseMetadataAuthors(inputMetadata);
   const explicitCategories = parseMetadataCategories(inputMetadata);
   const explicitYear = metadataInteger(inputMetadata, "year");
+  const explicitDoi = normalizeDoi(metadataDisplayString(inputMetadata, "doi"));
+  const explicitVenue = parseMetadataVenue(inputMetadata);
+  const explicitReferences = parseMetadataReferenceList(inputMetadata);
+  const explicitArxiv = parseExplicitArxivMetadata(inputMetadata);
   const explicitAdapterHint = adapterHintFromMetadata(inputMetadata);
   const explicitSourceType = metadataString(inputMetadata, "source_type");
   const explicitPaperSource =
@@ -4043,6 +5232,8 @@ function normalizePaperMetadata(
   if (explicitAuthors.length > 0) metadata.authors = explicitAuthors;
   if (explicitCategories.length > 0) metadata.categories = explicitCategories;
   if (explicitYear !== undefined) metadata.year = explicitYear;
+  if (explicitDoi !== undefined) metadata.doi = explicitDoi;
+  if (explicitVenue !== undefined) metadata.venue = explicitVenue;
 
   if (
     extraction.isArxiv ||
@@ -4056,11 +5247,39 @@ function normalizePaperMetadata(
   setMetadataIfMissing(metadata, "abstract", extraction.abstract);
   setMetadataIfMissing(metadata, "authors", extraction.authors);
   setMetadataIfMissing(metadata, "year", extraction.year);
-  setMetadataIfMissing(metadata, "arxiv_id", extraction.arxivId);
-  setMetadataIfMissing(metadata, "arxiv_version", extraction.arxivVersion);
+  setMetadataIfMissing(metadata, "arxiv_id", explicitArxiv.arxivId ?? extraction.arxivId);
+  setMetadataIfMissing(
+    metadata,
+    "arxiv_version",
+    explicitArxiv.arxivVersion ?? extraction.arxivVersion,
+  );
   setMetadataIfMissing(metadata, "doi", extraction.doi);
+  setMetadataIfMissing(metadata, "venue", extraction.venue);
   setMetadataIfMissing(metadata, "categories", extraction.categories);
+  setMetadataIfMissing(
+    metadata,
+    "reference_list",
+    explicitReferences.length > 0 ? explicitReferences : extraction.referenceList,
+  );
   setMetadataIfMissing(metadata, "sectionOutline", extraction.sectionOutline);
+
+  const contract = buildPaperMetadataContract({
+    metadata,
+    inputMetadata,
+    extraction,
+    sourceUrl,
+    explicitAuthors,
+    explicitYear,
+    explicitDoi,
+    explicitVenue,
+    explicitReferences,
+    explicitArxiv,
+  });
+  if (contract !== undefined) {
+    metadata.paper_metadata = contract;
+    metadata.alternate_urls = contract.alternateUrls;
+    metadata.source_trust = contract.sourceTrust;
+  }
 }
 
 function parseArxivUrl(sourceUrl: string): ArxivParseResult {
@@ -4129,9 +5348,25 @@ function extractPaperTextMetadata(
     abstract: extractLabeledBlock(lines, ["abstract"]),
     authors: parsePaperAuthors(extractLabeledLine(lines, ["authors", "author"]) ?? ""),
     doi: extractDoi(prefix),
+    venue: extractPaperVenue(lines),
     categories: parsePaperCategories(categoryText ?? ""),
+    referenceList: parsePaperReferencesFromText(text),
     sectionOutline: paperSectionOutline(text),
   };
+}
+
+function extractPaperVenue(lines: string[]) {
+  return (
+    extractLabeledLine(lines, [
+      "venue",
+      "journal-ref",
+      "journal ref",
+      "journal",
+      "conference",
+      "published",
+      "publisher",
+    ]) ?? undefined
+  );
 }
 
 function extractLabeledLine(lines: string[], labels: string[]) {
@@ -4210,6 +5445,63 @@ function parseMetadataCategories(metadata: Record<string, unknown>) {
   );
 }
 
+function parseMetadataVenue(metadata: Record<string, unknown>) {
+  return (
+    metadataDisplayString(metadata, "venue") ??
+    metadataDisplayString(metadata, "journal_ref") ??
+    metadataDisplayString(metadata, "journal-ref") ??
+    metadataDisplayString(metadata, "journalRef") ??
+    metadataDisplayString(metadata, "journal") ??
+    metadataDisplayString(metadata, "conference") ??
+    metadataDisplayString(metadata, "published")
+  );
+}
+
+function parseExplicitArxivMetadata(metadata: Record<string, unknown>): ArxivParseResult {
+  const rawId =
+    metadataDisplayString(metadata, "arxiv_id") ??
+    metadataDisplayString(metadata, "arxivId") ??
+    metadataDisplayString(metadata, "arxiv") ??
+    metadataDisplayString(metadata, "eprint");
+  const rawVersion =
+    metadataDisplayString(metadata, "arxiv_version") ??
+    metadataDisplayString(metadata, "arxivVersion");
+  if (rawId === undefined) return { isArxiv: false };
+  const parsed = arxivParseResultFromIdCandidate(`${rawId}${rawVersion ?? ""}`);
+  return {
+    ...parsed,
+    arxivVersion: parsed.arxivVersion ?? rawVersion?.toLowerCase(),
+  };
+}
+
+function parseMetadataReferenceList(metadata: Record<string, unknown>) {
+  const raw =
+    metadata.reference_list ??
+    metadata.referenceList ??
+    metadata.references ??
+    metadata.pdf_references;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .flatMap((item, index): PaperMetadataReferenceEntry[] => {
+      if (typeof item === "string") return paperReferenceEntryFromRaw(index, item);
+      if (!isRecord(item)) return [];
+      const rawText =
+        typeof item.raw === "string"
+          ? item.raw
+          : typeof item.text === "string"
+            ? item.text
+            : typeof item.title === "string"
+              ? item.title
+              : "";
+      return paperReferenceEntryFromRaw(
+        typeof item.index === "number" && Number.isFinite(item.index) ? item.index : index,
+        rawText,
+        item,
+      );
+    })
+    .slice(0, 80);
+}
+
 function parsePaperAuthors(input: string) {
   return input
     .replace(/^authors?\s*:\s*/i, "")
@@ -4237,7 +5529,318 @@ function parsePaperCategories(input: string) {
 function extractDoi(input: string) {
   const match = /\b(10\.\d{4,9}\/[-._;()/:A-Z0-9]+)\b/i.exec(input);
   if (match === null) return undefined;
-  return normalizeText(match[1] ?? "").replace(/[).,;]+$/, "");
+  return normalizeDoi(match[1]);
+}
+
+function normalizeDoi(input: string | undefined) {
+  if (input === undefined) return undefined;
+  const normalized = normalizeText(input)
+    .replace(/^doi\s*:\s*/i, "")
+    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
+    .replace(/^doi\.org\//i, "")
+    .replace(/[)\].,;]+$/, "")
+    .toLowerCase();
+  return /^10\.\d{4,9}\/[-._;()/:a-z0-9]+$/i.test(normalized) ? normalized : undefined;
+}
+
+function parsePaperReferencesFromText(text: string) {
+  const normalized = normalizeText(text);
+  const lines = normalized.split("\n");
+  const start = lines.findIndex((line) => /^(references|bibliography)\s*$/i.test(line.trim()));
+  if (start < 0) return [];
+  const entries: string[] = [];
+  let current = "";
+  for (const line of lines.slice(start + 1, start + 260)) {
+    const trimmed = normalizeText(line);
+    if (trimmed.length === 0) {
+      if (current.length > 0) {
+        entries.push(current);
+        current = "";
+      }
+      continue;
+    }
+    if (looksLikePaperSectionHeading(trimmed) && entries.length > 0) break;
+    if (/^(?:\[\d+\]|\d+[.)])\s+/.test(trimmed)) {
+      if (current.length > 0) entries.push(current);
+      current = trimmed;
+      continue;
+    }
+    current = current.length === 0 ? trimmed : `${current} ${trimmed}`;
+  }
+  if (current.length > 0) entries.push(current);
+  return entries.flatMap((entry, index) => paperReferenceEntryFromRaw(index, entry)).slice(0, 80);
+}
+
+function paperReferenceEntryFromRaw(
+  index: number,
+  rawInput: string,
+  record: Record<string, unknown> = {},
+): PaperMetadataReferenceEntry[] {
+  const raw = normalizeText(rawInput).slice(0, 2_000);
+  if (raw.length === 0) return [];
+  const explicitDoi = typeof record.doi === "string" ? normalizeDoi(record.doi) : undefined;
+  const explicitArxiv =
+    typeof record.arxivId === "string"
+      ? arxivParseResultFromIdCandidate(record.arxivId).arxivId
+      : typeof record.arxiv_id === "string"
+        ? arxivParseResultFromIdCandidate(record.arxiv_id).arxivId
+        : undefined;
+  const doi = explicitDoi ?? extractDoi(raw);
+  const arxivId = explicitArxiv ?? parseArxivText(raw).arxivId;
+  const year =
+    typeof record.year === "number" && isReasonablePaperYear(record.year)
+      ? Math.floor(record.year)
+      : inferReferenceYear(raw);
+  const title =
+    typeof record.title === "string" && normalizeText(record.title).length > 0
+      ? normalizeText(record.title).slice(0, 500)
+      : inferReferenceTitle(raw);
+  return [
+    {
+      index,
+      raw,
+      ...(doi === undefined ? {} : { doi }),
+      ...(arxivId === undefined ? {} : { arxivId }),
+      ...(title === undefined ? {} : { title }),
+      ...(year === undefined ? {} : { year }),
+    },
+  ];
+}
+
+function inferReferenceYear(raw: string) {
+  const match = /\b(19\d{2}|20\d{2}|2100)\b/.exec(raw);
+  if (match === null) return undefined;
+  const year = Number(match[1]);
+  return isReasonablePaperYear(year) ? year : undefined;
+}
+
+function inferReferenceTitle(raw: string) {
+  const cleaned = raw.replace(/^(?:\[\d+\]|\d+[.)])\s+/, "");
+  const parts = cleaned
+    .split(/\.\s+/)
+    .map((part) => normalizeText(part))
+    .filter((part) => part.length > 0);
+  const candidate = parts.find((part) => part.length >= 8 && !/\b(19\d{2}|20\d{2})\b/.test(part));
+  return candidate === undefined ? undefined : candidate.slice(0, 500);
+}
+
+function buildPaperMetadataContract(input: {
+  metadata: Record<string, unknown>;
+  inputMetadata: Record<string, unknown>;
+  extraction: PaperMetadataExtraction;
+  sourceUrl: string;
+  explicitAuthors: string[];
+  explicitYear?: number;
+  explicitDoi?: string;
+  explicitVenue?: string;
+  explicitReferences: PaperMetadataReferenceEntry[];
+  explicitArxiv: ArxivParseResult;
+}): PaperMetadataContractV1 | undefined {
+  const doi =
+    normalizeDoi(metadataDisplayString(input.metadata, "doi")) ??
+    input.explicitDoi ??
+    input.extraction.doi;
+  const arxivId =
+    metadataDisplayString(input.metadata, "arxiv_id") ??
+    metadataDisplayString(input.metadata, "arxivId") ??
+    input.explicitArxiv.arxivId ??
+    input.extraction.arxivId;
+  const arxivVersion =
+    metadataDisplayString(input.metadata, "arxiv_version") ??
+    metadataDisplayString(input.metadata, "arxivVersion") ??
+    input.explicitArxiv.arxivVersion ??
+    input.extraction.arxivVersion;
+  const authors = parseMetadataAuthors(input.metadata).slice(0, 50);
+  const year =
+    metadataInteger(input.metadata, "year") ?? input.explicitYear ?? input.extraction.year;
+  const venue = parseMetadataVenue(input.metadata) ?? input.explicitVenue ?? input.extraction.venue;
+  const referenceList = parseMetadataReferenceList(input.metadata).slice(0, 80);
+  if (
+    !paperMetadataHasSignal({
+      metadata: input.metadata,
+      extraction: input.extraction,
+      doi,
+      arxivId,
+      authors,
+      venue,
+      referenceList,
+    })
+  ) {
+    return undefined;
+  }
+
+  return {
+    version: 1,
+    ...(doi === undefined ? {} : { doi }),
+    ...(arxivId === undefined ? {} : { arxivId }),
+    ...(arxivVersion === undefined ? {} : { arxivVersion }),
+    authors,
+    ...(year === undefined ? {} : { year }),
+    ...(venue === undefined ? {} : { venue }),
+    referenceList,
+    alternateUrls: paperMetadataAlternateUrls(input.sourceUrl, doi, arxivId, arxivVersion),
+    sourceTrust: paperMetadataSourceTrust({
+      metadata: input.metadata,
+      inputMetadata: input.inputMetadata,
+      extraction: input.extraction,
+      doi,
+      arxivId,
+      referenceList,
+    }),
+    fields: paperMetadataFieldConfidence({
+      explicitAuthors: input.explicitAuthors,
+      explicitYear: input.explicitYear,
+      explicitDoi: input.explicitDoi,
+      explicitVenue: input.explicitVenue,
+      explicitReferences: input.explicitReferences,
+      explicitArxiv: input.explicitArxiv,
+      extraction: input.extraction,
+      doi,
+      arxivId,
+      authors,
+      year,
+      venue,
+      referenceList,
+    }),
+    remote: {
+      status: "disabled",
+      reason: "explicit_remote_enrichment_not_configured",
+    },
+  };
+}
+
+function paperMetadataHasSignal(input: {
+  metadata: Record<string, unknown>;
+  extraction: PaperMetadataExtraction;
+  doi?: string;
+  arxivId?: string;
+  authors: string[];
+  venue?: string;
+  referenceList: PaperMetadataReferenceEntry[];
+}) {
+  const sourceType = metadataString(input.metadata, "source_type");
+  const paperSource =
+    metadataString(input.metadata, "paper_source") ??
+    metadataString(input.metadata, "source_provider");
+  return (
+    sourceType === "paper" ||
+    sourceType === "arxiv" ||
+    paperSource === "arxiv" ||
+    input.extraction.isArxiv ||
+    input.doi !== undefined ||
+    input.arxivId !== undefined ||
+    input.venue !== undefined ||
+    input.referenceList.length > 0 ||
+    (input.authors.length > 0 &&
+      (input.extraction.abstract !== undefined || input.extraction.title !== undefined))
+  );
+}
+
+function paperMetadataAlternateUrls(
+  sourceUrl: string,
+  doi: string | undefined,
+  arxivId: string | undefined,
+  arxivVersion: string | undefined,
+) {
+  const urls = new Set<string>();
+  const normalizedSourceUrl = normalizeText(sourceUrl);
+  if (normalizedSourceUrl.length > 0) urls.add(normalizedSourceUrl);
+  if (doi !== undefined) urls.add(`https://doi.org/${doi}`);
+  if (arxivId !== undefined) {
+    const versionedId = `${arxivId}${arxivVersion ?? ""}`;
+    urls.add(`https://arxiv.org/abs/${versionedId}`);
+    urls.add(`https://arxiv.org/pdf/${versionedId}.pdf`);
+  }
+  return Array.from(urls).slice(0, 12);
+}
+
+function paperMetadataSourceTrust(input: {
+  metadata: Record<string, unknown>;
+  inputMetadata: Record<string, unknown>;
+  extraction: PaperMetadataExtraction;
+  doi?: string;
+  arxivId?: string;
+  referenceList: PaperMetadataReferenceEntry[];
+}): PaperMetadataSourceTrust {
+  if (
+    input.arxivId !== undefined ||
+    input.doi !== undefined ||
+    metadataString(input.inputMetadata, "source_adapter") === "arxiv" ||
+    metadataString(input.metadata, "paper_source") === "arxiv"
+  ) {
+    return "high";
+  }
+  if (input.extraction.title !== undefined || input.referenceList.length > 0) return "medium";
+  return "low";
+}
+
+function paperMetadataFieldConfidence(input: {
+  explicitAuthors: string[];
+  explicitYear?: number;
+  explicitDoi?: string;
+  explicitVenue?: string;
+  explicitReferences: PaperMetadataReferenceEntry[];
+  explicitArxiv: ArxivParseResult;
+  extraction: PaperMetadataExtraction;
+  doi?: string;
+  arxivId?: string;
+  authors: string[];
+  year?: number;
+  venue?: string;
+  referenceList: PaperMetadataReferenceEntry[];
+}) {
+  const fields: Record<string, PaperMetadataFieldConfidence> = {};
+  const set = (key: string, source: string, confidence: number) => {
+    fields[key] = { source, confidence };
+  };
+  if (input.doi !== undefined)
+    set(
+      "doi",
+      input.explicitDoi !== undefined ? "payload" : "text",
+      input.explicitDoi !== undefined ? 0.98 : 0.8,
+    );
+  if (input.arxivId !== undefined) {
+    set(
+      "arxivId",
+      input.explicitArxiv.arxivId !== undefined ? "payload" : "url_or_text",
+      input.explicitArxiv.arxivId !== undefined ? 0.98 : 0.9,
+    );
+  }
+  if (
+    input.explicitArxiv.arxivVersion !== undefined ||
+    input.extraction.arxivVersion !== undefined
+  ) {
+    set(
+      "arxivVersion",
+      input.explicitArxiv.arxivVersion !== undefined ? "payload" : "url_or_text",
+      input.explicitArxiv.arxivVersion !== undefined ? 0.98 : 0.9,
+    );
+  }
+  if (input.authors.length > 0)
+    set(
+      "authors",
+      input.explicitAuthors.length > 0 ? "payload" : "text",
+      input.explicitAuthors.length > 0 ? 0.96 : 0.74,
+    );
+  if (input.year !== undefined)
+    set(
+      "year",
+      input.explicitYear !== undefined ? "payload" : "url_or_text",
+      input.explicitYear !== undefined ? 0.96 : 0.78,
+    );
+  if (input.venue !== undefined)
+    set(
+      "venue",
+      input.explicitVenue !== undefined ? "payload" : "text",
+      input.explicitVenue !== undefined ? 0.94 : 0.72,
+    );
+  if (input.referenceList.length > 0)
+    set(
+      "referenceList",
+      input.explicitReferences.length > 0 ? "payload_or_parser" : "text",
+      input.explicitReferences.length > 0 ? 0.9 : 0.68,
+    );
+  return fields;
 }
 
 function paperSectionOutline(text: string) {
@@ -4478,6 +6081,45 @@ function upsertSourceMetadata(
     title: input.sourceTitle,
     abstract: abstract ?? "",
     url: input.sourceUrl,
+  });
+}
+
+function updateSourceMetadataJson(
+  db: SqliteDb,
+  sourceId: string,
+  updater: (metadata: Record<string, unknown>) => Record<string, unknown>,
+) {
+  const row = db.selectObject(
+    `SELECT metadata_json
+     FROM source_metadata
+     WHERE source_id = ?
+     LIMIT 1`,
+    [sourceId],
+  );
+  if (row === undefined) return;
+  const metadata = updater(parseMetadata(stringField(row, "metadata_json")));
+  const metadataJson = safeJsonObjectString(JSON.stringify(metadata));
+  const abstract = stringMetadataField(metadata, "abstract");
+  const authorsJson = JSON.stringify(stringArrayMetadataField(metadata, "authors"));
+  const sectionOutlineJson = JSON.stringify(
+    Array.isArray(metadata.sectionOutline) ? metadata.sectionOutline.slice(0, 200) : [],
+  );
+  db.exec({
+    sql: `UPDATE source_metadata
+          SET metadata_json = ?,
+              section_outline_json = ?,
+              abstract = ?,
+              authors_json = ?,
+              updated_at = ?
+          WHERE source_id = ?`,
+    bind: [
+      metadataJson,
+      sectionOutlineJson,
+      abstract,
+      authorsJson,
+      new Date().toISOString(),
+      sourceId,
+    ],
   });
 }
 
@@ -4956,6 +6598,9 @@ async function runJob(
   jobId: string,
   embeddingProviderOverride?: EmbeddingProvider,
   embeddingProviderFactory?: EmbeddingProviderFactory,
+  figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory,
+  pdfRawFileStore?: PdfRawFileStore,
+  pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor = extractPdfFigureVisionImageInput,
 ): Promise<JobSummary> {
   const job = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [jobId]);
   if (job === undefined) {
@@ -4994,6 +6639,9 @@ async function runJob(
         stringField(job, "payload_json"),
         embeddingProviderOverride,
         embeddingProviderFactory,
+        figureVisionAnalyzerFactory,
+        pdfRawFileStore,
+        pdfFigureVisionImageExtractor,
       );
     } else if (type === "resolve_anchor") {
       result = { ok: true, reserved: "resolve_anchor" };
@@ -5055,6 +6703,7 @@ function rebuildFtsData(db: SqliteDb) {
        FROM source_chunks c
        JOIN sources s ON s.id = c.source_id
        WHERE s.lifecycle_status <> 'deleted'
+         AND c.role = 'child'
        ORDER BY s.captured_at DESC, c.ord ASC`,
     );
     for (const row of rows) {
@@ -5244,15 +6893,23 @@ async function runPostCaptureHardeningJob(
   payloadJson: string,
   embeddingProviderOverride?: EmbeddingProvider,
   embeddingProviderFactory?: EmbeddingProviderFactory,
+  figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory,
+  pdfRawFileStore?: PdfRawFileStore,
+  pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor = extractPdfFigureVisionImageInput,
 ): Promise<Record<string, unknown>> {
   const payload = parsePostCaptureHardeningPayload(payloadJson);
   if (payload.sourceId.length === 0) {
     throw new EngineRpcError("INVALID_JOB_PAYLOAD", "Post-capture job is missing sourceId.");
   }
+  const shouldRunPaperMetadata = payload.stages.includes("paper_metadata");
   const shouldRunChunkMeta = payload.stages.includes("chunk_meta");
   const shouldRunEmbedding = payload.stages.length === 0 || payload.stages.includes("embedding");
   const shouldRunGraph = payload.stages.includes("graph");
+  const shouldRunFigureVision = payload.stages.includes("figure_vision");
 
+  const paperMetadata = shouldRunPaperMetadata
+    ? runPaperMetadataStageForSource(db, payload.sourceId)
+    : { skipped: true, reason: "stage_not_requested" };
   const chunkMeta = shouldRunChunkMeta
     ? runChunkMetaStageForSource(db, payload.sourceId)
     : { skipped: true, reason: "stage_not_requested" };
@@ -5265,6 +6922,16 @@ async function runPostCaptureHardeningJob(
       )
     : { ok: true, embedding: { skipped: true, reason: "stage_not_requested" } };
 
+  const figureVision = shouldRunFigureVision
+    ? await runPdfFigureVisionStageForSource(
+        db,
+        payload.sourceId,
+        pdfRawFileStore,
+        figureVisionAnalyzerFactory,
+        pdfFigureVisionImageExtractor,
+      )
+    : { skipped: true, reason: "stage_not_requested" };
+
   const graph =
     shouldRunGraph && payload.graphBuildMode === "deterministic"
       ? runDeterministicGraphBuildForSource(db, payload.sourceId)
@@ -5274,8 +6941,10 @@ async function runPostCaptureHardeningJob(
 
   return {
     ok: true,
+    paperMetadata,
     embedding: embeddingResult.embedding,
     chunkMeta,
+    figureVision,
     graph,
   };
 }
@@ -5291,7 +6960,572 @@ function parsePostCaptureHardeningPayload(payloadJson: string) {
 }
 
 function isPostCaptureStageName(value: unknown): value is PostCaptureStageName {
-  return value === "embedding" || value === "chunk_meta" || value === "graph";
+  return (
+    value === "paper_metadata" ||
+    value === "embedding" ||
+    value === "chunk_meta" ||
+    value === "graph" ||
+    value === "figure_vision"
+  );
+}
+
+function runPaperMetadataStageForSource(db: SqliteDb, sourceId: string): Record<string, unknown> {
+  const source = db.selectObject(
+    `SELECT
+       s.id,
+       s.source_kind,
+       s.source_url,
+       s.source_title,
+       s.source_type,
+       s.lifecycle_status,
+       s.normalized_text,
+       sm.metadata_json
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.id = ?
+     LIMIT 1`,
+    [sourceId],
+  );
+  if (source === undefined) {
+    throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
+  }
+  if (stringField(source, "lifecycle_status") === "deleted") {
+    return { skipped: true, reason: "source_deleted" };
+  }
+
+  const sourceUrl = stringField(source, "source_url");
+  const sourceTitle = stringField(source, "source_title");
+  const metadata = parseMetadata(stringField(source, "metadata_json"));
+  const extraction = extractPaperMetadata({
+    sourceUrl,
+    sourceTitle,
+    normalizedText: stringField(source, "normalized_text"),
+    metadata,
+  });
+  normalizePaperMetadata(metadata, metadata, extraction, sourceUrl);
+
+  const contract = isRecord(metadata.paper_metadata)
+    ? (metadata.paper_metadata as unknown as PaperMetadataContractV1)
+    : undefined;
+  if (contract === undefined) {
+    return { skipped: true, reason: "no_paper_metadata_signal" };
+  }
+
+  updateSourceMetadataJson(db, sourceId, () => metadata);
+  insertSourceMetadataFtsRow(db, {
+    sourceId,
+    sourceKind: sourceKindField(source, "source_kind"),
+    sourceType: stringField(source, "source_type"),
+    lifecycleStatus: searchableLifecycleStatusField(source, "lifecycle_status"),
+    title: metadataDisplayString(metadata, "title") ?? sourceTitle,
+    abstract: metadataDisplayString(metadata, "abstract") ?? "",
+    url: sourceUrl,
+  });
+  replaceKeywordIndexForSource(db, sourceId);
+  return {
+    version: contract.version,
+    sourceTrust: contract.sourceTrust,
+    remoteStatus: contract.remote.status,
+    referenceCount: contract.referenceList.length,
+    alternateUrlCount: contract.alternateUrls.length,
+  };
+}
+
+async function runPdfFigureVisionStageForSource(
+  db: SqliteDb,
+  sourceId: string,
+  pdfRawFileStore: PdfRawFileStore | undefined,
+  figureVisionAnalyzerFactory: FigureVisionAnalyzerFactory | undefined,
+  pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor,
+): Promise<Record<string, unknown>> {
+  const row = db.selectObject(
+    `SELECT
+       s.id,
+       s.lifecycle_status,
+       s.normalized_text,
+       sm.metadata_json
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.id = ?
+     LIMIT 1`,
+    [sourceId],
+  );
+  if (row === undefined) {
+    throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
+  }
+  if (stringField(row, "lifecycle_status") === "deleted") {
+    return { skipped: true, reason: "source_deleted" };
+  }
+
+  const metadata = parseMetadata(stringField(row, "metadata_json"));
+  const images = pdfImageArtifactsFromMetadata(metadata.pdf_images);
+  const analyses = pdfFigureAnalysesFromMetadata(metadata.pdf_figure_analyses);
+  if (images.length === 0 || analyses.length === 0) {
+    return { skipped: true, reason: "no_pdf_figure_analyses" };
+  }
+
+  const rawFile = isRecord(metadata.pdf_raw_file) ? metadata.pdf_raw_file : {};
+  if (rawFile.status !== "persisted" || pdfRawFileStore === undefined) {
+    const result = writePdfFigureVisionUnavailable(metadata, analyses, "pdf_raw_file_unavailable");
+    updateSourceMetadataJson(db, sourceId, () => metadata);
+    return result;
+  }
+
+  let pdfBytes: Uint8Array;
+  try {
+    pdfBytes = await pdfRawFileStore.read(sourceId);
+  } catch {
+    const result = writePdfFigureVisionUnavailable(metadata, analyses, "pdf_raw_file_read_failed");
+    updateSourceMetadataJson(db, sourceId, () => metadata);
+    return result;
+  }
+
+  const analyzer = figureVisionAnalyzerFactory?.() ?? null;
+  if (analyzer === null) {
+    const result = writePdfFigureVisionUnavailable(
+      metadata,
+      analyses,
+      "figure_vision_analyzer_unavailable",
+    );
+    updateSourceMetadataJson(db, sourceId, () => metadata);
+    return result;
+  }
+
+  const results = pdfFigureAnalysisResultsFromMetadata(metadata.pdf_figure_analysis_results);
+  const resultById = new Map(results.map((result) => [result.analysisId, result]));
+  const imageById = new Map(images.map((image) => [image.id, image]));
+  const normalizedText = stringField(row, "normalized_text");
+  let analyzed = 0;
+  let unavailable = 0;
+  let error = 0;
+  let skipped = 0;
+
+  for (const analysis of analyses) {
+    if (analyzed + unavailable + error >= figureVisionMaxAnalysesPerJob) break;
+    if (resultById.has(analysis.id)) {
+      skipped += 1;
+      continue;
+    }
+    const image = imageById.get(analysis.imageId);
+    if (image === undefined || analysis.inputStatus !== "needs_bounded_crop") {
+      const result = pdfFigureAnalysisUnavailableResult(
+        analysis,
+        image,
+        "figure_image_pixels_unavailable",
+      );
+      resultById.set(result.analysisId, result);
+      unavailable += 1;
+      continue;
+    }
+
+    const extracted = await pdfFigureVisionImageExtractor({
+      bytes: pdfBytes,
+      pageNumber: analysis.pageNumber,
+      bbox: image.bbox,
+    });
+    if (extracted.status !== "ready") {
+      const result = pdfFigureAnalysisUnavailableResult(analysis, image, extracted.reason);
+      resultById.set(result.analysisId, result);
+      unavailable += 1;
+      continue;
+    }
+
+    const input: FigureVisionAnalysisInput = {
+      analysisId: analysis.id,
+      imageId: analysis.imageId,
+      pageNumber: analysis.pageNumber,
+      ...(analysis.label === undefined ? {} : { label: analysis.label }),
+      ...(analysis.caption === undefined ? {} : { caption: analysis.caption }),
+      pageContext: pdfPageContextForAnalysis(normalizedText, metadata, analysis.pageNumber),
+      image: extracted.image,
+    };
+    const output = await analyzer.analyze(input);
+    const result = pdfFigureAnalysisResultFromAnalyzer(output, extracted.crop, analysis, image);
+    resultById.set(result.analysisId, result);
+    if (output.status === "analyzed") analyzed += 1;
+    else if (output.status === "unavailable") unavailable += 1;
+    else error += 1;
+  }
+
+  const nextResults = Array.from(resultById.values()).slice(0, 80);
+  metadata.pdf_figure_analysis_results = nextResults;
+  metadata.pdf_figure_analyses = analyses.map((analysis) => {
+    const result = resultById.get(analysis.id);
+    if (result === undefined) return analysis;
+    return {
+      ...analysis,
+      status:
+        result.status === "analyzed"
+          ? "analyzed"
+          : result.status === "error"
+            ? "error"
+            : "unavailable",
+      resultId: result.analysisId,
+      resultStatus: result.status,
+      resultReason: result.reason,
+      analyzedAt: result.analyzedAt,
+    };
+  });
+  updatePdfParseQualityAfterFigureVision(metadata, nextResults);
+  updateSourceMetadataJson(db, sourceId, () => metadata);
+
+  return {
+    version: "clio-pdf-figure-vision-stage-v1",
+    analyzed,
+    unavailable,
+    error,
+    skipped,
+    resultCount: nextResults.length,
+  };
+}
+
+interface PdfFigureVisionAnalysisMetadata {
+  id: string;
+  imageId: string;
+  pageNumber: number;
+  label?: string;
+  caption?: string;
+  inputStatus: "needs_bounded_crop" | "image_pixels_unavailable";
+  [key: string]: unknown;
+}
+
+interface PdfFigureVisionImageMetadata {
+  id: string;
+  pageNumber: number;
+  label?: string;
+  caption?: string;
+  bbox?: ParsedPdfImageArtifact["bbox"];
+}
+
+interface PdfFigureVisionPersistedResult {
+  analysisId: string;
+  imageId: string;
+  pageNumber?: number;
+  label?: string;
+  caption?: string;
+  status: FigureVisionAnalysisResult["status"];
+  analyzedAt: string;
+  providerKind?: "chat";
+  summary?: string;
+  chartType?: string;
+  extractedLabels: string[];
+  extractedValues: string[];
+  claims: FigureVisionAnalysisResult["claims"];
+  reason?: string;
+  crop?: Record<string, unknown>;
+}
+
+function pdfImageArtifactsFromMetadata(value: unknown): PdfFigureVisionImageMetadata[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const record = metadataRecord(item);
+    const id = pdfMetadataString(record?.id);
+    const pageNumber = pdfMetadataNumber(record?.pageNumber);
+    if (record === undefined || id === undefined || pageNumber === undefined) return [];
+    return [
+      {
+        id,
+        pageNumber,
+        ...(pdfMetadataString(record.label) === undefined
+          ? {}
+          : { label: pdfMetadataString(record.label) }),
+        ...(pdfMetadataString(record.caption) === undefined
+          ? {}
+          : { caption: pdfMetadataString(record.caption) }),
+        ...(metadataBoundingBox(record.bbox) === undefined
+          ? {}
+          : { bbox: metadataBoundingBox(record.bbox) }),
+      },
+    ];
+  });
+}
+
+function pdfFigureAnalysesFromMetadata(value: unknown): PdfFigureVisionAnalysisMetadata[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const record = metadataRecord(item);
+    const id = pdfMetadataString(record?.id);
+    const imageId = pdfMetadataString(record?.imageId);
+    const pageNumber = pdfMetadataNumber(record?.pageNumber);
+    if (
+      record === undefined ||
+      id === undefined ||
+      imageId === undefined ||
+      pageNumber === undefined
+    ) {
+      return [];
+    }
+    const inputStatus =
+      record.inputStatus === "needs_bounded_crop"
+        ? "needs_bounded_crop"
+        : "image_pixels_unavailable";
+    return [
+      {
+        ...record,
+        id,
+        imageId,
+        pageNumber,
+        inputStatus,
+        ...(pdfMetadataString(record.label) === undefined
+          ? {}
+          : { label: pdfMetadataString(record.label) }),
+        ...(pdfMetadataString(record.caption) === undefined
+          ? {}
+          : { caption: pdfMetadataString(record.caption) }),
+      },
+    ];
+  });
+}
+
+function pdfFigureAnalysisResultsFromMetadata(value: unknown): PdfFigureVisionPersistedResult[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const record = metadataRecord(item);
+    const analysisId = pdfMetadataString(record?.analysisId);
+    const imageId = pdfMetadataString(record?.imageId);
+    const status = metadataFigureVisionStatus(record?.status);
+    const analyzedAt = pdfMetadataString(record?.analyzedAt);
+    if (
+      record === undefined ||
+      analysisId === undefined ||
+      imageId === undefined ||
+      status === undefined ||
+      analyzedAt === undefined
+    ) {
+      return [];
+    }
+    return [
+      {
+        analysisId,
+        imageId,
+        ...(pdfMetadataNumber(record.pageNumber) === undefined
+          ? {}
+          : { pageNumber: pdfMetadataNumber(record.pageNumber) }),
+        status,
+        analyzedAt,
+        ...(record.providerKind === "chat" ? { providerKind: "chat" as const } : {}),
+        ...(pdfMetadataString(record.summary) === undefined
+          ? {}
+          : { summary: pdfMetadataString(record.summary) }),
+        ...(pdfMetadataString(record.chartType) === undefined
+          ? {}
+          : { chartType: pdfMetadataString(record.chartType) }),
+        extractedLabels: pdfMetadataStringArray(record.extractedLabels).slice(0, 12),
+        extractedValues: pdfMetadataStringArray(record.extractedValues).slice(0, 20),
+        claims: metadataFigureVisionClaims(record.claims),
+        ...(pdfMetadataString(record.reason) === undefined
+          ? {}
+          : { reason: pdfMetadataString(record.reason) }),
+        ...(metadataRecord(record.crop) === undefined ? {} : { crop: metadataRecord(record.crop) }),
+      },
+    ];
+  });
+}
+
+function writePdfFigureVisionUnavailable(
+  metadata: Record<string, unknown>,
+  analyses: PdfFigureVisionAnalysisMetadata[],
+  reason: string,
+) {
+  const existing = pdfFigureAnalysisResultsFromMetadata(metadata.pdf_figure_analysis_results);
+  const resultById = new Map(existing.map((result) => [result.analysisId, result]));
+  let unavailable = 0;
+  for (const analysis of analyses.slice(0, figureVisionMaxAnalysesPerJob)) {
+    if (resultById.has(analysis.id)) continue;
+    const result = pdfFigureAnalysisUnavailableResult(analysis, undefined, reason);
+    resultById.set(result.analysisId, result);
+    unavailable += 1;
+  }
+  const nextResults = Array.from(resultById.values()).slice(0, 80);
+  metadata.pdf_figure_analysis_results = nextResults;
+  metadata.pdf_figure_analyses = analyses.map((analysis) => {
+    const result = resultById.get(analysis.id);
+    if (result === undefined) return analysis;
+    return {
+      ...analysis,
+      status: "unavailable",
+      resultId: result.analysisId,
+      resultStatus: result.status,
+      resultReason: result.reason,
+      analyzedAt: result.analyzedAt,
+    };
+  });
+  updatePdfParseQualityAfterFigureVision(metadata, nextResults);
+  return {
+    version: "clio-pdf-figure-vision-stage-v1",
+    analyzed: 0,
+    unavailable,
+    error: 0,
+    skipped: analyses.length - unavailable,
+    resultCount: nextResults.length,
+    reason,
+  };
+}
+
+function pdfFigureAnalysisUnavailableResult(
+  analysis: PdfFigureVisionAnalysisMetadata,
+  image: PdfFigureVisionImageMetadata | undefined,
+  reason: string,
+): PdfFigureVisionPersistedResult {
+  return {
+    analysisId: analysis.id,
+    imageId: analysis.imageId,
+    pageNumber: analysis.pageNumber,
+    status: "unavailable",
+    analyzedAt: new Date().toISOString(),
+    providerKind: "chat",
+    extractedLabels: [],
+    extractedValues: [],
+    claims: [],
+    reason,
+    ...(image?.label === undefined ? {} : { label: image.label }),
+    ...(image?.caption === undefined ? {} : { caption: image.caption }),
+  };
+}
+
+function pdfFigureAnalysisResultFromAnalyzer(
+  output: FigureVisionAnalysisResult,
+  crop: Record<string, unknown>,
+  analysis: PdfFigureVisionAnalysisMetadata,
+  image: PdfFigureVisionImageMetadata | undefined,
+): PdfFigureVisionPersistedResult {
+  const label = image?.label ?? analysis.label;
+  const caption = image?.caption ?? analysis.caption;
+  return {
+    analysisId: output.analysisId,
+    imageId: output.imageId,
+    pageNumber: analysis.pageNumber,
+    status: output.status,
+    analyzedAt: new Date().toISOString(),
+    ...(output.providerKind === undefined ? {} : { providerKind: output.providerKind }),
+    ...(label === undefined ? {} : { label }),
+    ...(caption === undefined ? {} : { caption }),
+    ...(output.summary === undefined ? {} : { summary: output.summary }),
+    ...(output.chartType === undefined ? {} : { chartType: output.chartType }),
+    extractedLabels: output.extractedLabels,
+    extractedValues: output.extractedValues,
+    claims: output.claims,
+    ...(output.reason === undefined ? {} : { reason: output.reason }),
+    crop,
+  };
+}
+
+function pdfPageContextForAnalysis(
+  normalizedText: string,
+  metadata: Record<string, unknown>,
+  pageNumber: number,
+) {
+  const page = metadataRecordArray(metadata.pdf_pages).find(
+    (record) => pdfMetadataNumber(record.pageNumber) === pageNumber,
+  );
+  const charStart = pdfMetadataNumber(page?.charStart);
+  const charEnd = pdfMetadataNumber(page?.charEnd);
+  const text =
+    charStart === undefined || charEnd === undefined
+      ? ""
+      : normalizedText.slice(Math.max(0, charStart), Math.max(charStart, charEnd));
+  return text.slice(0, figureVisionMaxPageContextChars);
+}
+
+function updatePdfParseQualityAfterFigureVision(
+  metadata: Record<string, unknown>,
+  results: PdfFigureVisionPersistedResult[],
+) {
+  const quality = metadataRecord(metadata.pdf_parse_quality);
+  if (quality === undefined) return;
+  const metrics = metadataRecord(quality.metrics) ?? {};
+  const analyzed = results.filter((result) => result.status === "analyzed").length;
+  const unavailable = results.filter((result) => result.status === "unavailable").length;
+  const error = results.filter((result) => result.status === "error").length;
+  quality.metrics = {
+    ...metrics,
+    figureVisionResultCount: results.length,
+    figureVisionAnalyzedCount: analyzed,
+    figureVisionUnavailableCount: unavailable,
+    figureVisionErrorCount: error,
+  };
+  const warnings = pdfMetadataStringArray(quality.warnings).filter(
+    (warning) => warning !== "figure_visual_model_required",
+  );
+  if (unavailable > 0 || error > 0) warnings.push("figure_vision_unavailable");
+  quality.warnings = Array.from(new Set(warnings)).slice(0, 20);
+  metadata.pdf_parse_quality = quality;
+}
+
+function metadataRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function metadataRecordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.flatMap((item) => {
+        const record = metadataRecord(item);
+        return record === undefined ? [] : [record];
+      })
+    : [];
+}
+
+function pdfMetadataString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function pdfMetadataNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function pdfMetadataStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.flatMap((item) => (typeof item === "string" ? [item] : []))
+    : [];
+}
+
+function metadataFigureVisionStatus(
+  value: unknown,
+): FigureVisionAnalysisResult["status"] | undefined {
+  return value === "analyzed" || value === "unavailable" || value === "error" ? value : undefined;
+}
+
+function metadataFigureVisionClaims(value: unknown): FigureVisionAnalysisResult["claims"] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 6).flatMap((item) => {
+    const record = metadataRecord(item);
+    const claimId = pdfMetadataString(record?.claimId);
+    const text = pdfMetadataString(record?.text);
+    if (claimId === undefined || text === undefined) return [];
+    return [
+      {
+        claimId,
+        text,
+        confidence:
+          record?.confidence === "low" ||
+          record?.confidence === "medium" ||
+          record?.confidence === "high"
+            ? record.confidence
+            : "low",
+      },
+    ];
+  });
+}
+
+function metadataBoundingBox(value: unknown): ParsedPdfImageArtifact["bbox"] | undefined {
+  const record = metadataRecord(value);
+  if (record === undefined) return undefined;
+  const xMin = pdfMetadataNumber(record.xMin);
+  const yMin = pdfMetadataNumber(record.yMin);
+  const xMax = pdfMetadataNumber(record.xMax);
+  const yMax = pdfMetadataNumber(record.yMax);
+  if (
+    xMin === undefined ||
+    yMin === undefined ||
+    xMax === undefined ||
+    yMax === undefined ||
+    record.unit !== "pdf_user_space"
+  ) {
+    return undefined;
+  }
+  return { xMin, yMin, xMax, yMax, unit: "pdf_user_space" };
 }
 
 function runChunkMetaStageForSource(db: SqliteDb, sourceId: string): Record<string, unknown> {
@@ -5302,9 +7536,11 @@ function runChunkMetaStageForSource(db: SqliteDb, sourceId: string): Record<stri
        s.source_title,
        s.source_type,
        s.lifecycle_status,
+       s.normalized_text,
        sm.title AS meta_title,
        sm.source_type AS meta_source_type,
-       sm.metadata_json
+       sm.metadata_json,
+       sm.section_outline_json
      FROM sources s
      LEFT JOIN source_metadata sm ON sm.source_id = s.id
      WHERE s.id = ?
@@ -5323,24 +7559,80 @@ function runChunkMetaStageForSource(db: SqliteDb, sourceId: string): Record<stri
     };
   }
 
-  const metaHeadJson = buildChunkMetaHeadJsonFromSourceMetadata({
-    sourceTitle: stringField(source, "meta_title") || stringField(source, "source_title"),
-    sourceType:
-      stringField(source, "meta_source_type") ||
-      stringField(source, "source_type") ||
-      sourceKindField(source, "source_kind"),
-    metadataJson: stringField(source, "metadata_json"),
-  });
-  const chunkCount = Number(
-    db.selectValue("SELECT COUNT(*) FROM source_chunks WHERE source_id = ?", [sourceId]) ?? 0,
+  const chunks = db.selectObjects(
+    `SELECT id, ord, text, char_start, char_end, role, parent_chunk_id
+     FROM source_chunks
+     WHERE source_id = ?
+     ORDER BY ord ASC`,
+    [sourceId],
   );
-  db.exec({
-    sql: "UPDATE source_chunks SET meta_head_json = ? WHERE source_id = ?",
-    bind: [metaHeadJson, sourceId],
+  const headings = sectionHeadingRanges(
+    stringField(source, "normalized_text"),
+    sectionOutlineFromJson(stringField(source, "section_outline_json")),
+  );
+  const resolvedChunks = chunks.map((chunk) => {
+    const chunkRange = chunkTextRangeFromRow(chunk);
+    return {
+      row: chunk,
+      id: stringField(chunk, "id"),
+      role: stringField(chunk, "role") || "child",
+      sectionPath: sectionPathForChunk(chunkRange, headings),
+    };
   });
+  const childChunks = resolvedChunks.filter((chunk) => chunk.role === "child");
+  const childIndexById = new Map(childChunks.map((chunk, index) => [chunk.id, index]));
+  transaction(db, () => {
+    for (const chunk of resolvedChunks) {
+      const relations: ChunkMetaRelationV1[] = [];
+      if (chunk.role === "child") {
+        const parentChunkId = stringField(chunk.row, "parent_chunk_id");
+        if (parentChunkId.length > 0) {
+          relations.push({
+            kind: "parent",
+            target: parentChunkId,
+            label: chunk.sectionPath,
+          });
+        }
+        const childIndex = childIndexById.get(chunk.id);
+        if (childIndex !== undefined) {
+          const previous = childChunks[childIndex - 1];
+          const next = childChunks[childIndex + 1];
+          if (previous !== undefined) {
+            relations.push({ kind: "previous", target: previous.id, label: previous.sectionPath });
+          }
+          if (next !== undefined) {
+            relations.push({ kind: "next", target: next.id, label: next.sectionPath });
+          }
+        }
+      }
+      const metaHeadJson = buildChunkMetaHeadJsonFromSourceMetadata({
+        sourceTitle: stringField(source, "meta_title") || stringField(source, "source_title"),
+        sourceType:
+          stringField(source, "meta_source_type") ||
+          stringField(source, "source_type") ||
+          sourceKindField(source, "source_kind"),
+        metadataJson: stringField(source, "metadata_json"),
+        chunkText: stringField(chunk.row, "text"),
+        sectionPath: chunk.sectionPath,
+        roleHint: chunk.role,
+        relations,
+        selectedTier: "tier1",
+      });
+      db.exec({
+        sql: "UPDATE source_chunks SET section_path = ?, meta_head_json = ? WHERE id = ?",
+        bind: [chunk.sectionPath, metaHeadJson, chunk.id],
+      });
+    }
+  });
+  const childChunkCount = chunks.filter((chunk) => stringField(chunk, "role") === "child").length;
   return {
-    tier: "tier0",
-    chunkCount,
+    tier: "tier1",
+    selectedTier: "tier1",
+    chunkCount: childChunkCount,
+    childChunkCount,
+    tier1Count: chunks.length,
+    tier2DisabledCount: chunks.length,
+    tier2Reason: "explicit_llm_chunk_meta_not_configured",
   };
 }
 
@@ -5392,6 +7684,7 @@ async function runEmbeddingStageForSourceWithProvider(
     `SELECT id, source_id, text, hash, meta_head_json
      FROM source_chunks
      WHERE source_id = ?
+       AND role = 'child'
      ORDER BY ord ASC`,
     [sourceId],
   );
@@ -5803,6 +8096,7 @@ function buildDeterministicGraphForSource(db: SqliteDb, sourceId: string): Deter
     `SELECT id, ord, text, meta_head_json, page_start, page_end
      FROM source_chunks
      WHERE source_id = ?
+       AND role = 'child'
      ORDER BY ord ASC
      LIMIT ?`,
     [sourceId, graphBuilderMaxChunkSamples],
@@ -6370,6 +8664,7 @@ function loadGraphEvidenceAnchors(db: SqliteDb, edges: GraphEdge[]): GraphEviden
       `SELECT source_id, id, ord, text, page_start, page_end
        FROM source_chunks
        WHERE id IN (${chunkIds.map(() => "?").join(", ")})
+         AND role = 'child'
        ORDER BY source_id ASC, ord ASC`,
       chunkIds,
     );
@@ -6393,6 +8688,7 @@ function loadGraphEvidenceAnchors(db: SqliteDb, edges: GraphEdge[]): GraphEviden
       `SELECT source_id, id, ord, text, page_start, page_end
        FROM source_chunks
        WHERE source_id = ?
+         AND role = 'child'
        ORDER BY ord ASC
        LIMIT 1`,
       [sourceId],
@@ -6766,6 +9062,7 @@ function collectKeywordTermsForSource(db: SqliteDb, sourceId: string) {
     `SELECT text, meta_head_json
      FROM source_chunks
      WHERE source_id = ?
+       AND role = 'child'
      ORDER BY ord ASC
      LIMIT ?`,
     [sourceId, keywordIndexMaxChunkSamples],
@@ -6899,7 +9196,7 @@ function loadWorkingSetStatus(db: SqliteDb): WorkingSetStatusResult {
      FROM source_working_set ws
      JOIN sources s ON s.id = ws.source_id
      LEFT JOIN source_metadata sm ON sm.source_id = ws.source_id
-     LEFT JOIN source_chunks c ON c.source_id = ws.source_id
+     LEFT JOIN source_chunks c ON c.source_id = ws.source_id AND c.role = 'child'
      WHERE s.lifecycle_status <> 'deleted'
      GROUP BY ws.source_id
      ORDER BY
@@ -7283,7 +9580,7 @@ function loadSourceContextSourceStates(
      FROM sources s
      LEFT JOIN source_metadata sm ON sm.source_id = s.id
      LEFT JOIN source_working_set ws ON ws.source_id = s.id
-     LEFT JOIN source_chunks c ON c.source_id = s.id
+     LEFT JOIN source_chunks c ON c.source_id = s.id AND c.role = 'child'
      WHERE s.lifecycle_status <> 'deleted'
        AND s.id IN (${candidates.map(() => "?").join(", ")})
      GROUP BY s.id`,
@@ -7430,7 +9727,11 @@ function buildSourceContextSourcePack(
     return undefined;
   }
 
-  const windows = loadSourceContextCandidateWindows(db, state, options);
+  const windows = loadSourceContextParentWindows(
+    db,
+    state,
+    loadSourceContextCandidateWindows(db, state, options),
+  );
   const maxSourceTokens = Math.min(options.maxGroupTokens, options.maxTotalTokens);
   let selectedDepth = requestedDepth;
   let tokenEstimate = baseTokenEstimate;
@@ -7580,6 +9881,7 @@ function loadSourceContextCandidateWindows(
        JOIN source_chunks c ON c.id = source_fts.chunk_id
        WHERE source_fts MATCH ?
          AND s.id = ?
+         AND c.role = 'child'
          AND s.lifecycle_status <> 'deleted'
        ORDER BY score ASC
        LIMIT ?`,
@@ -7601,13 +9903,141 @@ function loadSourceContextCandidateWindows(
     const fallback = db.selectObject(
       `SELECT MIN(ord) AS chunk_ord
        FROM source_chunks
-       WHERE source_id = ?`,
+       WHERE source_id = ?
+         AND role = 'child'`,
       [state.source.id],
     );
     if (fallback !== undefined) addWindow(numberField(fallback, "chunk_ord"), "fallback");
   }
 
   return windows;
+}
+
+function loadSourceContextParentWindows(
+  db: SqliteDb,
+  state: SourceContextSourceState,
+  windows: InternalSourceContextWindow[],
+): InternalSourceContextWindow[] {
+  const depth = state.source.requestedLoadDepth;
+  if ((depth !== "chunks" && depth !== "full") || windows.length === 0) return windows;
+
+  const childChunkIds = boundedUniqueStrings(
+    windows.flatMap((window) => window.childChunkIds),
+    maxSourceContextPackWindowsPerSource * 4,
+  );
+  if (childChunkIds.length === 0) return windows;
+
+  const parentByChildId = loadSourceContextParentWindowsByChildId(db, state, childChunkIds);
+  if (parentByChildId.size === 0) return windows;
+
+  const result: InternalSourceContextWindow[] = [];
+  const seenParentIds = new Set<string>();
+  for (const window of windows) {
+    result.push(window);
+    for (const childChunkId of window.childChunkIds) {
+      const parentWindow = parentByChildId.get(childChunkId);
+      if (parentWindow === undefined || seenParentIds.has(parentWindow.chunkId)) continue;
+      seenParentIds.add(parentWindow.chunkId);
+      result.push(parentWindow);
+      break;
+    }
+  }
+  return result;
+}
+
+function loadSourceContextParentWindowsByChildId(
+  db: SqliteDb,
+  state: SourceContextSourceState,
+  childChunkIds: string[],
+): Map<string, InternalSourceContextWindow> {
+  const rows = db.selectObjects(
+    `SELECT
+      c.id AS child_id,
+      p.id,
+      p.ord,
+      p.text,
+      p.meta_head_json,
+      p.page_start,
+      p.page_end
+     FROM source_chunks c
+     JOIN source_chunks p ON p.id = c.parent_chunk_id
+     WHERE c.source_id = ?
+       AND c.role = 'child'
+       AND c.id IN (${childChunkIds.map(() => "?").join(", ")})
+       AND p.source_id = ?
+       AND p.role = 'parent'
+     ORDER BY c.ord ASC`,
+    [state.source.id, ...childChunkIds, state.source.id],
+  );
+  const parentById = new Map<string, InternalSourceContextWindow>();
+  const parentByChildId = new Map<string, InternalSourceContextWindow>();
+  for (const row of rows) {
+    const parentId = stringField(row, "id");
+    if (parentId.length === 0) continue;
+    const existing =
+      parentById.get(parentId) ?? sourceContextParentWindowFromRow(row, state.source);
+    if (existing === undefined) continue;
+    parentById.set(parentId, existing);
+    parentByChildId.set(stringField(row, "child_id"), existing);
+  }
+  return parentByChildId;
+}
+
+function sourceContextParentWindowFromRow(
+  row: SqlRow,
+  source: SourceContextPackSource,
+): InternalSourceContextWindow | undefined {
+  const parentId = stringField(row, "id");
+  if (parentId.length === 0) return undefined;
+  const text = sourceContextParentWindowText(
+    stringField(row, "meta_head_json"),
+    stringField(row, "text"),
+  );
+  if (text.length === 0) return undefined;
+  const tokenEstimate = estimateTokens(text);
+  return {
+    sourceId: source.id,
+    chunkId: parentId,
+    ord: numberField(row, "ord"),
+    text,
+    tokenCount: tokenEstimate,
+    tokenEstimate,
+    sourceKind: source.sourceKind,
+    sourceUrl: source.sourceUrl,
+    sourceTitle: source.sourceTitle,
+    sourceType: source.sourceType,
+    priority: "parent",
+    childChunkIds: [],
+    ...optionalPageRangeFromRow(row),
+  };
+}
+
+function sourceContextParentWindowText(metaHeadJson: string, fallbackText: string) {
+  const metaHead = parseMetadata(metaHeadJson);
+  const selectedTier =
+    stringMetadataField(metaHead, "selectedTier") ?? stringMetadataField(metaHead, "tier");
+  const tierState = selectedChunkMetaTierState(metaHead, selectedTier);
+  const sectionPath = stringMetadataField(metaHead, "sectionPath") ?? "";
+  const sectionSummary =
+    stringMetadataField(tierState, "sectionSummary") ??
+    stringMetadataField(metaHead, "sectionSummary") ??
+    "";
+  const chunkSummary =
+    stringMetadataField(tierState, "chunkSummary") ??
+    stringMetadataField(metaHead, "chunkSummary") ??
+    "";
+  const summary = boundedNormalizedText(
+    [
+      sectionPath.length > 0 ? `Section: ${sectionPath}` : "",
+      sectionSummary.length > 0 ? `Section summary: ${sectionSummary}` : "",
+      chunkSummary.length > 0 ? `Parent summary: ${chunkSummary}` : "",
+    ]
+      .filter((part) => part.length > 0)
+      .join("\n"),
+    sourceContextPackParentWindowMaxChars,
+  );
+  if (summary.length > 0) return summary;
+  return excerpt(fallbackText, sourceContextPackParentWindowMaxChars);
 }
 
 function sourceContextWindowFromEvidenceWindow(
@@ -7632,6 +10062,7 @@ function sourceContextWindowFromEvidenceWindow(
     sourceTitle: window.sourceTitle,
     sourceType,
     priority,
+    childChunkIds: window.chunks.map((chunk) => chunk.id),
     ...(window.anchor === undefined ? {} : { anchor: window.anchor }),
     ...(pageStart === undefined ? {} : { pageStart }),
     ...(pageEnd === undefined ? {} : { pageEnd }),
@@ -7712,6 +10143,7 @@ function packSourceContextGroups(
 
     current.sourceIds.push(candidate.source.id);
     current.tokenEstimate += candidate.tokenEstimate;
+    logSelectedParentContextWindows(candidate, compressionLog);
     current.windows.push(...candidate.windows.map(publicSourceContextWindow));
     totalTokenEstimate += candidate.tokenEstimate;
     sources.push(candidate.source);
@@ -7719,6 +10151,24 @@ function packSourceContextGroups(
 
   flushCurrent();
   return { sources, groups };
+}
+
+function logSelectedParentContextWindows(
+  pack: SourceContextSourcePack,
+  compressionLog: SourceContextCompressionLogEntry[],
+) {
+  for (const window of pack.windows) {
+    if (window.priority !== "parent") continue;
+    compressionLog.push({
+      reason: "parent_context_selected",
+      sourceId: pack.source.id,
+      chunkId: window.chunkId,
+      requestedLoadDepth: pack.source.requestedLoadDepth,
+      selectedLoadDepth: pack.source.selectedLoadDepth,
+      tokenEstimate: window.tokenEstimate,
+      message: "Selected a bounded parent chunk summary as compressed source context.",
+    });
+  }
 }
 
 function emptySourceContextPackGroup(index: number): SourceContextPackGroup {
@@ -8067,14 +10517,17 @@ function resolveEvidenceWindowAnchorOrd(
 ): number | undefined {
   if (anchor.chunkId !== undefined && anchor.chunkId.length > 0) {
     const chunk = db.selectObject(
-      `SELECT ord
+      `SELECT ord, role
        FROM source_chunks
        WHERE source_id = ?
          AND id = ?
        LIMIT 1`,
       [anchor.memoryId, anchor.chunkId],
     );
-    if (chunk !== undefined) return numberField(chunk, "ord");
+    if (chunk !== undefined) {
+      if (stringField(chunk, "role") !== "child") return undefined;
+      return numberField(chunk, "ord");
+    }
   }
   if (anchor.ord === undefined || !Number.isFinite(anchor.ord)) return undefined;
   return Math.max(0, Math.floor(anchor.ord));
@@ -8110,6 +10563,7 @@ function loadSourceEvidenceWindow(
     `SELECT id, ord, text, token_count, page_start, page_end
      FROM source_chunks
      WHERE source_id = ?
+       AND role = 'child'
        AND ord BETWEEN ? AND ?
      ORDER BY ord ASC`,
     [input.sourceId, startOrd, endOrd],
@@ -8154,6 +10608,17 @@ function normalizeRetrieveSourcesFilter(
 ): NormalizedRetrieveSourcesFilter {
   const sourceTypes = normalizeSourceTypeFilters(filter?.sourceTypes);
   const hasSourceTypeFilter = filter?.sourceTypes !== undefined;
+  const doi = normalizeDoi(filter?.doi);
+  const arxivIds = normalizeArxivIdFilters(filter?.arxivIds);
+  const years = normalizePaperYearFilters(filter?.years);
+  const venues = normalizePaperTextFilters(filter?.venues);
+  const authors = normalizePaperTextFilters(filter?.authors);
+  const hasPaperMetadataFilter =
+    filter?.doi !== undefined ||
+    filter?.arxivIds !== undefined ||
+    filter?.years !== undefined ||
+    filter?.venues !== undefined ||
+    filter?.authors !== undefined;
   const lifecycleStatuses =
     filter?.lifecycleStatuses === undefined
       ? [...searchableSourceLifecycleStatuses]
@@ -8161,10 +10626,21 @@ function normalizeRetrieveSourcesFilter(
   return {
     sourceTypes,
     lifecycleStatuses,
+    ...(doi === undefined ? {} : { doi }),
+    arxivIds,
+    years,
+    venues,
+    authors,
     hasSourceTypeFilter,
+    hasPaperMetadataFilter,
     hasImpossibleFilter:
       (hasSourceTypeFilter && sourceTypes.length === 0) ||
-      (filter?.lifecycleStatuses !== undefined && lifecycleStatuses.length === 0),
+      (filter?.lifecycleStatuses !== undefined && lifecycleStatuses.length === 0) ||
+      (filter?.doi !== undefined && doi === undefined) ||
+      (filter?.arxivIds !== undefined && arxivIds.length === 0) ||
+      (filter?.years !== undefined && years.length === 0) ||
+      (filter?.venues !== undefined && venues.length === 0) ||
+      (filter?.authors !== undefined && authors.length === 0),
   };
 }
 
@@ -8190,6 +10666,48 @@ function normalizeSourceLifecycleFilters(
   });
 }
 
+function normalizeArxivIdFilters(values: string[] | undefined) {
+  if (values === undefined) return [];
+  const seen = new Set<string>();
+  return values.flatMap((value) => {
+    const fromUrl = parseArxivUrl(value).arxivId;
+    const fromCandidate = arxivParseResultFromIdCandidate(value).arxivId;
+    const normalized = fromUrl ?? fromCandidate;
+    if (normalized === undefined || seen.has(normalized) || seen.size >= 24) return [];
+    seen.add(normalized);
+    return [normalized];
+  });
+}
+
+function normalizePaperYearFilters(values: number[] | undefined) {
+  if (values === undefined) return [];
+  const seen = new Set<number>();
+  return values.flatMap((value) => {
+    const year = Math.floor(value);
+    if (
+      !Number.isFinite(value) ||
+      !isReasonablePaperYear(year) ||
+      seen.has(year) ||
+      seen.size >= 24
+    ) {
+      return [];
+    }
+    seen.add(year);
+    return [year];
+  });
+}
+
+function normalizePaperTextFilters(values: string[] | undefined) {
+  if (values === undefined) return [];
+  const seen = new Set<string>();
+  return values.flatMap((value) => {
+    const normalized = normalizeText(value).toLocaleLowerCase();
+    if (normalized.length === 0 || seen.has(normalized) || seen.size >= 24) return [];
+    seen.add(normalized);
+    return [normalized];
+  });
+}
+
 function sourceFilterWhereClause(filter: NormalizedRetrieveSourcesFilter): SqlWhereClause {
   if (filter.hasImpossibleFilter) return { sql: "1 = 0", bind: [] };
   const clauses = [`s.lifecycle_status IN (${filter.lifecycleStatuses.map(() => "?").join(", ")})`];
@@ -8197,6 +10715,26 @@ function sourceFilterWhereClause(filter: NormalizedRetrieveSourcesFilter): SqlWh
   if (filter.hasSourceTypeFilter) {
     clauses.push(`s.source_type IN (${filter.sourceTypes.map(() => "?").join(", ")})`);
     bind.push(...filter.sourceTypes);
+  }
+  if (filter.doi !== undefined) {
+    clauses.push("LOWER(COALESCE(sm.metadata_json, '')) LIKE ? ESCAPE '\\'");
+    bind.push(`%${escapeSqlLike(filter.doi)}%`);
+  }
+  for (const arxivId of filter.arxivIds) {
+    clauses.push("LOWER(COALESCE(sm.metadata_json, '')) LIKE ? ESCAPE '\\'");
+    bind.push(`%${escapeSqlLike(arxivId)}%`);
+  }
+  for (const year of filter.years) {
+    clauses.push("COALESCE(sm.metadata_json, '') LIKE ?");
+    bind.push(`%${year}%`);
+  }
+  for (const venue of filter.venues) {
+    clauses.push("LOWER(COALESCE(sm.metadata_json, '')) LIKE ? ESCAPE '\\'");
+    bind.push(`%${escapeSqlLike(venue)}%`);
+  }
+  for (const author of filter.authors) {
+    clauses.push("LOWER(COALESCE(sm.metadata_json, '')) LIKE ? ESCAPE '\\'");
+    bind.push(`%${escapeSqlLike(author)}%`);
   }
   return {
     sql: clauses.join("\n       AND "),
@@ -8264,6 +10802,7 @@ function findKeywordExpansionTerms(
      FROM keyword_index ki
      JOIN keyword_index_sources kis ON kis.term = ki.term
      JOIN sources s ON s.id = kis.source_id
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
      WHERE (${likeClause})
        AND ${sourceFilter.sql}
      GROUP BY ki.term, ki.normalized_term
@@ -8398,9 +10937,11 @@ function loadFtsChunkRetrievalHits(
       bm25(source_fts) AS score
      FROM source_fts
      JOIN sources s ON s.id = source_fts.source_id
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
      JOIN source_chunks c ON c.id = source_fts.chunk_id
      WHERE source_fts MATCH ?
        AND ${sourceFilter.sql}
+       AND c.role = 'child'
      ORDER BY score ASC
      LIMIT ?`,
     [ftsQuery, ...sourceFilter.bind, clampLimit(input.limit, 400)],
@@ -8602,8 +11143,10 @@ async function loadVectorChunkRetrievalHits(
      FROM source_embeddings se
      JOIN source_chunks c ON c.id = se.target_id
      JOIN sources s ON s.id = se.source_id
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
      WHERE se.model_id = ?
        AND se.target_kind = 'chunk'
+       AND c.role = 'child'
        AND ${sourceFilter.sql}`,
     [provider.modelId, ...sourceFilter.bind],
   );

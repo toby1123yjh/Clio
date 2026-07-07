@@ -1,3 +1,4 @@
+import type { FigureVisionAnalysisInput } from "@/src/agent-runtime/figure-vision-analyzer";
 import type {
   CaptureBasePayload,
   CaptureSelectionPayload,
@@ -16,6 +17,9 @@ import {
   type LocalEngineOptions,
   type LocalEngineSqliteApi,
   type LocalEngineSqliteDb,
+  type PdfRawFileStore,
+  type PdfRawFileStoreWriteInput,
+  type PdfRawFileStoreWriteResult,
 } from "./local-engine.worker";
 import type { ParsedPdfDocument } from "./pdf-parser";
 
@@ -71,11 +75,22 @@ describe("local engine behavior harness", () => {
       queued.jobs[0]?.id ?? "",
     ]);
     const defaultJobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
-      chunkMeta?: { chunkCount?: number; tier?: string };
+      chunkMeta?: {
+        chunkCount?: number;
+        selectedTier?: string;
+        tier?: string;
+        tier1Count?: number;
+        tier2DisabledCount?: number;
+        tier2Reason?: string;
+      };
       graph?: { skipped?: boolean; reason?: string };
     };
-    expect(defaultJobResult.chunkMeta?.tier).toBe("tier0");
+    expect(defaultJobResult.chunkMeta?.tier).toBe("tier1");
+    expect(defaultJobResult.chunkMeta?.selectedTier).toBe("tier1");
     expect(defaultJobResult.chunkMeta?.chunkCount ?? 0).toBeGreaterThan(0);
+    expect(defaultJobResult.chunkMeta?.tier1Count ?? 0).toBeGreaterThan(0);
+    expect(defaultJobResult.chunkMeta?.tier2DisabledCount ?? 0).toBeGreaterThan(0);
+    expect(defaultJobResult.chunkMeta?.tier2Reason).toBe("explicit_llm_chunk_meta_not_configured");
     expect(defaultJobResult.graph).toMatchObject({
       skipped: true,
       reason: "explicit_build_required",
@@ -222,22 +237,26 @@ describe("local engine behavior harness", () => {
     const metaHead = JSON.parse(String(firstChunk?.meta_head_json ?? "{}")) as {
       version?: number;
       tier?: string;
+      summarySource?: string;
       docContext?: string;
       source?: { title?: string; type?: string; abstract?: string | null };
+      sectionSummary?: string | null;
       chunkSummary?: string | null;
       roleHint?: string | null;
-      relations?: unknown[];
+      relations?: Array<{ kind?: string; target?: string; label?: string | null }>;
     };
     expect(metaHead.version).toBe(1);
     expect(metaHead.tier).toBe("tier0");
+    expect(metaHead.summarySource).toBe("deterministic");
     expect(metaHead.docContext).toContain("Alpha Metadata Retrieval");
     expect(metaHead.docContext).toContain(
       "Alpha metadata connects source-level search with bounded evidence windows.",
     );
     expect(metaHead.source?.type).toBe("research-note");
-    expect(metaHead.chunkSummary).toBeNull();
-    expect(metaHead.roleHint).toBeNull();
-    expect(metaHead.relations).toEqual([]);
+    expect(metaHead.sectionSummary).toBeNull();
+    expect(metaHead.chunkSummary).toContain("alpha metadata retrieval evidence");
+    expect(metaHead.roleHint).toBe("child");
+    expect(metaHead.relations).toEqual(expect.any(Array));
 
     const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
     expect(queued.jobs).toHaveLength(1);
@@ -258,7 +277,27 @@ describe("local engine behavior harness", () => {
       "SELECT text_hash FROM source_embeddings WHERE source_id = ? AND target_kind = 'chunk' ORDER BY target_id ASC LIMIT 1",
       [sourceId],
     );
-    const prefixedEmbeddingInput = `${metaHead.docContext}\n\n${String(firstChunk?.text ?? "")}`;
+    const repairedFirstChunk = harness.selectObject(
+      "SELECT id, text, hash, meta_head_json FROM source_chunks WHERE id = ? LIMIT 1",
+      [String(firstChunk?.id ?? "")],
+    );
+    const repairedMetaHead = JSON.parse(
+      String(repairedFirstChunk?.meta_head_json ?? "{}"),
+    ) as ChunkMetaHeadForTest;
+    expect(repairedMetaHead.tier).toBe("tier1");
+    expect(repairedMetaHead.selectedTier).toBe("tier1");
+    expect(repairedMetaHead.summarySource).toBe("local_extractive");
+    expect(repairedMetaHead.tiers?.tier1?.status).toBe("available");
+    expect(repairedMetaHead.tiers?.tier1?.summarySource).toBe("local_extractive");
+    expect(repairedMetaHead.tiers?.tier2?.status).toBe("disabled");
+    expect(repairedMetaHead.tiers?.tier2?.reason).toBe("explicit_llm_chunk_meta_not_configured");
+    expect(repairedMetaHead.semanticRelations?.some((relation) => relation.kind === "role")).toBe(
+      true,
+    );
+    const prefixedEmbeddingInput = chunkMetaEmbeddingInputForTest(
+      repairedMetaHead,
+      String(repairedFirstChunk?.text ?? ""),
+    );
     expect(chunkEmbedding?.text_hash).toBe(hashText(prefixedEmbeddingInput));
     expect(chunkEmbedding?.text_hash).not.toBe(firstChunk?.hash);
 
@@ -297,6 +336,281 @@ describe("local engine behavior harness", () => {
     expect(windows.items[0]?.chunks.map((chunk) => chunk.text).join("\n").length).toBeLessThan(
       sourceText.length,
     );
+  });
+
+  it("materializes section-aware chunk meta and repairs it before embedding", async () => {
+    const harness = createHarness();
+    const expectedSectionPath = "Markdown Adapter Notes > Registry Design";
+    const registryBody = ragText("registry design adapter chunk routing metadata", 260);
+    const capture = await harness.request({
+      kind: "captureMarkdown",
+      payload: {
+        sourceUrl: "clio://upload/markdown-adapter-notes.md",
+        sourceTitle: "Markdown Adapter Notes",
+        capturedAt: "2026-07-01T00:00:00.000Z",
+        markdownText: [
+          "# Markdown Adapter Notes",
+          "",
+          "## Registry Design",
+          registryBody,
+          "",
+          "## Queue Repair",
+          ragText("queue repair metadata rebuild stage", 80),
+        ].join("\n"),
+        metadata: {
+          abstract: "Section-aware chunk metadata should survive post-capture repair.",
+        },
+      },
+    });
+    expect(capture.status).toBe("saved");
+
+    const sourceId = capture.memory.id;
+    const sectionChunk = harness.selectObject(
+      `SELECT id, text, hash, section_path, meta_head_json
+       FROM source_chunks
+       WHERE source_id = ? AND section_path = ?
+       ORDER BY ord ASC
+       LIMIT 1`,
+      [sourceId, expectedSectionPath],
+    );
+    expect(sectionChunk?.section_path).toBe(expectedSectionPath);
+    const capturedMetaHead = JSON.parse(String(sectionChunk?.meta_head_json ?? "{}")) as {
+      summarySource?: string;
+      docContext?: string;
+      sectionPath?: string | null;
+      sectionSummary?: string | null;
+      chunkSummary?: string | null;
+      roleHint?: string | null;
+      relations?: Array<{ kind?: string; target?: string; label?: string | null }>;
+    };
+    expect(capturedMetaHead.summarySource).toBe("deterministic");
+    expect(capturedMetaHead.docContext).toContain("Markdown Adapter Notes");
+    expect(capturedMetaHead.sectionPath).toBe(expectedSectionPath);
+    expect(capturedMetaHead.sectionSummary).toBe("Section: Registry Design");
+    expect(capturedMetaHead.chunkSummary).toContain("registry design adapter");
+    expect(capturedMetaHead.roleHint).toBe("child");
+    expect(capturedMetaHead.relations?.some((relation) => relation.kind === "parent")).toBe(true);
+
+    harness.exec("UPDATE source_chunks SET section_path = NULL, meta_head_json = ? WHERE id = ?", [
+      "{not valid json",
+      String(sectionChunk?.id ?? ""),
+    ]);
+    const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
+    const job = await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+    expect(job.status).toBe("done");
+
+    const repairedChunk = harness.selectObject(
+      "SELECT id, text, hash, section_path, meta_head_json FROM source_chunks WHERE id = ? LIMIT 1",
+      [String(sectionChunk?.id ?? "")],
+    );
+    expect(repairedChunk?.section_path).toBe(expectedSectionPath);
+    const repairedMetaHead = JSON.parse(String(repairedChunk?.meta_head_json ?? "{}")) as {
+      tier?: string;
+      summarySource?: string;
+      selectedTier?: string;
+      tiers?: Record<string, { status?: string; reason?: string; summarySource?: string }>;
+      docContext?: string;
+      sectionPath?: string | null;
+      sectionSummary?: string | null;
+      chunkSummary?: string | null;
+      roleHint?: string | null;
+      relations?: Array<{ kind?: string; target?: string; label?: string | null }>;
+      semanticRelations?: Array<{ kind?: string; target?: string }>;
+    };
+    expect(repairedMetaHead.tier).toBe("tier1");
+    expect(repairedMetaHead.selectedTier).toBe("tier1");
+    expect(repairedMetaHead.summarySource).toBe("local_extractive");
+    expect(repairedMetaHead.tiers?.tier1?.status).toBe("available");
+    expect(repairedMetaHead.tiers?.tier2?.status).toBe("disabled");
+    expect(repairedMetaHead.tiers?.tier2?.reason).toBe("explicit_llm_chunk_meta_not_configured");
+    expect(repairedMetaHead.sectionPath).toBe(expectedSectionPath);
+    expect(repairedMetaHead.sectionSummary).toContain("Section: Registry Design");
+    expect(repairedMetaHead.chunkSummary).toContain("registry design adapter");
+    expect(repairedMetaHead.roleHint).toBe("child");
+    expect(repairedMetaHead.relations?.some((relation) => relation.kind === "parent")).toBe(true);
+    expect(repairedMetaHead.semanticRelations?.some((relation) => relation.kind === "parent")).toBe(
+      true,
+    );
+
+    const embedding = harness.selectObject(
+      "SELECT text_hash FROM source_embeddings WHERE target_id = ? AND target_kind = 'chunk' LIMIT 1",
+      [String(sectionChunk?.id ?? "")],
+    );
+    expect(embedding?.text_hash).toBe(
+      hashText(chunkMetaEmbeddingInputForTest(repairedMetaHead, String(repairedChunk?.text ?? ""))),
+    );
+    expect(embedding?.text_hash).not.toBe(repairedChunk?.hash);
+  });
+
+  it("chunks markdown sections without crossing section boundaries", async () => {
+    const harness = createHarness();
+    const alphaMarker = "ALPHA_SECTION_ONLY_BOUNDARY_MARKER";
+    const betaMarker = "BETA_SECTION_ONLY_BOUNDARY_MARKER";
+    const capture = await harness.request({
+      kind: "captureMarkdown",
+      payload: {
+        sourceUrl: "clio://upload/section-boundaries.md",
+        sourceTitle: "Section Boundaries",
+        capturedAt: "2026-07-05T00:00:00.000Z",
+        markdownText: [
+          "# Section Boundaries",
+          "",
+          "## Alpha",
+          ragText(`alpha boundary ${alphaMarker}`, 240),
+          "",
+          "## Beta",
+          ragText(`beta boundary ${betaMarker}`, 240),
+        ].join("\n"),
+        metadata: {
+          abstract: "Section-aware chunking should not cross heading boundaries.",
+        },
+      },
+    });
+    expect(capture.status).toBe("saved");
+
+    const rows = harness.selectObjects(
+      `SELECT text, section_path
+       FROM source_chunks
+       WHERE source_id = ? AND role = 'child'
+       ORDER BY ord ASC`,
+      [capture.memory.id],
+    );
+    const alphaRows = rows.filter(
+      (row) => String(row.section_path ?? "") === "Section Boundaries > Alpha",
+    );
+    const betaRows = rows.filter(
+      (row) => String(row.section_path ?? "") === "Section Boundaries > Beta",
+    );
+    expect(alphaRows.length).toBeGreaterThan(0);
+    expect(betaRows.length).toBeGreaterThan(0);
+    expect(alphaRows.every((row) => String(row.text ?? "").includes(alphaMarker))).toBe(true);
+    expect(alphaRows.every((row) => !String(row.text ?? "").includes(betaMarker))).toBe(true);
+    expect(betaRows.every((row) => String(row.text ?? "").includes(betaMarker))).toBe(true);
+    expect(betaRows.every((row) => !String(row.text ?? "").includes(alphaMarker))).toBe(true);
+  });
+
+  it("stores section parent chunks but keeps prompt and embedding paths child-only", async () => {
+    const harness = createHarness();
+    const sectionBody = ragText("parent child boundary retrieval evidence", 950);
+    const capture = await harness.request({
+      kind: "captureMarkdown",
+      payload: {
+        sourceUrl: "clio://upload/parent-child-boundary.md",
+        sourceTitle: "Parent Child Boundary",
+        capturedAt: "2026-07-05T00:00:00.000Z",
+        markdownText: [
+          "# Parent Child Boundary",
+          "",
+          "## Retrieval Boundary",
+          sectionBody,
+          "",
+          "## Queue Boundary",
+          ragText("queue boundary repair evidence", 160),
+        ].join("\n"),
+        metadata: {
+          abstract: "Parent chunks should remain structural and child chunks feed RAG.",
+        },
+      },
+    });
+    expect(capture.status).toBe("saved");
+    const sourceId = capture.memory.id;
+    const expectedSectionPath = "Parent Child Boundary > Retrieval Boundary";
+
+    const parentRows = harness.selectObjects(
+      `SELECT id, ord, text, fts_text, role, section_path, meta_head_json
+       FROM source_chunks
+       WHERE source_id = ? AND role = 'parent'
+       ORDER BY ord ASC`,
+      [sourceId],
+    );
+    const childRows = harness.selectObjects(
+      `SELECT id, ord, parent_chunk_id, role, section_path
+       FROM source_chunks
+       WHERE source_id = ? AND role = 'child'
+       ORDER BY ord ASC`,
+      [sourceId],
+    );
+    expect(parentRows.length).toBeGreaterThan(0);
+    expect(childRows.length).toBeGreaterThan(0);
+    expect(parentRows[0]?.fts_text).toBe("");
+    expect(Number(parentRows[0]?.ord ?? 0)).toBeGreaterThanOrEqual(1_000_000);
+
+    const childInSection = childRows.find(
+      (row) => String(row.section_path ?? "") === expectedSectionPath,
+    );
+    expect(childInSection?.parent_chunk_id).toBeTruthy();
+    const parentForSection = parentRows.find((row) => row.id === childInSection?.parent_chunk_id);
+    expect(parentForSection?.section_path).toBe(expectedSectionPath);
+    const parentMetaHead = JSON.parse(String(parentForSection?.meta_head_json ?? "{}")) as {
+      sectionPath?: string | null;
+      sectionSummary?: string | null;
+      roleHint?: string | null;
+    };
+    expect(parentMetaHead.sectionPath).toBe(expectedSectionPath);
+    expect(parentMetaHead.sectionSummary).toBe("Section: Retrieval Boundary");
+    expect(parentMetaHead.roleHint).toBe("parent");
+
+    const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
+    const job = await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+    expect(job.status).toBe("done");
+
+    expect(
+      harness.count(
+        "source_embeddings se JOIN source_chunks c ON c.id = se.target_id",
+        "se.source_id = ? AND se.target_kind = 'chunk' AND c.role = 'parent'",
+        [sourceId],
+      ),
+    ).toBe(0);
+    expect(
+      harness.count(
+        "source_embeddings se JOIN source_chunks c ON c.id = se.target_id",
+        "se.source_id = ? AND se.target_kind = 'chunk' AND c.role = 'child'",
+        [sourceId],
+      ),
+    ).toBeGreaterThan(0);
+    expect(harness.count("source_fts", "source_id = ?", [sourceId])).toBe(childRows.length);
+
+    const detail = await harness.request({ kind: "getMemory", id: sourceId });
+    expect(detail?.chunks).toHaveLength(childRows.length);
+    expect(detail?.chunks.some((chunk) => chunk.id.startsWith(`${sourceId}:parent:`))).toBe(false);
+
+    const windows = await harness.request({
+      kind: "getMemoryEvidenceWindows",
+      payload: {
+        memoryIds: [sourceId],
+        query: "parent child boundary evidence",
+        limit: 2,
+        contextChunksBefore: 1,
+        contextChunksAfter: 1,
+      },
+    });
+    const windowChunkIds = windows.items.flatMap((item) => item.chunks.map((chunk) => chunk.id));
+    expect(windowChunkIds.length).toBeGreaterThan(0);
+    expect(windowChunkIds.some((id) => id.startsWith(`${sourceId}:parent:`))).toBe(false);
+
+    const parentAnchor = await harness.request({
+      kind: "getMemoryEvidenceWindows",
+      payload: {
+        anchors: [{ memoryId: sourceId, chunkId: String(parentRows[0]?.id ?? "") }],
+        limit: 1,
+      },
+    });
+    expect(parentAnchor.items).toHaveLength(0);
+
+    const parentAnchorWithOrdFallback = await harness.request({
+      kind: "getMemoryEvidenceWindows",
+      payload: {
+        anchors: [
+          {
+            memoryId: sourceId,
+            chunkId: String(parentRows[0]?.id ?? ""),
+            ord: Number(childRows[0]?.ord ?? 0),
+          },
+        ],
+        limit: 1,
+      },
+    });
+    expect(parentAnchorWithOrdFallback.items).toHaveLength(0);
   });
 
   it("uses a remote active embedding factory for jobs and vector retrieval", async () => {
@@ -616,9 +930,13 @@ describe("local engine behavior harness", () => {
     const metaHead = JSON.parse(String(chunk?.meta_head_json ?? "{}")) as {
       docContext?: string;
       source?: { abstract?: string | null };
+      chunkSummary?: string | null;
+      roleHint?: string | null;
     };
     expect(metaHead.docContext).toContain("Malformed Meta Head");
     expect(metaHead.source?.abstract).toBeNull();
+    expect(metaHead.chunkSummary).toContain("malformed meta head fallback");
+    expect(metaHead.roleHint).toBe("child");
 
     harness.exec("UPDATE source_chunks SET meta_head_json = ? WHERE id = ?", [
       "{not valid json",
@@ -632,9 +950,16 @@ describe("local engine behavior harness", () => {
       queued.jobs[0]?.id ?? "",
     ]);
     const jobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
-      chunkMeta?: { tier?: string; chunkCount?: number };
+      chunkMeta?: {
+        selectedTier?: string;
+        tier?: string;
+        chunkCount?: number;
+        tier2Reason?: string;
+      };
     };
-    expect(jobResult.chunkMeta?.tier).toBe("tier0");
+    expect(jobResult.chunkMeta?.tier).toBe("tier1");
+    expect(jobResult.chunkMeta?.selectedTier).toBe("tier1");
+    expect(jobResult.chunkMeta?.tier2Reason).toBe("explicit_llm_chunk_meta_not_configured");
     expect(jobResult.chunkMeta?.chunkCount ?? 0).toBeGreaterThan(0);
 
     const repairedChunk = harness.selectObject(
@@ -642,18 +967,37 @@ describe("local engine behavior harness", () => {
       [String(chunk?.id ?? "")],
     );
     const repairedMetaHead = JSON.parse(String(repairedChunk?.meta_head_json ?? "{}")) as {
+      tier?: string;
+      summarySource?: string;
+      selectedTier?: string;
+      tiers?: Record<string, { status?: string; reason?: string; summarySource?: string }>;
       docContext?: string;
+      sectionPath?: string | null;
+      sectionSummary?: string | null;
+      chunkSummary?: string | null;
+      roleHint?: string | null;
+      semanticRelations?: Array<{ kind?: string; target?: string }>;
     };
+    expect(repairedMetaHead.tier).toBe("tier1");
+    expect(repairedMetaHead.selectedTier).toBe("tier1");
+    expect(repairedMetaHead.summarySource).toBe("local_extractive");
+    expect(repairedMetaHead.tiers?.tier1?.status).toBe("available");
+    expect(repairedMetaHead.tiers?.tier2?.status).toBe("disabled");
+    expect(repairedMetaHead.tiers?.tier2?.reason).toBe("explicit_llm_chunk_meta_not_configured");
     expect(repairedMetaHead.docContext).toContain("Malformed Meta Head");
+    expect(repairedMetaHead.chunkSummary).toContain("malformed meta head fallback");
+    expect(repairedMetaHead.roleHint).toBe("child");
+    expect(repairedMetaHead.semanticRelations?.some((relation) => relation.kind === "role")).toBe(
+      true,
+    );
 
     const embedding = harness.selectObject(
       "SELECT text_hash FROM source_embeddings WHERE source_id = ? AND target_kind = 'chunk' ORDER BY target_id ASC LIMIT 1",
       [sourceId],
     );
-    const prefixedEmbeddingInput = `${repairedMetaHead.docContext}\n\n${String(
-      repairedChunk?.text ?? "",
-    )}`;
-    expect(embedding?.text_hash).toBe(hashText(prefixedEmbeddingInput));
+    expect(embedding?.text_hash).toBe(
+      hashText(chunkMetaEmbeddingInputForTest(repairedMetaHead, String(repairedChunk?.text ?? ""))),
+    );
     expect(embedding?.text_hash).not.toBe(repairedChunk?.hash);
   });
 
@@ -864,7 +1208,12 @@ describe("local engine behavior harness", () => {
   it("builds bounded source context packs for explicit sources and anchors", async () => {
     const harness = createHarness();
     const hiddenTailNeedle = "SOURCE_CONTEXT_PACK_HIDDEN_TAIL_NEEDLE";
-    const sourceText = `${ragText("alpha context pack anchor evidence", 700)} ${hiddenTailNeedle}`;
+    const sourceText = [
+      "# Overview",
+      "Context pack source overview keeps parent sections available.",
+      "## Evidence Windows",
+      `${ragText("alpha context pack anchor evidence", 700)} ${hiddenTailNeedle}`,
+    ].join("\n");
     const capture = await harness.request({
       kind: "capturePage",
       payload: pagePayload({
@@ -919,6 +1268,33 @@ describe("local engine behavior harness", () => {
     expect(pack.groups[0]?.windows[0]?.sourceId).toBe(sourceId);
     expect(JSON.stringify(pack)).not.toContain(hiddenTailNeedle);
 
+    const parentPack = await harness.request({
+      kind: "buildSourceContextPack",
+      payload: {
+        query: "alpha context pack",
+        sourceIds: [sourceId],
+        anchors: [{ memoryId: sourceId, chunkId: String(firstChunk?.id ?? "") }],
+        useWorkingSet: false,
+        maxTotalTokens: 3_000,
+        maxGroupTokens: 2_500,
+        maxWindowsPerSource: 2,
+        contextChunksBefore: 0,
+        contextChunksAfter: 0,
+      },
+    });
+    const parentWindow = parentPack.groups
+      .flatMap((group) => group.windows)
+      .find((window) => window.priority === "parent");
+    expect(parentWindow).toBeDefined();
+    expect(parentWindow?.sourceId).toBe(sourceId);
+    expect(parentWindow?.text).toContain("Section summary:");
+    expect(parentWindow?.text).toContain("Parent summary:");
+    expect(parentWindow?.text.length ?? 0).toBeLessThanOrEqual(900);
+    expect(JSON.stringify(parentPack)).not.toContain(hiddenTailNeedle);
+    expect(parentPack.compressionLog.map((entry) => entry.reason)).toContain(
+      "parent_context_selected",
+    );
+
     const tightPack = await harness.request({
       kind: "buildSourceContextPack",
       payload: {
@@ -929,9 +1305,12 @@ describe("local engine behavior harness", () => {
         maxWindowsPerSource: 3,
       },
     });
-    expect(tightPack.groups[0]?.windows).toEqual([]);
+    const tightWindows = tightPack.groups.flatMap((group) => group.windows);
+    expect(tightWindows.length).toBeLessThanOrEqual(1);
+    expect(tightWindows.every((window) => window.priority === "parent")).toBe(true);
+    expect(JSON.stringify(tightPack)).not.toContain(hiddenTailNeedle);
     expect(tightPack.compressionLog.map((entry) => entry.reason)).toEqual(
-      expect.arrayContaining(["chunk_window_omitted", "source_downgraded"]),
+      expect.arrayContaining(["chunk_window_omitted", "parent_context_selected"]),
     );
 
     await harness.request({ kind: "deleteMemory", id: sourceId });
@@ -1290,6 +1669,38 @@ describe("local engine behavior harness", () => {
       { level: 1, text: "Introduction" },
       { level: 1, text: "Method" },
     ]);
+    const paperMetadata = detail?.metadata.paper_metadata as
+      | {
+          version?: number;
+          doi?: string;
+          arxivId?: string;
+          arxivVersion?: string;
+          year?: number;
+          authors?: string[];
+          sourceTrust?: string;
+          alternateUrls?: string[];
+          fields?: Record<string, { source?: string; confidence?: number }>;
+          remote?: { status?: string };
+        }
+      | undefined;
+    expect(paperMetadata).toMatchObject({
+      version: 1,
+      doi: "10.5555/clio.2024",
+      arxivId: "2401.01234",
+      arxivVersion: "v2",
+      year: 2024,
+      authors: ["Ada Lovelace", "Grace Hopper"],
+      sourceTrust: "high",
+      remote: { status: "disabled" },
+    });
+    expect(paperMetadata?.alternateUrls).toEqual(
+      expect.arrayContaining([
+        "https://arxiv.org/abs/2401.01234v2",
+        "https://arxiv.org/pdf/2401.01234v2.pdf",
+        "https://doi.org/10.5555/clio.2024",
+      ]),
+    );
+    expect(paperMetadata?.fields?.doi?.confidence ?? 0).toBeGreaterThan(0.7);
 
     const retrieved = await harness.request({
       kind: "retrieveSources",
@@ -1355,13 +1766,89 @@ describe("local engine behavior harness", () => {
     expect(degradedDetail?.metadata.source_type).toBe("paper");
     expect(degradedDetail?.metadata.paper_source).toBe("arxiv");
     expect(degradedDetail?.metadata.arxiv_id).toBeUndefined();
+    expect(degradedDetail?.metadata.paper_metadata).toMatchObject({
+      version: 1,
+      remote: { status: "disabled" },
+    });
     expect(degraded.memory.sourceTitle).toBe("Malformed Arxiv Metadata");
   });
 
+  it("runs paper metadata hardening and filters by structured paper fields", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/papers/metadata-filter",
+        sourceTitle: "Structured Metadata Filter",
+        normalizedText: [
+          "Title: Structured Metadata Filter",
+          "Abstract: Structured paper metadata should be queryable after hardening.",
+          "",
+          "1 Method",
+          "The structured metadata body uses deterministic enrichment.",
+        ].join("\n"),
+        metadata: {
+          source_type: "paper",
+          doi: "https://doi.org/10.7777/CLIO.2026",
+          arxiv_id: "2501.01234",
+          arxiv_version: "v1",
+          year: 2026,
+          venue: "Clio Metadata Symposium",
+          authors: ["Katherine Johnson", "Edsger Dijkstra"],
+          references: ["Barbara Liskov. Durable local memory systems. 2024. doi:10.8888/clio.ref"],
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+    const queued = await harness.request({ kind: "getJobStatus", status: "queued", limit: 10 });
+    const job = await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+    expect(job.status).toBe("done");
+
+    const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
+      queued.jobs[0]?.id ?? "",
+    ]);
+    const jobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
+      paperMetadata?: { version?: number; remoteStatus?: string; referenceCount?: number };
+    };
+    expect(jobResult.paperMetadata).toMatchObject({
+      version: 1,
+      remoteStatus: "disabled",
+      referenceCount: 1,
+    });
+
+    const detail = await harness.request({ kind: "getMemory", id: sourceId });
+    const paperMetadata = detail?.metadata.paper_metadata as
+      | { referenceList?: Array<{ doi?: string; year?: number }> }
+      | undefined;
+    expect(paperMetadata?.referenceList).toMatchObject([{ doi: "10.8888/clio.ref", year: 2024 }]);
+
+    const filterCases = [
+      { doi: "https://doi.org/10.7777/CLIO.2026" },
+      { arxivIds: ["https://arxiv.org/abs/2501.01234v1"] },
+      { years: [2026] },
+      { venues: ["metadata symposium"] },
+      { authors: ["katherine johnson"] },
+    ];
+    for (const filter of filterCases) {
+      const retrieved = await harness.request({
+        kind: "retrieveSources",
+        payload: { query: "", limit: 5, filter },
+      });
+      expect(retrieved.items.map((item) => item.id)).toEqual([sourceId]);
+    }
+
+    const excluded = await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "", limit: 5, filter: { authors: ["unmatched author"] } },
+    });
+    expect(excluded.items.map((item) => item.id)).not.toContain(sourceId);
+  });
+
   it("captures PDF bytes through the public capturePdf RPC", async () => {
-    const page1 = "Uploaded PDF page one covers parser-backed capture.";
+    const page1 = "Uploaded PDF page one cites parser-backed capture [1].";
     const page2 = "Uploaded PDF page two keeps concrete page anchors.";
     const text = `${page1}\n\n${page2}`;
+    const page2Start = page1.length + 2;
     const parsed: ParsedPdfDocument = {
       text,
       pages: [
@@ -1369,10 +1856,225 @@ describe("local engine behavior harness", () => {
         {
           pageNumber: 2,
           text: page2,
-          charStart: page1.length + 2,
-          charEnd: page1.length + 2 + page2.length,
+          charStart: page2Start,
+          charEnd: page2Start + page2.length,
         },
       ],
+      sections: [
+        {
+          level: 1,
+          text: "Introduction",
+          kind: "introduction",
+          charStart: 0,
+          charEnd: page2Start,
+          pageStart: 1,
+          pageEnd: 1,
+        },
+        {
+          level: 1,
+          text: "References",
+          kind: "references",
+          charStart: page2Start,
+          charEnd: text.length,
+          pageStart: 2,
+          pageEnd: 2,
+        },
+      ],
+      references: [
+        {
+          index: 0,
+          label: "[1]",
+          text: "Ada Lovelace. Parser-backed capture. 2024. doi:10.1234/clio.pdf",
+          charStart: page2Start,
+          charEnd: text.length,
+          pageStart: 2,
+          pageEnd: 2,
+          doi: "10.1234/clio.pdf",
+          year: 2024,
+        },
+      ],
+      figures: [
+        {
+          id: "figure:1",
+          kind: "figure",
+          label: "Figure 1",
+          caption: "Parser-backed capture flow.",
+          charStart: 0,
+          charEnd: page1.length,
+          pageNumber: 1,
+          confidence: "medium",
+        },
+      ],
+      tables: [
+        {
+          id: "table:1",
+          kind: "table",
+          label: "Table 1",
+          caption: "Concrete page anchors.",
+          charStart: page2Start,
+          charEnd: text.length,
+          pageNumber: 2,
+          confidence: "medium",
+        },
+      ],
+      images: [
+        {
+          id: "image:1",
+          pageNumber: 1,
+          label: "Figure 1",
+          caption: "Parser-backed capture flow.",
+          captionCharStart: 0,
+          captionCharEnd: page1.length,
+          objectRef: "figure_image_1",
+          source: "pdfjs_operator_list",
+          extractionStatus: "operator_detected",
+          visionAnalysis: {
+            analysisId: "figure-analysis:1",
+            status: "requires_visual_model",
+            modelInput: "image",
+            inputRequirement: "bounded_image_or_page_crop",
+            inputStatus: "needs_bounded_crop",
+            promptBoundary: "no_full_pdf_prompt",
+            providerBoundary: "trusted_runtime_required",
+          },
+          confidence: "medium",
+        },
+      ],
+      tableStructures: [
+        {
+          id: "table-structure:1",
+          pageNumber: 2,
+          charStart: page2Start,
+          charEnd: text.length,
+          rowCount: 2,
+          columnCount: 2,
+          rows: [
+            ["Metric", "Value"],
+            ["Precision", "0.91"],
+          ],
+          cells: [
+            { rowIndex: 0, columnIndex: 0, text: "Metric", rowSpan: 1, columnSpan: 1 },
+            { rowIndex: 0, columnIndex: 1, text: "Value", rowSpan: 1, columnSpan: 1 },
+            { rowIndex: 1, columnIndex: 0, text: "Precision", rowSpan: 1, columnSpan: 1 },
+            { rowIndex: 1, columnIndex: 1, text: "0.91", rowSpan: 1, columnSpan: 1 },
+          ],
+          semanticVersion: "clio-pdf-table-semantics-v1",
+          headerRowCount: 1,
+          headerRows: [0],
+          columnTypes: ["text", "numeric"],
+          columnSemantics: [
+            {
+              columnIndex: 0,
+              header: "Metric",
+              type: "text",
+              nonEmptyCellCount: 1,
+              numericCellRatio: 0,
+              sampleValues: ["Precision"],
+            },
+            {
+              columnIndex: 1,
+              header: "Value",
+              type: "numeric",
+              nonEmptyCellCount: 1,
+              numericCellRatio: 1,
+              sampleValues: ["0.91"],
+            },
+          ],
+          mergedCellHints: [],
+          sparseRowIndexes: [],
+          multiPageContinuation: {
+            status: "single_page",
+            confidence: "low",
+          },
+          semanticWarnings: [],
+          markdownPreview: ["| Metric | Value |", "| --- | --- |", "| Precision | 0.91 |"].join(
+            "\n",
+          ),
+          csvPreview: ["Metric,Value", "Precision,0.91"].join("\n"),
+          captionLabel: "Table 1",
+          caption: "Concrete page anchors.",
+          captionCharStart: page2Start,
+          captionCharEnd: text.length,
+          source: "coordinate_text_items",
+          confidence: "low",
+        },
+      ],
+      figureAnalyses: [
+        {
+          id: "figure-analysis:1",
+          imageId: "image:1",
+          pageNumber: 1,
+          label: "Figure 1",
+          caption: "Parser-backed capture flow.",
+          source: "pdfjs_operator_list",
+          status: "requires_visual_model",
+          modelInput: "image",
+          inputRequirement: "bounded_image_or_page_crop",
+          inputStatus: "needs_bounded_crop",
+          promptBoundary: "no_full_pdf_prompt",
+          providerBoundary: "trusted_runtime_required",
+          reason: "bounded_image_crop_required",
+          confidence: "medium",
+        },
+      ],
+      citationLinks: [
+        {
+          id: "citation-link:1",
+          marker: "[1]",
+          citationStyle: "numeric_bracket",
+          normalizedTargetLabel: "[1]",
+          targetReferenceIndex: 0,
+          targetReferenceLabel: "[1]",
+          charStart: 50,
+          charEnd: 53,
+          pageNumber: 1,
+          context: "Uploaded PDF page one cites parser-backed capture [1].",
+          confidence: "high",
+        },
+      ],
+      pageLabels: [
+        { pageNumber: 1, label: "Page 1", charStart: 0, charEnd: page1.length },
+        {
+          pageNumber: 2,
+          label: "Page 2",
+          charStart: page2Start,
+          charEnd: page2Start + page2.length,
+        },
+      ],
+      parseProfile: {
+        parser: "pdfjs",
+        parserVersion: "clio-pdf-structure-v2",
+        pageCount: 2,
+        textHash: hashText(text),
+        ocrStatus: "not_required",
+        warnings: [],
+      },
+      parseQuality: {
+        version: "clio-pdf-parse-quality-v1",
+        status: "pass",
+        score: 1,
+        metrics: {
+          pageCount: 2,
+          textPageCoverage: 1,
+          sectionCount: 2,
+          referenceCount: 1,
+          figureCaptionCount: 1,
+          imageArtifactCount: 1,
+          tableCaptionCount: 1,
+          tableStructureCount: 1,
+          tableSemanticCount: 1,
+          figureAnalysisQueueCount: 1,
+          figureVisionReadyCount: 1,
+          citationLinkCount: 1,
+          linkedReferenceRatio: 1,
+        },
+        warnings: [],
+      },
+      rawFile: {
+        status: "not_persisted",
+        reason: "raw_file_persistence_pending",
+        byteLength: 3,
+      },
       metadata: {
         title: "Uploaded Parser PDF",
         pageCount: 2,
@@ -1381,7 +2083,9 @@ describe("local engine behavior harness", () => {
       },
     };
     const parserInputs: Array<Uint8Array | ArrayBuffer> = [];
+    const pdfRawFileStore = new MemoryPdfRawFileStore();
     const harness = createHarness({
+      pdfRawFileStore,
       pdfParser: async (bytes) => {
         parserInputs.push(bytes);
         return parsed;
@@ -1393,6 +2097,7 @@ describe("local engine behavior harness", () => {
       payload: {
         sourceUrl: "clio://upload/parser.pdf",
         sourceTitle: "parser.pdf",
+        capturedAt: "2026-07-01T00:00:00.000Z",
         bytes: new Uint8Array([1, 2, 3]),
         metadata: {
           file_name: "parser.pdf",
@@ -1403,6 +2108,16 @@ describe("local engine behavior harness", () => {
     const sourceId = capture.memory.id;
 
     expect(parserInputs).toHaveLength(1);
+    expect(parserInputs[0]).toBeInstanceOf(Uint8Array);
+    expect(Array.from(parserInputs[0] as Uint8Array)).toEqual([1, 2, 3]);
+    expect(pdfRawFileStore.writes).toHaveLength(1);
+    expect(pdfRawFileStore.writes[0]).toMatchObject({
+      sourceId,
+      sourceUrl: "clio://upload/parser.pdf",
+      sourceTitle: "Uploaded Parser PDF",
+      capturedAt: "2026-07-01T00:00:00.000Z",
+    });
+    expect(Array.from(pdfRawFileStore.writes[0]?.bytes ?? [])).toEqual([1, 2, 3]);
     expect(capture.status).toBe("saved");
     expect(capture.memory.sourceTitle).toBe("Uploaded Parser PDF");
     expect(harness.count("sources", "id = ? AND source_type = 'pdf'", [sourceId])).toBe(1);
@@ -1412,6 +2127,125 @@ describe("local engine behavior harness", () => {
     expect(detail?.metadata.source_type).toBe("pdf");
     expect(detail?.metadata.parser).toBe("pdfjs");
     expect(detail?.metadata.pdf_page_count).toBe(2);
+    expect(detail?.metadata.pdf_parse_profile).toMatchObject({
+      parser: "pdfjs",
+      parserVersion: "clio-pdf-structure-v2",
+      pageCount: 2,
+      ocrStatus: "not_required",
+      warnings: [],
+    });
+    expect(detail?.metadata.sectionOutline).toEqual([
+      { level: 1, text: "Introduction" },
+      { level: 1, text: "References" },
+    ]);
+    expect(detail?.metadata.pdf_references).toMatchObject([
+      {
+        index: 0,
+        label: "[1]",
+        doi: "10.1234/clio.pdf",
+        year: 2024,
+        pageStart: 2,
+        pageEnd: 2,
+      },
+    ]);
+    expect(detail?.metadata.pdf_figures).toMatchObject([
+      { label: "Figure 1", caption: "Parser-backed capture flow.", pageNumber: 1 },
+    ]);
+    expect(detail?.metadata.pdf_images).toMatchObject([
+      {
+        pageNumber: 1,
+        label: "Figure 1",
+        objectRef: "figure_image_1",
+        source: "pdfjs_operator_list",
+        extractionStatus: "operator_detected",
+        visionAnalysis: {
+          status: "requires_visual_model",
+          modelInput: "image",
+          inputStatus: "needs_bounded_crop",
+        },
+      },
+    ]);
+    expect(detail?.metadata.pdf_figure_analyses).toMatchObject([
+      {
+        imageId: "image:1",
+        pageNumber: 1,
+        label: "Figure 1",
+        status: "requires_visual_model",
+        modelInput: "image",
+        inputStatus: "needs_bounded_crop",
+      },
+    ]);
+    expect(detail?.metadata.pdf_tables).toMatchObject([
+      { label: "Table 1", caption: "Concrete page anchors.", pageNumber: 2 },
+    ]);
+    expect(detail?.metadata.pdf_table_structures).toMatchObject([
+      {
+        pageNumber: 2,
+        rowCount: 2,
+        columnCount: 2,
+        rows: [
+          ["Metric", "Value"],
+          ["Precision", "0.91"],
+        ],
+        cells: [
+          { rowIndex: 0, columnIndex: 0, text: "Metric" },
+          { rowIndex: 0, columnIndex: 1, text: "Value" },
+          { rowIndex: 1, columnIndex: 0, text: "Precision" },
+          { rowIndex: 1, columnIndex: 1, text: "0.91" },
+        ],
+        semanticVersion: "clio-pdf-table-semantics-v1",
+        headerRowCount: 1,
+        columnTypes: ["text", "numeric"],
+        markdownPreview: ["| Metric | Value |", "| --- | --- |", "| Precision | 0.91 |"].join("\n"),
+        csvPreview: "Metric,Value\nPrecision,0.91",
+        captionLabel: "Table 1",
+        source: "coordinate_text_items",
+      },
+    ]);
+    expect(detail?.metadata.pdf_citation_links).toMatchObject([
+      {
+        marker: "[1]",
+        normalizedTargetLabel: "[1]",
+        targetReferenceIndex: 0,
+        confidence: "high",
+      },
+    ]);
+    expect(detail?.metadata.pdf_parse_quality).toMatchObject({
+      version: "clio-pdf-parse-quality-v1",
+      status: "pass",
+      metrics: {
+        referenceCount: 1,
+        imageArtifactCount: 1,
+        tableStructureCount: 1,
+        tableSemanticCount: 1,
+        figureAnalysisQueueCount: 1,
+        figureVisionReadyCount: 1,
+        citationLinkCount: 1,
+      },
+    });
+    expect(detail?.metadata.pdf_raw_file).toMatchObject({
+      status: "persisted",
+      storage: "opfs",
+      path: `memory://${sourceId}.pdf`,
+      byteLength: 3,
+      contentType: "application/pdf",
+    });
+    const rawFile = await harness.request({ kind: "getPdfRawFile", id: sourceId });
+    expect(rawFile).toMatchObject({
+      memoryId: sourceId,
+      sourceTitle: "Uploaded Parser PDF",
+      sourceUrl: "clio://upload/parser.pdf",
+      byteLength: 3,
+      contentType: "application/pdf",
+    });
+    expect(
+      Array.from(
+        rawFile.bytes instanceof Uint8Array ? rawFile.bytes : new Uint8Array(rawFile.bytes),
+      ),
+    ).toEqual([1, 2, 3]);
+    expect(typeof (detail?.metadata.pdf_raw_file as { persistedAt?: unknown })?.persistedAt).toBe(
+      "string",
+    );
     expect(detail?.metadata.file_name).toBe("parser.pdf");
     expect(detail?.chunks[0]?.pageStart).toBe(1);
     expect(detail?.chunks[0]?.pageEnd).toBe(2);
@@ -1428,6 +2262,422 @@ describe("local engine behavior harness", () => {
     expect(retrieved.items.map((item) => item.id)).toEqual([sourceId]);
     expect(retrieved.items[0]?.hitChunks[0]?.pageStart).toBe(1);
     expect(retrieved.items[0]?.hitChunks[0]?.pageEnd).toBe(2);
+
+    await harness.request({ kind: "deleteMemory", id: sourceId });
+    expect(pdfRawFileStore.deletedSourceIds).toEqual([sourceId]);
+  });
+
+  it("runs the PDF figure vision queue with bounded image input and persists results", async () => {
+    const page1 =
+      "Introduction\nFigure 1: Parser-backed capture flow.\nThe figure shows a bounded PDF analysis pipeline.";
+    const page2 = "References\n[1] Ada Lovelace. Notes on local memory. 2024.";
+    const text = `${page1}\n\n${page2}`;
+    const page2Start = page1.length + 2;
+    const figureBbox = {
+      xMin: 10,
+      yMin: 20,
+      xMax: 210,
+      yMax: 220,
+      unit: "pdf_user_space" as const,
+    };
+    const parsed: ParsedPdfDocument = {
+      text,
+      pages: [
+        { pageNumber: 1, text: page1, charStart: 0, charEnd: page1.length },
+        { pageNumber: 2, text: page2, charStart: page2Start, charEnd: page2Start + page2.length },
+      ],
+      sections: [
+        {
+          level: 1,
+          text: "Introduction",
+          kind: "introduction",
+          charStart: 0,
+          charEnd: page1.length,
+          pageStart: 1,
+          pageEnd: 1,
+        },
+      ],
+      references: [],
+      figures: [
+        {
+          id: "figure:1",
+          kind: "figure",
+          label: "Figure 1",
+          caption: "Parser-backed capture flow.",
+          charStart: 13,
+          charEnd: 53,
+          pageNumber: 1,
+          bbox: figureBbox,
+          confidence: "medium",
+        },
+      ],
+      tables: [],
+      images: [
+        {
+          id: "image:1",
+          pageNumber: 1,
+          label: "Figure 1",
+          caption: "Parser-backed capture flow.",
+          captionCharStart: 13,
+          captionCharEnd: 53,
+          bbox: figureBbox,
+          objectRef: "figure_image_1",
+          source: "pdfjs_operator_list",
+          extractionStatus: "operator_detected",
+          visionAnalysis: {
+            analysisId: "figure-analysis:1",
+            status: "requires_visual_model",
+            modelInput: "image",
+            inputRequirement: "bounded_image_or_page_crop",
+            inputStatus: "needs_bounded_crop",
+            promptBoundary: "no_full_pdf_prompt",
+            providerBoundary: "trusted_runtime_required",
+          },
+          confidence: "medium",
+        },
+      ],
+      tableStructures: [],
+      figureAnalyses: [
+        {
+          id: "figure-analysis:1",
+          imageId: "image:1",
+          pageNumber: 1,
+          label: "Figure 1",
+          caption: "Parser-backed capture flow.",
+          source: "pdfjs_operator_list",
+          status: "requires_visual_model",
+          modelInput: "image",
+          inputRequirement: "bounded_image_or_page_crop",
+          inputStatus: "needs_bounded_crop",
+          promptBoundary: "no_full_pdf_prompt",
+          providerBoundary: "trusted_runtime_required",
+          reason: "bounded_image_crop_required",
+          confidence: "medium",
+        },
+      ],
+      citationLinks: [],
+      pageLabels: [
+        { pageNumber: 1, label: "Page 1", charStart: 0, charEnd: page1.length },
+        {
+          pageNumber: 2,
+          label: "Page 2",
+          charStart: page2Start,
+          charEnd: page2Start + page2.length,
+        },
+      ],
+      parseProfile: {
+        parser: "pdfjs",
+        parserVersion: "clio-pdf-structure-v2",
+        pageCount: 2,
+        textHash: hashText(text),
+        ocrStatus: "not_required",
+        warnings: [],
+      },
+      parseQuality: {
+        version: "clio-pdf-parse-quality-v1",
+        status: "pass",
+        score: 0.92,
+        metrics: {
+          pageCount: 2,
+          textPageCoverage: 1,
+          sectionCount: 1,
+          referenceCount: 0,
+          figureCaptionCount: 1,
+          imageArtifactCount: 1,
+          tableCaptionCount: 0,
+          tableStructureCount: 0,
+          tableSemanticCount: 0,
+          figureAnalysisQueueCount: 1,
+          figureVisionReadyCount: 1,
+          citationLinkCount: 0,
+          linkedReferenceRatio: null,
+        },
+        warnings: ["figure_visual_model_required"],
+      },
+      rawFile: {
+        status: "not_persisted",
+        reason: "raw_file_persistence_pending",
+        byteLength: 3,
+      },
+      metadata: {
+        title: "Figure Vision PDF",
+        pageCount: 2,
+        parser: "pdfjs",
+        textHash: hashText(text),
+      },
+    };
+    const analyzerInputs: FigureVisionAnalysisInput[] = [];
+    const extractorInputs: Array<{
+      bytes: number[];
+      pageNumber: number;
+      bbox?: typeof figureBbox;
+    }> = [];
+    const pdfRawFileStore = new MemoryPdfRawFileStore();
+    const harness = createHarness({
+      pdfRawFileStore,
+      pdfParser: async () => parsed,
+      pdfFigureVisionImageExtractor: async (input) => {
+        extractorInputs.push({
+          bytes: Array.from(
+            input.bytes instanceof Uint8Array ? input.bytes : new Uint8Array(input.bytes),
+          ),
+          pageNumber: input.pageNumber,
+          ...(input.bbox === undefined ? {} : { bbox: input.bbox }),
+        });
+        return {
+          status: "ready",
+          pageNumber: input.pageNumber,
+          image: {
+            base64: "UE5H",
+            mimeType: "image/png",
+            byteLength: 3,
+          },
+          crop: {
+            kind: "exact_bbox_crop",
+            pageNumber: input.pageNumber,
+            width: 140,
+            height: 120,
+            scale: 0.5,
+            maxWidth: 1024,
+            maxHeight: 1024,
+            sourcePage: {
+              width: 320,
+              height: 240,
+            },
+            cropRect: {
+              x: 5,
+              y: 10,
+              width: 140,
+              height: 120,
+              marginPx: 8,
+            },
+            ...(input.bbox === undefined ? {} : { bbox: input.bbox }),
+          },
+        };
+      },
+      figureVisionAnalyzer: {
+        async analyze(input) {
+          analyzerInputs.push(input);
+          return {
+            status: "analyzed",
+            analysisId: input.analysisId,
+            imageId: input.imageId,
+            providerKind: "chat",
+            summary: "The figure summarizes the capture-to-analysis pipeline.",
+            chartType: "diagram",
+            extractedLabels: ["capture", "analysis"],
+            extractedValues: ["bounded image"],
+            claims: [
+              {
+                claimId: "claim:0",
+                text: "The figure depicts a bounded PDF analysis pipeline.",
+                confidence: "high",
+              },
+            ],
+          };
+        },
+      },
+    });
+
+    const capture = await harness.request({
+      kind: "capturePdf",
+      payload: {
+        sourceUrl: "clio://upload/figure-vision.pdf",
+        sourceTitle: "figure-vision.pdf",
+        capturedAt: "2026-07-01T00:00:00.000Z",
+        bytes: new Uint8Array([7, 8, 9]),
+      },
+    });
+    const queued = await harness.request({ kind: "getJobStatus", status: "queued", limit: 5 });
+    expect(queued.jobs).toHaveLength(1);
+
+    const job = await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+    expect(job.status).toBe("done");
+
+    expect(extractorInputs).toEqual([{ bytes: [7, 8, 9], pageNumber: 1, bbox: figureBbox }]);
+    expect(analyzerInputs).toHaveLength(1);
+    expect(analyzerInputs[0]).toMatchObject({
+      analysisId: "figure-analysis:1",
+      imageId: "image:1",
+      pageNumber: 1,
+      label: "Figure 1",
+      caption: "Parser-backed capture flow.",
+      pageContext: page1,
+      image: {
+        base64: "UE5H",
+        mimeType: "image/png",
+        byteLength: 3,
+      },
+    });
+    expect(analyzerInputs[0]?.pageContext).not.toContain(page2);
+    expect("pdfBytes" in ((analyzerInputs[0] ?? {}) as Record<string, unknown>)).toBe(false);
+    expect("fullText" in ((analyzerInputs[0] ?? {}) as Record<string, unknown>)).toBe(false);
+    expect("apiKey" in ((analyzerInputs[0] ?? {}) as Record<string, unknown>)).toBe(false);
+
+    const detail = await harness.request({ kind: "getMemory", id: capture.memory.id });
+    const analyses = detail?.metadata.pdf_figure_analyses as Array<Record<string, unknown>>;
+    const results = detail?.metadata.pdf_figure_analysis_results as Array<Record<string, unknown>>;
+    expect(analyses).toMatchObject([
+      {
+        id: "figure-analysis:1",
+        imageId: "image:1",
+        pageNumber: 1,
+        status: "analyzed",
+        resultId: "figure-analysis:1",
+        resultStatus: "analyzed",
+      },
+    ]);
+    expect(results).toMatchObject([
+      {
+        analysisId: "figure-analysis:1",
+        imageId: "image:1",
+        pageNumber: 1,
+        label: "Figure 1",
+        caption: "Parser-backed capture flow.",
+        status: "analyzed",
+        providerKind: "chat",
+        summary: "The figure summarizes the capture-to-analysis pipeline.",
+        chartType: "diagram",
+        extractedLabels: ["capture", "analysis"],
+        extractedValues: ["bounded image"],
+        claims: [
+          {
+            claimId: "claim:0",
+            text: "The figure depicts a bounded PDF analysis pipeline.",
+            confidence: "high",
+          },
+        ],
+        crop: {
+          kind: "exact_bbox_crop",
+          pageNumber: 1,
+          width: 140,
+          height: 120,
+          sourcePage: {
+            width: 320,
+            height: 240,
+          },
+          cropRect: {
+            x: 5,
+            y: 10,
+            width: 140,
+            height: 120,
+            marginPx: 8,
+          },
+        },
+      },
+    ]);
+    expect(detail?.metadata.pdf_parse_quality).toMatchObject({
+      metrics: {
+        figureVisionResultCount: 1,
+        figureVisionAnalyzedCount: 1,
+        figureVisionUnavailableCount: 0,
+        figureVisionErrorCount: 0,
+      },
+      warnings: [],
+    });
+
+    const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
+      job.id,
+    ]);
+    expect(JSON.parse(String(finishedJob?.result_json ?? "{}"))).toMatchObject({
+      figureVision: {
+        version: "clio-pdf-figure-vision-stage-v1",
+        analyzed: 1,
+        unavailable: 0,
+        error: 0,
+        resultCount: 1,
+      },
+    });
+  });
+
+  it("keeps PDF capture saved when raw file persistence fails", async () => {
+    const text = "Uploaded PDF remains searchable when raw file persistence fails.";
+    const parsed: ParsedPdfDocument = {
+      text,
+      pages: [{ pageNumber: 1, text, charStart: 0, charEnd: text.length }],
+      sections: [],
+      references: [],
+      figures: [],
+      tables: [],
+      images: [],
+      tableStructures: [],
+      figureAnalyses: [],
+      citationLinks: [],
+      pageLabels: [{ pageNumber: 1, label: "Page 1", charStart: 0, charEnd: text.length }],
+      parseProfile: {
+        parser: "pdfjs",
+        parserVersion: "clio-pdf-structure-v2",
+        pageCount: 1,
+        textHash: hashText(text),
+        ocrStatus: "not_required",
+        warnings: [],
+      },
+      parseQuality: {
+        version: "clio-pdf-parse-quality-v1",
+        status: "needs_review",
+        score: 0.61,
+        metrics: {
+          pageCount: 1,
+          textPageCoverage: 1,
+          sectionCount: 0,
+          referenceCount: 0,
+          figureCaptionCount: 0,
+          imageArtifactCount: 0,
+          tableCaptionCount: 0,
+          tableStructureCount: 0,
+          tableSemanticCount: 0,
+          figureAnalysisQueueCount: 0,
+          figureVisionReadyCount: 0,
+          citationLinkCount: 0,
+          linkedReferenceRatio: null,
+        },
+        warnings: ["section_outline_unavailable"],
+      },
+      rawFile: {
+        status: "not_persisted",
+        reason: "raw_file_persistence_pending",
+        byteLength: 4,
+      },
+      metadata: {
+        title: "Persistence Failure PDF",
+        pageCount: 1,
+        parser: "pdfjs",
+        textHash: hashText(text),
+      },
+    };
+    const pdfRawFileStore = new MemoryPdfRawFileStore({ failWrite: true });
+    const harness = createHarness({
+      pdfRawFileStore,
+      pdfParser: async () => parsed,
+    });
+
+    const capture = await harness.request({
+      kind: "capturePdf",
+      payload: {
+        sourceUrl: "clio://upload/raw-failure.pdf",
+        sourceTitle: "raw-failure.pdf",
+        capturedAt: "2026-07-01T00:00:00.000Z",
+        bytes: new Uint8Array([9, 8, 7, 6]),
+        metadata: {},
+      },
+    });
+    const detail = await harness.request({ kind: "getMemory", id: capture.memory.id });
+
+    expect(capture.status).toBe("saved");
+    expect(harness.count("sources", "id = ? AND source_type = 'pdf'", [capture.memory.id])).toBe(1);
+    expect(pdfRawFileStore.writes).toHaveLength(1);
+    expect(detail?.metadata.pdf_raw_file).toMatchObject({
+      status: "persist_failed",
+      reason: "PDF_RAW_FILE_PERSIST_FAILED",
+      message: "raw store offline",
+      byteLength: 4,
+    });
+    await expect(
+      harness.request({ kind: "getPdfRawFile", id: capture.memory.id }),
+    ).rejects.toMatchObject({
+      code: "PDF_RAW_FILE_NOT_AVAILABLE",
+    });
+    expect(detail?.chunks[0]?.text).toContain("raw file persistence fails");
   });
 
   it("adapts ordinary PDF sources without classifying them as papers", async () => {
@@ -1626,7 +2876,52 @@ function createHarness(options: Omit<LocalEngineOptions, "openDatabase"> = {}) {
       if (db === undefined) throw new Error("Test database is not open.");
       return db.selectObject(sql, bind);
     },
+    selectObjects(sql: string, bind: unknown[] = []) {
+      if (db === undefined) throw new Error("Test database is not open.");
+      return db.selectObjects(sql, bind);
+    },
   };
+}
+
+class MemoryPdfRawFileStore implements PdfRawFileStore {
+  readonly writes: PdfRawFileStoreWriteInput[] = [];
+  readonly deletedSourceIds: string[] = [];
+  readonly files = new Map<string, Uint8Array>();
+  clearCount = 0;
+
+  constructor(private readonly options: { failWrite?: boolean } = {}) {}
+
+  async write(input: PdfRawFileStoreWriteInput): Promise<PdfRawFileStoreWriteResult> {
+    this.writes.push({
+      ...input,
+      bytes: new Uint8Array(input.bytes),
+    });
+    if (this.options.failWrite === true) {
+      throw new Error("raw store offline");
+    }
+    this.files.set(input.sourceId, new Uint8Array(input.bytes));
+    return {
+      storage: "opfs",
+      path: `memory://${input.sourceId}.pdf`,
+      byteLength: input.bytes.byteLength,
+      contentType: "application/pdf",
+      persistedAt: "2026-07-01T00:00:00.000Z",
+    };
+  }
+
+  async read(sourceId: string): Promise<Uint8Array> {
+    const bytes = this.files.get(sourceId);
+    if (bytes === undefined) throw new Error("raw file missing");
+    return new Uint8Array(bytes);
+  }
+
+  async delete(sourceId: string): Promise<void> {
+    this.deletedSourceIds.push(sourceId);
+  }
+
+  async clear(): Promise<void> {
+    this.clearCount += 1;
+  }
 }
 
 function pagePayload(
@@ -1659,6 +2954,108 @@ function selectionPayload(
 
 function ragText(seed: string, repeat: number) {
   return Array.from({ length: repeat }, (_, index) => `${seed} chunk ${index}.`).join(" ");
+}
+
+type ChunkMetaSemanticRelationForTest = {
+  kind?: unknown;
+  target?: unknown;
+};
+
+type ChunkMetaTierStateForTest = {
+  status?: unknown;
+  summarySource?: unknown;
+  reason?: unknown;
+  sectionSummary?: string | null;
+  chunkSummary?: string | null;
+  semanticRelations?: ChunkMetaSemanticRelationForTest[];
+};
+
+type ChunkMetaHeadForTest = {
+  tier?: string;
+  summarySource?: string;
+  selectedTier?: string;
+  docContext?: string;
+  sectionPath?: string | null;
+  sectionSummary?: string | null;
+  chunkSummary?: string | null;
+  roleHint?: string | null;
+  tiers?: Record<string, ChunkMetaTierStateForTest | undefined>;
+  semanticRelations?: ChunkMetaSemanticRelationForTest[];
+};
+
+function chunkMetaEmbeddingInputForTest(metaHead: ChunkMetaHeadForTest, text: string) {
+  const selectedTierState = selectedChunkMetaTierStateForTest(metaHead);
+  const sectionSummary =
+    stringFieldForTest(selectedTierState?.sectionSummary) ?? metaHead.sectionSummary;
+  const chunkSummary = stringFieldForTest(selectedTierState?.chunkSummary) ?? metaHead.chunkSummary;
+  const relationHints = chunkMetaRelationHintsForTest(metaHead, selectedTierState);
+  const prefix = [
+    metaHead.docContext ?? "",
+    metaHead.sectionPath === null || metaHead.sectionPath === undefined
+      ? ""
+      : `Section: ${metaHead.sectionPath}`,
+    sectionSummary === null || sectionSummary === undefined
+      ? ""
+      : `Section summary: ${sectionSummary}`,
+    chunkSummary === null || chunkSummary === undefined ? "" : `Chunk summary: ${chunkSummary}`,
+    metaHead.roleHint === null || metaHead.roleHint === undefined
+      ? ""
+      : `Role: ${metaHead.roleHint}`,
+    relationHints.length === 0 ? "" : `Relations: ${relationHints.join("; ")}`,
+  ]
+    .filter((part) => part.length > 0)
+    .join("\n");
+  const normalizedPrefix = boundedNormalizedTextForTest(prefix, 2_000);
+  return normalizedPrefix.length === 0 ? text : `${normalizedPrefix}\n\n${text}`;
+}
+
+function selectedChunkMetaTierStateForTest(
+  metaHead: ChunkMetaHeadForTest,
+): ChunkMetaTierStateForTest | undefined {
+  const tiers = metaHead.tiers;
+  if (tiers === undefined) return undefined;
+  const selectedTier = metaHead.selectedTier ?? metaHead.tier;
+  const preferred = selectedTier === undefined ? undefined : tiers[selectedTier];
+  if (preferred?.status === "available") return preferred;
+  if (tiers.tier1?.status === "available") return tiers.tier1;
+  return tiers.tier0;
+}
+
+function chunkMetaRelationHintsForTest(
+  metaHead: ChunkMetaHeadForTest,
+  selectedTierState: ChunkMetaTierStateForTest | undefined,
+) {
+  const relations = selectedTierState?.semanticRelations ?? metaHead.semanticRelations ?? [];
+  return relations
+    .flatMap((relation): string[] => {
+      const kind = typeof relation.kind === "string" ? normalizeTextForTest(relation.kind) : "";
+      const target =
+        typeof relation.target === "string" ? normalizeTextForTest(relation.target) : "";
+      if (kind.length === 0 || target.length === 0) return [];
+      return [`${kind}:${target}`];
+    })
+    .slice(0, 6);
+}
+
+function stringFieldForTest(input: unknown): string | null | undefined {
+  if (input === null || input === undefined) return input;
+  return typeof input === "string" ? input : undefined;
+}
+
+function boundedNormalizedTextForTest(input: string, maxLength: number) {
+  const normalized = normalizeTextForTest(input);
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function normalizeTextForTest(input: string) {
+  return input
+    .normalize("NFKC")
+    .replace(/\u00a0/g, " ")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function remoteEmbeddingVector(input: string) {

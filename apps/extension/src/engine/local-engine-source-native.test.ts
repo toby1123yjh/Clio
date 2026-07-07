@@ -22,6 +22,11 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_chunks");
+    expect(workerSource).toContain("role TEXT NOT NULL DEFAULT 'child'");
+    expect(workerSource).toContain("parent_chunk_id TEXT REFERENCES source_chunks(id)");
+    expect(workerSource).toContain("section_path TEXT");
+    expect(workerSource).toContain("char_start INTEGER");
+    expect(workerSource).toContain("char_end INTEGER");
     expect(workerSource).toContain("page_start INTEGER");
     expect(workerSource).toContain("page_end INTEGER");
     expect(workerSource).toContain('ensureColumn(db, "source_chunks", "page_start", "INTEGER")');
@@ -120,15 +125,25 @@ describe("local engine source-native storage foundation", () => {
 
   it("queues bounded post-capture work and does not add public ingest job types", () => {
     expect(workerSource).toContain('enqueueJob(db, "post_capture_hardening"');
-    expect(workerSource).toContain('stages: ["embedding", "chunk_meta", "graph"]');
+    expect(workerSource).toContain("type PostCaptureStageName =");
+    expect(workerSource).toContain('"paper_metadata"');
+    expect(workerSource).toContain('"figure_vision"');
     expect(workerSource).toContain("function boundAuditPayload(payload: Record<string, unknown>)");
     expect(workerSource).toContain("function runPostCaptureHardeningJob");
+    expect(workerSource).toContain("function runPaperMetadataStageForSource");
     expect(workerSource).toContain("function runChunkMetaStageForSource");
+    expect(workerSource).toContain("function runPdfFigureVisionStageForSource");
     expect(workerSource).toContain("function runEmbeddingStageForSource");
     expect(workerSource).toContain("function runDeterministicGraphBuildForSource");
+    expect(workerSource).toContain("pdfFigureVisionImageExtractor");
+    expect(workerSource).toContain("CLIO_WORKER_VISION_ANALYSIS_REQUEST");
+    expect(workerSource).toContain("isWorkerVisionAnalysisResponseMessage");
+    expect(workerSource).toContain("pdf_figure_analysis_results");
     expect(workerSource).toContain("private async runQueuedJob");
     expect(workerSource).toContain('case "runJob"');
     expect(workerSource).toContain("function parsePostCaptureHardeningPayload");
+    expect(workerSource).toContain('value === "paper_metadata"');
+    expect(workerSource).toContain('value === "figure_vision"');
     expect(workerSource).toContain('graphBuildMode === "deterministic"');
     expect(workerSource).toContain("function upsertSourceChunkEmbeddings");
     expect(workerSource).toContain("function upsertSourceMetaEmbedding");
@@ -179,27 +194,38 @@ describe("local engine source-native storage foundation", () => {
     expect(markdownSection).toContain('source_type: "markdown"');
     expect(markdownSection).toContain('adapter: "markdown"');
     expect(markdownSection).toContain('return await this.capture("page"');
-    expect(pdfSection).toContain("const parsed = await this.pdfParser(payload.bytes)");
+    expect(pdfSection).toContain("const pdfBytes = normalizePdfBytes(payload.bytes)");
+    expect(pdfSection).toContain("const parsed = await this.pdfParser(pdfBytes)");
     expect(pdfSection).toContain("pdfCapturePayloadFromParsedDocument");
+    expect(pdfSection).toContain("afterSave");
+    expect(pdfSection).toContain("persistPdfRawFile");
     expect(pdfSection).toContain("return await this.capture(");
   });
 
   it("keeps capture source-native and defers embedding work outside the capture transaction", () => {
-    const captureSection = sourceSection("private async capture", "private async retrieveSources");
+    const captureSection = sourceSection("private async capture(", "private async retrieveSources");
 
     expect(captureSection).toContain("defaultSourceAdapterRegistry.resolve");
     expect(captureSection).toContain("adapter.adapt");
-    expect(captureSection).toContain("const chunks = chunkText(draft.normalizedText)");
+    expect(captureSection).toContain("const chunks = chunkTextForDocument(draft)");
     expect(captureSection).toContain("const chunkRanges = locateChunkTextRanges");
-    expect(captureSection).toContain("const chunkMetaHeadJson = buildChunkMetaHeadJson(draft)");
+    expect(captureSection).toContain("const materializedChunks = materializeSourceChunks");
     expect(captureSection).toContain("transaction(db, () => {");
     expect(captureSection).toContain("insertSourceRow(db");
     expect(captureSection).toContain("insertSourceLifecycleEvent(db");
     expect(captureSection).toContain("insertSourceAuditLog(db");
     expect(captureSection).toContain("INSERT INTO source_chunks");
-    expect(captureSection).toContain("pageRangeForChunk");
+    expect(captureSection).toContain("for (const parent of materializedChunks.parents)");
+    expect(captureSection).toContain("'parent'");
+    expect(captureSection).toContain("for (const materialized of materializedChunks.children)");
+    expect(captureSection).toContain("'child'");
+    expect(captureSection).toContain("parent_chunk_id");
+    expect(workerSource).toContain("function pageRangeForChunk");
+    expect(workerSource).toContain("pageRange: pageRangeForChunk(range, draft.pdfPages)");
+    expect(workerSource).toContain("pageRange: pageRangeForChunk(parentRange, draft.pdfPages)");
     expect(captureSection).toContain("page_start");
     expect(captureSection).toContain("page_end");
+    expect(captureSection).toContain("section_path");
     expect(captureSection).toContain("meta_head_json");
     expect(captureSection).toContain("insertSourceFtsRow(db");
     expect(captureSection).toContain("insertAnchor(");
@@ -238,6 +264,7 @@ describe("local engine source-native storage foundation", () => {
     expect(deleteSection).toContain("DELETE FROM source_chunks WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_metadata WHERE source_id = ?");
     expect(deleteSection).toContain("markSourceDeleted(db");
+    expect(deleteSection).toContain("this.pdfRawFileStore.delete(id).catch(() => undefined)");
 
     const resetSection = sourceSection("private async resetLibrary", "private async ensureReady");
     expect(resetSection).toContain('db.exec("DELETE FROM jobs")');
@@ -252,6 +279,7 @@ describe("local engine source-native storage foundation", () => {
     expect(resetSection).toContain('db.exec("DELETE FROM source_fts")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_chunks")');
     expect(resetSection).toContain('db.exec("DELETE FROM sources")');
+    expect(resetSection).toContain("this.pdfRawFileStore.clear().catch(() => undefined)");
   });
 
   it("rebuilds FTS from source chunks without changing embedding rows", () => {
@@ -266,6 +294,7 @@ describe("local engine source-native storage foundation", () => {
     expect(rebuildSection).toContain("FROM source_chunks c");
     expect(rebuildSection).toContain("JOIN sources s ON s.id = c.source_id");
     expect(rebuildSection).toContain("WHERE s.lifecycle_status <> 'deleted'");
+    expect(rebuildSection).toContain("AND c.role = 'child'");
     expect(rebuildSection).toContain("insertSourceFtsRow(db");
     expect(rebuildSection).toContain("LEFT JOIN source_metadata sm ON sm.source_id = s.id");
     expect(rebuildSection).toContain("insertSourceMetadataFtsRow(db");
@@ -298,6 +327,8 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("const explicitAnchors = boundedEvidenceWindowAnchors");
     expect(workerSource).toContain("FROM source_chunks");
     expect(workerSource).toContain("ord BETWEEN ? AND ?");
+    expect(workerSource).toContain("AND role = 'child'");
+    expect(workerSource).toContain("AND c.role = 'child'");
 
     const evidenceWindowSection = workerSource.slice(
       workerSource.indexOf("private async getMemoryEvidenceWindows"),
@@ -309,6 +340,7 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("function optionalAnchorFromRow"),
     );
     expect(loaderSection).not.toContain("normalized_text");
+    expect(loaderSection).toContain("AND role = 'child'");
   });
 
   it("orders bounded evidence loading as anchors, then query hits, then requested-source fallback", () => {
@@ -339,13 +371,23 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("function resolveSourceContextPackCandidates");
     expect(workerSource).toContain("function loadSourceContextSourceStates");
     expect(workerSource).toContain("function loadSourceContextCandidateWindows");
+    expect(workerSource).toContain("function loadSourceContextParentWindows");
+    expect(workerSource).toContain("function loadSourceContextParentWindowsByChildId");
+    expect(workerSource).toContain("function sourceContextParentWindowText");
+    expect(workerSource).toContain("function logSelectedParentContextWindows");
     expect(workerSource).toContain("function packSourceContextGroups");
     expect(workerSource).toContain("function trimSourceContextPackToBudget");
     expect(workerSource).toContain("FROM source_working_set ws");
     expect(workerSource).toContain("FROM source_fts");
     expect(workerSource).toContain("JOIN source_chunks c ON c.id = source_fts.chunk_id");
+    expect(workerSource).toContain(
+      "LEFT JOIN source_chunks c ON c.source_id = s.id AND c.role = 'child'",
+    );
     expect(workerSource).toContain("LEFT JOIN source_metadata sm ON sm.source_id = s.id");
     expect(workerSource).toContain("full_depth_bounded");
+    expect(workerSource).toContain("parent_context_selected");
+    expect(workerSource).toContain('priority: "parent"');
+    expect(workerSource).toContain("sourceContextPackParentWindowMaxChars");
     expect(workerSource).toContain("source_context_pack_v1");
     expect(workerSource).not.toContain("CREATE TABLE IF NOT EXISTS compression_log");
 
@@ -446,6 +488,7 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("function fuseSourceRetrievalHits"),
     );
     expect(vectorRetrievalSection).not.toContain("normalized_text");
+    expect(vectorRetrievalSection).toContain("AND c.role = 'child'");
     const fusionSection = workerSource.slice(
       workerSource.indexOf("function fuseSourceRetrievalHits"),
       workerSource.indexOf("function reciprocalRankFusionScore"),
@@ -486,6 +529,7 @@ describe("local engine source-native storage foundation", () => {
     );
     expect(embeddingStageSection).toContain("EMBEDDING_MODEL_UNAVAILABLE");
     expect(embeddingStageSection).toContain("meta_head_json");
+    expect(embeddingStageSection).toContain("AND role = 'child'");
     expect(embeddingStageSection).toContain("ORDER BY ord ASC");
     expect(embeddingStageSection).toContain("loadSourceMetaEmbeddingInput(db, sourceId)");
     expect(embeddingStageSection).toContain("buildSourceMetaEmbeddingText(metaInput)");
@@ -512,16 +556,64 @@ describe("local engine source-native storage foundation", () => {
   it("defines chunk meta head Tier0 builders without changing prompt evidence output", () => {
     expect(workerSource).toContain("interface ChunkMetaHeadV1");
     expect(workerSource).toContain("const chunkMetaHeadVersion = 1");
+    expect(workerSource).toContain("type ChunkMetaTierV1");
+    expect(workerSource).toContain("type ChunkMetaSummarySourceV1");
+    expect(workerSource).toContain("interface ChunkMetaTierStateV1");
+    expect(workerSource).toContain("interface ChunkMetaSemanticRelationV1");
     expect(workerSource).toContain("function buildChunkMetaHeadJson");
     expect(workerSource).toContain("function buildChunkMetaHeadJsonFromSourceMetadata");
     expect(workerSource).toContain("function runChunkMetaStageForSource");
+    expect(workerSource).toContain("function localExtractiveChunkSummary");
+    expect(workerSource).toContain("function localExtractiveSectionSummary");
+    expect(workerSource).toContain("function buildLocalChunkMetaSemanticRelations");
+    expect(workerSource).toContain("function normalizeChunkMetaSemanticRelations");
+    expect(workerSource).toContain("function selectedChunkMetaTierState");
+    expect(workerSource).toContain("function sectionHeadingRanges");
+    expect(workerSource).toContain("function sectionPathForChunk");
+    expect(workerSource).toContain("function sectionOutlineFromJson");
+    expect(workerSource).toContain("function chunkTextRangeFromRow");
+    expect(workerSource).toContain("function chunkTextForDocument");
+    expect(workerSource).toContain("function chunkSegmentsForDocument");
+    expect(workerSource).toContain("function materializeSourceChunks");
+    expect(workerSource).toContain("function parentChunkGroupsForChildren");
+    expect(workerSource).toContain("function parentChunkRange");
+    expect(workerSource).toContain("const parentChunkOrdBase");
+    expect(workerSource).toContain("const parentChunkTextMaxChars");
+    expect(workerSource).toContain("const chunkMetaSectionSummaryMaxChars");
+    expect(workerSource).toContain("const chunkMetaChunkSummaryMaxChars");
+    expect(workerSource).toContain("const chunkMetaMaxRelations");
     expect(workerSource).toContain('tier: "tier0"');
+    expect(workerSource).toContain('selectedTier: "tier1"');
+    expect(workerSource).toContain('summarySource: "deterministic"');
+    expect(workerSource).toContain('summarySource: "local_extractive"');
+    expect(workerSource).toContain("explicit_llm_chunk_meta_not_configured");
+    expect(workerSource).toContain("selectedTier");
+    expect(workerSource).toContain("tiers");
+    expect(workerSource).toContain("semanticRelations");
+    expect(workerSource).toContain("tier2DisabledCount");
     expect(workerSource).toContain("docContext");
-    expect(workerSource).toContain("chunkSummary: null");
-    expect(workerSource).toContain("roleHint: null");
-    expect(workerSource).toContain("relations: []");
+    expect(workerSource).toContain("sectionPath: string | null");
+    expect(workerSource).toContain("sectionSummary: tier0SectionSummary");
+    expect(workerSource).toContain("chunkSummary: tier0ChunkSummary");
+    expect(workerSource).toContain("const roleHint = normalizeChunkMetaRoleHint(input.roleHint)");
+    expect(workerSource).toContain("roleHint,");
+    expect(workerSource).toContain("const relations = normalizeChunkMetaRelations");
+    expect(workerSource).toContain("relations,");
+    expect(workerSource).toContain("function parseChunkMetaRelations");
+    expect(workerSource).toContain("function normalizeChunkMetaRelations");
+    expect(workerSource).toContain("function isChunkMetaRelationKind");
+    expect(workerSource).toContain("Section: ${sectionPath}");
+    expect(workerSource).toContain("Section summary: ${sectionSummary}");
+    expect(workerSource).toContain("Role: ${roleHint}");
+    expect(workerSource).toContain(
+      "UPDATE source_chunks SET section_path = ?, meta_head_json = ? WHERE id = ?",
+    );
+    expect(workerSource).toContain(
+      "SELECT id, ord, text, char_start, char_end, role, parent_chunk_id",
+    );
     expect(workerSource).toContain("function buildChunkEmbeddingInput");
     expect(workerSource).toContain("function buildChunkMetaEmbeddingPrefix");
+    expect(workerSource).toContain('Relations: ${relationHints.join("; ")}');
 
     const evidenceWindowSection = workerSource.slice(
       workerSource.indexOf("function loadSourceEvidenceWindow"),

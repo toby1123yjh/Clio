@@ -8,12 +8,17 @@ import type {
   SourceContextPackResult,
   SourceContextPackWindow,
 } from "@/src/shared/rpc";
-import { citationValidatorErrorResult, validateCitationCoverage } from "./citation-validator";
+import {
+  buildSemanticCitationJudgeInput,
+  citationValidatorErrorResult,
+  validateCitationCoverage,
+} from "./citation-validator";
 import {
   type IClioCompactionRuntime,
   buildRequestWithProviderContext,
   estimateProviderContextTokens,
 } from "./compaction-context";
+import type { SemanticCitationJudge, SemanticCitationJudgeResult } from "./semantic-citation-judge";
 import {
   readSourceContextPackRequestOptions,
   sourceContextPackAutoBudgetDefaults,
@@ -22,6 +27,7 @@ import {
 import type {
   AgentChatRequest,
   AgentStreamEvent,
+  CitationValidationReason,
   CitationValidationResult,
   EvidenceItem,
   IAgentRuntime,
@@ -30,6 +36,7 @@ import type {
 
 export interface AgentRunHostOptions {
   runtime: IAgentRuntime;
+  semanticCitationJudge?: SemanticCitationJudge;
   compactionRuntime?: IClioCompactionRuntime;
   requestEngine: <T>(request: EngineRequest) => Promise<T>;
   emitEvent: (event: AgentStreamEvent) => void;
@@ -47,6 +54,8 @@ interface HostedAgentRun {
   providerStarted: boolean;
   citations: LocalCitation[];
   citationValidation?: CitationValidationResult;
+  citationRepairCount: number;
+  citationRepairReason?: CitationValidationReason;
   worldKnowledge: string[];
   content: string;
 }
@@ -61,12 +70,14 @@ export class AgentRunHost {
   private readonly activeRuns = new Map<string, HostedAgentRun>();
   private readonly activeManualCompactions = new Map<string, HostedManualCompactRun>();
   private readonly runtime: IAgentRuntime;
+  private readonly semanticCitationJudge?: SemanticCitationJudge;
   private readonly compactionRuntime?: IClioCompactionRuntime;
   private readonly requestEngine: AgentRunHostOptions["requestEngine"];
   private readonly emitEvent: AgentRunHostOptions["emitEvent"];
 
   constructor(options: AgentRunHostOptions) {
     this.runtime = options.runtime;
+    this.semanticCitationJudge = options.semanticCitationJudge;
     this.compactionRuntime = options.compactionRuntime;
     this.requestEngine = options.requestEngine;
     this.emitEvent = options.emitEvent;
@@ -84,6 +95,7 @@ export class AgentRunHost {
       abortController: new AbortController(),
       providerStarted: false,
       citations: [],
+      citationRepairCount: 0,
       worldKnowledge: [],
       content: "",
     };
@@ -163,24 +175,30 @@ export class AgentRunHost {
 
       run.request = preparedRequest;
       run.providerStarted = true;
-      for await (const event of this.runtime.streamChat(run.request, {
-        signal: run.abortController.signal,
-      })) {
-        if (event.type === "run_completed") {
-          const validationEvent = this.buildCitationValidationEvent(run);
-          await this.persistEvent(run, validationEvent);
-          this.emitEvent(validationEvent);
-        }
-        await this.persistEvent(run, event);
-        if (isTerminalAgentEvent(event)) {
-          terminalEventEmitted = true;
+      providerAttempts: while (!run.abortController.signal.aborted) {
+        for await (const event of this.runtime.streamChat(run.request, {
+          signal: run.abortController.signal,
+        })) {
           if (event.type === "run_completed") {
-            await this.startNextQueuedFollowUp(run);
+            const validationEvent = await this.buildCitationValidationEvent(run);
+            if (this.shouldRepairCitationValidation(run, validationEvent.validation)) {
+              await this.startCitationRepair(run, validationEvent.validation);
+              continue providerAttempts;
+            }
+            await this.persistEvent(run, validationEvent);
+            this.emitEvent(validationEvent);
+          }
+          await this.persistEvent(run, event);
+          if (isTerminalAgentEvent(event)) {
+            terminalEventEmitted = true;
+            if (event.type === "run_completed") {
+              await this.startNextQueuedFollowUp(run);
+            }
+            this.emitEvent(event);
+            return;
           }
           this.emitEvent(event);
-          return;
         }
-        this.emitEvent(event);
       }
     } catch (error) {
       if (run.abortController.signal.aborted) {
@@ -573,6 +591,7 @@ export class AgentRunHost {
       abortController: new AbortController(),
       providerStarted: false,
       citations: [],
+      citationRepairCount: 0,
       worldKnowledge: [],
       content: "",
     };
@@ -580,17 +599,42 @@ export class AgentRunHost {
     void this.pump(nextRun);
   }
 
-  private buildCitationValidationEvent(run: HostedAgentRun): AgentStreamEvent {
+  private async buildCitationValidationEvent(
+    run: HostedAgentRun,
+  ): Promise<Extract<AgentStreamEvent, { type: "citation_validation" }>> {
     const input = {
       evidence: citationEvidenceForRequest(run.request),
       citations: run.citations,
       content: run.content,
+      question: run.request.question,
+      retry:
+        run.citationRepairCount === 0
+          ? undefined
+          : {
+              attempted: true,
+              count: run.citationRepairCount,
+              exhausted: false,
+              reason: run.citationRepairReason,
+            },
     };
     try {
+      const semanticInput = buildSemanticCitationJudgeInput(input);
+      const semanticJudge =
+        semanticInput === undefined
+          ? undefined
+          : await this.evaluateSemanticCitationJudge(semanticInput, run);
+      const validation = validateCitationCoverage({
+        ...input,
+        semanticJudge,
+        semanticJudgeRequired: semanticInput !== undefined,
+      });
       return {
         type: "citation_validation",
         runId: run.request.runId,
-        validation: validateCitationCoverage(input),
+        validation:
+          run.citationRepairCount === 0 || validation.status === "valid"
+            ? validation
+            : withCitationRetryExhausted(validation, run),
       };
     } catch {
       return {
@@ -601,10 +645,78 @@ export class AgentRunHost {
     }
   }
 
+  private async evaluateSemanticCitationJudge(
+    input: NonNullable<ReturnType<typeof buildSemanticCitationJudgeInput>>,
+    run: HostedAgentRun,
+  ): Promise<SemanticCitationJudgeResult> {
+    if (this.semanticCitationJudge === undefined) {
+      return {
+        status: "unavailable",
+        checkedClaimCount: input.claims.length,
+        unsupportedClaimIds: [],
+        providerKind: "chat",
+        reason: "semantic_judge_not_configured",
+      };
+    }
+    return this.semanticCitationJudge.judge(input, { signal: run.abortController.signal });
+  }
+
+  private shouldRepairCitationValidation(
+    run: HostedAgentRun,
+    validation: CitationValidationResult,
+  ) {
+    return (
+      validation.status === "warning" &&
+      run.citationRepairCount === 0 &&
+      !run.abortController.signal.aborted &&
+      validation.memoryEvidenceCount > 0 &&
+      isRepairableCitationValidationReason(validation.reason)
+    );
+  }
+
+  private async startCitationRepair(run: HostedAgentRun, validation: CitationValidationResult) {
+    run.citationRepairCount += 1;
+    run.citationRepairReason = validation.reason;
+    const event: AgentStreamEvent = {
+      type: "citation_repair_started",
+      runId: run.request.runId,
+      reason: validation.reason,
+      attempt: run.citationRepairCount,
+      message: citationRepairStartedMessage(validation),
+    };
+    await this.persistEvent(run, event);
+    this.emitEvent(event);
+    run.request = {
+      ...run.request,
+      question: buildCitationRepairPrompt(run.request, run.content, validation),
+      createdAt: new Date().toISOString(),
+    };
+  }
+
   private async persistEvent(run: HostedAgentRun, event: AgentStreamEvent) {
     const { sessionId, assistantMessageId } = run.request;
     if (sessionId === undefined || assistantMessageId === undefined) return;
 
+    if (event.type === "citation_repair_started") {
+      run.content = "";
+      run.citations = [];
+      run.citationValidation = undefined;
+      const updatedAt = new Date().toISOString();
+      await this.requestEngine<ChatMessageRecord>({
+        kind: "updateChatMessage",
+        payload: {
+          id: assistantMessageId,
+          sessionId,
+          content: "",
+          citations: [],
+          status: "streaming",
+          clearError: true,
+          piAgentMessageJson: assistantPiAgentMessageJson("", updatedAt),
+          updatedAt,
+        },
+      });
+      return;
+    }
     if (event.type === "text_delta") {
       run.content = `${run.content}${event.delta}`;
       const updatedAt = new Date().toISOString();
@@ -740,6 +852,111 @@ function assistantPiAgentMessageJson(
     timestamp: Date.parse(at) || Date.now(),
     ...(validation === undefined ? {} : { clioCitationValidation: validation }),
   };
+}
+
+function isRepairableCitationValidationReason(reason: CitationValidationReason) {
+  return (
+    reason === "missing_memory_citation" ||
+    reason === "missing_memory_claim_citation" ||
+    reason === "invalid_citation" ||
+    reason === "unsupported_memory_claim" ||
+    reason === "insufficient_memory_evidence" ||
+    reason === "semantic_judge_unavailable" ||
+    reason === "semantic_judge_error"
+  );
+}
+
+function withCitationRetryExhausted(
+  validation: CitationValidationResult,
+  run: HostedAgentRun,
+): CitationValidationResult {
+  return {
+    ...validation,
+    retry: {
+      attempted: true,
+      count: run.citationRepairCount,
+      exhausted: validation.status === "warning",
+      reason: run.citationRepairReason,
+    },
+  };
+}
+
+function citationRepairStartedMessage(validation: CitationValidationResult) {
+  return `Repairing local citations: ${validation.reason}.`;
+}
+
+function buildCitationRepairPrompt(
+  request: AgentChatRequest,
+  previousAnswer: string,
+  validation: CitationValidationResult,
+) {
+  const evidence = citationEvidenceForRequest(request).filter(
+    (item) => item.sourceKind === "memory",
+  );
+  const claimPreviews =
+    validation.uncoveredClaims === undefined || validation.uncoveredClaims.length === 0
+      ? "none"
+      : validation.uncoveredClaims
+          .slice(0, 5)
+          .map((claim, index) => `${index + 1}. ${claim.reason}: ${claim.text}`)
+          .join("\n");
+  const semantic =
+    validation.semanticJudge === undefined
+      ? "not_run"
+      : [
+          `status=${validation.semanticJudge.status}`,
+          `checked=${validation.semanticJudge.checkedClaimCount}`,
+          `unsupported=${validation.semanticJudge.unsupportedClaimCount}`,
+          validation.semanticJudge.reason === undefined
+            ? undefined
+            : `reason=${validation.semanticJudge.reason}`,
+        ]
+          .filter((item): item is string => item !== undefined)
+          .join("; ");
+
+  return [
+    "Repair the previous answer so every factual local-knowledge claim is supported by exact citation ids.",
+    "Use only the bounded evidence blocks already attached to this request.",
+    "Do not use web search, outside knowledge, full documents, or any unlisted citation id.",
+    "If the evidence does not support a claim, remove or narrow that claim.",
+    "",
+    `Original question: ${truncatePromptText(originalQuestionForRepair(request.question), 700)}`,
+    "",
+    "Previous answer excerpt:",
+    truncatePromptText(previousAnswer, 1000) || "none",
+    "",
+    `Validation reason: ${validation.reason}`,
+    `Evidence quality: ${validation.evidenceQuality ?? "unknown"}`,
+    `Claims: total=${validation.claimCount ?? 0}, covered=${validation.coveredClaimCount ?? 0}, unresolved=${validation.uncoveredClaimCount ?? 0}`,
+    `Semantic judge: ${semantic}`,
+    "",
+    "Unresolved claim previews:",
+    claimPreviews,
+    "",
+    "Available local evidence ids:",
+    evidence.length === 0
+      ? "none"
+      : evidence
+          .slice(0, 8)
+          .map((item) => `- ${item.id} (${truncatePromptText(item.sourceTitle, 120)})`)
+          .join("\n"),
+  ].join("\n");
+}
+
+function originalQuestionForRepair(question: string) {
+  const marker = "Original question:";
+  const index = question.indexOf(marker);
+  if (index < 0) return question;
+  const rest = question.slice(index + marker.length).trim();
+  const lineEnd = rest.indexOf("\n");
+  return lineEnd < 0 ? rest : rest.slice(0, lineEnd).trim();
+}
+
+function truncatePromptText(input: string, maxChars: number) {
+  const text = input.replace(/\s+/g, " ").trim();
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 3) return text.slice(0, maxChars);
+  return `${text.slice(0, maxChars - 3).trimEnd()}...`;
 }
 
 function citationEvidenceForRequest(request: AgentChatRequest) {

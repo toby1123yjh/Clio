@@ -69,14 +69,19 @@ export function excerpt(input: string, maxLength = 220) {
   return `${compact.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
 }
 
-export function chunkText(input: string, targetTokens = 900, overlapTokens = 120): TextChunk[] {
+export function chunkText(
+  input: string,
+  targetTokens = 900,
+  overlapTokens = 120,
+  ordOffset = 0,
+): TextChunk[] {
   const normalized = normalizeText(input);
   const tokens = normalized.match(tokenPattern) ?? [];
   if (tokens.length === 0) return [];
   if (tokens.length <= targetTokens) {
     return [
       {
-        ord: 0,
+        ord: ordOffset,
         text: joinTokens(tokens),
         tokenCount: tokens.length,
         hash: hashText(normalized),
@@ -91,7 +96,7 @@ export function chunkText(input: string, targetTokens = 900, overlapTokens = 120
     if (slice.length === 0) break;
     const text = joinTokens(slice);
     chunks.push({
-      ord: chunks.length,
+      ord: ordOffset + chunks.length,
       text,
       tokenCount: slice.length,
       hash: hashText(text),

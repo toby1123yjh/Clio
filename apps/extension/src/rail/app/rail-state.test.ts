@@ -367,6 +367,113 @@ describe("rail state reducer", () => {
     });
   });
 
+  it("resets the active assistant message when citation repair starts", () => {
+    const started = reduceRailState(createInitialRailState(pageA), {
+      type: "START_AGENT_RUN",
+      content: "Use local memory",
+      now: "2026-05-21T00:00:00.000Z",
+      idSeed: "run-1",
+      scope: "general",
+    });
+    const withText = reduceRailState(started, {
+      type: "APPLY_AGENT_EVENT",
+      event: { type: "text_delta", runId: "run-1", delta: "First unsupported answer." },
+    });
+    const withCitation = reduceRailState(withText, {
+      type: "APPLY_AGENT_EVENT",
+      event: {
+        type: "citation",
+        runId: "run-1",
+        citation: {
+          id: "cite-1",
+          evidenceId: "memory:mem-1:chunk:chunk-1",
+          label: "Memory",
+          sourceKind: "memory",
+          sourceUrl: "https://example.com/memory",
+          sourceTitle: "Saved Memory",
+          excerpt: "Bounded evidence excerpt",
+        },
+      },
+    });
+    const withValidation = reduceRailState(withCitation, {
+      type: "APPLY_AGENT_EVENT",
+      event: {
+        type: "citation_validation",
+        runId: "run-1",
+        validation: {
+          status: "warning",
+          reason: "unsupported_memory_claim",
+          evidenceCount: 1,
+          memoryEvidenceCount: 1,
+          citationCount: 1,
+          validCitationCount: 1,
+          validMemoryCitationCount: 1,
+          claimCount: 1,
+          coveredClaimCount: 0,
+          uncoveredClaimCount: 1,
+        },
+      },
+    });
+    const withWorldKnowledge = reduceRailState(withValidation, {
+      type: "APPLY_AGENT_EVENT",
+      event: { type: "world_knowledge", runId: "run-1", note: "Local memory evidence loaded." },
+    });
+    const withThinking = reduceRailState(withWorldKnowledge, {
+      type: "APPLY_AGENT_EVENT",
+      event: {
+        type: "thinking_delta",
+        runId: "run-1",
+        delta: "Checking citation coverage.",
+      },
+    });
+    const withToolTrace = reduceRailState(withThinking, {
+      type: "APPLY_AGENT_EVENT",
+      event: {
+        type: "tool_trace",
+        runId: "run-1",
+        trace: {
+          toolCallId: "tool-1",
+          toolName: "search_memory",
+          status: "completed",
+          summary: "Found one memory",
+        },
+      },
+    });
+    const withStaleError = {
+      ...withToolTrace,
+      dialogueMessages: withToolTrace.dialogueMessages.map((message) =>
+        message.id === "run-1:assistant"
+          ? {
+              ...message,
+              error: { code: "PROVIDER_ERROR" as const, message: "Old provider error" },
+            }
+          : message,
+      ),
+    };
+
+    const repaired = reduceRailState(withStaleError, {
+      type: "APPLY_AGENT_EVENT",
+      event: {
+        type: "citation_repair_started",
+        runId: "run-1",
+        reason: "unsupported_memory_claim",
+        attempt: 1,
+        message: "Repairing unsupported memory citations.",
+      },
+    });
+
+    const assistant = repaired.dialogueMessages[1];
+    expect(assistant?.status).toBe("streaming");
+    expect(assistant?.content).toBe("");
+    expect(assistant?.citations).toEqual([]);
+    expect(assistant?.citationValidation).toBeUndefined();
+    expect(assistant?.error).toBeUndefined();
+    expect(assistant?.thinkingTrace).toBeUndefined();
+    expect(assistant?.toolTraces).toEqual([]);
+    expect(assistant?.worldKnowledge).toEqual(["Local memory evidence loaded."]);
+    expect(repaired.activeAgentRun?.runId).toBe("run-1");
+  });
+
   it("tracks assistant thinking and tool traces as transient message state", () => {
     const started = reduceRailState(createInitialRailState(pageA), {
       type: "START_AGENT_RUN",
