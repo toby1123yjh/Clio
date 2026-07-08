@@ -154,6 +154,54 @@ describe("content local RAG flow", () => {
     expect(compressionPanelSection).not.toContain("requestEngine");
   });
 
+  it("exposes explicit source context planner UI through content-owned pack preview", () => {
+    const contentPlannerPreviewSection = contentSource.slice(
+      contentSource.indexOf("const previewSourceContextPlanner = React.useCallback"),
+      contentSource.indexOf("const loadChatHistory = React.useCallback"),
+    );
+    const contentPlannerStartSection = contentSource.slice(
+      contentSource.indexOf("const startSourceContextPlannerResearch = React.useCallback"),
+      contentSource.indexOf("const handleSubmitDialogue = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const plannerPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function SourceContextPlannerPanel"),
+      railShellSource.indexOf("function SourceContextCompressionLogPanel"),
+    );
+    const memoryListSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryList"),
+      railShellSource.indexOf("function MemoryDetailPanel"),
+    );
+
+    expect(contentSource).toContain("React.useState<SourceContextPlannerState>");
+    expect(contentPlannerPreviewSection).toContain('kind: "buildSourceContextPack"');
+    expect(contentPlannerPreviewSection).toContain("sourceIds,");
+    expect(contentPlannerPreviewSection).toContain("useWorkingSet: false");
+    expect(contentPlannerPreviewSection).toContain("sourceContextPlanner.budget");
+    expect(contentPlannerPreviewSection).not.toContain("openAgentStream");
+    expect(contentPlannerStartSection).toContain("sourceContextPackOptionsFromPlanner");
+    expect(contentPlannerStartSection).toContain("sourceIds,");
+    expect(contentPlannerStartSection).toContain("budget: sourceContextPlanner.budget");
+    expect(contentPlannerStartSection).toContain("startAgentRun(normalizedQuestion");
+    expect(railPropsSection).toContain("sourceContextPlanner={sourceContextPlanner}");
+    expect(railPropsSection).toContain(
+      "onSelectSourceContextPlannerSource={selectSourceContextPlannerSource}",
+    );
+    expect(railPropsSection).toContain(
+      "onPreviewSourceContextPlanner={(query) => void previewSourceContextPlanner(query)}",
+    );
+    expect(plannerPanelSection).toContain('data-clio-source-context-planner="true"');
+    expect(plannerPanelSection).toContain("SourceContextPlannerBudgetInput");
+    expect(plannerPanelSection).toContain("SourceContextPlannerPreviewSummary");
+    expect(plannerPanelSection).toContain("workingSetLoadDepthLabel");
+    expect(plannerPanelSection).not.toContain("requestEngine");
+    expect(plannerPanelSection).not.toContain('kind: "getMemory"');
+    expect(memoryListSection).toContain("onSelectSourceContextPlannerSource(item.id)");
+  });
+
   it("routes Knowledge Base uploads through public file capture RPCs", () => {
     const uploadSection = contentSource.slice(
       contentSource.indexOf("const uploadKnowledgeFiles = React.useCallback"),

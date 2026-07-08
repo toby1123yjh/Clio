@@ -48,6 +48,16 @@ export function readSourceContextPackRequestOptions(
   if (value.triggerReason !== undefined && typeof value.triggerReason !== "string") {
     return undefined;
   }
+  if (
+    value.sourceIds !== undefined &&
+    (!Array.isArray(value.sourceIds) ||
+      !value.sourceIds.every((sourceId) => typeof sourceId === "string"))
+  ) {
+    return undefined;
+  }
+  if (value.useWorkingSet !== undefined && typeof value.useWorkingSet !== "boolean") {
+    return undefined;
+  }
   for (const field of numericSourceContextPackFields) {
     if (!isOptionalFiniteNumber(value[field])) return undefined;
   }
@@ -63,6 +73,8 @@ export function readSourceContextPackRequestOptions(
     mode: value.mode,
     ...(value.planner === undefined ? {} : { planner: value.planner }),
     ...(value.triggerReason === undefined ? {} : { triggerReason: value.triggerReason }),
+    ...(value.sourceIds === undefined ? {} : { sourceIds: value.sourceIds }),
+    ...(value.useWorkingSet === undefined ? {} : { useWorkingSet: value.useWorkingSet }),
     ...copyOptionalNumberFields(value, numericSourceContextPackFields),
     ...(mapReduce === undefined ? {} : { mapReduce }),
   };

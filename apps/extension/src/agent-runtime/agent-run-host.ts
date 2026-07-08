@@ -990,9 +990,11 @@ function citationEvidenceForRequest(request: AgentChatRequest) {
 function sourceContextPackPayload(request: AgentChatRequest): BuildSourceContextPackPayload {
   const options = request.sourceContextPack;
   const defaults = sourceContextPackBudgetDefaults(options);
+  const sourceIds = options?.sourceIds;
   return {
     query: request.question,
-    useWorkingSet: true,
+    ...(sourceIds === undefined ? {} : { sourceIds }),
+    useWorkingSet: options?.useWorkingSet ?? sourceIds === undefined,
     maxTotalTokens: options?.maxTotalTokens ?? defaults.maxTotalTokens,
     maxGroups: options?.maxGroups ?? defaults.maxGroups,
     maxGroupTokens: options?.maxGroupTokens ?? defaults.maxGroupTokens,

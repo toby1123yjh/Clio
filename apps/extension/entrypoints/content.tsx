@@ -126,6 +126,8 @@ import {
   type KnowledgeBaseFilterState,
   type PdfReaderPreviewState,
   RailShell,
+  type SourceContextPlannerBudget,
+  type SourceContextPlannerState,
 } from "@/src/rail/components/RailShell";
 import { SelectionMiniUi } from "@/src/rail/components/SelectionMiniUi";
 import { Toast } from "@/src/rail/components/Toast";
@@ -175,6 +177,7 @@ import {
   type RetrieveSourcesResult,
   type SearchMemoryItem,
   type SourceContextCompressionLogRecord,
+  type SourceContextPackResult,
   type TopicGraphEdge,
   type TopicPageDetail,
   type TopicPageSummary,
@@ -203,6 +206,15 @@ import { createRoot } from "react-dom/client";
 
 const commandEventName = "clio:content-command";
 const relatedSearchLimit = 12;
+const defaultSourceContextPlannerBudget = {
+  maxTotalTokens: sourceContextPackResearchBudgetDefaults.maxTotalTokens,
+  maxGroups: sourceContextPackResearchBudgetDefaults.maxGroups,
+  maxGroupTokens: sourceContextPackResearchBudgetDefaults.maxGroupTokens,
+  maxSources: sourceContextPackResearchBudgetDefaults.maxSources,
+  maxWindowsPerSource: sourceContextPackResearchBudgetDefaults.maxWindowsPerSource,
+  contextChunksBefore: sourceContextPackResearchBudgetDefaults.contextChunksBefore,
+  contextChunksAfter: sourceContextPackResearchBudgetDefaults.contextChunksAfter,
+} as const;
 const defaultSourceContextPackIntentNeedles = [
   "research",
   "paper",
@@ -742,6 +754,30 @@ function planDefaultSourceContextPack(
   };
 }
 
+function sourceContextPackOptionsFromPlanner(input: {
+  sourceIds: string[];
+  budget: SourceContextPlannerBudget;
+}): AgentChatRequest["sourceContextPack"] {
+  return {
+    mode: "research",
+    planner: "source_context_planner_v1",
+    triggerReason: "explicit_source_picker_planning",
+    sourceIds: input.sourceIds,
+    useWorkingSet: false,
+    ...input.budget,
+    mapReduce: {
+      enabled: true,
+      maxGroups: input.budget.maxGroups,
+      perGroupTokenBudget: input.budget.maxGroupTokens,
+    },
+  };
+}
+
+function sourceContextPackPreviewSummary(pack: SourceContextPackResult) {
+  const windowCount = pack.groups.reduce((total, group) => total + group.windows.length, 0);
+  return `Preview: ${pack.sources.length} source(s), ${pack.groups.length} group(s), ${windowCount} window(s), ${pack.trace.totalTokenEstimate} token(s).`;
+}
+
 function buildAttachedEvidence(
   kind: ComposerContextAttachmentKind | undefined,
   pageContext: { url: string; title: string },
@@ -943,6 +979,14 @@ function ClioContentApp() {
   const [sourceContextCompressionLogs, setSourceContextCompressionLogs] = React.useState<
     SourceContextCompressionLogRecord[]
   >([]);
+  const [sourceContextPlanner, setSourceContextPlanner] = React.useState<SourceContextPlannerState>(
+    {
+      selectedSourceIds: [],
+      budget: { ...defaultSourceContextPlannerBudget },
+      preview: null,
+      previewLoading: false,
+    },
+  );
   const [topicPages, setTopicPages] = React.useState<TopicPageSummary[]>([]);
   const [topicDetail, setTopicDetail] = React.useState<TopicPageDetail | null>(null);
   const [topicForm, setTopicForm] = React.useState<TopicPageFormState>(emptyTopicPageForm);
@@ -1316,6 +1360,99 @@ function ClioContentApp() {
       }
     },
     [showToast],
+  );
+
+  const selectSourceContextPlannerSource = React.useCallback((sourceId: string) => {
+    setSourceContextPlanner((current) => {
+      if (current.selectedSourceIds.includes(sourceId)) return current;
+      return {
+        ...current,
+        selectedSourceIds: [...current.selectedSourceIds, sourceId],
+        preview: null,
+        previewError: undefined,
+      };
+    });
+  }, []);
+
+  const removeSourceContextPlannerSource = React.useCallback((sourceId: string) => {
+    setSourceContextPlanner((current) => ({
+      ...current,
+      selectedSourceIds: current.selectedSourceIds.filter((id) => id !== sourceId),
+      preview: null,
+      previewError: undefined,
+    }));
+  }, []);
+
+  const changeSourceContextPlannerBudget = React.useCallback(
+    (budget: SourceContextPlannerBudget) => {
+      setSourceContextPlanner((current) => ({
+        ...current,
+        budget,
+        preview: null,
+        previewError: undefined,
+      }));
+    },
+    [],
+  );
+
+  const previewSourceContextPlanner = React.useCallback(
+    async (query: string) => {
+      const normalizedQuery = normalizeText(query);
+      const sourceIds = sourceContextPlanner.selectedSourceIds;
+      if (normalizedQuery.length === 0) {
+        setSourceContextPlanner((current) => ({
+          ...current,
+          preview: null,
+          previewError: "Enter a research query before previewing.",
+        }));
+        dispatch({ type: "SET_RUNTIME_STATUS", message: "Enter a research query first" });
+        return;
+      }
+      if (sourceIds.length === 0) {
+        setSourceContextPlanner((current) => ({
+          ...current,
+          preview: null,
+          previewError: "Select at least one source before previewing.",
+        }));
+        dispatch({ type: "SET_RUNTIME_STATUS", message: "Select at least one source first" });
+        return;
+      }
+      setSourceContextPlanner((current) => ({
+        ...current,
+        previewLoading: true,
+        previewError: undefined,
+      }));
+      try {
+        const pack = await requestEngine({
+          kind: "buildSourceContextPack",
+          payload: {
+            query: normalizedQuery,
+            sourceIds,
+            useWorkingSet: false,
+            ...sourceContextPlanner.budget,
+          },
+        });
+        setSourceContextPlanner((current) => ({
+          ...current,
+          preview: pack,
+          previewLoading: false,
+          previewError: undefined,
+        }));
+        dispatch({
+          type: "SET_RUNTIME_STATUS",
+          message: sourceContextPackPreviewSummary(pack),
+        });
+      } catch (error) {
+        setSourceContextPlanner((current) => ({
+          ...current,
+          preview: null,
+          previewLoading: false,
+          previewError: error instanceof Error ? error.message : "Preview failed.",
+        }));
+        showToast(errorToast(error));
+      }
+    },
+    [showToast, sourceContextPlanner.budget, sourceContextPlanner.selectedSourceIds],
   );
 
   const loadChatHistory = React.useCallback(async () => {
@@ -3472,6 +3609,36 @@ function ClioContentApp() {
     ],
   );
 
+  const startSourceContextPlannerResearch = React.useCallback(
+    (query: string) => {
+      const normalizedQuestion = normalizeText(query);
+      const sourceIds = sourceContextPlanner.selectedSourceIds;
+      if (normalizedQuestion.length === 0) {
+        setSourceContextPlanner((current) => ({
+          ...current,
+          previewError: "Enter a research query before starting.",
+        }));
+        dispatch({ type: "SET_RUNTIME_STATUS", message: "Enter a research query first" });
+        return;
+      }
+      if (sourceIds.length === 0) {
+        setSourceContextPlanner((current) => ({
+          ...current,
+          previewError: "Select at least one source before starting research.",
+        }));
+        dispatch({ type: "SET_RUNTIME_STATUS", message: "Select at least one source first" });
+        return;
+      }
+      void startAgentRun(normalizedQuestion, undefined, "general", undefined, {
+        sourceContextPack: sourceContextPackOptionsFromPlanner({
+          sourceIds,
+          budget: sourceContextPlanner.budget,
+        }),
+      });
+    },
+    [sourceContextPlanner.budget, sourceContextPlanner.selectedSourceIds, startAgentRun],
+  );
+
   const handleSubmitDialogue = React.useCallback(
     (content: string, attachment?: ComposerContextAttachmentKind) => {
       void startAgentRun(content, attachment, undefined, railState.composerSkillMode);
@@ -3852,6 +4019,7 @@ function ClioContentApp() {
         knowledgeBaseFilter={knowledgeBaseFilter}
         workingSetStatus={workingSetStatus}
         sourceContextCompressionLogs={sourceContextCompressionLogs}
+        sourceContextPlanner={sourceContextPlanner}
         topicDetail={topicDetail}
         topicForm={topicForm}
         topicFormOpen={topicFormOpen}
@@ -3927,6 +4095,11 @@ function ClioContentApp() {
         onRefreshSourceContextCompressionLogs={() =>
           void loadSourceContextCompressionLogs(railState.activeSessionId)
         }
+        onSelectSourceContextPlannerSource={selectSourceContextPlannerSource}
+        onRemoveSourceContextPlannerSource={removeSourceContextPlannerSource}
+        onSourceContextPlannerBudgetChange={changeSourceContextPlannerBudget}
+        onPreviewSourceContextPlanner={(query) => void previewSourceContextPlanner(query)}
+        onStartSourceContextPlannerResearch={startSourceContextPlannerResearch}
         onOpenTopicPage={(id) => void openTopicDetail(id)}
         onCreateTopicPage={() => void createTopicPage()}
         onCancelTopicForm={() => setTopicFormOpen(false)}

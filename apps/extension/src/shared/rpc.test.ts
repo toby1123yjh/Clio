@@ -671,6 +671,8 @@ describe("session engine RPC guards", () => {
               mode: "research",
               planner: "source_context_planner_v1",
               triggerReason: "explicit_research_command",
+              sourceIds: ["source-1", "source-2"],
+              useWorkingSet: false,
               maxTotalTokens: 10_000,
               maxGroups: 3,
               maxGroupTokens: 4_000,
@@ -738,6 +740,44 @@ describe("session engine RPC guards", () => {
             pageTitle: "Example",
             evidence: [],
             sourceContextPack: { mode: "automatic" },
+            createdAt: "2026-05-22T00:00:00.000Z",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isAgentRunRequestMessage({
+        type: CLIO_AGENT_RUN_REQUEST,
+        request: {
+          kind: "start",
+          request: {
+            runId: "run-1",
+            question: "Explain persistence",
+            scope: "general",
+            pageUrl: "https://example.com/a",
+            pageTitle: "Example",
+            evidence: [],
+            sourceContextPack: { mode: "research", sourceIds: ["source-1", 2] },
+            createdAt: "2026-05-22T00:00:00.000Z",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isAgentRunRequestMessage({
+        type: CLIO_AGENT_RUN_REQUEST,
+        request: {
+          kind: "start",
+          request: {
+            runId: "run-1",
+            question: "Explain persistence",
+            scope: "general",
+            pageUrl: "https://example.com/a",
+            pageTitle: "Example",
+            evidence: [],
+            sourceContextPack: { mode: "research", useWorkingSet: "false" },
             createdAt: "2026-05-22T00:00:00.000Z",
           },
         },

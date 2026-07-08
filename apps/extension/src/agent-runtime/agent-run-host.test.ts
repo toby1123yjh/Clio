@@ -123,6 +123,8 @@ const queuedSourceContextPack = {
   mode: "auto",
   planner: "source_context_planner_v1",
   triggerReason: "default_chat_long_context_intent",
+  sourceIds: ["source-1"],
+  useWorkingSet: false,
   maxTotalTokens: 6_000,
   maxGroups: 2,
   maxGroupTokens: 3_000,
@@ -569,6 +571,53 @@ describe("AgentRunHost", () => {
         memoryEvidenceCount: 1,
       },
     });
+  });
+
+  it("passes explicit source planner selections to the source context pack builder", async () => {
+    const calls: EngineRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
+        if (engineRequest.kind === "buildSourceContextPack") return sourceContextPack as T;
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: {
+          mode: "research",
+          sourceIds: ["source-1", "source-2"],
+          useWorkingSet: false,
+          maxTotalTokens: 8_000,
+          maxSources: 2,
+        },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(calls).toContainEqual(
+      expect.objectContaining({
+        kind: "buildSourceContextPack",
+        payload: expect.objectContaining({
+          query: "Explain persistence",
+          sourceIds: ["source-1", "source-2"],
+          useWorkingSet: false,
+          maxTotalTokens: 8_000,
+          maxSources: 2,
+        }),
+      }),
+    );
   });
 
   it("builds source context pack evidence for controlled auto runs", async () => {

@@ -120,6 +120,7 @@ import type {
   RetrieveSourceLifecycleFilter,
   SearchMemoryItem,
   SourceContextCompressionLogRecord,
+  SourceContextPackResult,
   TopicGraphEdge,
   TopicPageDetail,
   TopicPageSummary,
@@ -202,6 +203,7 @@ export interface RailShellProps {
   knowledgeBaseFilter: KnowledgeBaseFilterState;
   workingSetStatus: WorkingSetStatusResult | null;
   sourceContextCompressionLogs: SourceContextCompressionLogRecord[];
+  sourceContextPlanner: SourceContextPlannerState;
   topicPages: TopicPageSummary[];
   relatedItems: SearchMemoryItem[];
   chatSessions: ChatSessionSummary[];
@@ -281,6 +283,11 @@ export interface RailShellProps {
   onSetWorkingSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
   onReloadWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRefreshSourceContextCompressionLogs: () => void;
+  onSelectSourceContextPlannerSource: (sourceId: string) => void;
+  onRemoveSourceContextPlannerSource: (sourceId: string) => void;
+  onSourceContextPlannerBudgetChange: (budget: SourceContextPlannerBudget) => void;
+  onPreviewSourceContextPlanner: (query: string) => void;
+  onStartSourceContextPlannerResearch: (query: string) => void;
   onQueryChange: (query: string) => void;
   onRefresh: () => void;
   onRefreshProvider: () => Promise<boolean>;
@@ -375,6 +382,24 @@ export type KnowledgeBaseSourceTypeFilter = "all" | "webpage" | "markdown" | "pd
 export interface KnowledgeBaseFilterState {
   sourceType: KnowledgeBaseSourceTypeFilter;
   lifecycleStatus: "all" | RetrieveSourceLifecycleFilter;
+}
+
+export interface SourceContextPlannerBudget {
+  maxTotalTokens: number;
+  maxGroups: number;
+  maxGroupTokens: number;
+  maxSources: number;
+  maxWindowsPerSource: number;
+  contextChunksBefore: number;
+  contextChunksAfter: number;
+}
+
+export interface SourceContextPlannerState {
+  selectedSourceIds: string[];
+  budget: SourceContextPlannerBudget;
+  preview: SourceContextPackResult | null;
+  previewLoading: boolean;
+  previewError?: string;
 }
 
 const workingSetLoadDepthOptions: WorkingSetLoadDepth[] = ["meta", "outline", "chunks", "full"];
@@ -4623,6 +4648,10 @@ function KnowledgeBasePanel(props: RailShellProps) {
     () => new Set(props.workingSetStatus?.entries.map((entry) => entry.source.id) ?? []),
     [props.workingSetStatus],
   );
+  const selectedPlannerSourceIds = React.useMemo(
+    () => new Set(props.sourceContextPlanner.selectedSourceIds),
+    [props.sourceContextPlanner.selectedSourceIds],
+  );
   const updateSourceTypeFilter = React.useCallback(
     (sourceType: KnowledgeBaseSourceTypeFilter) => {
       props.onKnowledgeBaseFilterChange({
@@ -4815,6 +4844,17 @@ function KnowledgeBasePanel(props: RailShellProps) {
               onReload={props.onReloadWorkingSetSource}
               onSetDepth={props.onSetWorkingSetSourceDepth}
             />
+            <SourceContextPlannerPanel
+              disabled={props.state.loading}
+              items={props.items}
+              query={props.state.query}
+              state={props.sourceContextPlanner}
+              workingSetStatus={props.workingSetStatus}
+              onBudgetChange={props.onSourceContextPlannerBudgetChange}
+              onPreview={props.onPreviewSourceContextPlanner}
+              onRemoveSource={props.onRemoveSourceContextPlannerSource}
+              onStartResearch={props.onStartSourceContextPlannerResearch}
+            />
             <SourceContextCompressionLogPanel
               disabled={props.state.loading}
               logs={props.sourceContextCompressionLogs}
@@ -4825,9 +4865,11 @@ function KnowledgeBasePanel(props: RailShellProps) {
               highlightedId={props.state.highlightedMemoryId}
               items={props.items}
               loading={props.state.loading}
+              selectedPlannerSourceIds={selectedPlannerSourceIds}
               workingSetSourceIds={workingSetSourceIds}
               onOpenDetail={props.onOpenDetail}
               onPinWorkingSetSource={props.onPinWorkingSetSource}
+              onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
             />
           </div>
         )}
@@ -4994,6 +5036,232 @@ function KnowledgeBaseWorkingSetPanel({
   );
 }
 
+function SourceContextPlannerPanel({
+  disabled,
+  items,
+  query,
+  state,
+  workingSetStatus,
+  onBudgetChange,
+  onPreview,
+  onRemoveSource,
+  onStartResearch,
+}: {
+  disabled: boolean;
+  items: SearchMemoryItem[];
+  query: string;
+  state: SourceContextPlannerState;
+  workingSetStatus: WorkingSetStatusResult | null;
+  onBudgetChange: (budget: SourceContextPlannerBudget) => void;
+  onPreview: (query: string) => void;
+  onRemoveSource: (sourceId: string) => void;
+  onStartResearch: (query: string) => void;
+}) {
+  const selectedItems = sourceContextPlannerSelectedItems(
+    state.selectedSourceIds,
+    items,
+    workingSetStatus,
+  );
+  const normalizedQuery = query.trim();
+  const actionDisabled =
+    disabled ||
+    state.previewLoading ||
+    state.selectedSourceIds.length === 0 ||
+    normalizedQuery.length === 0;
+  return (
+    <section
+      className="rounded-lg border border-border bg-surface px-4 py-3"
+      data-clio-source-context-planner="true"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">Source planner</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Query: {normalizedQuery.length > 0 ? normalizedQuery : "empty"}
+          </p>
+        </div>
+        <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+          {state.selectedSourceIds.length}
+        </Badge>
+      </div>
+
+      {selectedItems.length === 0 ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No selected sources.</p>
+      ) : (
+        <ul className="mt-3 divide-y divide-border">
+          {selectedItems.map((item) => (
+            <li
+              className="flex min-w-0 items-start justify-between gap-2 py-3 first:pt-0 last:pb-0"
+              key={item.id}
+            >
+              <div className="min-w-0">
+                <h4 className="line-clamp-1 text-[12.5px] font-semibold leading-5">{item.title}</h4>
+                <p className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <span>{item.sourceKind}</span>
+                  <span>
+                    {item.loadDepth === undefined
+                      ? "Depth default"
+                      : workingSetLoadDepthLabel(item.loadDepth)}
+                  </span>
+                  {item.tokenEstimate === undefined ? null : (
+                    <span>{formatWorkingSetTokenCount(item.tokenEstimate)} tokens</span>
+                  )}
+                </p>
+              </div>
+              <Button
+                aria-label={`Remove ${item.title} from source planner`}
+                disabled={disabled}
+                onClick={() => onRemoveSource(item.id)}
+                size="icon"
+                title="Remove"
+                variant="ghost"
+              >
+                <X size={14} />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <SourceContextPlannerBudgetInput
+          disabled={disabled}
+          label="Total tokens"
+          min={1_000}
+          value={state.budget.maxTotalTokens}
+          onChange={(value) => onBudgetChange({ ...state.budget, maxTotalTokens: value })}
+        />
+        <SourceContextPlannerBudgetInput
+          disabled={disabled}
+          label="Groups"
+          min={1}
+          value={state.budget.maxGroups}
+          onChange={(value) => onBudgetChange({ ...state.budget, maxGroups: value })}
+        />
+        <SourceContextPlannerBudgetInput
+          disabled={disabled}
+          label="Group tokens"
+          min={500}
+          value={state.budget.maxGroupTokens}
+          onChange={(value) => onBudgetChange({ ...state.budget, maxGroupTokens: value })}
+        />
+        <SourceContextPlannerBudgetInput
+          disabled={disabled}
+          label="Sources"
+          min={1}
+          value={state.budget.maxSources}
+          onChange={(value) => onBudgetChange({ ...state.budget, maxSources: value })}
+        />
+        <SourceContextPlannerBudgetInput
+          disabled={disabled}
+          label="Windows/source"
+          min={1}
+          value={state.budget.maxWindowsPerSource}
+          onChange={(value) => onBudgetChange({ ...state.budget, maxWindowsPerSource: value })}
+        />
+        <div className="grid grid-cols-2 gap-2">
+          <SourceContextPlannerBudgetInput
+            disabled={disabled}
+            label="Before"
+            min={0}
+            value={state.budget.contextChunksBefore}
+            onChange={(value) => onBudgetChange({ ...state.budget, contextChunksBefore: value })}
+          />
+          <SourceContextPlannerBudgetInput
+            disabled={disabled}
+            label="After"
+            min={0}
+            value={state.budget.contextChunksAfter}
+            onChange={(value) => onBudgetChange({ ...state.budget, contextChunksAfter: value })}
+          />
+        </div>
+      </div>
+
+      <div className="mt-3 flex flex-wrap justify-end gap-2">
+        <Button
+          disabled={actionDisabled}
+          onClick={() => onPreview(query)}
+          size="sm"
+          variant="subtle"
+        >
+          {state.previewLoading ? (
+            <Loader2 className="animate-spin" size={14} />
+          ) : (
+            <Eye size={14} />
+          )}
+          Preview pack
+        </Button>
+        <Button
+          disabled={actionDisabled}
+          onClick={() => onStartResearch(query)}
+          size="sm"
+          variant="default"
+        >
+          <Sparkles size={14} />
+          Use for research
+        </Button>
+      </div>
+
+      {state.previewError !== undefined ? (
+        <p className="mt-3 text-[12px] text-destructive">{state.previewError}</p>
+      ) : state.preview !== null ? (
+        <SourceContextPlannerPreviewSummary pack={state.preview} />
+      ) : null}
+    </section>
+  );
+}
+
+function SourceContextPlannerBudgetInput({
+  disabled,
+  label,
+  min,
+  value,
+  onChange,
+}: {
+  disabled: boolean;
+  label: string;
+  min: number;
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  const inputId = React.useId();
+  return (
+    <label className="grid gap-1.5 text-[11px]" htmlFor={inputId}>
+      <span className="font-medium text-muted-foreground">{label}</span>
+      <Input
+        className="h-8 rounded-md border-border bg-background px-2 text-[12px]"
+        disabled={disabled}
+        id={inputId}
+        min={min}
+        onChange={(event) => {
+          const next = Number.parseInt(event.target.value, 10);
+          if (!Number.isFinite(next)) return;
+          onChange(Math.max(min, next));
+        }}
+        type="number"
+        value={value}
+      />
+    </label>
+  );
+}
+
+function SourceContextPlannerPreviewSummary({ pack }: { pack: SourceContextPackResult }) {
+  const windowCount = sourceContextPlannerPreviewWindowCount(pack);
+  return (
+    <div className="mt-3 rounded-md border border-border bg-background px-3 py-2">
+      <div className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+        <span>Sources {pack.sources.length}</span>
+        <span>Groups {pack.groups.length}</span>
+        <span>Windows {windowCount}</span>
+        <span>Tokens {formatWorkingSetTokenCount(pack.trace.totalTokenEstimate)}</span>
+      </div>
+      <p className="mt-2 line-clamp-2 text-[11px] text-muted-foreground">
+        Compression {sourceContextPlannerCompressionSummary(pack)}
+      </p>
+    </div>
+  );
+}
+
 function SourceContextCompressionLogPanel({
   disabled,
   logs,
@@ -5074,6 +5342,54 @@ function SourceContextCompressionLogPanel({
   );
 }
 
+interface SourceContextPlannerSelectedItem {
+  id: string;
+  title: string;
+  sourceKind: string;
+  loadDepth?: WorkingSetLoadDepth;
+  tokenEstimate?: number;
+}
+
+function sourceContextPlannerSelectedItems(
+  sourceIds: string[],
+  items: SearchMemoryItem[],
+  workingSetStatus: WorkingSetStatusResult | null,
+): SourceContextPlannerSelectedItem[] {
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  const workingSetEntryById = new Map(
+    (workingSetStatus?.entries ?? []).map((entry) => [entry.source.id, entry]),
+  );
+  return sourceIds.map((sourceId) => {
+    const item = itemById.get(sourceId);
+    const workingSetEntry = workingSetEntryById.get(sourceId);
+    return {
+      id: sourceId,
+      title: item?.sourceTitle ?? workingSetEntry?.source.sourceTitle ?? sourceId,
+      sourceKind: item?.sourceKind ?? workingSetEntry?.source.sourceKind ?? "source",
+      ...(workingSetEntry === undefined ? {} : { loadDepth: workingSetEntry.loadDepth }),
+      ...(workingSetEntry === undefined ? {} : { tokenEstimate: workingSetEntry.tokenEstimate }),
+    };
+  });
+}
+
+function sourceContextPlannerPreviewWindowCount(pack: SourceContextPackResult) {
+  return pack.groups.reduce((total, group) => total + group.windows.length, 0);
+}
+
+function sourceContextPlannerCompressionSummary(pack: SourceContextPackResult) {
+  if (pack.compressionLog.length === 0) return "none";
+  const reasonCounts = new Map<
+    SourceContextPackResult["compressionLog"][number]["reason"],
+    number
+  >();
+  for (const entry of pack.compressionLog) {
+    reasonCounts.set(entry.reason, (reasonCounts.get(entry.reason) ?? 0) + 1);
+  }
+  return Array.from(reasonCounts.entries())
+    .map(([reason, count]) => `${sourceContextCompressionReasonLabel(reason)} x${count}`)
+    .join(", ");
+}
+
 function formatWorkingSetTokenCount(value: number) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
 }
@@ -5082,7 +5398,7 @@ function workingSetLoadDepthLabel(depth: WorkingSetLoadDepth) {
   if (depth === "meta") return "Meta";
   if (depth === "outline") return "Outline";
   if (depth === "chunks") return "Chunks";
-  return "Full";
+  return "Full (bounded)";
 }
 
 function workingSetPinStatusLabel(status: WorkingSetStatusResult["entries"][number]["pinStatus"]) {
@@ -5737,16 +6053,20 @@ function MemoryList({
   highlightedId,
   items,
   loading,
+  selectedPlannerSourceIds,
   workingSetSourceIds,
   onOpenDetail,
   onPinWorkingSetSource,
+  onSelectSourceContextPlannerSource,
 }: {
   highlightedId?: string;
   items: SearchMemoryItem[];
   loading: boolean;
+  selectedPlannerSourceIds: ReadonlySet<string>;
   workingSetSourceIds: ReadonlySet<string>;
   onOpenDetail: (id: string) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
+  onSelectSourceContextPlannerSource: (sourceId: string) => void;
 }) {
   if (loading) {
     return (
@@ -5767,11 +6087,12 @@ function MemoryList({
     <ul className="flex flex-col gap-2">
       {items.map((item) => {
         const isInWorkingSet = workingSetSourceIds.has(item.id);
+        const isSelectedForPlanner = selectedPlannerSourceIds.has(item.id);
         return (
           <li className="relative" key={item.id}>
             <button
               className={[
-                "relative flex w-full flex-col gap-2 overflow-hidden rounded-lg border bg-surface p-3.5 pr-12 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
+                "relative flex w-full flex-col gap-2 overflow-hidden rounded-lg border bg-surface p-3.5 pr-24 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
                 highlightedId === item.id ? "border-primary/70" : "border-border",
               ].join(" ")}
               onClick={() => onOpenDetail(item.id)}
@@ -5800,6 +6121,18 @@ function MemoryList({
               <p className="line-clamp-3 pl-9 text-[12.5px] leading-5 text-muted-foreground">
                 {item.snippet || item.excerpt}
               </p>
+            </button>
+            <button
+              aria-label={`${isSelectedForPlanner ? "Already selected" : "Select"} ${item.sourceTitle} for source planner`}
+              className="absolute right-12 top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
+              disabled={loading || isSelectedForPlanner}
+              onClick={() => onSelectSourceContextPlannerSource(item.id)}
+              title={
+                isSelectedForPlanner ? "Selected for source planner" : "Select for source planner"
+              }
+              type="button"
+            >
+              {isSelectedForPlanner ? <CheckCircle2 size={14} /> : <Plus size={14} />}
             </button>
             <button
               aria-label={`${isInWorkingSet ? "Already pinned" : "Pin"} ${item.sourceTitle} to working set`}

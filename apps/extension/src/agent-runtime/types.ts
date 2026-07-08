@@ -48,6 +48,8 @@ export interface SourceContextPackRequestOptions {
   mode: SourceContextPackMode;
   planner?: SourceContextPlannerKind;
   triggerReason?: string;
+  sourceIds?: string[];
+  useWorkingSet?: boolean;
   maxTotalTokens?: number;
   maxGroups?: number;
   maxGroupTokens?: number;
