@@ -888,6 +888,11 @@ describe("local engine behavior harness", () => {
     expect(expanded.items.map((item) => item.id)).toContain(sourceId);
     expect(expanded.expansion.status).toBe("used");
     expect(expanded.expansion.terms).toContain("degradation");
+    expect(expanded.expansion.termSources).toContainEqual({
+      term: "degradation",
+      sources: ["keyword_index"],
+      sourceCount: 1,
+    });
     expect(expanded.expansion.expandedQuery).toContain("degradation");
 
     const filtered = await harness.request({
@@ -907,6 +912,65 @@ describe("local engine behavior harness", () => {
     const reindex = await harness.request({ kind: "reindex", scope: "fts" });
     expect(reindex.status).toBe("done");
     expect(harness.count("keyword_index", "term = ?", ["degradation"])).toBe(1);
+  });
+
+  it("uses source graph terms only as knowledge-base page expansion diagnostics", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceTitle: "Graph Term Expansion Study",
+        normalizedText: ragText("retrieval adapter evidence window quality", 24),
+        metadata: {
+          title: "Graph Term Expansion Study",
+          abstract: "Graph labels can help clipped queries reach bounded source evidence.",
+          source_type: "paper",
+          authors: ["Ada Lovelace"],
+          categories: ["graph retrieval"],
+          sectionOutline: [{ level: 1, text: "Retrieval Adapter Architecture" }],
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+
+    const keywordOnly = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: { query: "retriev", limit: 5, includeChunks: 1 },
+    });
+    expect(
+      keywordOnly.expansion.termSources?.some((term) => term.sources.includes("source_graph")) ??
+        false,
+    ).toBe(false);
+
+    const graph = await harness.request({
+      kind: "buildSourceGraph",
+      payload: { sourceId, mode: "deterministic" },
+    });
+    expect(graph.edgeCount).toBeGreaterThan(0);
+    expect(harness.count("graph_edges")).toBeGreaterThan(0);
+
+    const graphExpanded = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: { query: "retriev", limit: 5, includeChunks: 1 },
+    });
+    expect(graphExpanded.items.map((item) => item.id)).toContain(sourceId);
+    expect(graphExpanded.expansion.status).toBe("used");
+    expect(
+      graphExpanded.expansion.termSources?.some((term) => term.sources.includes("source_graph")) ??
+        false,
+    ).toBe(true);
+
+    await harness.request({ kind: "deleteMemory", id: sourceId });
+    expect(harness.count("graph_edges")).toBe(0);
+    const afterDelete = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: { query: "retriev", limit: 5, includeChunks: 1 },
+    });
+    expect(afterDelete.items.map((item) => item.id)).not.toContain(sourceId);
+    expect(
+      afterDelete.expansion.termSources?.some((term) => term.sources.includes("source_graph")) ??
+        false,
+    ).toBe(false);
   });
 
   it("clusters knowledge base page search results without graph or full document dependencies", async () => {

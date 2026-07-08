@@ -60,6 +60,8 @@ import {
   type JobType,
   type KnowledgeBaseClusteringOptions,
   type KnowledgeBaseEngineClusterBy,
+  type KnowledgeBaseExpansionTermSource,
+  type KnowledgeBaseExpansionTermTrace,
   type KnowledgeBaseSourceCluster,
   type ListMemoriesResult,
   type MemoryDetail,
@@ -1365,11 +1367,12 @@ export class LocalEngine {
       );
     }
 
-    const terms = findKeywordExpansionTerms(db, {
+    const expansionTerms = findKnowledgeBaseExpansionTerms(db, {
       query,
       limit: keywordIndexMaxExpansionTerms,
       filter: filters,
     });
+    const { terms } = expansionTerms;
     if (terms.length === 0) {
       return knowledgeBaseSearchResultWithClusters(
         db,
@@ -1396,6 +1399,7 @@ export class LocalEngine {
           expansion: {
             status: "skipped",
             terms,
+            termSources: expansionTerms.termSources,
             reason: "expanded_query_empty",
             originalItemCount: original.items.length,
             expandedItemCount: 0,
@@ -1423,6 +1427,7 @@ export class LocalEngine {
         expansion: {
           status: "used",
           terms,
+          termSources: expansionTerms.termSources,
           expandedQuery,
           originalItemCount: original.items.length,
           expandedItemCount: expanded.items.length,
@@ -11046,25 +11051,64 @@ function emptyFilteredRetrieveSourcesResult(
   };
 }
 
-function findKeywordExpansionTerms(
+interface KnowledgeBaseExpansionCandidate {
+  term: string;
+  source: KnowledgeBaseExpansionTermSource;
+  sourceIds: string[];
+  sourceCount: number;
+  hitCount: number;
+  score: number;
+}
+
+interface KnowledgeBaseExpansionQueryContext {
+  query: string;
+  limit: number;
+  filter: NormalizedRetrieveSourcesFilter;
+  needles: string[];
+  normalizedQuery: string | undefined;
+  likeNeedles: string[];
+}
+
+function findKnowledgeBaseExpansionTerms(
   db: SqliteDb,
   input: { query: string; limit: number; filter: NormalizedRetrieveSourcesFilter },
-) {
+): { terms: string[]; termSources: KnowledgeBaseExpansionTermTrace[] } {
   const needles = keywordTokens(input.query).filter(isUsefulKeywordToken).slice(0, 8);
   const normalizedQuery = normalizeKeywordTerm(input.query);
-  if (needles.length === 0 && normalizedQuery === undefined) return [];
+  if (needles.length === 0 && normalizedQuery === undefined) return { terms: [], termSources: [] };
   const likeNeedles =
     needles.length > 0 ? needles : normalizedQuery === undefined ? [] : [normalizedQuery];
-  if (likeNeedles.length === 0) return [];
+  if (likeNeedles.length === 0) return { terms: [], termSources: [] };
+  const context: KnowledgeBaseExpansionQueryContext = {
+    ...input,
+    needles,
+    normalizedQuery,
+    likeNeedles,
+  };
+  return mergeKnowledgeBaseExpansionCandidates(
+    [
+      ...loadKeywordExpansionTermCandidates(db, context),
+      ...loadGraphExpansionTermCandidates(db, context),
+    ],
+    input.limit,
+  );
+}
 
+function loadKeywordExpansionTermCandidates(
+  db: SqliteDb,
+  input: KnowledgeBaseExpansionQueryContext,
+): KnowledgeBaseExpansionCandidate[] {
   const sourceFilter = sourceFilterWhereClause(input.filter);
-  const likeClause = likeNeedles.map(() => "ki.normalized_term LIKE ? ESCAPE '\\'").join(" OR ");
+  const likeClause = input.likeNeedles
+    .map(() => "ki.normalized_term LIKE ? ESCAPE '\\'")
+    .join(" OR ");
   const rows = db.selectObjects(
     `SELECT
       ki.term,
       ki.normalized_term,
       COUNT(DISTINCT kis.source_id) AS source_count,
-      COALESCE(SUM(kis.hit_count), 0) AS hit_count
+      COALESCE(SUM(kis.hit_count), 0) AS hit_count,
+      GROUP_CONCAT(DISTINCT kis.source_id) AS source_ids
      FROM keyword_index ki
      JOIN keyword_index_sources kis ON kis.term = ki.term
      JOIN sources s ON s.id = kis.source_id
@@ -11075,7 +11119,7 @@ function findKeywordExpansionTerms(
      ORDER BY source_count DESC, hit_count DESC, ki.term ASC
      LIMIT ?`,
     [
-      ...likeNeedles.map((needle) => `%${escapeSqlLike(needle)}%`),
+      ...input.likeNeedles.map((needle) => `%${escapeSqlLike(needle)}%`),
       ...sourceFilter.bind,
       Math.max(input.limit * 8, 24),
     ],
@@ -11085,13 +11129,17 @@ function findKeywordExpansionTerms(
     .flatMap((row) => {
       const term = normalizeKeywordTerm(stringField(row, "term"));
       if (term === undefined) return [];
-      if (normalizedQuery !== undefined && term === normalizedQuery) return [];
+      if (input.normalizedQuery !== undefined && term === input.normalizedQuery) return [];
       return [
         {
           term,
+          source: "keyword_index" as const,
+          sourceIds: sqlGroupConcatStrings(row, "source_ids"),
+          sourceCount: numberField(row, "source_count"),
+          hitCount: numberField(row, "hit_count"),
           score: keywordExpansionScore(term, {
-            normalizedQuery,
-            needles,
+            normalizedQuery: input.normalizedQuery,
+            needles: input.needles,
             sourceCount: numberField(row, "source_count"),
             hitCount: numberField(row, "hit_count"),
           }),
@@ -11099,9 +11147,156 @@ function findKeywordExpansionTerms(
       ];
     })
     .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score || left.term.localeCompare(right.term));
+}
+
+function loadGraphExpansionTermCandidates(
+  db: SqliteDb,
+  input: KnowledgeBaseExpansionQueryContext,
+): KnowledgeBaseExpansionCandidate[] {
+  const sourceFilter = sourceFilterWhereClause(input.filter);
+  const likeClause = input.likeNeedles
+    .map(() => "(LOWER(gn.label) LIKE ? ESCAPE '\\' OR LOWER(gn.canonical_id) LIKE ? ESCAPE '\\')")
+    .join(" OR ");
+  const rows = db.selectObjects(
+    `SELECT
+      gn.label,
+      gn.canonical_id,
+      COUNT(DISTINCT ge.evidence_source_id) AS source_count,
+      COUNT(DISTINCT ge.id) AS hit_count,
+      COALESCE(SUM(ge.weight), 0) AS weight_sum,
+      GROUP_CONCAT(DISTINCT ge.evidence_source_id) AS source_ids
+     FROM graph_nodes gn
+     JOIN graph_edges ge ON ge.target_node_id = gn.id
+     JOIN sources s ON s.id = ge.evidence_source_id
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE gn.kind <> 'source'
+       AND (${likeClause})
+       AND ${sourceFilter.sql}
+     GROUP BY gn.id, gn.label, gn.canonical_id
+     ORDER BY source_count DESC, hit_count DESC, weight_sum DESC, gn.label ASC
+     LIMIT ?`,
+    [
+      ...input.likeNeedles.flatMap((needle) => {
+        const likeNeedle = `%${escapeSqlLike(needle.toLocaleLowerCase())}%`;
+        return [likeNeedle, likeNeedle];
+      }),
+      ...sourceFilter.bind,
+      Math.max(input.limit * 8, 24),
+    ],
+  );
+
+  return rows
+    .flatMap((row) => {
+      const sourceCount = numberField(row, "source_count");
+      const hitCount = numberField(row, "hit_count");
+      const weightSum = realField(row, "weight_sum");
+      return graphExpansionTermsFromRow(row).flatMap((term) => {
+        if (input.normalizedQuery !== undefined && term === input.normalizedQuery) return [];
+        const score =
+          keywordExpansionScore(term, {
+            normalizedQuery: input.normalizedQuery,
+            needles: input.needles,
+            sourceCount,
+            hitCount,
+          }) +
+          Math.min(weightSum, 8) * 0.1;
+        if (score <= 0) return [];
+        return [
+          {
+            term,
+            source: "source_graph" as const,
+            sourceIds: sqlGroupConcatStrings(row, "source_ids"),
+            sourceCount,
+            hitCount,
+            score,
+          },
+        ];
+      });
+    })
+    .sort((left, right) => right.score - left.score || left.term.localeCompare(right.term));
+}
+
+function graphExpansionTermsFromRow(row: SqlRow) {
+  const rawTerms = [
+    stringField(row, "label"),
+    stringField(row, "canonical_id").replace(/^[\p{L}\p{N}_-]+:/u, ""),
+  ];
+  const seen = new Set<string>();
+  return rawTerms.flatMap((rawTerm) => {
+    const term = normalizeKeywordTerm(rawTerm);
+    if (term === undefined || seen.has(term)) return [];
+    seen.add(term);
+    return [term];
+  });
+}
+
+function mergeKnowledgeBaseExpansionCandidates(
+  candidates: KnowledgeBaseExpansionCandidate[],
+  limit: number,
+) {
+  const byTerm = new Map<
+    string,
+    {
+      term: string;
+      score: number;
+      sources: Set<KnowledgeBaseExpansionTermSource>;
+      sourceIds: Set<string>;
+      sourceCount: number;
+    }
+  >();
+  for (const candidate of candidates) {
+    const entry =
+      byTerm.get(candidate.term) ??
+      ({
+        term: candidate.term,
+        score: 0,
+        sources: new Set<KnowledgeBaseExpansionTermSource>(),
+        sourceIds: new Set<string>(),
+        sourceCount: 0,
+      } satisfies {
+        term: string;
+        score: number;
+        sources: Set<KnowledgeBaseExpansionTermSource>;
+        sourceIds: Set<string>;
+        sourceCount: number;
+      });
+    entry.score = Math.max(entry.score, candidate.score);
+    entry.sources.add(candidate.source);
+    for (const sourceId of candidate.sourceIds) entry.sourceIds.add(sourceId);
+    entry.sourceCount = Math.max(entry.sourceCount, candidate.sourceCount);
+    byTerm.set(candidate.term, entry);
+  }
+
+  const ranked = Array.from(byTerm.values())
+    .map((entry) => {
+      const sourceCount = entry.sourceIds.size > 0 ? entry.sourceIds.size : entry.sourceCount;
+      return {
+        ...entry,
+        sourceCount,
+        score: entry.score + Math.min(sourceCount, 8) * 0.05 + (entry.sources.size > 1 ? 0.25 : 0),
+      };
+    })
+    .filter((entry) => entry.score > 0)
     .sort((left, right) => right.score - left.score || left.term.localeCompare(right.term))
-    .slice(0, input.limit)
-    .map((candidate) => candidate.term);
+    .slice(0, limit);
+
+  return {
+    terms: ranked.map((entry) => entry.term),
+    termSources: ranked.map((entry) => ({
+      term: entry.term,
+      sources: knowledgeBaseExpansionTermSources(entry.sources),
+      sourceCount: entry.sourceCount,
+    })),
+  };
+}
+
+function knowledgeBaseExpansionTermSources(sources: Set<KnowledgeBaseExpansionTermSource>) {
+  return (["keyword_index", "source_graph"] as const).filter((source) => sources.has(source));
+}
+
+function sqlGroupConcatStrings(row: SqlRow, key: string) {
+  return boundedUniqueStrings(stringField(row, key).split(","), 100);
 }
 
 function keywordExpansionScore(

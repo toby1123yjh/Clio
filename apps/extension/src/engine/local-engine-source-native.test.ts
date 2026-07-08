@@ -302,17 +302,24 @@ describe("local engine source-native storage foundation", () => {
     expect(rebuildSection).not.toContain("source_embeddings");
   });
 
-  it("exposes knowledge-base search expansion over the local keyword index", () => {
+  it("exposes knowledge-base search expansion over keyword and graph term sources", () => {
     expect(workerSource).toContain('case "searchKnowledgeBase"');
     expect(workerSource).toContain("private async searchKnowledgeBase");
     expect(workerSource).toContain("function replaceKeywordIndexForSource");
     expect(workerSource).toContain("function collectKeywordTermsForSource");
-    expect(workerSource).toContain("function findKeywordExpansionTerms");
+    expect(workerSource).toContain("function findKnowledgeBaseExpansionTerms");
+    expect(workerSource).toContain("function loadKeywordExpansionTermCandidates");
+    expect(workerSource).toContain("function loadGraphExpansionTermCandidates");
+    expect(workerSource).toContain("function mergeKnowledgeBaseExpansionCandidates");
     expect(workerSource).toContain("function mergeKnowledgeBaseSearchItems");
     expect(workerSource).toContain("JOIN keyword_index_sources kis ON kis.term = ki.term");
+    expect(workerSource).toContain("JOIN graph_edges ge ON ge.target_node_id = gn.id");
+    expect(workerSource).toContain("JOIN sources s ON s.id = ge.evidence_source_id");
     expect(workerSource).toContain("JOIN sources s ON s.id = kis.source_id");
     expect(workerSource).toContain("const original = await this.retrieveSources");
     expect(workerSource).toContain("const expanded = await this.retrieveSources");
+    expect(workerSource).toContain('source: "source_graph"');
+    expect(workerSource).toContain("termSources: expansionTerms.termSources");
     expect(workerSource).toContain("expansion: {");
   });
 
@@ -464,8 +471,16 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("private async searchKnowledgeBase"),
       workerSource.indexOf("private async getMemoryEvidenceWindows"),
     );
-    expect(searchKnowledgeBaseSection).not.toContain("graph_nodes");
-    expect(searchKnowledgeBaseSection).not.toContain("graph_edges");
+    expect(searchKnowledgeBaseSection).not.toContain("JOIN graph_nodes");
+    expect(searchKnowledgeBaseSection).not.toContain("JOIN graph_edges");
+    const graphExpansionSection = workerSource.slice(
+      workerSource.indexOf("function loadGraphExpansionTermCandidates"),
+      workerSource.indexOf("function graphExpansionTermsFromRow"),
+    );
+    expect(graphExpansionSection).toContain("FROM graph_nodes gn");
+    expect(graphExpansionSection).toContain("JOIN graph_edges ge ON ge.target_node_id = gn.id");
+    expect(graphExpansionSection).toContain("JOIN sources s ON s.id = ge.evidence_source_id");
+    expect(graphExpansionSection).toContain("sourceFilterWhereClause");
     const metaRetrievalSection = workerSource.slice(
       workerSource.indexOf("function loadMetaSourceRetrievalHits"),
       workerSource.indexOf("function loadFtsChunkRetrievalHits"),

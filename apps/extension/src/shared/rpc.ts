@@ -277,9 +277,18 @@ export interface SearchKnowledgeBasePayload {
   clustering?: KnowledgeBaseClusteringOptions;
 }
 
+export type KnowledgeBaseExpansionTermSource = "keyword_index" | "source_graph";
+
+export interface KnowledgeBaseExpansionTermTrace {
+  term: string;
+  sources: KnowledgeBaseExpansionTermSource[];
+  sourceCount: number;
+}
+
 export interface KnowledgeBaseExpansionTrace {
   status: "used" | "skipped";
   terms: string[];
+  termSources?: KnowledgeBaseExpansionTermTrace[];
   reason?: "empty_query" | "filter_no_match" | "no_terms" | "expanded_query_empty";
   expandedQuery?: string;
   originalItemCount?: number;
