@@ -119,6 +119,7 @@ import type {
   MemoryDetail,
   RetrieveSourceLifecycleFilter,
   SearchMemoryItem,
+  SourceContextCompressionLogRecord,
   TopicGraphEdge,
   TopicPageDetail,
   TopicPageSummary,
@@ -200,6 +201,7 @@ export interface RailShellProps {
   items: SearchMemoryItem[];
   knowledgeBaseFilter: KnowledgeBaseFilterState;
   workingSetStatus: WorkingSetStatusResult | null;
+  sourceContextCompressionLogs: SourceContextCompressionLogRecord[];
   topicPages: TopicPageSummary[];
   relatedItems: SearchMemoryItem[];
   chatSessions: ChatSessionSummary[];
@@ -278,6 +280,7 @@ export interface RailShellProps {
   onEvictWorkingSetSource: (sourceId: string) => void;
   onSetWorkingSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
   onReloadWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
+  onRefreshSourceContextCompressionLogs: () => void;
   onQueryChange: (query: string) => void;
   onRefresh: () => void;
   onRefreshProvider: () => Promise<boolean>;
@@ -4812,6 +4815,12 @@ function KnowledgeBasePanel(props: RailShellProps) {
               onReload={props.onReloadWorkingSetSource}
               onSetDepth={props.onSetWorkingSetSourceDepth}
             />
+            <SourceContextCompressionLogPanel
+              disabled={props.state.loading}
+              logs={props.sourceContextCompressionLogs}
+              sessionId={props.state.activeSessionId}
+              onRefresh={props.onRefreshSourceContextCompressionLogs}
+            />
             <MemoryList
               highlightedId={props.state.highlightedMemoryId}
               items={props.items}
@@ -4985,6 +4994,86 @@ function KnowledgeBaseWorkingSetPanel({
   );
 }
 
+function SourceContextCompressionLogPanel({
+  disabled,
+  logs,
+  sessionId,
+  onRefresh,
+}: {
+  disabled: boolean;
+  logs: SourceContextCompressionLogRecord[];
+  sessionId?: string;
+  onRefresh: () => void;
+}) {
+  return (
+    <section
+      className="rounded-lg border border-border bg-surface px-4 py-3"
+      data-clio-source-context-compression-log="true"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">Source context compression</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">Non-citeable context diagnostics</p>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Badge className="border-border bg-surface-subtle text-muted-foreground">
+            {logs.length}
+          </Badge>
+          <Button
+            aria-label="Refresh source context compression logs"
+            disabled={disabled || sessionId === undefined}
+            onClick={onRefresh}
+            size="icon"
+            title="Refresh"
+            variant="ghost"
+          >
+            <RefreshCw size={14} />
+          </Button>
+        </div>
+      </div>
+      {sessionId === undefined ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No active conversation.</p>
+      ) : logs.length === 0 ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No compression events yet.</p>
+      ) : (
+        <ul className="mt-3 divide-y divide-border">
+          {logs.slice(0, 6).map((log) => (
+            <li className="grid gap-2 py-3 first:pt-0 last:pb-0" key={log.id}>
+              <div className="flex min-w-0 items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <h4 className="line-clamp-1 text-[12.5px] font-semibold leading-5">
+                    {sourceContextCompressionReasonLabel(log.reason)}
+                  </h4>
+                  <p className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">
+                    {log.message}
+                  </p>
+                </div>
+                <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+                  {formatDate(log.createdAt)}
+                </Badge>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+                <span className="min-w-0 truncate">
+                  Source {sourceContextCompressionSourceLabel(log)}
+                </span>
+                <span className="min-w-0 truncate">
+                  Depth {sourceContextCompressionDepthLabel(log)}
+                </span>
+                <span className="min-w-0 truncate">
+                  Tokens {sourceContextCompressionTokenLabel(log)}
+                </span>
+                <span className="min-w-0 truncate">
+                  Lost {sourceContextLostInfoLabel(log.lostInfoTypes)}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 function formatWorkingSetTokenCount(value: number) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
 }
@@ -5000,6 +5089,59 @@ function workingSetPinStatusLabel(status: WorkingSetStatusResult["entries"][numb
   if (status === "pinned") return "Pinned";
   if (status === "evicted") return "Evicted";
   return "Auto";
+}
+
+function sourceContextCompressionReasonLabel(reason: SourceContextCompressionLogRecord["reason"]) {
+  if (reason === "query_no_hits") return "Query no hits";
+  if (reason === "source_not_found") return "Source not found";
+  if (reason === "source_over_budget") return "Source over budget";
+  if (reason === "source_downgraded") return "Source downgraded";
+  if (reason === "chunk_window_omitted") return "Chunk windows omitted";
+  if (reason === "parent_context_selected") return "Parent context selected";
+  if (reason === "full_depth_bounded") return "Full depth bounded";
+  return "Group limit reached";
+}
+
+function sourceContextCompressionSourceLabel(log: SourceContextCompressionLogRecord) {
+  const source = log.sourceId ?? "none";
+  if (log.chunkId === undefined) return source;
+  return `${source} / ${log.chunkId}`;
+}
+
+function sourceContextCompressionDepthLabel(log: SourceContextCompressionLogRecord) {
+  if (log.requestedLoadDepth === undefined && log.selectedLoadDepth === undefined) return "n/a";
+  return `${log.requestedLoadDepth ?? "n/a"} -> ${log.selectedLoadDepth ?? "n/a"}`;
+}
+
+function sourceContextCompressionTokenLabel(log: SourceContextCompressionLogRecord) {
+  const tokenEstimate = log.tokenEstimate ?? 0;
+  const omitted = log.omittedTokenEstimate ?? 0;
+  const omittedWindows = log.omittedWindowCount ?? 0;
+  if (omitted === 0 && omittedWindows === 0) {
+    return formatWorkingSetTokenCount(tokenEstimate);
+  }
+  return `${formatWorkingSetTokenCount(tokenEstimate)} / -${formatWorkingSetTokenCount(
+    omitted,
+  )} (${omittedWindows} windows)`;
+}
+
+function sourceContextLostInfoLabel(
+  lostInfoTypes: SourceContextCompressionLogRecord["lostInfoTypes"],
+) {
+  if (lostInfoTypes.length === 0) return "n/a";
+  return lostInfoTypes.map(sourceContextLostInfoTypeLabel).join(", ");
+}
+
+function sourceContextLostInfoTypeLabel(
+  value: SourceContextCompressionLogRecord["lostInfoTypes"][number],
+) {
+  if (value === "query_candidates") return "query candidates";
+  if (value === "source") return "source";
+  if (value === "load_depth") return "load depth";
+  if (value === "chunk_windows") return "chunk windows";
+  if (value === "chunk_detail") return "chunk detail";
+  if (value === "full_document") return "full document";
+  return "groups";
 }
 
 function TopicKnowledgePanel({

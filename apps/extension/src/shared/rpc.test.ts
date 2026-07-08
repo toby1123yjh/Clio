@@ -984,6 +984,108 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts source context compression log requests and rejects invalid payloads", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextCompressionLogs",
+          payload: {
+            sessionId: "session-1",
+            runId: "run-1",
+            entries: [
+              {
+                reason: "full_depth_bounded",
+                message: "Full depth was bounded to selected windows.",
+                sourceId: "source-1",
+                requestedLoadDepth: "full",
+                selectedLoadDepth: "chunks",
+                tokenEstimate: 400,
+                omittedTokenEstimate: 120,
+                omittedWindowCount: 2,
+                lostInfoTypes: ["full_document", "chunk_windows"],
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listSourceContextCompressionLogs",
+          filter: { sessionId: "session-1", runId: "run-1", sourceId: "source-1", limit: 20 },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "clearSourceContextCompressionLogs",
+          filter: { sessionId: "session-1" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextCompressionLogs",
+          payload: {
+            entries: [{ reason: "full_depth_bounded", message: "missing run/session" }],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextCompressionLogs",
+          payload: {
+            runId: "run-1",
+            entries: [{ reason: "unknown_reason", message: "bad" }],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listSourceContextCompressionLogs",
+          filter: { limit: "many" },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextCompressionLogs",
+          payload: {
+            runId: "run-1",
+            entries: [
+              {
+                reason: "chunk_window_omitted",
+                message: "bad numeric payload",
+                omittedWindowCount: Number.POSITIVE_INFINITY,
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts source retrieval requests", () => {
     expect(
       isEngineRequestMessage({

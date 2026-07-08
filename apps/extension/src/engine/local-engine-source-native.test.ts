@@ -17,7 +17,7 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 18");
+    expect(workerSource).toContain("const schemaVersion = 19");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
@@ -389,7 +389,8 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain('priority: "parent"');
     expect(workerSource).toContain("sourceContextPackParentWindowMaxChars");
     expect(workerSource).toContain("source_context_pack_v1");
-    expect(workerSource).not.toContain("CREATE TABLE IF NOT EXISTS compression_log");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_context_compression_logs");
+    expect(workerSource).toContain('case "appendSourceContextCompressionLogs"');
 
     const handlerSection = sourceSection(
       "private async buildSourceContextPack",

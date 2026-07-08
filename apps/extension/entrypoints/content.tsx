@@ -174,6 +174,7 @@ import {
   type RetrieveSourcesFilter,
   type RetrieveSourcesResult,
   type SearchMemoryItem,
+  type SourceContextCompressionLogRecord,
   type TopicGraphEdge,
   type TopicPageDetail,
   type TopicPageSummary,
@@ -939,6 +940,9 @@ function ClioContentApp() {
   const [workingSetStatus, setWorkingSetStatus] = React.useState<WorkingSetStatusResult | null>(
     null,
   );
+  const [sourceContextCompressionLogs, setSourceContextCompressionLogs] = React.useState<
+    SourceContextCompressionLogRecord[]
+  >([]);
   const [topicPages, setTopicPages] = React.useState<TopicPageSummary[]>([]);
   const [topicDetail, setTopicDetail] = React.useState<TopicPageDetail | null>(null);
   const [topicForm, setTopicForm] = React.useState<TopicPageFormState>(emptyTopicPageForm);
@@ -1196,6 +1200,22 @@ function ClioContentApp() {
     [loadWikiCompileJobEvents],
   );
 
+  const loadSourceContextCompressionLogs = React.useCallback(async (sessionId?: string) => {
+    if (sessionId === undefined) {
+      setSourceContextCompressionLogs([]);
+      return;
+    }
+    try {
+      const result = await requestEngine({
+        kind: "listSourceContextCompressionLogs",
+        filter: { sessionId, limit: 30 },
+      });
+      setSourceContextCompressionLogs(result.items);
+    } catch {
+      setSourceContextCompressionLogs([]);
+    }
+  }, []);
+
   const loadLibrary = React.useCallback(
     async (nextQuery = railState.query) => {
       dispatch({ type: "SET_LOADING", loading: true });
@@ -1371,6 +1391,7 @@ function ClioContentApp() {
                   window.setTimeout(() => attachActiveRun(session.id, nextActiveRun), 0);
                 }
                 void loadChatHistory();
+                void loadSourceContextCompressionLogs(session.id);
               })
               .catch(() => undefined);
           },
@@ -1385,7 +1406,7 @@ function ClioContentApp() {
         },
       );
     },
-    [loadChatHistory, maybeAttachReplySuggestions],
+    [loadChatHistory, loadSourceContextCompressionLogs, maybeAttachReplySuggestions],
   );
 
   const loadChatSession = React.useCallback(
@@ -1420,6 +1441,10 @@ function ClioContentApp() {
     },
     [attachActiveRun, railState.activePageContext, railState.activeSessionId, showToast],
   );
+
+  React.useEffect(() => {
+    void loadSourceContextCompressionLogs(railState.activeSessionId);
+  }, [loadSourceContextCompressionLogs, railState.activeSessionId]);
 
   const openHome = React.useCallback(async () => {
     setDetail(null);
@@ -3422,6 +3447,7 @@ function ClioContentApp() {
                   attachActiveRun(session.id, nextActiveRun);
                 }
                 void loadChatHistory();
+                void loadSourceContextCompressionLogs(session.id);
               })
               .catch(() => undefined);
           }
@@ -3436,7 +3462,14 @@ function ClioContentApp() {
         },
       });
     },
-    [attachActiveRun, loadChatHistory, maybeAttachReplySuggestions, railState, showToast],
+    [
+      attachActiveRun,
+      loadChatHistory,
+      loadSourceContextCompressionLogs,
+      maybeAttachReplySuggestions,
+      railState,
+      showToast,
+    ],
   );
 
   const handleSubmitDialogue = React.useCallback(
@@ -3499,6 +3532,7 @@ function ClioContentApp() {
       }
     }
     dispatch({ type: "CLEAR_DIALOGUE" });
+    setSourceContextCompressionLogs([]);
   }, [railState.activePageContext, railState.activeSessionId]);
 
   const handleRetryDialogue = React.useCallback(
@@ -3553,6 +3587,7 @@ function ClioContentApp() {
                   attachActiveRun(session.id, nextRun);
                 }
                 void loadChatHistory();
+                void loadSourceContextCompressionLogs(session.id);
               })
               .catch(() => undefined);
           },
@@ -3569,7 +3604,14 @@ function ClioContentApp() {
         showToast(errorToast(error));
       }
     },
-    [attachActiveRun, loadChatHistory, maybeAttachReplySuggestions, railState, showToast],
+    [
+      attachActiveRun,
+      loadChatHistory,
+      loadSourceContextCompressionLogs,
+      maybeAttachReplySuggestions,
+      railState,
+      showToast,
+    ],
   );
 
   const handleStopInterruptedDialogue = React.useCallback(
@@ -3809,6 +3851,7 @@ function ClioContentApp() {
         items={items}
         knowledgeBaseFilter={knowledgeBaseFilter}
         workingSetStatus={workingSetStatus}
+        sourceContextCompressionLogs={sourceContextCompressionLogs}
         topicDetail={topicDetail}
         topicForm={topicForm}
         topicFormOpen={topicFormOpen}
@@ -3880,6 +3923,9 @@ function ClioContentApp() {
         }
         onReloadWorkingSetSource={(sourceId, loadDepth) =>
           void reloadWorkingSetSource(sourceId, loadDepth)
+        }
+        onRefreshSourceContextCompressionLogs={() =>
+          void loadSourceContextCompressionLogs(railState.activeSessionId)
         }
         onOpenTopicPage={(id) => void openTopicDetail(id)}
         onCreateTopicPage={() => void createTopicPage()}

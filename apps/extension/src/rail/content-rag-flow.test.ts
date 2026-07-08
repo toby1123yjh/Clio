@@ -127,6 +127,33 @@ describe("content local RAG flow", () => {
     expect(memoryListSection).not.toContain('kind: "getMemory"');
   });
 
+  it("exposes source context compression logs as non-citeable Rail diagnostics", () => {
+    const contentCompressionSection = contentSource.slice(
+      contentSource.indexOf("const loadSourceContextCompressionLogs = React.useCallback"),
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const compressionPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function SourceContextCompressionLogPanel"),
+      railShellSource.indexOf("function formatWorkingSetTokenCount"),
+    );
+
+    expect(contentCompressionSection).toContain('kind: "listSourceContextCompressionLogs"');
+    expect(contentCompressionSection).toContain("filter: { sessionId, limit: 30 }");
+    expect(railPropsSection).toContain(
+      "sourceContextCompressionLogs={sourceContextCompressionLogs}",
+    );
+    expect(railPropsSection).toContain("onRefreshSourceContextCompressionLogs=");
+    expect(compressionPanelSection).toContain('data-clio-source-context-compression-log="true"');
+    expect(compressionPanelSection).toContain("Non-citeable context diagnostics");
+    expect(compressionPanelSection).toContain("log.reason");
+    expect(compressionPanelSection).toContain("log.lostInfoTypes");
+    expect(compressionPanelSection).not.toContain("requestEngine");
+  });
+
   it("routes Knowledge Base uploads through public file capture RPCs", () => {
     const uploadSection = contentSource.slice(
       contentSource.indexOf("const uploadKnowledgeFiles = React.useCallback"),

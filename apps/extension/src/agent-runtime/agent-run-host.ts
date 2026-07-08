@@ -345,6 +345,7 @@ export class AgentRunHost {
         kind: "buildSourceContextPack",
         payload: sourceContextPackPayload(run.request),
       });
+      await this.persistSourceContextCompressionLogs(run, pack);
       const packEvidence = sourceContextPackToEvidence(pack);
       if (packEvidence.length === 0) {
         this.emitEvent({
@@ -379,6 +380,29 @@ export class AgentRunHost {
         message: "Source context unavailable; continuing without it.",
       });
       return run.request;
+    }
+  }
+
+  private async persistSourceContextCompressionLogs(
+    run: HostedAgentRun,
+    pack: SourceContextPackResult,
+  ) {
+    if (pack.compressionLog.length === 0) return;
+    try {
+      await this.requestEngine({
+        kind: "appendSourceContextCompressionLogs",
+        payload: {
+          ...(run.request.sessionId === undefined ? {} : { sessionId: run.request.sessionId }),
+          runId: run.request.runId,
+          entries: pack.compressionLog,
+        },
+      });
+    } catch {
+      this.emitEvent({
+        type: "runtime_status",
+        runId: run.request.runId,
+        message: "Source context compression log was not saved.",
+      });
     }
   }
 

@@ -9,6 +9,7 @@ import {
   type AnchorInfo,
   type AnchorResolveResult,
   type AppendSessionEvidencePayload,
+  type AppendSourceContextCompressionLogsPayload,
   type BuildSourceContextPackPayload,
   type BuildSourceGraphPayload,
   type BuildSourceGraphResult,
@@ -78,6 +79,9 @@ import {
   type SessionEvidenceRecord,
   type SessionLeaseResult,
   type SourceContextCompressionLogEntry,
+  type SourceContextCompressionLogFilter,
+  type SourceContextCompressionLogRecord,
+  type SourceContextLostInfoType,
   type SourceContextPackGroup,
   type SourceContextPackOutlineItem,
   type SourceContextPackResult,
@@ -304,7 +308,7 @@ export interface LocalEngineOptions {
 
 const databasePath = "/clio-browser-phase1.sqlite3";
 const pdfRawFileDirectoryName = "clio-pdf-raw-files";
-const schemaVersion = 18;
+const schemaVersion = 19;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -752,6 +756,12 @@ export class LocalEngine {
         return await this.getMemoryEvidenceWindows(request.payload);
       case "buildSourceContextPack":
         return await this.buildSourceContextPack(request.payload);
+      case "appendSourceContextCompressionLogs":
+        return await this.appendSourceContextCompressionLogs(request.payload);
+      case "listSourceContextCompressionLogs":
+        return await this.listSourceContextCompressionLogs(request.filter);
+      case "clearSourceContextCompressionLogs":
+        return await this.clearSourceContextCompressionLogs(request.filter);
       case "deleteMemory":
         return await this.delete(request.id);
       case "listTopicPages":
@@ -1661,6 +1671,101 @@ export class LocalEngine {
     return buildSourceContextPack(db, payload);
   }
 
+  private async appendSourceContextCompressionLogs(
+    payload: AppendSourceContextCompressionLogsPayload,
+  ): Promise<{ items: SourceContextCompressionLogRecord[] }> {
+    if (payload.entries.length === 0) return { items: [] };
+    const db = await this.ensureReady();
+    if (payload.sessionId !== undefined) {
+      const session = db.selectObject("SELECT id FROM sessions WHERE id = ? LIMIT 1", [
+        payload.sessionId,
+      ]);
+      if (session === undefined) {
+        throw new EngineRpcError(
+          "SESSION_NOT_FOUND",
+          `Chat session not found: ${payload.sessionId}`,
+        );
+      }
+    }
+
+    const createdAt = payload.createdAt ?? new Date().toISOString();
+    const ids = payload.entries.map(() => createId("sctx_cmp"));
+    transaction(db, () => {
+      payload.entries.forEach((entry, index) => {
+        db.exec({
+          sql: `INSERT INTO source_context_compression_logs (
+            id,
+            session_id,
+            run_id,
+            source_id,
+            chunk_id,
+            reason,
+            message,
+            requested_load_depth,
+            selected_load_depth,
+            token_estimate,
+            omitted_token_estimate,
+            omitted_window_count,
+            lost_info_types_json,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          bind: [
+            ids[index],
+            payload.sessionId ?? null,
+            payload.runId ?? null,
+            entry.sourceId ?? null,
+            entry.chunkId ?? null,
+            entry.reason,
+            entry.message,
+            entry.requestedLoadDepth ?? null,
+            entry.selectedLoadDepth ?? null,
+            finiteNumberOrNull(entry.tokenEstimate),
+            finiteNumberOrNull(entry.omittedTokenEstimate),
+            finiteNumberOrNull(entry.omittedWindowCount),
+            JSON.stringify(sourceContextLostInfoTypesForEntry(entry)),
+            createdAt,
+          ],
+        });
+      });
+    });
+
+    const rows = ids.flatMap((id) => {
+      const row = db.selectObject("SELECT * FROM source_context_compression_logs WHERE id = ?", [
+        id,
+      ]);
+      return row === undefined ? [] : [row];
+    });
+    return { items: rows.map(sourceContextCompressionLogRecordFromRow) };
+  }
+
+  private async listSourceContextCompressionLogs(
+    filter: SourceContextCompressionLogFilter = {},
+  ): Promise<{ items: SourceContextCompressionLogRecord[] }> {
+    const db = await this.ensureReady();
+    const where = sourceContextCompressionLogWhereClause(filter);
+    const rows = db.selectObjects(
+      `SELECT *
+       FROM source_context_compression_logs
+       ${where.sql}
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+      [...where.bind, clampOptionalLimit(filter.limit, 30, 100)],
+    );
+    return { items: rows.map(sourceContextCompressionLogRecordFromRow) };
+  }
+
+  private async clearSourceContextCompressionLogs(
+    filter: SourceContextCompressionLogFilter = {},
+  ): Promise<{ cleared: number }> {
+    const db = await this.ensureReady();
+    const where = sourceContextCompressionLogWhereClause(filter);
+    db.exec({
+      sql: `DELETE FROM source_context_compression_logs ${where.sql}`,
+      bind: where.bind,
+    });
+    return { cleared: Number(db.selectValue("SELECT changes()") ?? 0) };
+  }
+
   private async pinWorkingSetSource(
     sourceId: string,
     loadDepth: WorkingSetLoadDepth = "meta",
@@ -1758,6 +1863,10 @@ export class LocalEngine {
       db.exec({ sql: "DELETE FROM anchors WHERE memory_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM topic_graph_edges WHERE memory_id = ?", bind: [id] });
       deleteGraphForSource(db, id);
+      db.exec({
+        sql: "DELETE FROM source_context_compression_logs WHERE source_id = ?",
+        bind: [id],
+      });
       db.exec({ sql: "DELETE FROM source_embeddings WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_working_set WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_metadata_fts WHERE source_id = ?", bind: [id] });
@@ -3050,6 +3159,7 @@ export class LocalEngine {
       db.exec("DELETE FROM source_lifecycle_events");
       db.exec("DELETE FROM graph_edges");
       db.exec("DELETE FROM graph_nodes");
+      db.exec("DELETE FROM source_context_compression_logs");
       db.exec("DELETE FROM source_working_set");
       db.exec("DELETE FROM source_metadata");
       db.exec("DELETE FROM keyword_index_sources");
@@ -3594,6 +3704,39 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS source_context_compression_logs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      run_id TEXT,
+      source_id TEXT,
+      chunk_id TEXT,
+      reason TEXT NOT NULL CHECK (
+        reason IN (
+          'query_no_hits',
+          'source_not_found',
+          'source_over_budget',
+          'source_downgraded',
+          'chunk_window_omitted',
+          'parent_context_selected',
+          'full_depth_bounded',
+          'group_limit_reached'
+        )
+      ),
+      message TEXT NOT NULL,
+      requested_load_depth TEXT CHECK (
+        requested_load_depth IS NULL OR requested_load_depth IN ('meta', 'outline', 'chunks', 'full')
+      ),
+      selected_load_depth TEXT CHECK (
+        selected_load_depth IS NULL OR selected_load_depth IN ('meta', 'outline', 'chunks', 'full')
+      ),
+      token_estimate INTEGER,
+      omitted_token_estimate INTEGER,
+      omitted_window_count INTEGER,
+      lost_info_types_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS web_search_history (
       id TEXT PRIMARY KEY,
       query TEXT NOT NULL,
@@ -3768,6 +3911,18 @@ function migrate(db: SqliteDb) {
   );
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_compactions_previous ON compactions(previous_compaction_id)",
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_compression_logs_session_created
+     ON source_context_compression_logs(session_id, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_compression_logs_run_created
+     ON source_context_compression_logs(run_id, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_compression_logs_source_created
+     ON source_context_compression_logs(source_id, created_at DESC)`,
   );
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_web_search_history_created ON web_search_history(created_at DESC)",
@@ -9334,6 +9489,94 @@ function estimateWorkingSetTokens(
   return metaTokens + Math.min(chunkTokens, 16_000);
 }
 
+function sourceContextCompressionLogWhereClause(
+  filter: SourceContextCompressionLogFilter,
+): SqlWhereClause {
+  const conditions: string[] = [];
+  const bind: unknown[] = [];
+  if (filter.sessionId !== undefined) {
+    conditions.push("session_id = ?");
+    bind.push(filter.sessionId);
+  }
+  if (filter.runId !== undefined) {
+    conditions.push("run_id = ?");
+    bind.push(filter.runId);
+  }
+  if (filter.sourceId !== undefined) {
+    conditions.push("source_id = ?");
+    bind.push(filter.sourceId);
+  }
+  return {
+    sql: conditions.length === 0 ? "" : `WHERE ${conditions.join(" AND ")}`,
+    bind,
+  };
+}
+
+function sourceContextLostInfoTypesForEntry(
+  entry: SourceContextCompressionLogEntry,
+): SourceContextLostInfoType[] {
+  const explicit = normalizeSourceContextLostInfoTypes(entry.lostInfoTypes ?? []);
+  if (explicit.length > 0) return explicit;
+  return sourceContextLostInfoTypesForReason(entry.reason);
+}
+
+function parseSourceContextLostInfoTypes(
+  input: string,
+  reason: SourceContextCompressionLogEntry["reason"],
+): SourceContextLostInfoType[] {
+  const parsed = normalizeSourceContextLostInfoTypes(parseStringArray(input));
+  return parsed.length === 0 ? sourceContextLostInfoTypesForReason(reason) : parsed;
+}
+
+function normalizeSourceContextLostInfoTypes(
+  input: readonly string[],
+): SourceContextLostInfoType[] {
+  const output: SourceContextLostInfoType[] = [];
+  for (const value of input) {
+    const normalized = sourceContextLostInfoTypeFromString(value);
+    if (normalized === undefined || output.includes(normalized)) continue;
+    output.push(normalized);
+  }
+  return output;
+}
+
+function sourceContextLostInfoTypesForReason(
+  reason: SourceContextCompressionLogEntry["reason"],
+): SourceContextLostInfoType[] {
+  switch (reason) {
+    case "query_no_hits":
+      return ["query_candidates"];
+    case "source_not_found":
+    case "source_over_budget":
+      return ["source"];
+    case "source_downgraded":
+      return ["load_depth"];
+    case "chunk_window_omitted":
+      return ["chunk_windows"];
+    case "parent_context_selected":
+      return ["chunk_detail"];
+    case "full_depth_bounded":
+      return ["full_document", "chunk_windows"];
+    case "group_limit_reached":
+      return ["groups"];
+  }
+}
+
+function sourceContextLostInfoTypeFromString(value: string): SourceContextLostInfoType | undefined {
+  if (
+    value === "query_candidates" ||
+    value === "source" ||
+    value === "load_depth" ||
+    value === "chunk_windows" ||
+    value === "chunk_detail" ||
+    value === "full_document" ||
+    value === "groups"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
 function buildSourceContextPack(
   db: SqliteDb,
   payload: BuildSourceContextPackPayload,
@@ -11588,6 +11831,37 @@ function compactionRecordFromRow(row: SqlRow): CompactionRecord {
   };
 }
 
+function sourceContextCompressionLogRecordFromRow(row: SqlRow): SourceContextCompressionLogRecord {
+  const sessionId = optionalString(row, "session_id");
+  const runId = optionalString(row, "run_id");
+  const sourceId = optionalString(row, "source_id");
+  const chunkId = optionalString(row, "chunk_id");
+  const requestedLoadDepth = optionalWorkingSetLoadDepth(row, "requested_load_depth");
+  const selectedLoadDepth = optionalWorkingSetLoadDepth(row, "selected_load_depth");
+  const tokenEstimate = optionalNumber(row, "token_estimate");
+  const omittedTokenEstimate = optionalNumber(row, "omitted_token_estimate");
+  const omittedWindowCount = optionalNumber(row, "omitted_window_count");
+  return {
+    id: stringField(row, "id"),
+    ...(sessionId === undefined ? {} : { sessionId }),
+    ...(runId === undefined ? {} : { runId }),
+    reason: sourceContextCompressionReasonField(row, "reason"),
+    message: stringField(row, "message"),
+    ...(sourceId === undefined ? {} : { sourceId }),
+    ...(chunkId === undefined ? {} : { chunkId }),
+    ...(requestedLoadDepth === undefined ? {} : { requestedLoadDepth }),
+    ...(selectedLoadDepth === undefined ? {} : { selectedLoadDepth }),
+    ...(tokenEstimate === undefined ? {} : { tokenEstimate }),
+    ...(omittedTokenEstimate === undefined ? {} : { omittedTokenEstimate }),
+    ...(omittedWindowCount === undefined ? {} : { omittedWindowCount }),
+    lostInfoTypes: parseSourceContextLostInfoTypes(
+      stringField(row, "lost_info_types_json"),
+      sourceContextCompressionReasonField(row, "reason"),
+    ),
+    createdAt: stringField(row, "created_at"),
+  };
+}
+
 function chatMessageRecordFromRow(row: SqlRow): ChatMessageRecord {
   const pageUrl = optionalString(row, "page_url");
   const pageTitle = optionalString(row, "page_title");
@@ -11921,6 +12195,14 @@ function workingSetLoadDepthField(row: SqlRow, key: string): WorkingSetLoadDepth
   return "meta";
 }
 
+function optionalWorkingSetLoadDepth(row: SqlRow, key: string): WorkingSetLoadDepth | undefined {
+  const value = optionalString(row, key);
+  if (value === undefined) return undefined;
+  if (value === "outline" || value === "chunks" || value === "full") return value;
+  if (value === "meta") return value;
+  return undefined;
+}
+
 function workingSetPinStatusField(
   row: SqlRow,
   key: string,
@@ -12000,10 +12282,41 @@ function chatMessageStatusField(row: SqlRow, key: string): ChatMessageStatus {
   return "queued";
 }
 
+function sourceContextCompressionReasonField(
+  row: SqlRow,
+  key: string,
+): SourceContextCompressionLogEntry["reason"] {
+  const value = stringField(row, key);
+  if (
+    value === "query_no_hits" ||
+    value === "source_not_found" ||
+    value === "source_over_budget" ||
+    value === "source_downgraded" ||
+    value === "chunk_window_omitted" ||
+    value === "parent_context_selected" ||
+    value === "full_depth_bounded" ||
+    value === "group_limit_reached"
+  ) {
+    return value;
+  }
+  return "chunk_window_omitted";
+}
+
 function agentScopeField(row: SqlRow, key: string): ChatMessageRecord["scope"] {
   const value = stringField(row, key);
   if (value === "general" || value === "selection") return value;
   return "current-page";
+}
+
+function optionalNumber(row: SqlRow, key: string) {
+  const value = row[key];
+  if (value === null || value === undefined) return undefined;
+  const parsed = numberField(row, key);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function finiteNumberOrNull(value: number | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : null;
 }
 
 function clampLimit(limit: number, max: number) {

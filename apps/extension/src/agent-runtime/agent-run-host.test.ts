@@ -538,6 +538,16 @@ describe("AgentRunHost", () => {
         }),
       }),
     );
+    expect(calls).toContainEqual(
+      expect.objectContaining({
+        kind: "appendSourceContextCompressionLogs",
+        payload: {
+          sessionId: "session-1",
+          runId: "run-1",
+          entries: sourceContextPack.compressionLog,
+        },
+      }),
+    );
     expect(providerRequests[0]?.evidence).toEqual([
       expect.objectContaining({
         id: "memory:source-1:chunk:chunk-1",
@@ -684,6 +694,7 @@ describe("AgentRunHost", () => {
   });
 
   it("continues research runs when the source context pack is empty", async () => {
+    const calls: EngineRequest[] = [];
     const providerRequests: AgentChatRequest[] = [];
     const emitted: AgentStreamEvent[] = [];
     const host = new AgentRunHost({
@@ -694,6 +705,7 @@ describe("AgentRunHost", () => {
         },
       },
       requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
         if (engineRequest.kind === "buildSourceContextPack") return emptySourceContextPack as T;
         if (engineRequest.kind === "loadChatSession") return null as T;
         return {} as T;
@@ -717,9 +729,13 @@ describe("AgentRunHost", () => {
         message: "No source context found; continuing without it.",
       }),
     );
+    expect(
+      calls.some((engineRequest) => engineRequest.kind === "appendSourceContextCompressionLogs"),
+    ).toBe(false);
   });
 
   it("continues research runs when source context pack loading fails", async () => {
+    const calls: EngineRequest[] = [];
     const providerRequests: AgentChatRequest[] = [];
     const emitted: AgentStreamEvent[] = [];
     const host = new AgentRunHost({
@@ -730,6 +746,7 @@ describe("AgentRunHost", () => {
         },
       },
       requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
         if (engineRequest.kind === "buildSourceContextPack") {
           throw new Error("engine unavailable");
         }
@@ -755,6 +772,9 @@ describe("AgentRunHost", () => {
         message: "Source context unavailable; continuing without it.",
       }),
     );
+    expect(
+      calls.some((engineRequest) => engineRequest.kind === "appendSourceContextCompressionLogs"),
+    ).toBe(false);
   });
 
   it("marks missing active runs as interrupted when subscribe cannot reattach", async () => {

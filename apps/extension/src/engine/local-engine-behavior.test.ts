@@ -1060,6 +1060,14 @@ describe("local engine behavior harness", () => {
       payload: selectionPayload({ normalizedText: ragText("cleanup derived rows", 10) }),
     });
     const sourceId = capture.memory.id;
+    const compressionSession = await harness.request({
+      kind: "createChatSession",
+      payload: {
+        id: "session-cleanup-compression",
+        title: "Cleanup compression logs",
+        createdAt: "2026-07-07T00:00:00.000Z",
+      },
+    });
     const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
     await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
 
@@ -1074,7 +1082,23 @@ describe("local engine behavior harness", () => {
       kind: "pinWorkingSetSource",
       payload: { sourceId, loadDepth: "chunks" },
     });
+    await harness.request({
+      kind: "appendSourceContextCompressionLogs",
+      payload: {
+        sessionId: compressionSession.id,
+        runId: "run-cleanup-delete",
+        entries: [
+          {
+            reason: "chunk_window_omitted",
+            message: "Cleanup test compression log.",
+            sourceId,
+            omittedWindowCount: 1,
+          },
+        ],
+      },
+    });
     expect(harness.count("source_working_set", "source_id = ?", [sourceId])).toBe(1);
+    expect(harness.count("source_context_compression_logs", "source_id = ?", [sourceId])).toBe(1);
 
     const deleted = await harness.request({ kind: "deleteMemory", id: sourceId });
     expect(deleted.deleted).toBe(true);
@@ -1084,6 +1108,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("keyword_index_sources", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_embeddings", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_working_set", "source_id = ?", [sourceId])).toBe(0);
+    expect(harness.count("source_context_compression_logs", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_metadata", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("anchors", "memory_id = ?", [sourceId])).toBe(0);
 
@@ -1104,8 +1129,23 @@ describe("local engine behavior harness", () => {
       kind: "pinWorkingSetSource",
       payload: { sourceId: resetSource.memory.id, loadDepth: "meta" },
     });
+    await harness.request({
+      kind: "appendSourceContextCompressionLogs",
+      payload: {
+        sessionId: compressionSession.id,
+        runId: "run-cleanup-reset",
+        entries: [
+          {
+            reason: "full_depth_bounded",
+            message: "Reset test compression log.",
+            sourceId: resetSource.memory.id,
+          },
+        ],
+      },
+    });
     expect(harness.count("sources", "lifecycle_status <> 'deleted'")).toBe(1);
     expect(harness.count("source_working_set")).toBe(1);
+    expect(harness.count("source_context_compression_logs")).toBe(1);
 
     const reset = await harness.request({ kind: "repair", action: "reset_library" });
     expect(reset.action).toBe("reset_library");
@@ -1117,6 +1157,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("keyword_index_sources")).toBe(0);
     expect(harness.count("source_embeddings")).toBe(0);
     expect(harness.count("source_working_set")).toBe(0);
+    expect(harness.count("source_context_compression_logs")).toBe(0);
     expect(harness.count("source_metadata")).toBe(0);
     expect(harness.count("anchors")).toBe(0);
     expect(harness.count("jobs")).toBe(0);
@@ -1384,6 +1425,140 @@ describe("local engine behavior harness", () => {
     expect(fullSource?.windowCount).toBeLessThanOrEqual(1);
     expect(pack.groups.flatMap((group) => group.windows).length).toBeLessThanOrEqual(1);
     expect(pack.compressionLog.map((entry) => entry.reason)).toContain("full_depth_bounded");
+  });
+
+  it("persists source context compression logs by session and run", async () => {
+    const harness = createHarness();
+    const session = await harness.request({
+      kind: "createChatSession",
+      payload: {
+        id: "session-source-context-compression",
+        title: "Source context compression",
+        initialScope: "general",
+        createdAt: "2026-07-07T00:00:00.000Z",
+      },
+    });
+    const sourceText = [
+      "# Compression Source",
+      "Parent context should summarize bounded source windows.",
+      "## Evidence",
+      ragText("compression budget parent full depth evidence", 900),
+    ].join("\n");
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/source-context-compression",
+        sourceTitle: "Source Context Compression",
+        normalizedText: sourceText,
+        metadata: {
+          title: "Source Context Compression",
+          abstract: "Compression logs should be inspectable.",
+          source_type: "paper",
+        },
+      }),
+    });
+    const sourceId = capture.memory.id;
+    const firstChunk = harness.selectObject(
+      "SELECT id FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
+      [sourceId],
+    );
+    const parentPack = await harness.request({
+      kind: "buildSourceContextPack",
+      payload: {
+        sourceIds: [sourceId],
+        anchors: [{ memoryId: sourceId, chunkId: String(firstChunk?.id ?? "") }],
+        useWorkingSet: false,
+        maxTotalTokens: 3_000,
+        maxGroupTokens: 2_500,
+        maxWindowsPerSource: 2,
+      },
+    });
+    const tightPack = await harness.request({
+      kind: "buildSourceContextPack",
+      payload: {
+        sourceIds: [sourceId],
+        useWorkingSet: false,
+        maxTotalTokens: 80,
+        maxGroupTokens: 80,
+        maxWindowsPerSource: 3,
+      },
+    });
+    await harness.request({
+      kind: "pinWorkingSetSource",
+      payload: { sourceId, loadDepth: "full" },
+    });
+    const fullPack = await harness.request({
+      kind: "buildSourceContextPack",
+      payload: {
+        useWorkingSet: true,
+        maxWindowsPerSource: 1,
+        maxTotalTokens: 3_000,
+        maxGroupTokens: 1_500,
+      },
+    });
+
+    const appended = await harness.request({
+      kind: "appendSourceContextCompressionLogs",
+      payload: {
+        sessionId: session.id,
+        runId: "run-source-context-compression",
+        entries: [
+          ...parentPack.compressionLog,
+          ...tightPack.compressionLog,
+          ...fullPack.compressionLog,
+        ],
+        createdAt: "2026-07-07T00:00:01.000Z",
+      },
+    });
+    expect(appended.items.length).toBeGreaterThan(0);
+
+    const listed = await harness.request({
+      kind: "listSourceContextCompressionLogs",
+      filter: { sessionId: session.id, runId: "run-source-context-compression", limit: 20 },
+    });
+    const reasons = listed.items.map((entry) => entry.reason);
+    expect(reasons).toEqual(
+      expect.arrayContaining([
+        "parent_context_selected",
+        "chunk_window_omitted",
+        "full_depth_bounded",
+      ]),
+    );
+    expect(
+      listed.items.find((entry) => entry.reason === "full_depth_bounded")?.lostInfoTypes,
+    ).toEqual(expect.arrayContaining(["full_document", "chunk_windows"]));
+    expect(
+      listed.items.find((entry) => entry.reason === "parent_context_selected")?.lostInfoTypes,
+    ).toEqual(["chunk_detail"]);
+
+    await harness.request({ kind: "deleteMemory", id: sourceId });
+    expect(harness.count("source_context_compression_logs", "source_id = ?", [sourceId])).toBe(0);
+    const afterDelete = await harness.request({
+      kind: "buildSourceContextPack",
+      payload: { sourceIds: [sourceId], useWorkingSet: false },
+    });
+    await harness.request({
+      kind: "appendSourceContextCompressionLogs",
+      payload: {
+        sessionId: session.id,
+        runId: "run-source-context-missing",
+        entries: afterDelete.compressionLog,
+      },
+    });
+    const missingSource = await harness.request({
+      kind: "listSourceContextCompressionLogs",
+      filter: { sessionId: session.id, runId: "run-source-context-missing" },
+    });
+    expect(missingSource.items.map((entry) => entry.reason)).toContain("source_not_found");
+
+    const cleared = await harness.request({
+      kind: "clearSourceContextCompressionLogs",
+      filter: { sessionId: session.id },
+    });
+    expect(cleared.cleared).toBeGreaterThan(0);
+    expect(harness.count("source_context_compression_logs", "session_id = ?", [session.id])).toBe(
+      0,
+    );
   });
 
   it("returns recent sources and truthful skipped traces for empty query", async () => {
