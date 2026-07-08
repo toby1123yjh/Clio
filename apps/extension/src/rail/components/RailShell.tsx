@@ -118,6 +118,7 @@ import type {
   ImageGenerationHistoryRecord,
   MemoryDetail,
   RetrieveSourceLifecycleFilter,
+  RetrieveSourcesFilter,
   SearchMemoryItem,
   SourceContextCompressionLogRecord,
   SourceContextPackResult,
@@ -201,6 +202,7 @@ export interface RailShellProps {
   health: EngineHealth | null;
   items: SearchMemoryItem[];
   knowledgeBaseFilter: KnowledgeBaseFilterState;
+  knowledgeBaseRetrieveFilter?: RetrieveSourcesFilter;
   workingSetStatus: WorkingSetStatusResult | null;
   sourceContextCompressionLogs: SourceContextCompressionLogRecord[];
   sourceContextPlanner: SourceContextPlannerState;
@@ -382,6 +384,113 @@ export type KnowledgeBaseSourceTypeFilter = "all" | "webpage" | "markdown" | "pd
 export interface KnowledgeBaseFilterState {
   sourceType: KnowledgeBaseSourceTypeFilter;
   lifecycleStatus: "all" | RetrieveSourceLifecycleFilter;
+  yearsText: string;
+  authorsText: string;
+  venuesText: string;
+  doiText: string;
+  arxivIdsText: string;
+}
+
+type KnowledgeBaseAdvancedFilterField =
+  | "yearsText"
+  | "authorsText"
+  | "venuesText"
+  | "doiText"
+  | "arxivIdsText";
+
+const knowledgeBaseAdvancedFilterFields: KnowledgeBaseAdvancedFilterField[] = [
+  "yearsText",
+  "authorsText",
+  "venuesText",
+  "doiText",
+  "arxivIdsText",
+];
+
+interface KnowledgeBaseAdvancedFilterChip {
+  key: string;
+  field: KnowledgeBaseAdvancedFilterField;
+  label: string;
+  value: string;
+}
+
+const emptyKnowledgeBaseAdvancedFilterPatch: Record<KnowledgeBaseAdvancedFilterField, string> = {
+  yearsText: "",
+  authorsText: "",
+  venuesText: "",
+  doiText: "",
+  arxivIdsText: "",
+};
+
+function hasKnowledgeBaseAdvancedFilterText(filter: KnowledgeBaseFilterState) {
+  return knowledgeBaseAdvancedFilterFields.some((field) => filter[field].trim().length > 0);
+}
+
+function knowledgeBaseAdvancedFilterChips(
+  filter: RetrieveSourcesFilter | undefined,
+): KnowledgeBaseAdvancedFilterChip[] {
+  const chips: KnowledgeBaseAdvancedFilterChip[] = [];
+  for (const year of filter?.years ?? []) {
+    chips.push({
+      key: `year:${year}`,
+      field: "yearsText",
+      label: "Year",
+      value: String(year),
+    });
+  }
+  for (const author of filter?.authors ?? []) {
+    chips.push({
+      key: `author:${author}`,
+      field: "authorsText",
+      label: "Author",
+      value: author,
+    });
+  }
+  for (const venue of filter?.venues ?? []) {
+    chips.push({
+      key: `venue:${venue}`,
+      field: "venuesText",
+      label: "Venue",
+      value: venue,
+    });
+  }
+  if (filter?.doi !== undefined) {
+    chips.push({
+      key: `doi:${filter.doi}`,
+      field: "doiText",
+      label: "DOI",
+      value: filter.doi,
+    });
+  }
+  for (const arxivId of filter?.arxivIds ?? []) {
+    chips.push({
+      key: `arxiv:${arxivId}`,
+      field: "arxivIdsText",
+      label: "ArXiv",
+      value: arxivId,
+    });
+  }
+  return chips;
+}
+
+function nextKnowledgeBaseAdvancedFieldText(
+  chip: KnowledgeBaseAdvancedFilterChip,
+  filter: RetrieveSourcesFilter | undefined,
+) {
+  switch (chip.field) {
+    case "yearsText":
+      return (filter?.years ?? [])
+        .filter((year) => String(year) !== chip.value)
+        .map((year) => String(year))
+        .join(", ");
+    case "authorsText":
+      return (filter?.authors ?? []).filter((author) => author !== chip.value).join(", ");
+    case "venuesText":
+      return (filter?.venues ?? []).filter((venue) => venue !== chip.value).join(", ");
+    case "doiText":
+      return "";
+    case "arxivIdsText":
+      return (filter?.arxivIds ?? []).filter((arxivId) => arxivId !== chip.value).join(", ");
+  }
 }
 
 export interface SourceContextPlannerBudget {
@@ -4652,20 +4761,11 @@ function KnowledgeBasePanel(props: RailShellProps) {
     () => new Set(props.sourceContextPlanner.selectedSourceIds),
     [props.sourceContextPlanner.selectedSourceIds],
   );
-  const updateSourceTypeFilter = React.useCallback(
-    (sourceType: KnowledgeBaseSourceTypeFilter) => {
+  const patchKnowledgeBaseFilter = React.useCallback(
+    (patch: Partial<KnowledgeBaseFilterState>) => {
       props.onKnowledgeBaseFilterChange({
         ...props.knowledgeBaseFilter,
-        sourceType,
-      });
-    },
-    [props.knowledgeBaseFilter, props.onKnowledgeBaseFilterChange],
-  );
-  const updateLifecycleFilter = React.useCallback(
-    (lifecycleStatus: KnowledgeBaseFilterState["lifecycleStatus"]) => {
-      props.onKnowledgeBaseFilterChange({
-        ...props.knowledgeBaseFilter,
-        lifecycleStatus,
+        ...patch,
       });
     },
     [props.knowledgeBaseFilter, props.onKnowledgeBaseFilterChange],
@@ -4808,8 +4908,8 @@ function KnowledgeBasePanel(props: RailShellProps) {
           <KnowledgeBaseFilterControls
             disabled={props.state.loading}
             filter={props.knowledgeBaseFilter}
-            onLifecycleStatusChange={updateLifecycleFilter}
-            onSourceTypeChange={updateSourceTypeFilter}
+            normalizedFilter={props.knowledgeBaseRetrieveFilter}
+            onFilterChange={patchKnowledgeBaseFilter}
           />
         ) : null}
         {section === "topics" ? (
@@ -4881,53 +4981,167 @@ function KnowledgeBasePanel(props: RailShellProps) {
 function KnowledgeBaseFilterControls({
   disabled,
   filter,
-  onLifecycleStatusChange,
-  onSourceTypeChange,
+  normalizedFilter,
+  onFilterChange,
 }: {
   disabled: boolean;
   filter: KnowledgeBaseFilterState;
-  onLifecycleStatusChange: (status: KnowledgeBaseFilterState["lifecycleStatus"]) => void;
-  onSourceTypeChange: (sourceType: KnowledgeBaseSourceTypeFilter) => void;
+  normalizedFilter?: RetrieveSourcesFilter;
+  onFilterChange: (patch: Partial<KnowledgeBaseFilterState>) => void;
 }) {
+  const activeAdvancedChips = React.useMemo(
+    () => knowledgeBaseAdvancedFilterChips(normalizedFilter),
+    [normalizedFilter],
+  );
+  const hasAdvancedText = React.useMemo(() => hasKnowledgeBaseAdvancedFilterText(filter), [filter]);
+  const removeAdvancedChip = React.useCallback(
+    (chip: KnowledgeBaseAdvancedFilterChip) => {
+      onFilterChange({
+        [chip.field]: nextKnowledgeBaseAdvancedFieldText(chip, normalizedFilter),
+      });
+    },
+    [normalizedFilter, onFilterChange],
+  );
   return (
-    <div className="grid grid-cols-2 gap-2" data-clio-knowledge-filters="true">
-      <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-source-type-filter">
-        <span className="font-medium text-muted-foreground">Type</span>
-        <select
-          className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
-          disabled={disabled}
-          id="clio-kb-source-type-filter"
-          onChange={(event) =>
-            onSourceTypeChange(event.target.value as KnowledgeBaseSourceTypeFilter)
-          }
-          value={filter.sourceType}
-        >
-          <option value="all">All types</option>
-          <option value="webpage">Web pages</option>
-          <option value="markdown">Markdown</option>
-          <option value="pdf">PDF</option>
-          <option value="paper">Papers</option>
-        </select>
-      </label>
-      <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-lifecycle-filter">
-        <span className="font-medium text-muted-foreground">Status</span>
-        <select
-          className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
-          disabled={disabled}
-          id="clio-kb-lifecycle-filter"
-          onChange={(event) =>
-            onLifecycleStatusChange(
-              event.target.value as KnowledgeBaseFilterState["lifecycleStatus"],
-            )
-          }
-          value={filter.lifecycleStatus}
-        >
-          <option value="all">Searchable</option>
-          <option value="fresh">Fresh</option>
-          <option value="stale">Stale</option>
-          <option value="archived">Archived</option>
-        </select>
-      </label>
+    <div className="grid gap-3" data-clio-knowledge-filters="true">
+      <div className="grid grid-cols-2 gap-2">
+        <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-source-type-filter">
+          <span className="font-medium text-muted-foreground">Type</span>
+          <select
+            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+            disabled={disabled}
+            id="clio-kb-source-type-filter"
+            onChange={(event) =>
+              onFilterChange({
+                sourceType: event.target.value as KnowledgeBaseSourceTypeFilter,
+              })
+            }
+            value={filter.sourceType}
+          >
+            <option value="all">All types</option>
+            <option value="webpage">Web pages</option>
+            <option value="markdown">Markdown</option>
+            <option value="pdf">PDF</option>
+            <option value="paper">Papers</option>
+          </select>
+        </label>
+        <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-lifecycle-filter">
+          <span className="font-medium text-muted-foreground">Status</span>
+          <select
+            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+            disabled={disabled}
+            id="clio-kb-lifecycle-filter"
+            onChange={(event) =>
+              onFilterChange({
+                lifecycleStatus: event.target.value as KnowledgeBaseFilterState["lifecycleStatus"],
+              })
+            }
+            value={filter.lifecycleStatus}
+          >
+            <option value="all">Searchable</option>
+            <option value="fresh">Fresh</option>
+            <option value="stale">Stale</option>
+            <option value="archived">Archived</option>
+          </select>
+        </label>
+      </div>
+      <section
+        className="grid gap-2 rounded-lg border border-border bg-surface px-3 py-3"
+        data-clio-knowledge-advanced-filters="true"
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <h4 className="text-[12px] font-semibold leading-5">Metadata</h4>
+            <p className="text-[11px] text-muted-foreground">Year, author, venue, DOI, ArXiv</p>
+          </div>
+          <Button
+            disabled={disabled || !hasAdvancedText}
+            onClick={() => onFilterChange(emptyKnowledgeBaseAdvancedFilterPatch)}
+            size="sm"
+            type="button"
+            variant="ghost"
+          >
+            Clear
+          </Button>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-years-filter">
+            <span className="font-medium text-muted-foreground">Year(s)</span>
+            <Input
+              className="h-8 px-2.5 text-[12px]"
+              disabled={disabled}
+              id="clio-kb-years-filter"
+              onChange={(event) => onFilterChange({ yearsText: event.target.value })}
+              placeholder="2024, 2025"
+              value={filter.yearsText}
+            />
+          </label>
+          <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-doi-filter">
+            <span className="font-medium text-muted-foreground">DOI</span>
+            <Input
+              className="h-8 px-2.5 text-[12px]"
+              disabled={disabled}
+              id="clio-kb-doi-filter"
+              onChange={(event) => onFilterChange({ doiText: event.target.value })}
+              placeholder="10.5555/clio.2026"
+              value={filter.doiText}
+            />
+          </label>
+          <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-authors-filter">
+            <span className="font-medium text-muted-foreground">Author(s)</span>
+            <Input
+              className="h-8 px-2.5 text-[12px]"
+              disabled={disabled}
+              id="clio-kb-authors-filter"
+              onChange={(event) => onFilterChange({ authorsText: event.target.value })}
+              placeholder="Ada Lovelace, Alan Turing"
+              value={filter.authorsText}
+            />
+          </label>
+          <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-arxiv-filter">
+            <span className="font-medium text-muted-foreground">ArXiv ID(s)</span>
+            <Input
+              className="h-8 px-2.5 text-[12px]"
+              disabled={disabled}
+              id="clio-kb-arxiv-filter"
+              onChange={(event) => onFilterChange({ arxivIdsText: event.target.value })}
+              placeholder="2501.01234, cs.CL/9901001"
+              value={filter.arxivIdsText}
+            />
+          </label>
+          <label className="col-span-2 grid gap-1.5 text-[11px]" htmlFor="clio-kb-venues-filter">
+            <span className="font-medium text-muted-foreground">Venue(s)</span>
+            <Input
+              className="h-8 px-2.5 text-[12px]"
+              disabled={disabled}
+              id="clio-kb-venues-filter"
+              onChange={(event) => onFilterChange({ venuesText: event.target.value })}
+              placeholder="NeurIPS, Nature"
+              value={filter.venuesText}
+            />
+          </label>
+        </div>
+        {activeAdvancedChips.length > 0 ? (
+          <div
+            className="flex flex-wrap gap-1.5"
+            data-clio-knowledge-advanced-filter-summary="true"
+          >
+            {activeAdvancedChips.map((chip) => (
+              <button
+                aria-label={`Remove ${chip.label} filter ${chip.value}`}
+                className="inline-flex max-w-full items-center gap-1 rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
+                key={chip.key}
+                onClick={() => removeAdvancedChip(chip)}
+                type="button"
+              >
+                <span className="text-muted-foreground">{chip.label}</span>
+                <span className="truncate">{chip.value}</span>
+                <X size={12} />
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </section>
     </div>
   );
 }

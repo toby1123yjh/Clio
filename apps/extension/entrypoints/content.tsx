@@ -312,9 +312,57 @@ const defaultSuggestionCooldown: SuggestionCooldownState = {
 const defaultKnowledgeBaseFilter: KnowledgeBaseFilterState = {
   sourceType: "all",
   lifecycleStatus: "all",
+  yearsText: "",
+  authorsText: "",
+  venuesText: "",
+  doiText: "",
+  arxivIdsText: "",
 };
 
 type KnowledgeUploadKind = "markdown" | "pdf";
+
+function uniqueKnowledgeBaseFilterValues(values: string[]): string[] {
+  const seen = new Set<string>();
+  const next: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0 || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    next.push(trimmed);
+  }
+  return next;
+}
+
+function normalizeKnowledgeBaseListText(
+  value: string,
+  options: { allowWhitespace: boolean },
+): string[] | undefined {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  const values = options.allowWhitespace ? trimmed.split(/[\s,;]+/) : trimmed.split(/[\r\n,;]+/);
+  const normalized = uniqueKnowledgeBaseFilterValues(values);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeKnowledgeBaseYears(value: string): number[] | undefined {
+  const tokens = normalizeKnowledgeBaseListText(value, { allowWhitespace: true });
+  if (tokens === undefined) return undefined;
+  const years: number[] = [];
+  const seen = new Set<number>();
+  for (const token of tokens) {
+    if (!/^\d{1,4}$/.test(token)) continue;
+    const year = Number.parseInt(token, 10);
+    if (!Number.isInteger(year) || seen.has(year)) continue;
+    seen.add(year);
+    years.push(year);
+  }
+  return years.length > 0 ? years : undefined;
+}
+
+function normalizeKnowledgeBaseScalarText(value: string): string | undefined {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
 
 function retrieveFilterForKnowledgeBase(
   filter: KnowledgeBaseFilterState,
@@ -326,10 +374,32 @@ function retrieveFilterForKnowledgeBase(
         ? ["webpage", "page", "selection"]
         : [filter.sourceType];
   const lifecycleStatuses = filter.lifecycleStatus === "all" ? undefined : [filter.lifecycleStatus];
-  if (sourceTypes === undefined && lifecycleStatuses === undefined) return undefined;
+  const years = normalizeKnowledgeBaseYears(filter.yearsText);
+  const authors = normalizeKnowledgeBaseListText(filter.authorsText, { allowWhitespace: false });
+  const venues = normalizeKnowledgeBaseListText(filter.venuesText, { allowWhitespace: false });
+  const doi = normalizeKnowledgeBaseScalarText(filter.doiText);
+  const arxivIds = normalizeKnowledgeBaseListText(filter.arxivIdsText, {
+    allowWhitespace: true,
+  });
+  if (
+    sourceTypes === undefined &&
+    lifecycleStatuses === undefined &&
+    years === undefined &&
+    authors === undefined &&
+    venues === undefined &&
+    doi === undefined &&
+    arxivIds === undefined
+  ) {
+    return undefined;
+  }
   return {
     ...(sourceTypes === undefined ? {} : { sourceTypes }),
     ...(lifecycleStatuses === undefined ? {} : { lifecycleStatuses }),
+    ...(years === undefined ? {} : { years }),
+    ...(authors === undefined ? {} : { authors }),
+    ...(venues === undefined ? {} : { venues }),
+    ...(doi === undefined ? {} : { doi }),
+    ...(arxivIds === undefined ? {} : { arxivIds }),
   };
 }
 
@@ -973,6 +1043,10 @@ function ClioContentApp() {
   const [knowledgeBaseFilter, setKnowledgeBaseFilter] = React.useState<KnowledgeBaseFilterState>(
     defaultKnowledgeBaseFilter,
   );
+  const knowledgeBaseRetrieveFilter = React.useMemo(
+    () => retrieveFilterForKnowledgeBase(knowledgeBaseFilter),
+    [knowledgeBaseFilter],
+  );
   const [workingSetStatus, setWorkingSetStatus] = React.useState<WorkingSetStatusResult | null>(
     null,
   );
@@ -1264,7 +1338,6 @@ function ClioContentApp() {
     async (nextQuery = railState.query) => {
       dispatch({ type: "SET_LOADING", loading: true });
       try {
-        const retrieveFilter = retrieveFilterForKnowledgeBase(knowledgeBaseFilter);
         const topicResult = await requestEngine({
           kind: "listTopicPages",
           query: nextQuery.trim().length > 0 ? nextQuery : undefined,
@@ -1280,7 +1353,9 @@ function ClioContentApp() {
             query: nextQuery,
             limit: 40,
             includeChunks: 2,
-            ...(retrieveFilter === undefined ? {} : { filter: retrieveFilter }),
+            ...(knowledgeBaseRetrieveFilter === undefined
+              ? {}
+              : { filter: knowledgeBaseRetrieveFilter }),
           },
         });
         const workingSet = await requestEngine({ kind: "getWorkingSetStatus" });
@@ -1299,7 +1374,7 @@ function ClioContentApp() {
         dispatch({ type: "SET_LOADING", loading: false });
       }
     },
-    [knowledgeBaseFilter, loadWikiCompileJobEvents, railState.query, showToast],
+    [knowledgeBaseRetrieveFilter, loadWikiCompileJobEvents, railState.query, showToast],
   );
 
   const pinWorkingSetSource = React.useCallback(
@@ -4017,6 +4092,7 @@ function ClioContentApp() {
         imageGenerationState={imageGenerationState}
         items={items}
         knowledgeBaseFilter={knowledgeBaseFilter}
+        knowledgeBaseRetrieveFilter={knowledgeBaseRetrieveFilter}
         workingSetStatus={workingSetStatus}
         sourceContextCompressionLogs={sourceContextCompressionLogs}
         sourceContextPlanner={sourceContextPlanner}

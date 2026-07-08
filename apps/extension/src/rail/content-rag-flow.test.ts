@@ -53,6 +53,10 @@ describe("content local RAG flow", () => {
       contentSource.indexOf("function retrieveFilterForKnowledgeBase"),
       contentSource.indexOf("function knowledgeUploadKindForFile"),
     );
+    const contentStateSection = contentSource.slice(
+      contentSource.indexOf("function ClioContentApp()"),
+      contentSource.indexOf("React.useEffect(() => {"),
+    );
     const loadLibrarySection = contentSource.slice(
       contentSource.indexOf("const loadLibrary = React.useCallback"),
       contentSource.indexOf("const loadChatHistory = React.useCallback"),
@@ -60,14 +64,31 @@ describe("content local RAG flow", () => {
 
     expect(loadLibrarySection).toContain('kind: "searchKnowledgeBase"');
     expect(loadLibrarySection).toContain("toKnowledgeBaseSearchItem");
-    expect(loadLibrarySection).toContain("retrieveFilterForKnowledgeBase(knowledgeBaseFilter)");
+    expect(contentStateSection).toContain("const knowledgeBaseRetrieveFilter = React.useMemo(");
+    expect(contentStateSection).toContain("retrieveFilterForKnowledgeBase(knowledgeBaseFilter)");
     expect(retrieveFilterSection).toContain('["webpage", "page", "selection"]');
-    expect(loadLibrarySection).toContain("filter: retrieveFilter");
+    expect(retrieveFilterSection).toContain(
+      "const years = normalizeKnowledgeBaseYears(filter.yearsText)",
+    );
+    expect(retrieveFilterSection).toContain(
+      "const authors = normalizeKnowledgeBaseListText(filter.authorsText",
+    );
+    expect(retrieveFilterSection).toContain(
+      "const venues = normalizeKnowledgeBaseListText(filter.venuesText",
+    );
+    expect(retrieveFilterSection).toContain(
+      "const doi = normalizeKnowledgeBaseScalarText(filter.doiText)",
+    );
+    expect(retrieveFilterSection).toContain(
+      "const arxivIds = normalizeKnowledgeBaseListText(filter.arxivIdsText",
+    );
+    expect(loadLibrarySection).toContain("knowledgeBaseRetrieveFilter === undefined");
+    expect(loadLibrarySection).toContain("{ filter: knowledgeBaseRetrieveFilter }");
     expect(loadLibrarySection).not.toContain('kind: "searchMemory"');
     expect(loadLibrarySection).not.toContain('kind: "listMemories"');
   });
 
-  it("exposes Knowledge Base source filters without bypassing searchKnowledgeBase", () => {
+  it("exposes Knowledge Base advanced source filters without bypassing searchKnowledgeBase", () => {
     const contentStateSection = contentSource.slice(
       contentSource.indexOf("function ClioContentApp()"),
       contentSource.indexOf("React.useEffect(() => {"),
@@ -76,19 +97,33 @@ describe("content local RAG flow", () => {
       contentSource.indexOf("<RailShell"),
       contentSource.indexOf("</RailShell>"),
     );
-    const knowledgePanelSection = railShellSource.slice(
-      railShellSource.indexOf("function KnowledgeBasePanel"),
-      railShellSource.indexOf("function TopicKnowledgePanel"),
+    const knowledgeFilterSection = railShellSource.slice(
+      railShellSource.indexOf("type KnowledgeBaseAdvancedFilterField"),
+      railShellSource.indexOf("function KnowledgeBaseWorkingSetPanel"),
     );
 
     expect(contentStateSection).toContain("defaultKnowledgeBaseFilter");
+    expect(contentSource).toContain('yearsText: ""');
+    expect(contentSource).toContain('authorsText: ""');
+    expect(contentSource).toContain('venuesText: ""');
+    expect(contentSource).toContain('doiText: ""');
+    expect(contentSource).toContain('arxivIdsText: ""');
     expect(railPropsSection).toContain("knowledgeBaseFilter={knowledgeBaseFilter}");
+    expect(railPropsSection).toContain("knowledgeBaseRetrieveFilter={knowledgeBaseRetrieveFilter}");
     expect(railPropsSection).toContain("onKnowledgeBaseFilterChange={setKnowledgeBaseFilter}");
-    expect(knowledgePanelSection).toContain('data-clio-knowledge-filters="true"');
-    expect(knowledgePanelSection).toContain('id="clio-kb-source-type-filter"');
-    expect(knowledgePanelSection).toContain('id="clio-kb-lifecycle-filter"');
-    expect(knowledgePanelSection).not.toContain('kind: "searchMemory"');
-    expect(knowledgePanelSection).not.toContain('kind: "listMemories"');
+    expect(knowledgeFilterSection).toContain('data-clio-knowledge-filters="true"');
+    expect(knowledgeFilterSection).toContain('data-clio-knowledge-advanced-filters="true"');
+    expect(knowledgeFilterSection).toContain('id="clio-kb-source-type-filter"');
+    expect(knowledgeFilterSection).toContain('id="clio-kb-lifecycle-filter"');
+    expect(knowledgeFilterSection).toContain('id="clio-kb-years-filter"');
+    expect(knowledgeFilterSection).toContain('id="clio-kb-authors-filter"');
+    expect(knowledgeFilterSection).toContain('id="clio-kb-venues-filter"');
+    expect(knowledgeFilterSection).toContain('id="clio-kb-doi-filter"');
+    expect(knowledgeFilterSection).toContain('id="clio-kb-arxiv-filter"');
+    expect(knowledgeFilterSection).toContain("knowledgeBaseAdvancedFilterChips");
+    expect(knowledgeFilterSection).toContain("nextKnowledgeBaseAdvancedFieldText");
+    expect(knowledgeFilterSection).not.toContain('kind: "searchMemory"');
+    expect(knowledgeFilterSection).not.toContain('kind: "listMemories"');
   });
 
   it("exposes Working Set controls without loading full memories in the Rail", () => {
