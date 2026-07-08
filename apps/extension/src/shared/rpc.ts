@@ -251,11 +251,30 @@ export interface RetrieveSourcesResult {
   };
 }
 
+export type KnowledgeBaseClusterBy = "none" | "semantic" | "year" | "venue" | "source_type";
+export type KnowledgeBaseClusterGranularity = "coarse" | "medium" | "fine";
+export type KnowledgeBaseEngineClusterBy = Exclude<KnowledgeBaseClusterBy, "none">;
+
+export interface KnowledgeBaseClusteringOptions {
+  clusterBy: KnowledgeBaseEngineClusterBy;
+  granularity?: KnowledgeBaseClusterGranularity;
+}
+
+export interface KnowledgeBaseSourceCluster {
+  id: string;
+  label: string;
+  clusterBy: KnowledgeBaseEngineClusterBy;
+  sourceIds: string[];
+  sourceCount: number;
+  score: number;
+}
+
 export interface SearchKnowledgeBasePayload {
   query: string;
   limit?: number;
   includeChunks?: number;
   filter?: RetrieveSourcesFilter;
+  clustering?: KnowledgeBaseClusteringOptions;
 }
 
 export interface KnowledgeBaseExpansionTrace {
@@ -269,6 +288,7 @@ export interface KnowledgeBaseExpansionTrace {
 
 export interface SearchKnowledgeBaseResult extends RetrieveSourcesResult {
   expansion: KnowledgeBaseExpansionTrace;
+  clusters?: KnowledgeBaseSourceCluster[];
 }
 
 export interface WorkingSetSourceSummary extends MemorySummary {
@@ -2283,8 +2303,27 @@ function isSearchKnowledgeBasePayload(value: unknown): value is SearchKnowledgeB
     typeof value.query === "string" &&
     (value.limit === undefined || typeof value.limit === "number") &&
     (value.includeChunks === undefined || typeof value.includeChunks === "number") &&
-    (value.filter === undefined || isRetrieveSourcesFilter(value.filter))
+    (value.filter === undefined || isRetrieveSourcesFilter(value.filter)) &&
+    (value.clustering === undefined || isKnowledgeBaseClusteringOptions(value.clustering))
   );
+}
+
+function isKnowledgeBaseClusteringOptions(value: unknown): value is KnowledgeBaseClusteringOptions {
+  return (
+    isRecord(value) &&
+    isKnowledgeBaseEngineClusterBy(value.clusterBy) &&
+    (value.granularity === undefined || isKnowledgeBaseClusterGranularity(value.granularity))
+  );
+}
+
+function isKnowledgeBaseEngineClusterBy(value: unknown): value is KnowledgeBaseEngineClusterBy {
+  return value === "semantic" || value === "year" || value === "venue" || value === "source_type";
+}
+
+function isKnowledgeBaseClusterGranularity(
+  value: unknown,
+): value is KnowledgeBaseClusterGranularity {
+  return value === "coarse" || value === "medium" || value === "fine";
 }
 
 function isRetrieveSourcesFilter(value: unknown): value is RetrieveSourcesFilter {

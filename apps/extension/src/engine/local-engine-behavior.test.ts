@@ -909,6 +909,93 @@ describe("local engine behavior harness", () => {
     expect(harness.count("keyword_index", "term = ?", ["degradation"])).toBe(1);
   });
 
+  it("clusters knowledge base page search results without graph or full document dependencies", async () => {
+    const harness = createHarness();
+    const fixture = [
+      { title: "Cluster Alpha", sourceType: "paper", year: 2026, venue: "Local RAG Symposium" },
+      { title: "Cluster Beta", sourceType: "paper", year: 2026, venue: "Local RAG Symposium" },
+      { title: "Cluster Gamma", sourceType: "pdf", year: 2025, venue: "Browser Systems" },
+      { title: "Cluster Delta", sourceType: "markdown", year: 2024, venue: "Browser Systems" },
+      { title: "Cluster Epsilon", sourceType: "webpage", year: 2023, venue: "Memory Notes" },
+      { title: "Cluster Zeta", sourceType: "paper", year: 2022, venue: "Graph Notes" },
+      { title: "Cluster Eta", sourceType: "pdf", year: 2021, venue: "Citation Notes" },
+      { title: "Cluster Theta", sourceType: "webpage", year: 2020, venue: "Parser Notes" },
+    ];
+
+    for (const item of fixture) {
+      await harness.request({
+        kind: "capturePage",
+        payload: pagePayload({
+          sourceTitle: item.title,
+          sourceUrl: `https://example.test/${item.title.toLowerCase().replace(/\s+/g, "-")}`,
+          normalizedText: ragText(`clusterable knowledge evidence ${item.title}`, 20),
+          metadata: {
+            title: item.title,
+            abstract: "Clusterable source-level grouping fixture.",
+            source_type: item.sourceType,
+            year: item.year,
+            venue: item.venue,
+          },
+        }),
+      });
+    }
+
+    const flat = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: { query: "clusterable knowledge evidence", limit: 20, includeChunks: 1 },
+    });
+    expect(flat.items.length).toBeGreaterThanOrEqual(fixture.length);
+    expect(flat.clusters).toBeUndefined();
+
+    const semantic = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "clusterable knowledge evidence",
+        limit: 20,
+        includeChunks: 1,
+        clustering: { clusterBy: "semantic", granularity: "fine" },
+      },
+    });
+    expect(semantic.clusters?.map((cluster) => cluster.label)).toContain(
+      "2026 / Local RAG Symposium",
+    );
+    expect(
+      semantic.clusters?.find((cluster) => cluster.label === "2026 / Local RAG Symposium")
+        ?.sourceCount,
+    ).toBe(2);
+
+    const sourceType = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "clusterable knowledge evidence",
+        limit: 20,
+        includeChunks: 1,
+        clustering: { clusterBy: "source_type", granularity: "fine" },
+      },
+    });
+    expect(sourceType.clusters?.map((cluster) => cluster.label)).toEqual(
+      expect.arrayContaining(["Paper", "PDF", "Markdown", "Webpage"]),
+    );
+
+    const coarseVenue = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "clusterable knowledge evidence",
+        limit: 20,
+        includeChunks: 1,
+        clustering: { clusterBy: "venue", granularity: "coarse" },
+      },
+    });
+    const coarseClusters = coarseVenue.clusters ?? [];
+    expect(coarseClusters.length).toBeLessThanOrEqual(4);
+    expect(coarseClusters.map((cluster) => cluster.label)).toContain("Other");
+    expect(coarseClusters.reduce((sum, cluster) => sum + cluster.sourceCount, 0)).toBe(
+      coarseVenue.items.length,
+    );
+    expect(harness.count("graph_nodes")).toBe(0);
+    expect(harness.count("graph_edges")).toBe(0);
+  });
+
   it("repairs malformed chunk meta heads before post-capture embedding", async () => {
     const harness = createHarness();
     const capture = await harness.request({

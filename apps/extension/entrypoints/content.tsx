@@ -123,6 +123,8 @@ import { type ToolboxSkill, toolboxSkills } from "@/src/rail/app/toolbox-registr
 import {
   type ImageGenerationDisplayState,
   type ImageGenerationSubmitInput,
+  type KnowledgeBaseClusterGroup,
+  type KnowledgeBaseClusteringState,
   type KnowledgeBaseFilterState,
   type PdfReaderPreviewState,
   RailShell,
@@ -170,6 +172,8 @@ import {
   type EngineHealth,
   type GetMemoryEvidenceWindowAnchor,
   type ImageGenerationHistoryRecord,
+  type KnowledgeBaseClusteringOptions,
+  type KnowledgeBaseSourceCluster,
   type MemoryDetail,
   type MemoryEvidenceWindow,
   type RetrieveSourceItem,
@@ -319,6 +323,11 @@ const defaultKnowledgeBaseFilter: KnowledgeBaseFilterState = {
   arxivIdsText: "",
 };
 
+const defaultKnowledgeBaseClustering: KnowledgeBaseClusteringState = {
+  clusterBy: "none",
+  granularity: "medium",
+};
+
 type KnowledgeUploadKind = "markdown" | "pdf";
 
 function uniqueKnowledgeBaseFilterValues(values: string[]): string[] {
@@ -401,6 +410,41 @@ function retrieveFilterForKnowledgeBase(
     ...(doi === undefined ? {} : { doi }),
     ...(arxivIds === undefined ? {} : { arxivIds }),
   };
+}
+
+function clusteringPayloadForKnowledgeBase(
+  clustering: KnowledgeBaseClusteringState,
+): KnowledgeBaseClusteringOptions | undefined {
+  if (clustering.clusterBy === "none") return undefined;
+  return {
+    clusterBy: clustering.clusterBy,
+    granularity: clustering.granularity,
+  };
+}
+
+function knowledgeBaseClusterGroups(
+  clusters: KnowledgeBaseSourceCluster[] | undefined,
+  items: SearchMemoryItem[],
+): KnowledgeBaseClusterGroup[] {
+  if (clusters === undefined || clusters.length === 0) return [];
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  return clusters.flatMap((cluster) => {
+    const clusterItems = cluster.sourceIds.flatMap((sourceId) => {
+      const item = itemById.get(sourceId);
+      return item === undefined ? [] : [item];
+    });
+    if (clusterItems.length === 0) return [];
+    return [
+      {
+        id: cluster.id,
+        label: cluster.label,
+        clusterBy: cluster.clusterBy,
+        sourceCount: cluster.sourceCount,
+        score: cluster.score,
+        items: clusterItems,
+      },
+    ];
+  });
 }
 
 function knowledgeUploadKindForFile(file: File): KnowledgeUploadKind | null {
@@ -1047,6 +1091,15 @@ function ClioContentApp() {
     () => retrieveFilterForKnowledgeBase(knowledgeBaseFilter),
     [knowledgeBaseFilter],
   );
+  const [knowledgeBaseClustering, setKnowledgeBaseClustering] =
+    React.useState<KnowledgeBaseClusteringState>(defaultKnowledgeBaseClustering);
+  const knowledgeBaseClusteringPayload = React.useMemo(
+    () => clusteringPayloadForKnowledgeBase(knowledgeBaseClustering),
+    [knowledgeBaseClustering],
+  );
+  const [knowledgeBaseClusters, setKnowledgeBaseClusters] = React.useState<
+    KnowledgeBaseClusterGroup[]
+  >([]);
   const [workingSetStatus, setWorkingSetStatus] = React.useState<WorkingSetStatusResult | null>(
     null,
   );
@@ -1356,6 +1409,9 @@ function ClioContentApp() {
             ...(knowledgeBaseRetrieveFilter === undefined
               ? {}
               : { filter: knowledgeBaseRetrieveFilter }),
+            ...(knowledgeBaseClusteringPayload === undefined
+              ? {}
+              : { clustering: knowledgeBaseClusteringPayload }),
           },
         });
         const workingSet = await requestEngine({ kind: "getWorkingSetStatus" });
@@ -1367,14 +1423,22 @@ function ClioContentApp() {
         } else {
           setWikiCompileJobEvents([]);
         }
-        setItems(result.items.map(toKnowledgeBaseSearchItem));
+        const nextItems = result.items.map(toKnowledgeBaseSearchItem);
+        setItems(nextItems);
+        setKnowledgeBaseClusters(knowledgeBaseClusterGroups(result.clusters, nextItems));
       } catch (error) {
         showToast(errorToast(error));
       } finally {
         dispatch({ type: "SET_LOADING", loading: false });
       }
     },
-    [knowledgeBaseRetrieveFilter, loadWikiCompileJobEvents, railState.query, showToast],
+    [
+      knowledgeBaseClusteringPayload,
+      knowledgeBaseRetrieveFilter,
+      loadWikiCompileJobEvents,
+      railState.query,
+      showToast,
+    ],
   );
 
   const pinWorkingSetSource = React.useCallback(
@@ -4091,6 +4155,8 @@ function ClioContentApp() {
         imageGenerationSettings={imageGenerationSettings}
         imageGenerationState={imageGenerationState}
         items={items}
+        knowledgeBaseClusters={knowledgeBaseClusters}
+        knowledgeBaseClustering={knowledgeBaseClustering}
         knowledgeBaseFilter={knowledgeBaseFilter}
         knowledgeBaseRetrieveFilter={knowledgeBaseRetrieveFilter}
         workingSetStatus={workingSetStatus}
@@ -4157,6 +4223,7 @@ function ClioContentApp() {
         onOpenSettings={openSettings}
         onImagePromptPrefillConsumed={() => dispatch({ type: "CLEAR_IMAGE_PROMPT_PREFILL" })}
         onOpenSource={(memory) => void openSource(memory)}
+        onKnowledgeBaseClusteringChange={setKnowledgeBaseClustering}
         onKnowledgeBaseFilterChange={setKnowledgeBaseFilter}
         onPinWorkingSetSource={(sourceId, loadDepth) =>
           void pinWorkingSetSource(sourceId, loadDepth)

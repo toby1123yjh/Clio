@@ -58,6 +58,9 @@ import {
   type JobStatus,
   type JobSummary,
   type JobType,
+  type KnowledgeBaseClusteringOptions,
+  type KnowledgeBaseEngineClusterBy,
+  type KnowledgeBaseSourceCluster,
   type ListMemoriesResult,
   type MemoryDetail,
   type MemoryEvidenceWindow,
@@ -1328,30 +1331,38 @@ export class LocalEngine {
     });
 
     if (query.length === 0) {
-      return {
-        ...original,
-        expansion: {
-          status: "skipped",
-          terms: [],
-          reason: "empty_query",
-          originalItemCount: original.items.length,
-          expandedItemCount: 0,
+      return knowledgeBaseSearchResultWithClusters(
+        db,
+        {
+          ...original,
+          expansion: {
+            status: "skipped",
+            terms: [],
+            reason: "empty_query",
+            originalItemCount: original.items.length,
+            expandedItemCount: 0,
+          },
         },
-      };
+        payload.clustering,
+      );
     }
 
     const filters = normalizeRetrieveSourcesFilter(payload.filter);
     if (filters.hasImpossibleFilter) {
-      return {
-        ...original,
-        expansion: {
-          status: "skipped",
-          terms: [],
-          reason: "filter_no_match",
-          originalItemCount: original.items.length,
-          expandedItemCount: 0,
+      return knowledgeBaseSearchResultWithClusters(
+        db,
+        {
+          ...original,
+          expansion: {
+            status: "skipped",
+            terms: [],
+            reason: "filter_no_match",
+            originalItemCount: original.items.length,
+            expandedItemCount: 0,
+          },
         },
-      };
+        payload.clustering,
+      );
     }
 
     const terms = findKeywordExpansionTerms(db, {
@@ -1360,30 +1371,38 @@ export class LocalEngine {
       filter: filters,
     });
     if (terms.length === 0) {
-      return {
-        ...original,
-        expansion: {
-          status: "skipped",
-          terms: [],
-          reason: "no_terms",
-          originalItemCount: original.items.length,
-          expandedItemCount: 0,
+      return knowledgeBaseSearchResultWithClusters(
+        db,
+        {
+          ...original,
+          expansion: {
+            status: "skipped",
+            terms: [],
+            reason: "no_terms",
+            originalItemCount: original.items.length,
+            expandedItemCount: 0,
+          },
         },
-      };
+        payload.clustering,
+      );
     }
 
     const expandedQuery = normalizeText([query, ...terms].join(" "));
     if (buildFtsQuery(expandedQuery).length === 0) {
-      return {
-        ...original,
-        expansion: {
-          status: "skipped",
-          terms,
-          reason: "expanded_query_empty",
-          originalItemCount: original.items.length,
-          expandedItemCount: 0,
+      return knowledgeBaseSearchResultWithClusters(
+        db,
+        {
+          ...original,
+          expansion: {
+            status: "skipped",
+            terms,
+            reason: "expanded_query_empty",
+            originalItemCount: original.items.length,
+            expandedItemCount: 0,
+          },
         },
-      };
+        payload.clustering,
+      );
     }
 
     const expanded = await this.retrieveSources({
@@ -1393,20 +1412,24 @@ export class LocalEngine {
       filter: payload.filter,
     });
 
-    return {
-      ...original,
-      items: mergeKnowledgeBaseSearchItems(original.items, expanded.items, {
-        limit,
-        includeChunks,
-      }),
-      expansion: {
-        status: "used",
-        terms,
-        expandedQuery,
-        originalItemCount: original.items.length,
-        expandedItemCount: expanded.items.length,
+    return knowledgeBaseSearchResultWithClusters(
+      db,
+      {
+        ...original,
+        items: mergeKnowledgeBaseSearchItems(original.items, expanded.items, {
+          limit,
+          includeChunks,
+        }),
+        expansion: {
+          status: "used",
+          terms,
+          expandedQuery,
+          originalItemCount: original.items.length,
+          expandedItemCount: expanded.items.length,
+        },
       },
-    };
+      payload.clustering,
+    );
   }
 
   private async search(query: string, limit = 30): Promise<SearchMemoryResult> {
@@ -11660,6 +11683,197 @@ function mergeKnowledgeBaseSearchItems(
       ...item,
       score,
     }));
+}
+
+function knowledgeBaseSearchResultWithClusters(
+  db: SqliteDb,
+  result: SearchKnowledgeBaseResult,
+  clustering: KnowledgeBaseClusteringOptions | undefined,
+): SearchKnowledgeBaseResult {
+  if (clustering === undefined) return result;
+  return {
+    ...result,
+    clusters: buildKnowledgeBaseSourceClusters(db, result.items, clustering),
+  };
+}
+
+interface KnowledgeBaseClusterSourceMetadata {
+  sourceId: string;
+  sourceType: string;
+  capturedAt: string;
+  metadata: Record<string, unknown>;
+}
+
+function buildKnowledgeBaseSourceClusters(
+  db: SqliteDb,
+  items: RetrieveSourceItem[],
+  clustering: KnowledgeBaseClusteringOptions,
+): KnowledgeBaseSourceCluster[] {
+  if (items.length === 0) return [];
+  const metadataBySourceId = loadKnowledgeBaseClusterMetadata(
+    db,
+    items.map((item) => item.id),
+  );
+  const grouped = new Map<
+    string,
+    {
+      label: string;
+      sourceIds: string[];
+      sourceCount: number;
+      score: number;
+      bestRank: number;
+    }
+  >();
+
+  items.forEach((item, index) => {
+    const metadata = metadataBySourceId.get(item.id);
+    const label = knowledgeBaseClusterLabel(clustering.clusterBy, item, metadata);
+    const key = `${clustering.clusterBy}:${label.toLowerCase()}`;
+    const existing = grouped.get(key);
+    const score = Number.isFinite(item.score) ? item.score : 0;
+    if (existing === undefined) {
+      grouped.set(key, {
+        label,
+        sourceIds: [item.id],
+        sourceCount: 1,
+        score,
+        bestRank: index + 1,
+      });
+      return;
+    }
+    existing.sourceIds.push(item.id);
+    existing.sourceCount += 1;
+    existing.score += score;
+    existing.bestRank = Math.min(existing.bestRank, index + 1);
+  });
+
+  const sorted = Array.from(grouped.values()).sort(
+    (left, right) =>
+      right.score - left.score ||
+      left.bestRank - right.bestRank ||
+      right.sourceCount - left.sourceCount ||
+      left.label.localeCompare(right.label),
+  );
+  const granularity = clustering.granularity ?? "medium";
+  const maxClusters =
+    granularity === "coarse" ? 3 : granularity === "medium" ? 6 : Number.POSITIVE_INFINITY;
+  const visible = sorted.slice(0, maxClusters);
+  const overflow = sorted.slice(maxClusters);
+  if (overflow.length > 0) {
+    visible.push({
+      label: "Other",
+      sourceIds: overflow.flatMap((cluster) => cluster.sourceIds),
+      sourceCount: overflow.reduce((sum, cluster) => sum + cluster.sourceCount, 0),
+      score: overflow.reduce((sum, cluster) => sum + cluster.score, 0),
+      bestRank: Math.min(...overflow.map((cluster) => cluster.bestRank)),
+    });
+  }
+
+  return visible.map((cluster) => ({
+    id: knowledgeBaseClusterId(clustering.clusterBy, cluster.label),
+    label: cluster.label,
+    clusterBy: clustering.clusterBy,
+    sourceIds: cluster.sourceIds,
+    sourceCount: cluster.sourceCount,
+    score: Number(cluster.score.toFixed(6)),
+  }));
+}
+
+function loadKnowledgeBaseClusterMetadata(db: SqliteDb, sourceIds: string[]) {
+  const uniqueIds = Array.from(new Set(sourceIds.filter((id) => id.length > 0))).slice(0, 80);
+  const metadataBySourceId = new Map<string, KnowledgeBaseClusterSourceMetadata>();
+  if (uniqueIds.length === 0) return metadataBySourceId;
+  const placeholders = uniqueIds.map(() => "?").join(", ");
+  const rows = db.selectObjects(
+    `SELECT
+       s.id,
+       s.source_type,
+       s.captured_at,
+       sm.metadata_json
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.id IN (${placeholders})
+       AND s.lifecycle_status <> 'deleted'`,
+    uniqueIds,
+  );
+  for (const row of rows) {
+    const sourceId = stringField(row, "id");
+    if (sourceId.length === 0) continue;
+    metadataBySourceId.set(sourceId, {
+      sourceId,
+      sourceType: stringField(row, "source_type"),
+      capturedAt: stringField(row, "captured_at"),
+      metadata: parseMetadata(stringField(row, "metadata_json")),
+    });
+  }
+  return metadataBySourceId;
+}
+
+function knowledgeBaseClusterLabel(
+  clusterBy: KnowledgeBaseEngineClusterBy,
+  item: RetrieveSourceItem,
+  sourceMetadata: KnowledgeBaseClusterSourceMetadata | undefined,
+) {
+  switch (clusterBy) {
+    case "year":
+      return knowledgeBaseSourceYear(sourceMetadata) ?? "Unknown year";
+    case "venue":
+      return (
+        knowledgeBaseSourceVenue(sourceMetadata?.metadata) ??
+        sourceTypeClusterLabel(sourceMetadata?.sourceType, item.sourceKind)
+      );
+    case "source_type":
+      return sourceTypeClusterLabel(sourceMetadata?.sourceType, item.sourceKind);
+    case "semantic":
+      return semanticFallbackClusterLabel(item, sourceMetadata);
+  }
+}
+
+function semanticFallbackClusterLabel(
+  item: RetrieveSourceItem,
+  sourceMetadata: KnowledgeBaseClusterSourceMetadata | undefined,
+) {
+  const year = knowledgeBaseSourceYear(sourceMetadata);
+  const venue = knowledgeBaseSourceVenue(sourceMetadata?.metadata);
+  if (year !== undefined && venue !== undefined) return `${year} / ${venue}`;
+  if (venue !== undefined) return venue;
+  if (year !== undefined) return year;
+  return sourceTypeClusterLabel(sourceMetadata?.sourceType, item.sourceKind);
+}
+
+function knowledgeBaseSourceYear(sourceMetadata: KnowledgeBaseClusterSourceMetadata | undefined) {
+  if (sourceMetadata === undefined) return undefined;
+  const metadataYear =
+    metadataInteger(sourceMetadata.metadata, "year") ??
+    metadataInteger(sourceMetadata.metadata, "published_year");
+  if (metadataYear !== undefined) return String(metadataYear);
+  const arxivYear = parseExplicitArxivMetadata(sourceMetadata.metadata).year;
+  if (arxivYear !== undefined) return String(arxivYear);
+  const capturedYear = new Date(sourceMetadata.capturedAt).getUTCFullYear();
+  return isReasonablePaperYear(capturedYear) ? String(capturedYear) : undefined;
+}
+
+function knowledgeBaseSourceVenue(metadata: Record<string, unknown> | undefined) {
+  if (metadata === undefined) return undefined;
+  return parseMetadataVenue(metadata);
+}
+
+function sourceTypeClusterLabel(sourceType: string | undefined, fallbackKind: SourceKind) {
+  const normalized = normalizeText(sourceType ?? "");
+  const rawLabel = normalized.length > 0 ? normalized : fallbackKind;
+  if (rawLabel.toLowerCase() === "pdf") return "PDF";
+  const words = rawLabel
+    .replace(/[_-]+/g, " ")
+    .split(/\s+/)
+    .filter((word) => word.length > 0);
+  if (words.length === 0) return "Unknown type";
+  return words
+    .map((word) => `${word.slice(0, 1).toUpperCase()}${word.slice(1).toLowerCase()}`)
+    .join(" ");
+}
+
+function knowledgeBaseClusterId(clusterBy: KnowledgeBaseEngineClusterBy, label: string) {
+  return `kb-cluster:${clusterBy}:${stableHashNumber(label).toString(36)}`;
 }
 
 function mergeRetrieveTracks(left: RetrieveTrackName[], right: RetrieveTrackName[]) {

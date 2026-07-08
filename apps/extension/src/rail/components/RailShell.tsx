@@ -116,6 +116,8 @@ import type {
   ClioWebSearchResult,
   EngineHealth,
   ImageGenerationHistoryRecord,
+  KnowledgeBaseClusterBy,
+  KnowledgeBaseClusterGranularity,
   MemoryDetail,
   RetrieveSourceLifecycleFilter,
   RetrieveSourcesFilter,
@@ -203,6 +205,8 @@ export interface RailShellProps {
   items: SearchMemoryItem[];
   knowledgeBaseFilter: KnowledgeBaseFilterState;
   knowledgeBaseRetrieveFilter?: RetrieveSourcesFilter;
+  knowledgeBaseClustering: KnowledgeBaseClusteringState;
+  knowledgeBaseClusters: KnowledgeBaseClusterGroup[];
   workingSetStatus: WorkingSetStatusResult | null;
   sourceContextCompressionLogs: SourceContextCompressionLogRecord[];
   sourceContextPlanner: SourceContextPlannerState;
@@ -280,6 +284,7 @@ export interface RailShellProps {
   onOpenSettings: () => void;
   onOpenSource: (memory: MemoryDetail) => void;
   onKnowledgeBaseFilterChange: (filter: KnowledgeBaseFilterState) => void;
+  onKnowledgeBaseClusteringChange: (state: KnowledgeBaseClusteringState) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onEvictWorkingSetSource: (sourceId: string) => void;
   onSetWorkingSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
@@ -391,6 +396,20 @@ export interface KnowledgeBaseFilterState {
   arxivIdsText: string;
 }
 
+export interface KnowledgeBaseClusteringState {
+  clusterBy: KnowledgeBaseClusterBy;
+  granularity: KnowledgeBaseClusterGranularity;
+}
+
+export interface KnowledgeBaseClusterGroup {
+  id: string;
+  label: string;
+  clusterBy: Exclude<KnowledgeBaseClusterBy, "none">;
+  sourceCount: number;
+  score: number;
+  items: SearchMemoryItem[];
+}
+
 type KnowledgeBaseAdvancedFilterField =
   | "yearsText"
   | "authorsText"
@@ -420,6 +439,26 @@ const emptyKnowledgeBaseAdvancedFilterPatch: Record<KnowledgeBaseAdvancedFilterF
   doiText: "",
   arxivIdsText: "",
 };
+
+const knowledgeBaseClusterByOptions: Array<{
+  value: KnowledgeBaseClusterBy;
+  label: string;
+}> = [
+  { value: "none", label: "No grouping" },
+  { value: "semantic", label: "Semantic fallback" },
+  { value: "year", label: "Year" },
+  { value: "venue", label: "Venue" },
+  { value: "source_type", label: "Source type" },
+];
+
+const knowledgeBaseClusterGranularityOptions: Array<{
+  value: KnowledgeBaseClusterGranularity;
+  label: string;
+}> = [
+  { value: "coarse", label: "Coarse" },
+  { value: "medium", label: "Medium" },
+  { value: "fine", label: "Fine" },
+];
 
 function hasKnowledgeBaseAdvancedFilterText(filter: KnowledgeBaseFilterState) {
   return knowledgeBaseAdvancedFilterFields.some((field) => filter[field].trim().length > 0);
@@ -4770,10 +4809,23 @@ function KnowledgeBasePanel(props: RailShellProps) {
     },
     [props.knowledgeBaseFilter, props.onKnowledgeBaseFilterChange],
   );
+  const patchKnowledgeBaseClustering = React.useCallback(
+    (patch: Partial<KnowledgeBaseClusteringState>) => {
+      props.onKnowledgeBaseClusteringChange({
+        ...props.knowledgeBaseClustering,
+        ...patch,
+      });
+    },
+    [props.knowledgeBaseClustering, props.onKnowledgeBaseClusteringChange],
+  );
   const topicCountLabel =
     props.topicPages.length === 0 ? "No topic pages" : `${props.topicPages.length} topic pages`;
   const memoryCountLabel =
-    props.items.length === 0 ? "Local memory" : `${props.items.length} local items`;
+    props.items.length === 0
+      ? "Local memory"
+      : props.knowledgeBaseClusters.length > 0
+        ? `${props.items.length} local items / ${props.knowledgeBaseClusters.length} clusters`
+        : `${props.items.length} local items`;
   const handleUploadFiles = React.useCallback(
     (event: React.ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(event.target.files ?? []);
@@ -4912,6 +4964,13 @@ function KnowledgeBasePanel(props: RailShellProps) {
             onFilterChange={patchKnowledgeBaseFilter}
           />
         ) : null}
+        {section === "memories" ? (
+          <KnowledgeBaseClusteringControls
+            clustering={props.knowledgeBaseClustering}
+            disabled={props.state.loading}
+            onClusteringChange={patchKnowledgeBaseClustering}
+          />
+        ) : null}
         {section === "topics" ? (
           <TopicKnowledgePanel
             detail={props.topicDetail}
@@ -4962,6 +5021,7 @@ function KnowledgeBasePanel(props: RailShellProps) {
               onRefresh={props.onRefreshSourceContextCompressionLogs}
             />
             <MemoryList
+              clusters={props.knowledgeBaseClusters}
               highlightedId={props.state.highlightedMemoryId}
               items={props.items}
               loading={props.state.loading}
@@ -5143,6 +5203,80 @@ function KnowledgeBaseFilterControls({
         ) : null}
       </section>
     </div>
+  );
+}
+
+function KnowledgeBaseClusteringControls({
+  clustering,
+  disabled,
+  onClusteringChange,
+}: {
+  clustering: KnowledgeBaseClusteringState;
+  disabled: boolean;
+  onClusteringChange: (patch: Partial<KnowledgeBaseClusteringState>) => void;
+}) {
+  const groupingEnabled = clustering.clusterBy !== "none";
+  return (
+    <section
+      className="grid gap-2 rounded-lg border border-border bg-surface px-3 py-3"
+      data-clio-knowledge-clustering="true"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <h4 className="text-[12px] font-semibold leading-5">Result grouping</h4>
+          <p className="text-[11px] text-muted-foreground">Source-level clusters</p>
+        </div>
+        <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+          {groupingEnabled ? knowledgeBaseClusterByLabel(clustering.clusterBy) : "Flat"}
+        </Badge>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-cluster-by">
+          <span className="font-medium text-muted-foreground">Group by</span>
+          <select
+            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+            disabled={disabled}
+            id="clio-kb-cluster-by"
+            onChange={(event) =>
+              onClusteringChange({ clusterBy: event.target.value as KnowledgeBaseClusterBy })
+            }
+            value={clustering.clusterBy}
+          >
+            {knowledgeBaseClusterByOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-cluster-granularity">
+          <span className="font-medium text-muted-foreground">Granularity</span>
+          <select
+            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+            disabled={disabled || !groupingEnabled}
+            id="clio-kb-cluster-granularity"
+            onChange={(event) =>
+              onClusteringChange({
+                granularity: event.target.value as KnowledgeBaseClusterGranularity,
+              })
+            }
+            value={clustering.granularity}
+          >
+            {knowledgeBaseClusterGranularityOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    </section>
+  );
+}
+
+function knowledgeBaseClusterByLabel(clusterBy: KnowledgeBaseClusterBy) {
+  return (
+    knowledgeBaseClusterByOptions.find((option) => option.value === clusterBy)?.label ?? "Unknown"
   );
 }
 
@@ -6264,6 +6398,7 @@ function TopicPageForm({
 }
 
 function MemoryList({
+  clusters,
   highlightedId,
   items,
   loading,
@@ -6273,6 +6408,7 @@ function MemoryList({
   onPinWorkingSetSource,
   onSelectSourceContextPlannerSource,
 }: {
+  clusters?: KnowledgeBaseClusterGroup[];
   highlightedId?: string;
   items: SearchMemoryItem[];
   loading: boolean;
@@ -6297,71 +6433,140 @@ function MemoryList({
       </div>
     );
   }
+  if (clusters !== undefined && clusters.length > 0) {
+    return (
+      <div className="grid gap-2" data-clio-knowledge-cluster-list="true">
+        {clusters.map((cluster) => (
+          <details
+            className="overflow-hidden rounded-lg border border-border bg-surface"
+            data-clio-knowledge-cluster="true"
+            key={cluster.id}
+            open
+          >
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3.5 py-3 text-left outline-none transition-colors hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary">
+              <div className="min-w-0">
+                <h3 className="truncate text-[13px] font-semibold leading-5">{cluster.label}</h3>
+                <p className="text-[11px] text-muted-foreground">
+                  {knowledgeBaseClusterByLabel(cluster.clusterBy)}
+                </p>
+              </div>
+              <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+                {cluster.sourceCount}
+              </Badge>
+            </summary>
+            <ul className="flex flex-col gap-2 border-t border-border p-2.5">
+              {cluster.items.map((item) => (
+                <MemoryListItem
+                  highlightedId={highlightedId}
+                  item={item}
+                  key={item.id}
+                  loading={loading}
+                  selectedPlannerSourceIds={selectedPlannerSourceIds}
+                  workingSetSourceIds={workingSetSourceIds}
+                  onOpenDetail={onOpenDetail}
+                  onPinWorkingSetSource={onPinWorkingSetSource}
+                  onSelectSourceContextPlannerSource={onSelectSourceContextPlannerSource}
+                />
+              ))}
+            </ul>
+          </details>
+        ))}
+      </div>
+    );
+  }
   return (
     <ul className="flex flex-col gap-2">
-      {items.map((item) => {
-        const isInWorkingSet = workingSetSourceIds.has(item.id);
-        const isSelectedForPlanner = selectedPlannerSourceIds.has(item.id);
-        return (
-          <li className="relative" key={item.id}>
-            <button
-              className={[
-                "relative flex w-full flex-col gap-2 overflow-hidden rounded-lg border bg-surface p-3.5 pr-24 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
-                highlightedId === item.id ? "border-primary/70" : "border-border",
-              ].join(" ")}
-              onClick={() => onOpenDetail(item.id)}
-              type="button"
-            >
-              {highlightedId === item.id ? (
-                <span className="absolute bottom-3 left-0 top-3 w-[2px] rounded-r bg-primary" />
-              ) : null}
-              <div className="flex items-start gap-2.5">
-                <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-surface-subtle text-primary">
-                  <FileText size={15} />
-                </span>
-                <div className="min-w-0 flex-1">
-                  <h3 className="line-clamp-2 text-sm font-semibold leading-5">
-                    {item.sourceTitle}
-                  </h3>
-                  <p className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-                    <span className="truncate">{item.sourceUrl}</span>
-                    <span>{formatDate(item.capturedAt)}</span>
-                  </p>
-                </div>
-                <Badge className="border-border bg-surface-subtle text-muted-foreground">
-                  {item.sourceKind}
-                </Badge>
-              </div>
-              <p className="line-clamp-3 pl-9 text-[12.5px] leading-5 text-muted-foreground">
-                {item.snippet || item.excerpt}
-              </p>
-            </button>
-            <button
-              aria-label={`${isSelectedForPlanner ? "Already selected" : "Select"} ${item.sourceTitle} for source planner`}
-              className="absolute right-12 top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
-              disabled={loading || isSelectedForPlanner}
-              onClick={() => onSelectSourceContextPlannerSource(item.id)}
-              title={
-                isSelectedForPlanner ? "Selected for source planner" : "Select for source planner"
-              }
-              type="button"
-            >
-              {isSelectedForPlanner ? <CheckCircle2 size={14} /> : <Plus size={14} />}
-            </button>
-            <button
-              aria-label={`${isInWorkingSet ? "Already pinned" : "Pin"} ${item.sourceTitle} to working set`}
-              className="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
-              disabled={loading || isInWorkingSet}
-              onClick={() => onPinWorkingSetSource(item.id, "meta")}
-              title={isInWorkingSet ? "In working set" : "Pin to working set"}
-              type="button"
-            >
-              <Pin size={14} />
-            </button>
-          </li>
-        );
-      })}
+      {items.map((item) => (
+        <MemoryListItem
+          highlightedId={highlightedId}
+          item={item}
+          key={item.id}
+          loading={loading}
+          selectedPlannerSourceIds={selectedPlannerSourceIds}
+          workingSetSourceIds={workingSetSourceIds}
+          onOpenDetail={onOpenDetail}
+          onPinWorkingSetSource={onPinWorkingSetSource}
+          onSelectSourceContextPlannerSource={onSelectSourceContextPlannerSource}
+        />
+      ))}
     </ul>
+  );
+}
+
+function MemoryListItem({
+  highlightedId,
+  item,
+  loading,
+  selectedPlannerSourceIds,
+  workingSetSourceIds,
+  onOpenDetail,
+  onPinWorkingSetSource,
+  onSelectSourceContextPlannerSource,
+}: {
+  highlightedId?: string;
+  item: SearchMemoryItem;
+  loading: boolean;
+  selectedPlannerSourceIds: ReadonlySet<string>;
+  workingSetSourceIds: ReadonlySet<string>;
+  onOpenDetail: (id: string) => void;
+  onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
+  onSelectSourceContextPlannerSource: (sourceId: string) => void;
+}) {
+  const isInWorkingSet = workingSetSourceIds.has(item.id);
+  const isSelectedForPlanner = selectedPlannerSourceIds.has(item.id);
+  return (
+    <li className="relative" key={item.id}>
+      <button
+        className={[
+          "relative flex w-full flex-col gap-2 overflow-hidden rounded-lg border bg-surface p-3.5 pr-24 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
+          highlightedId === item.id ? "border-primary/70" : "border-border",
+        ].join(" ")}
+        onClick={() => onOpenDetail(item.id)}
+        type="button"
+      >
+        {highlightedId === item.id ? (
+          <span className="absolute bottom-3 left-0 top-3 w-[2px] rounded-r bg-primary" />
+        ) : null}
+        <div className="flex items-start gap-2.5">
+          <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-surface-subtle text-primary">
+            <FileText size={15} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <h3 className="line-clamp-2 text-sm font-semibold leading-5">{item.sourceTitle}</h3>
+            <p className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+              <span className="truncate">{item.sourceUrl}</span>
+              <span>{formatDate(item.capturedAt)}</span>
+            </p>
+          </div>
+          <Badge className="border-border bg-surface-subtle text-muted-foreground">
+            {item.sourceKind}
+          </Badge>
+        </div>
+        <p className="line-clamp-3 pl-9 text-[12.5px] leading-5 text-muted-foreground">
+          {item.snippet || item.excerpt}
+        </p>
+      </button>
+      <button
+        aria-label={`${isSelectedForPlanner ? "Already selected" : "Select"} ${item.sourceTitle} for source planner`}
+        className="absolute right-12 top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
+        disabled={loading || isSelectedForPlanner}
+        onClick={() => onSelectSourceContextPlannerSource(item.id)}
+        title={isSelectedForPlanner ? "Selected for source planner" : "Select for source planner"}
+        type="button"
+      >
+        {isSelectedForPlanner ? <CheckCircle2 size={14} /> : <Plus size={14} />}
+      </button>
+      <button
+        aria-label={`${isInWorkingSet ? "Already pinned" : "Pin"} ${item.sourceTitle} to working set`}
+        className="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
+        disabled={loading || isInWorkingSet}
+        onClick={() => onPinWorkingSetSource(item.id, "meta")}
+        title={isInWorkingSet ? "In working set" : "Pin to working set"}
+        type="button"
+      >
+        <Pin size={14} />
+      </button>
+    </li>
   );
 }
 

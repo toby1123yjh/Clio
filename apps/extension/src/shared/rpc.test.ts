@@ -1256,6 +1256,10 @@ describe("session engine RPC guards", () => {
               venues: ["Local RAG Symposium"],
               authors: ["Ada Lovelace"],
             },
+            clustering: {
+              clusterBy: "semantic",
+              granularity: "medium",
+            },
           },
         },
       }),
@@ -1297,6 +1301,37 @@ describe("session engine RPC guards", () => {
             query: "long context degradation",
             filter: {
               sourceTypes: "paper",
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "long context degradation",
+            clustering: {
+              clusterBy: "none",
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "long context degradation",
+            clustering: {
+              clusterBy: "year",
+              granularity: "tiny",
             },
           },
         },

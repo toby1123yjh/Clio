@@ -66,7 +66,13 @@ describe("content local RAG flow", () => {
     expect(loadLibrarySection).toContain("toKnowledgeBaseSearchItem");
     expect(contentStateSection).toContain("const knowledgeBaseRetrieveFilter = React.useMemo(");
     expect(contentStateSection).toContain("retrieveFilterForKnowledgeBase(knowledgeBaseFilter)");
+    expect(contentStateSection).toContain("defaultKnowledgeBaseClustering");
+    expect(contentStateSection).toContain(
+      "clusteringPayloadForKnowledgeBase(knowledgeBaseClustering)",
+    );
     expect(retrieveFilterSection).toContain('["webpage", "page", "selection"]');
+    expect(retrieveFilterSection).toContain('if (clustering.clusterBy === "none")');
+    expect(retrieveFilterSection).toContain("clusterBy: clustering.clusterBy");
     expect(retrieveFilterSection).toContain(
       "const years = normalizeKnowledgeBaseYears(filter.yearsText)",
     );
@@ -84,6 +90,9 @@ describe("content local RAG flow", () => {
     );
     expect(loadLibrarySection).toContain("knowledgeBaseRetrieveFilter === undefined");
     expect(loadLibrarySection).toContain("{ filter: knowledgeBaseRetrieveFilter }");
+    expect(loadLibrarySection).toContain("knowledgeBaseClusteringPayload === undefined");
+    expect(loadLibrarySection).toContain("{ clustering: knowledgeBaseClusteringPayload }");
+    expect(loadLibrarySection).toContain("knowledgeBaseClusterGroups(result.clusters, nextItems)");
     expect(loadLibrarySection).not.toContain('kind: "searchMemory"');
     expect(loadLibrarySection).not.toContain('kind: "listMemories"');
   });
@@ -124,6 +133,47 @@ describe("content local RAG flow", () => {
     expect(knowledgeFilterSection).toContain("nextKnowledgeBaseAdvancedFieldText");
     expect(knowledgeFilterSection).not.toContain('kind: "searchMemory"');
     expect(knowledgeFilterSection).not.toContain('kind: "listMemories"');
+  });
+
+  it("exposes Knowledge Base clustering controls through content-owned search payloads", () => {
+    const contentStateSection = contentSource.slice(
+      contentSource.indexOf("function ClioContentApp()"),
+      contentSource.indexOf("React.useEffect(() => {"),
+    );
+    const loadLibrarySection = contentSource.slice(
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+      contentSource.indexOf("const pinWorkingSetSource = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const clusteringControlsSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBaseClusteringControls"),
+      railShellSource.indexOf("function KnowledgeBaseWorkingSetPanel"),
+    );
+    const memoryListSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryList"),
+      railShellSource.indexOf("function MemoryDetailPanel"),
+    );
+
+    expect(contentStateSection).toContain("React.useState<KnowledgeBaseClusteringState>");
+    expect(contentStateSection).toContain("KnowledgeBaseClusterGroup[]");
+    expect(loadLibrarySection).toContain("knowledgeBaseClusteringPayload");
+    expect(loadLibrarySection).toContain("result.clusters");
+    expect(railPropsSection).toContain("knowledgeBaseClustering={knowledgeBaseClustering}");
+    expect(railPropsSection).toContain("knowledgeBaseClusters={knowledgeBaseClusters}");
+    expect(railPropsSection).toContain(
+      "onKnowledgeBaseClusteringChange={setKnowledgeBaseClustering}",
+    );
+    expect(clusteringControlsSection).toContain('data-clio-knowledge-clustering="true"');
+    expect(clusteringControlsSection).toContain('id="clio-kb-cluster-by"');
+    expect(clusteringControlsSection).toContain('id="clio-kb-cluster-granularity"');
+    expect(clusteringControlsSection).toContain("knowledgeBaseClusterByOptions");
+    expect(memoryListSection).toContain('data-clio-knowledge-cluster-list="true"');
+    expect(memoryListSection).toContain('data-clio-knowledge-cluster="true"');
+    expect(clusteringControlsSection).not.toContain("requestEngine");
+    expect(memoryListSection).not.toContain("requestEngine");
   });
 
   it("exposes Working Set controls without loading full memories in the Rail", () => {

@@ -497,6 +497,14 @@ describe("local engine source-native storage foundation", () => {
     expect(fusionSection).toContain("hit.chunk !== undefined");
     expect(fusionSection).toContain("fallbackExcerpt");
     expect(fusionSection).toContain("item.chunks[0]?.snippet || item.fallbackExcerpt");
+    const knowledgeBaseClusterSection = workerSource.slice(
+      workerSource.indexOf("function buildKnowledgeBaseSourceClusters"),
+      workerSource.indexOf("function mergeRetrieveTracks"),
+    );
+    expect(knowledgeBaseClusterSection).toContain("loadKnowledgeBaseClusterMetadata");
+    expect(knowledgeBaseClusterSection).not.toContain("normalized_text");
+    expect(knowledgeBaseClusterSection).not.toContain("graph_nodes");
+    expect(knowledgeBaseClusterSection).not.toContain("graph_edges");
   });
 
   it("keeps embedding jobs idempotent and model-scoped", () => {
