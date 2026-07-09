@@ -1976,6 +1976,18 @@ function ClioContentApp() {
     [loadHealth, loadLibrary, railState.query, showToast],
   );
 
+  const openResearchPlanner = React.useCallback(async () => {
+    setDetail(null);
+    clearPdfPreview();
+    dispatch({ type: "SHOW_RESEARCH_PLANNER" });
+    try {
+      await loadHealth();
+      await loadLibrary(railState.query);
+    } catch (error) {
+      showToast(errorToast(error));
+    }
+  }, [clearPdfPreview, loadHealth, loadLibrary, railState.query, showToast]);
+
   const openWebSearch = React.useCallback(() => {
     setDetail(null);
     dispatch({ type: "SHOW_WEB_SEARCH" });
@@ -3518,7 +3530,7 @@ function ClioContentApp() {
   ]);
 
   React.useEffect(() => {
-    if (railState.mode !== "knowledge-base") return;
+    if (railState.mode !== "knowledge-base" && railState.mode !== "research-planner") return;
     const timer = window.setTimeout(() => {
       void loadLibrary(railState.query);
     }, 220);
@@ -4448,6 +4460,7 @@ function ClioContentApp() {
         onOpenChatSession={(sessionId) => void loadChatSession(sessionId)}
         onOpenDetail={(id) => void openDetail(id)}
         onOpenKnowledgeBase={() => void openKnowledgeBase()}
+        onOpenResearchPlanner={() => void openResearchPlanner()}
         onOpenMarkdownPreview={(messageId) =>
           dispatch({ type: "SHOW_MARKDOWN_PREVIEW", messageId })
         }

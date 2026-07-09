@@ -13,6 +13,7 @@ export type RailMode =
   | "collapsed"
   | "agent-home"
   | "knowledge-base"
+  | "research-planner"
   | "memory-detail"
   | "chat-history"
   | "web-search"
@@ -151,6 +152,7 @@ export type RailEvent =
   | { type: "COLLAPSE" }
   | { type: "TOGGLE" }
   | { type: "SHOW_KNOWLEDGE_BASE"; query?: string; highlightedMemoryId?: string }
+  | { type: "SHOW_RESEARCH_PLANNER" }
   | { type: "SHOW_DETAIL"; memoryId: string }
   | { type: "SHOW_CHAT_HISTORY" }
   | { type: "SHOW_WEB_SEARCH" }
@@ -295,6 +297,16 @@ export function reduceRailState(state: RailState, event: RailEvent): RailState {
         composerSkillMode: undefined,
         query: event.query ?? state.query,
         highlightedMemoryId: event.highlightedMemoryId ?? state.highlightedMemoryId,
+        errorMessage: undefined,
+      };
+    case "SHOW_RESEARCH_PLANNER":
+      return {
+        ...state,
+        mode: "research-planner",
+        previousMode: state.mode === "collapsed" ? state.previousMode : state.mode,
+        detailMemoryId: undefined,
+        previewMessageId: undefined,
+        composerSkillMode: undefined,
         errorMessage: undefined,
       };
     case "SHOW_DETAIL":

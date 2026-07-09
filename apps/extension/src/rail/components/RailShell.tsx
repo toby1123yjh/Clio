@@ -275,6 +275,7 @@ export interface RailShellProps {
   onOpenChatSession: (sessionId: string) => void;
   onOpenDetail: (id: string) => void;
   onOpenKnowledgeBase: () => void;
+  onOpenResearchPlanner: () => void;
   onOpenTopicPage: (id: string) => void;
   onCreateTopicPage: () => void;
   onCancelTopicForm: () => void;
@@ -907,7 +908,9 @@ function RightNavigation({
           <Home size={21} />
         </NavButton>
         <NavButton
-          active={mode === "knowledge-base" || mode === "memory-detail"}
+          active={
+            mode === "knowledge-base" || mode === "research-planner" || mode === "memory-detail"
+          }
           label="Knowledge"
           onClick={onOpenKnowledgeBase}
         >
@@ -1186,6 +1189,9 @@ function renderMode(props: RailShellProps) {
   }
   if (props.state.mode === "knowledge-base") {
     return <KnowledgeBasePanel {...props} />;
+  }
+  if (props.state.mode === "research-planner") {
+    return <ResearchPlannerPanel {...props} />;
   }
   if (props.state.mode === "chat-history") {
     return (
@@ -5034,6 +5040,18 @@ function KnowledgeBasePanel(props: RailShellProps) {
               onReload={props.onReloadWorkingSetSource}
               onSetDepth={props.onSetWorkingSetSourceDepth}
             />
+            <div className="flex justify-end">
+              <Button
+                className="border border-border bg-surface text-foreground hover:bg-muted"
+                disabled={props.state.loading}
+                onClick={props.onOpenResearchPlanner}
+                size="sm"
+                variant="subtle"
+              >
+                <Maximize2 size={14} />
+                Research planner
+              </Button>
+            </div>
             <SourceContextPlannerPanel
               disabled={props.state.loading}
               items={props.items}
@@ -5085,6 +5103,127 @@ function KnowledgeBasePanel(props: RailShellProps) {
             />
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function ResearchPlannerPanel(props: RailShellProps) {
+  const workingSetSourceIds = React.useMemo(
+    () => new Set(props.workingSetStatus?.entries.map((entry) => entry.source.id) ?? []),
+    [props.workingSetStatus],
+  );
+  const selectedPlannerSourceIds = React.useMemo(
+    () => new Set(props.sourceContextPlanner.selectedSourceIds),
+    [props.sourceContextPlanner.selectedSourceIds],
+  );
+  const sourceCountLabel =
+    props.items.length === 0
+      ? `${props.sourceContextPlanner.selectedSourceIds.length} selected sources`
+      : `${props.sourceContextPlanner.selectedSourceIds.length} selected / ${props.items.length} candidates`;
+  return (
+    <div className="relative z-10 flex min-h-0 flex-1 flex-col" data-clio-panel="research-planner">
+      <div className="flex h-[62px] shrink-0 items-center justify-between border-b border-border px-5">
+        <div className="flex min-w-0 items-center gap-3">
+          <IconButton label="Back to Knowledge Base" onClick={props.onBackToKnowledgeBase}>
+            <ArrowLeft size={17} />
+          </IconButton>
+          <div className="min-w-0 leading-tight">
+            <h3 className="truncate text-[20px] font-semibold leading-7">Research Planner</h3>
+            <p className="truncate text-[11px] text-muted-foreground">{sourceCountLabel}</p>
+          </div>
+        </div>
+        <Button
+          className="border border-border bg-surface text-muted-foreground hover:bg-muted hover:text-foreground"
+          disabled={props.state.loading}
+          onClick={props.onRefresh}
+          size="icon"
+          variant="ghost"
+        >
+          {props.state.loading ? (
+            <Loader2 className="animate-spin" size={15} />
+          ) : (
+            <RefreshCw size={15} />
+          )}
+        </Button>
+      </div>
+      <div className="clio-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden px-6 py-4">
+        {renderRoutePrompt(props)}
+        <InlineHealthBanner health={props.health} onOpenSettings={props.onOpenSettings} />
+        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(280px,0.85fr)] xl:items-start">
+          <div className="grid min-w-0 gap-3">
+            <SourceContextPlannerPanel
+              disabled={props.state.loading}
+              items={props.items}
+              query={props.state.query}
+              state={props.sourceContextPlanner}
+              workingSetStatus={props.workingSetStatus}
+              onBudgetChange={props.onSourceContextPlannerBudgetChange}
+              onPreview={props.onPreviewSourceContextPlanner}
+              onRemoveSource={props.onRemoveSourceContextPlannerSource}
+              onSetSourceDepth={props.onSetSourceContextPlannerSourceDepth}
+              onStartResearch={props.onStartSourceContextPlannerResearch}
+            />
+            <SourceContextCompressionLogPanel
+              disabled={props.state.loading}
+              logs={props.sourceContextCompressionLogs}
+              sessionId={props.state.activeSessionId}
+              onRefresh={props.onRefreshSourceContextCompressionLogs}
+            />
+            <SourceContextMapArtifactPanel
+              artifacts={props.sourceContextMapArtifacts}
+              disabled={props.state.loading}
+              sessionId={props.state.activeSessionId}
+              onRefresh={props.onRefreshSourceContextMapArtifacts}
+            />
+            <OrchestrationDiagnosticsPanel
+              disabled={props.state.loading}
+              events={props.orchestrationEvents}
+              runs={props.orchestrationRuns}
+              onCancel={props.onCancelOrchestrationRun}
+              onRefresh={props.onRefreshOrchestrationRuns}
+              onRetry={props.onRetryOrchestrationRun}
+            />
+          </div>
+          <section className="grid min-w-0 gap-3" data-clio-research-planner-source-list="true">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold">Candidate sources</h3>
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Select saved sources for bounded pack preview and explicit research.
+                </p>
+              </div>
+              <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+                {props.items.length}
+              </Badge>
+            </div>
+            <div className="relative">
+              <Search
+                className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+                size={15}
+              />
+              <Input
+                aria-label="Search research planner sources"
+                className="h-11 rounded-lg border-border bg-background pl-9 text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                onChange={(event) => props.onQueryChange(event.target.value)}
+                placeholder="Search sources"
+                value={props.state.query}
+              />
+            </div>
+            <MemoryList
+              clusters={props.knowledgeBaseClusters}
+              highlightedId={props.state.highlightedMemoryId}
+              items={props.items}
+              loading={props.state.loading}
+              selectedPlannerSourceIds={selectedPlannerSourceIds}
+              workingSetSourceIds={workingSetSourceIds}
+              onOpenDetail={props.onOpenDetail}
+              onPinWorkingSetSource={props.onPinWorkingSetSource}
+              onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
+              onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
+            />
+          </section>
+        </div>
       </div>
     </div>
   );

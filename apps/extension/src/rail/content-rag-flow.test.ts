@@ -398,6 +398,51 @@ describe("content local RAG flow", () => {
     expect(memoryListSection).toContain("onSelectSourceContextPlannerSource(item.id)");
   });
 
+  it("exposes a dedicated research planner route without moving Engine calls into RailShell", () => {
+    const contentOpenPlannerSection = contentSource.slice(
+      contentSource.indexOf("const openResearchPlanner = React.useCallback"),
+      contentSource.indexOf("const openWebSearch = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const renderModeSection = railShellSource.slice(
+      railShellSource.indexOf("function renderMode"),
+      railShellSource.indexOf("function RoutePrompt"),
+    );
+    const knowledgeBasePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+    );
+    const researchPlannerPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+      railShellSource.indexOf("function KnowledgeBaseFilterControls"),
+    );
+
+    expect(contentOpenPlannerSection).toContain('dispatch({ type: "SHOW_RESEARCH_PLANNER" })');
+    expect(contentOpenPlannerSection).toContain("await loadHealth()");
+    expect(contentOpenPlannerSection).toContain("await loadLibrary(railState.query)");
+    expect(contentOpenPlannerSection).not.toContain("buildSourceContextPack");
+    expect(contentOpenPlannerSection).not.toContain("startAgentRun");
+    expect(contentSource).toContain(
+      'railState.mode !== "knowledge-base" && railState.mode !== "research-planner"',
+    );
+    expect(railPropsSection).toContain("onOpenResearchPlanner={() => void openResearchPlanner()}");
+    expect(renderModeSection).toContain('props.state.mode === "research-planner"');
+    expect(knowledgeBasePanelSection).toContain("props.onOpenResearchPlanner");
+    expect(researchPlannerPanelSection).toContain('data-clio-panel="research-planner"');
+    expect(researchPlannerPanelSection).toContain('data-clio-research-planner-source-list="true"');
+    expect(researchPlannerPanelSection).toContain("SourceContextPlannerPanel");
+    expect(researchPlannerPanelSection).toContain("SourceContextCompressionLogPanel");
+    expect(researchPlannerPanelSection).toContain("SourceContextMapArtifactPanel");
+    expect(researchPlannerPanelSection).toContain("OrchestrationDiagnosticsPanel");
+    expect(researchPlannerPanelSection).toContain("MemoryList");
+    expect(researchPlannerPanelSection).not.toContain("requestEngine");
+    expect(researchPlannerPanelSection).not.toContain('kind: "getMemory"');
+    expect(researchPlannerPanelSection).not.toContain("normalizedText");
+  });
+
   it("routes Knowledge Base uploads through public file capture RPCs", () => {
     const uploadSection = contentSource.slice(
       contentSource.indexOf("const uploadKnowledgeFiles = React.useCallback"),

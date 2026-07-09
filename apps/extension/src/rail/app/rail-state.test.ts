@@ -70,6 +70,29 @@ describe("rail state reducer", () => {
     expect(detail.highlightedMemoryId).toBe("mem-2");
   });
 
+  it("opens the research planner as a top-level Knowledge route", () => {
+    const withTransientState = {
+      ...reduceRailState(createInitialRailState(pageA), {
+        type: "SET_COMPOSER_SKILL_MODE",
+        mode: translateMode,
+      }),
+      detailMemoryId: "mem-1",
+      previewMessageId: "msg-1",
+      errorMessage: "stale",
+      query: "paper synthesis",
+    };
+
+    const planner = reduceRailState(withTransientState, { type: "SHOW_RESEARCH_PLANNER" });
+
+    expect(planner.mode).toBe("research-planner");
+    expect(planner.query).toBe("paper synthesis");
+    expect(planner.previousMode).toBe("agent-home");
+    expect(planner.detailMemoryId).toBeUndefined();
+    expect(planner.previewMessageId).toBeUndefined();
+    expect(planner.composerSkillMode).toBeUndefined();
+    expect(planner.errorMessage).toBeUndefined();
+  });
+
   it("opens the web search tool page and clears composer skill mode", () => {
     const withSkill = reduceRailState(createInitialRailState(pageA), {
       type: "SET_COMPOSER_SKILL_MODE",
