@@ -110,6 +110,7 @@ import {
 import type {
   ActiveEmbeddingModelSummary,
   ChatSessionSummary,
+  ChunkMetaTier2AuditRecord,
   ClioImageGenerationMode,
   ClioImageGenerationResult,
   ClioImageInput,
@@ -210,6 +211,7 @@ export interface RailShellProps {
   knowledgeBaseClustering: KnowledgeBaseClusteringState;
   knowledgeBaseClusters: KnowledgeBaseClusterGroup[];
   workingSetStatus: WorkingSetStatusResult | null;
+  chunkMetaTier2Audit: ChunkMetaTier2AuditRecord[];
   sourceContextCompressionLogs: SourceContextCompressionLogRecord[];
   sourceContextMapArtifacts: SourceContextMapArtifactRecord[];
   sourceContextPlanner: SourceContextPlannerState;
@@ -292,6 +294,8 @@ export interface RailShellProps {
   onEvictWorkingSetSource: (sourceId: string) => void;
   onSetWorkingSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
   onReloadWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
+  onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
+  onRefreshChunkMetaTier2Audit: () => void;
   onRefreshSourceContextCompressionLogs: () => void;
   onRefreshSourceContextMapArtifacts: () => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
@@ -5027,6 +5031,11 @@ function KnowledgeBasePanel(props: RailShellProps) {
               sessionId={props.state.activeSessionId}
               onRefresh={props.onRefreshSourceContextCompressionLogs}
             />
+            <ChunkMetaTier2AuditPanel
+              audit={props.chunkMetaTier2Audit}
+              disabled={props.state.loading}
+              onRefresh={props.onRefreshChunkMetaTier2Audit}
+            />
             <SourceContextMapArtifactPanel
               artifacts={props.sourceContextMapArtifacts}
               disabled={props.state.loading}
@@ -5042,6 +5051,7 @@ function KnowledgeBasePanel(props: RailShellProps) {
               workingSetSourceIds={workingSetSourceIds}
               onOpenDetail={props.onOpenDetail}
               onPinWorkingSetSource={props.onPinWorkingSetSource}
+              onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
               onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
             />
           </div>
@@ -5725,6 +5735,81 @@ function SourceContextCompressionLogPanel({
   );
 }
 
+function ChunkMetaTier2AuditPanel({
+  audit,
+  disabled,
+  onRefresh,
+}: {
+  audit: ChunkMetaTier2AuditRecord[];
+  disabled: boolean;
+  onRefresh: () => void;
+}) {
+  return (
+    <section
+      className="rounded-lg border border-border bg-surface px-4 py-3"
+      data-clio-chunk-meta-tier2-audit="true"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">Tier2 summary audit</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Explicit chat-provider summaries; stores refs and lengths only
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Badge className="border-border bg-surface-subtle text-muted-foreground">
+            {audit.length}
+          </Badge>
+          <Button
+            aria-label="Refresh Tier2 summary audit"
+            disabled={disabled}
+            onClick={onRefresh}
+            size="icon"
+            title="Refresh"
+            variant="ghost"
+          >
+            <RefreshCw size={14} />
+          </Button>
+        </div>
+      </div>
+      {audit.length === 0 ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No Tier2 summary audit rows yet.</p>
+      ) : (
+        <ul className="mt-3 divide-y divide-border">
+          {audit.slice(0, 6).map((row) => (
+            <li className="grid gap-2 py-3 first:pt-0 last:pb-0" key={row.id}>
+              <div className="flex min-w-0 items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <h4 className="line-clamp-1 text-[12.5px] font-semibold leading-5">
+                    {chunkMetaTier2AuditStatusLabel(row.status)}
+                  </h4>
+                  <p className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">
+                    {row.reason ?? "No failure reason recorded."}
+                  </p>
+                </div>
+                <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+                  {formatDate(row.createdAt)}
+                </Badge>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+                <span className="min-w-0 truncate">Source {compactId(row.sourceId)}</span>
+                <span className="min-w-0 truncate">Chunk {compactId(row.chunkId)}</span>
+                <span className="min-w-0 truncate">Provider {row.providerKind ?? "not used"}</span>
+                <span className="min-w-0 truncate">
+                  Summary {chunkMetaTier2AuditLengthLabel(row)}
+                </span>
+                {row.jobId === undefined ? null : (
+                  <span className="min-w-0 truncate">Job {compactId(row.jobId)}</span>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 function SourceContextMapArtifactPanel({
   artifacts,
   disabled,
@@ -5883,6 +5968,24 @@ function workingSetPinStatusLabel(status: WorkingSetStatusResult["entries"][numb
   if (status === "pinned") return "Pinned";
   if (status === "evicted") return "Evicted";
   return "Auto";
+}
+
+function chunkMetaTier2AuditStatusLabel(status: ChunkMetaTier2AuditRecord["status"]) {
+  if (status === "summarized") return "Summarized";
+  if (status === "unavailable") return "Provider unavailable";
+  if (status === "error") return "Summary error";
+  return "Skipped";
+}
+
+function chunkMetaTier2AuditLengthLabel(row: ChunkMetaTier2AuditRecord) {
+  const section = row.sectionSummaryChars ?? 0;
+  const chunk = row.chunkSummaryChars ?? 0;
+  if (section === 0 && chunk === 0) return "none";
+  return `${section}/${chunk} chars`;
+}
+
+function compactId(value: string) {
+  return value.length <= 14 ? value : `${value.slice(0, 6)}...${value.slice(-5)}`;
 }
 
 function sourceContextCompressionReasonLabel(reason: SourceContextCompressionLogRecord["reason"]) {
@@ -6548,6 +6651,7 @@ function MemoryList({
   workingSetSourceIds,
   onOpenDetail,
   onPinWorkingSetSource,
+  onRunChunkMetaTier2Job,
   onSelectSourceContextPlannerSource,
 }: {
   clusters?: KnowledgeBaseClusterGroup[];
@@ -6558,6 +6662,7 @@ function MemoryList({
   workingSetSourceIds: ReadonlySet<string>;
   onOpenDetail: (id: string) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
+  onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
 }) {
   if (loading) {
@@ -6607,6 +6712,7 @@ function MemoryList({
                   workingSetSourceIds={workingSetSourceIds}
                   onOpenDetail={onOpenDetail}
                   onPinWorkingSetSource={onPinWorkingSetSource}
+                  onRunChunkMetaTier2Job={onRunChunkMetaTier2Job}
                   onSelectSourceContextPlannerSource={onSelectSourceContextPlannerSource}
                 />
               ))}
@@ -6628,6 +6734,7 @@ function MemoryList({
           workingSetSourceIds={workingSetSourceIds}
           onOpenDetail={onOpenDetail}
           onPinWorkingSetSource={onPinWorkingSetSource}
+          onRunChunkMetaTier2Job={onRunChunkMetaTier2Job}
           onSelectSourceContextPlannerSource={onSelectSourceContextPlannerSource}
         />
       ))}
@@ -6643,6 +6750,7 @@ function MemoryListItem({
   workingSetSourceIds,
   onOpenDetail,
   onPinWorkingSetSource,
+  onRunChunkMetaTier2Job,
   onSelectSourceContextPlannerSource,
 }: {
   highlightedId?: string;
@@ -6652,6 +6760,7 @@ function MemoryListItem({
   workingSetSourceIds: ReadonlySet<string>;
   onOpenDetail: (id: string) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
+  onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
 }) {
   const isInWorkingSet = workingSetSourceIds.has(item.id);
@@ -6660,7 +6769,7 @@ function MemoryListItem({
     <li className="relative" key={item.id}>
       <button
         className={[
-          "relative flex w-full flex-col gap-2 overflow-hidden rounded-lg border bg-surface p-3.5 pr-24 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
+          "relative flex w-full flex-col gap-2 overflow-hidden rounded-lg border bg-surface p-3.5 pr-36 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
           highlightedId === item.id ? "border-primary/70" : "border-border",
         ].join(" ")}
         onClick={() => onOpenDetail(item.id)}
@@ -6687,6 +6796,16 @@ function MemoryListItem({
         <p className="line-clamp-3 pl-9 text-[12.5px] leading-5 text-muted-foreground">
           {item.snippet || item.excerpt}
         </p>
+      </button>
+      <button
+        aria-label={`Run Tier2 summaries for ${item.sourceTitle}`}
+        className="absolute right-[84px] top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
+        disabled={loading}
+        onClick={() => onRunChunkMetaTier2Job(item.id, 8)}
+        title="Run Tier2 summaries with current chat provider"
+        type="button"
+      >
+        <Sparkles size={14} />
       </button>
       <button
         aria-label={`${isSelectedForPlanner ? "Already selected" : "Select"} ${item.sourceTitle} for source planner`}

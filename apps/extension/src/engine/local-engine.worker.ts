@@ -33,6 +33,9 @@ import {
   type ChatMessageStatus,
   type ChatSessionDetail,
   type ChatSessionSummary,
+  type ChunkMetaTier2AuditFilter,
+  type ChunkMetaTier2AuditRecord,
+  type ChunkMetaTier2AuditStatus,
   type CompactionRecord,
   type CreateChatSessionPayload,
   type CreateCompactionPayload,
@@ -854,6 +857,12 @@ export class LocalEngine {
         return await this.getJobStatus(request.status, request.limit);
       case "runJob":
         return await this.runQueuedJob(request.id);
+      case "enqueueChunkMetaTier2Job":
+        return await this.enqueueChunkMetaTier2Job(request.payload);
+      case "listChunkMetaTier2Audit":
+        return await this.listChunkMetaTier2Audit(request.filter);
+      case "clearChunkMetaTier2Audit":
+        return await this.clearChunkMetaTier2Audit(request.filter);
       case "reindex":
         return await this.reindex(request);
       case "resolveAnchor":
@@ -2033,6 +2042,10 @@ export class LocalEngine {
         bind: [id],
       });
       deleteSourceContextMapArtifactsForSource(db, id);
+      db.exec({
+        sql: "DELETE FROM chunk_meta_tier2_audit WHERE source_id = ?",
+        bind: [id],
+      });
       db.exec({ sql: "DELETE FROM source_embeddings WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_working_set WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_metadata_fts WHERE source_id = ?", bind: [id] });
@@ -2527,6 +2540,71 @@ export class LocalEngine {
     return {
       jobs: rows.map(jobSummaryFromRow),
     };
+  }
+
+  private async enqueueChunkMetaTier2Job(
+    payload: Extract<EngineRequest, { kind: "enqueueChunkMetaTier2Job" }>["payload"],
+  ): Promise<JobSummary> {
+    const db = await this.ensureReady();
+    const sourceId = normalizeText(payload.sourceId);
+    const source = db.selectObject(
+      "SELECT id FROM sources WHERE id = ? AND lifecycle_status <> 'deleted' LIMIT 1",
+      [sourceId],
+    );
+    if (source === undefined) {
+      throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
+    }
+
+    const jobId = enqueueJob(db, "post_capture_hardening", {
+      sourceId,
+      stages: ["chunk_meta", "embedding"],
+      chunkMetaTier2: {
+        enabled: true,
+        maxChunks: clampChunkMetaTier2MaxChunks(payload.maxChunks),
+      },
+      trigger: "manual_tier2_ui",
+    });
+    const job = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [jobId]);
+    if (job === undefined) {
+      throw new EngineRpcError("JOB_NOT_FOUND", `Job not found after enqueue: ${jobId}`);
+    }
+    return jobSummaryFromRow(job);
+  }
+
+  private async listChunkMetaTier2Audit(
+    filter: ChunkMetaTier2AuditFilter = {},
+  ): Promise<{ items: ChunkMetaTier2AuditRecord[] }> {
+    const db = await this.ensureReady();
+    const where = chunkMetaTier2AuditWhereClause(filter);
+    const rows = db.selectObjects(
+      `SELECT *
+       FROM chunk_meta_tier2_audit
+       ${where.sql}
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+      [...where.bind, clampOptionalLimit(filter.limit, 30, 100)],
+    );
+    return { items: rows.map(chunkMetaTier2AuditRecordFromRow) };
+  }
+
+  private async clearChunkMetaTier2Audit(
+    filter: ChunkMetaTier2AuditFilter,
+  ): Promise<{ cleared: number }> {
+    const hasSource = normalizeText(filter.sourceId ?? "").length > 0;
+    const hasJob = normalizeText(filter.jobId ?? "").length > 0;
+    if (!hasSource && !hasJob) {
+      throw new EngineRpcError(
+        "INVALID_CHUNK_META_TIER2_AUDIT_FILTER",
+        "Clearing Tier2 audit rows requires a sourceId or jobId.",
+      );
+    }
+    const db = await this.ensureReady();
+    const where = chunkMetaTier2AuditWhereClause(filter);
+    db.exec({
+      sql: `DELETE FROM chunk_meta_tier2_audit ${where.sql}`,
+      bind: where.bind,
+    });
+    return { cleared: Number(db.selectValue("SELECT changes()") ?? 0) };
   }
 
   private async runQueuedJob(id: string): Promise<JobSummary> {
@@ -3329,6 +3407,7 @@ export class LocalEngine {
       db.exec("DELETE FROM graph_nodes");
       db.exec("DELETE FROM source_context_compression_logs");
       db.exec("DELETE FROM source_context_map_artifacts");
+      db.exec("DELETE FROM chunk_meta_tier2_audit");
       db.exec("DELETE FROM source_working_set");
       db.exec("DELETE FROM source_metadata");
       db.exec("DELETE FROM keyword_index_sources");
@@ -3981,6 +4060,22 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS chunk_meta_tier2_audit (
+      id TEXT PRIMARY KEY,
+      source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+      chunk_id TEXT NOT NULL REFERENCES source_chunks(id) ON DELETE CASCADE,
+      job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+      tier TEXT NOT NULL CHECK (tier IN ('tier2')),
+      status TEXT NOT NULL CHECK (status IN ('summarized', 'unavailable', 'error', 'skipped')),
+      provider_kind TEXT CHECK (provider_kind IS NULL OR provider_kind IN ('chat')),
+      reason TEXT,
+      section_summary_chars INTEGER,
+      chunk_summary_chars INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS web_search_history (
       id TEXT PRIMARY KEY,
       query TEXT NOT NULL,
@@ -4179,6 +4274,18 @@ function migrate(db: SqliteDb) {
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_source_context_map_artifacts_status_created
      ON source_context_map_artifacts(status, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_chunk_meta_tier2_audit_source_created
+     ON chunk_meta_tier2_audit(source_id, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_chunk_meta_tier2_audit_job_created
+     ON chunk_meta_tier2_audit(job_id, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_chunk_meta_tier2_audit_status_created
+     ON chunk_meta_tier2_audit(status, created_at DESC)`,
   );
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_web_search_history_created ON web_search_history(created_at DESC)",
@@ -7049,6 +7156,7 @@ async function runJob(
       result = await runPostCaptureHardeningJob(
         db,
         stringField(job, "payload_json"),
+        jobId,
         embeddingProviderOverride,
         embeddingProviderFactory,
         chunkMetaSummarizerFactory,
@@ -7304,6 +7412,7 @@ function countEmbeddingsForModel(db: SqliteDb, modelId: string, targetKind: "chu
 async function runPostCaptureHardeningJob(
   db: SqliteDb,
   payloadJson: string,
+  jobId: string,
   embeddingProviderOverride?: EmbeddingProvider,
   embeddingProviderFactory?: EmbeddingProviderFactory,
   chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory,
@@ -7327,6 +7436,7 @@ async function runPostCaptureHardeningJob(
   const chunkMeta = shouldRunChunkMeta
     ? await runChunkMetaStageForSource(db, payload.sourceId, {
         tier2: payload.chunkMetaTier2,
+        jobId,
         summarizerFactory: chunkMetaSummarizerFactory,
       })
     : { skipped: true, reason: "stage_not_requested" };
@@ -7960,6 +8070,7 @@ interface RunChunkMetaStageOptions {
     enabled: boolean;
     maxChunks: number;
   };
+  jobId?: string;
   summarizerFactory?: ChunkMetaSummarizerFactory;
 }
 
@@ -8101,6 +8212,12 @@ async function runChunkMetaStageForSource(
       status: "disabled",
       reason: "chunk_meta_tier2_max_chunks_zero",
     });
+    insertChunkMetaTier2AuditRowsForChunks(db, chunkMetaRows, {
+      sourceId,
+      jobId: options.jobId,
+      status: "skipped",
+      reason: "chunk_meta_tier2_max_chunks_zero",
+    });
     return {
       ...baseResult,
       tier2Enabled: true,
@@ -8116,6 +8233,12 @@ async function runChunkMetaStageForSource(
   const summarizer = options.summarizerFactory?.() ?? null;
   if (summarizer === null) {
     updateChunkMetaTier2StateForRows(db, chunkMetaRows, {
+      status: "unavailable",
+      reason: "chunk_meta_summarizer_unavailable",
+    });
+    insertChunkMetaTier2AuditRowsForChunks(db, chunkMetaRows, {
+      sourceId,
+      jobId: options.jobId,
       status: "unavailable",
       reason: "chunk_meta_summarizer_unavailable",
     });
@@ -8149,6 +8272,16 @@ async function runChunkMetaStageForSource(
       sql: "UPDATE source_chunks SET meta_head_json = ? WHERE id = ?",
       bind: [updated, chunk.id],
     });
+    insertChunkMetaTier2AuditRow(db, {
+      sourceId,
+      chunkId: chunk.id,
+      jobId: options.jobId,
+      status: chunkMetaTier2AuditStatusFromSummary(result.status),
+      providerKind: result.providerKind,
+      reason: result.reason,
+      sectionSummaryChars: chunkMetaSummaryCharCount(result.sectionSummary),
+      chunkSummaryChars: chunkMetaSummaryCharCount(result.chunkSummary),
+    });
     if (result.status === "summarized") summarizedCount += 1;
     else if (result.status === "unavailable") unavailableCount += 1;
     else errorCount += 1;
@@ -8156,6 +8289,12 @@ async function runChunkMetaStageForSource(
   if (skippedRows.length > 0) {
     updateChunkMetaTier2StateForRows(db, skippedRows, {
       status: "disabled",
+      reason: "chunk_meta_tier2_max_chunks_exceeded",
+    });
+    insertChunkMetaTier2AuditRowsForChunks(db, skippedRows, {
+      sourceId,
+      jobId: options.jobId,
+      status: "skipped",
       reason: "chunk_meta_tier2_max_chunks_exceeded",
     });
   }
@@ -8217,6 +8356,78 @@ async function summarizeChunkMetaRow(
       ),
     };
   }
+}
+
+interface InsertChunkMetaTier2AuditInput {
+  sourceId: string;
+  chunkId: string;
+  jobId?: string;
+  status: ChunkMetaTier2AuditStatus;
+  providerKind?: "chat";
+  reason?: string;
+  sectionSummaryChars?: number;
+  chunkSummaryChars?: number;
+}
+
+function insertChunkMetaTier2AuditRowsForChunks(
+  db: SqliteDb,
+  rows: ChunkMetaStageRow[],
+  input: Omit<InsertChunkMetaTier2AuditInput, "chunkId">,
+) {
+  if (rows.length === 0) return;
+  transaction(db, () => {
+    for (const row of rows) {
+      insertChunkMetaTier2AuditRow(db, {
+        ...input,
+        chunkId: row.id,
+      });
+    }
+  });
+}
+
+function insertChunkMetaTier2AuditRow(db: SqliteDb, input: InsertChunkMetaTier2AuditInput) {
+  const now = new Date().toISOString();
+  db.exec({
+    sql: `INSERT INTO chunk_meta_tier2_audit (
+      id,
+      source_id,
+      chunk_id,
+      job_id,
+      tier,
+      status,
+      provider_kind,
+      reason,
+      section_summary_chars,
+      chunk_summary_chars,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, 'tier2', ?, ?, ?, ?, ?, ?, ?)`,
+    bind: [
+      createId("cmeta_t2_audit"),
+      input.sourceId,
+      input.chunkId,
+      normalizeOptionalAuditId(input.jobId) ?? null,
+      input.status,
+      input.providerKind ?? null,
+      normalizeOptionalArtifactText(input.reason, 240) ?? null,
+      finiteNumberOrNull(input.sectionSummaryChars),
+      finiteNumberOrNull(input.chunkSummaryChars),
+      now,
+      now,
+    ],
+  });
+}
+
+function chunkMetaTier2AuditStatusFromSummary(
+  status: ChunkMetaSummaryResult["status"],
+): ChunkMetaTier2AuditStatus {
+  if (status === "summarized" || status === "unavailable") return status;
+  return "error";
+}
+
+function chunkMetaSummaryCharCount(value: string | undefined) {
+  const normalized = normalizeText(value ?? "");
+  return normalized.length === 0 ? undefined : normalized.length;
 }
 
 function updateChunkMetaTier2StateForRows(
@@ -10122,6 +10333,29 @@ function sourceContextMapArtifactWhereClause(
     const pattern = sourceContextMapArtifactJsonLikePattern(filter.sourceId);
     conditions.push("(source_ids_json LIKE ? ESCAPE '\\' OR window_refs_json LIKE ? ESCAPE '\\')");
     bind.push(pattern, pattern);
+  }
+  return {
+    sql: conditions.length === 0 ? "" : `WHERE ${conditions.join(" AND ")}`,
+    bind,
+  };
+}
+
+function chunkMetaTier2AuditWhereClause(filter: ChunkMetaTier2AuditFilter): SqlWhereClause {
+  const conditions: string[] = [];
+  const bind: unknown[] = [];
+  const sourceId = normalizeOptionalAuditId(filter.sourceId);
+  const jobId = normalizeOptionalAuditId(filter.jobId);
+  if (sourceId !== undefined) {
+    conditions.push("source_id = ?");
+    bind.push(sourceId);
+  }
+  if (jobId !== undefined) {
+    conditions.push("job_id = ?");
+    bind.push(jobId);
+  }
+  if (filter.status !== undefined) {
+    conditions.push("status = ?");
+    bind.push(filter.status);
   }
   return {
     sql: conditions.length === 0 ? "" : `WHERE ${conditions.join(" AND ")}`,
@@ -12921,6 +13155,28 @@ function sourceContextMapArtifactRecordFromRow(row: SqlRow): SourceContextMapArt
   };
 }
 
+function chunkMetaTier2AuditRecordFromRow(row: SqlRow): ChunkMetaTier2AuditRecord {
+  const jobId = optionalString(row, "job_id");
+  const providerKind = optionalChunkMetaTier2AuditProvider(row, "provider_kind");
+  const reason = optionalString(row, "reason");
+  const sectionSummaryChars = optionalNumber(row, "section_summary_chars");
+  const chunkSummaryChars = optionalNumber(row, "chunk_summary_chars");
+  return {
+    id: stringField(row, "id"),
+    sourceId: stringField(row, "source_id"),
+    chunkId: stringField(row, "chunk_id"),
+    ...(jobId === undefined ? {} : { jobId }),
+    tier: "tier2",
+    status: chunkMetaTier2AuditStatusField(row, "status"),
+    ...(providerKind === undefined ? {} : { providerKind }),
+    ...(reason === undefined ? {} : { reason }),
+    ...(sectionSummaryChars === undefined ? {} : { sectionSummaryChars }),
+    ...(chunkSummaryChars === undefined ? {} : { chunkSummaryChars }),
+    createdAt: stringField(row, "created_at"),
+    updatedAt: stringField(row, "updated_at"),
+  };
+}
+
 function chatMessageRecordFromRow(row: SqlRow): ChatMessageRecord {
   const pageUrl = optionalString(row, "page_url");
   const pageTitle = optionalString(row, "page_title");
@@ -13397,6 +13653,16 @@ function sourceContextMapArtifactStatusField(
   return "started";
 }
 
+function chunkMetaTier2AuditStatusField(row: SqlRow, key: string): ChunkMetaTier2AuditStatus {
+  const value = stringField(row, key);
+  if (value === "summarized" || value === "unavailable" || value === "error") return value;
+  return "skipped";
+}
+
+function optionalChunkMetaTier2AuditProvider(row: SqlRow, key: string): "chat" | undefined {
+  return stringField(row, key) === "chat" ? "chat" : undefined;
+}
+
 function agentScopeField(row: SqlRow, key: string): ChatMessageRecord["scope"] {
   const value = stringField(row, key);
   if (value === "general" || value === "selection") return value;
@@ -13825,6 +14091,12 @@ function normalizeOptionalArtifactText(value: string | undefined, maxLength: num
   if (value === undefined) return undefined;
   const normalized = normalizeText(value);
   return normalized.length === 0 ? undefined : normalized.slice(0, maxLength);
+}
+
+function normalizeOptionalAuditId(value: string | undefined) {
+  if (value === undefined) return undefined;
+  const normalized = normalizeText(value).slice(0, 240);
+  return normalized.length === 0 ? undefined : normalized;
 }
 
 function boundedArtifactStrings(values: string[] | undefined, max: number) {

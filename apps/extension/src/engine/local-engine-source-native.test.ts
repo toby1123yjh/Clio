@@ -38,6 +38,7 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_working_set");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS keyword_index");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS keyword_index_sources");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS chunk_meta_tier2_audit");
     expect(workerSource).toContain("load_depth TEXT NOT NULL CHECK");
     expect(workerSource).toContain("pin_status TEXT NOT NULL CHECK");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_lifecycle_events");
@@ -607,6 +608,18 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST");
     expect(workerSource).toContain("isWorkerChunkMetaSummaryResponseMessage");
     expect(workerSource).toContain("chunkMetaTier2");
+    expect(workerSource).toContain('case "enqueueChunkMetaTier2Job"');
+    expect(workerSource).toContain('case "listChunkMetaTier2Audit"');
+    expect(workerSource).toContain('case "clearChunkMetaTier2Audit"');
+    expect(workerSource).toContain("private async enqueueChunkMetaTier2Job");
+    expect(workerSource).toContain("private async listChunkMetaTier2Audit");
+    expect(workerSource).toContain("private async clearChunkMetaTier2Audit");
+    expect(workerSource).toContain("idx_chunk_meta_tier2_audit_source_created");
+    expect(workerSource).toContain("idx_chunk_meta_tier2_audit_job_created");
+    expect(workerSource).toContain("idx_chunk_meta_tier2_audit_status_created");
+    expect(workerSource).toContain("insertChunkMetaTier2AuditRow");
+    expect(workerSource).toContain("chunkMetaTier2AuditRecordFromRow");
+    expect(workerSource).toContain("chunkMetaTier2AuditWhereClause");
     expect(workerSource).toContain("chunk_meta_summarizer_unavailable");
     expect(workerSource).toContain("chunk_meta_tier2_max_chunks_exceeded");
     expect(workerSource).toContain("applyChunkMetaTier2Result");

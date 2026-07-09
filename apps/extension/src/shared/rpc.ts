@@ -515,6 +515,35 @@ export interface SourceContextMapArtifactFilter {
   limit?: number;
 }
 
+export interface EnqueueChunkMetaTier2JobPayload {
+  sourceId: string;
+  maxChunks?: number;
+}
+
+export type ChunkMetaTier2AuditStatus = "summarized" | "unavailable" | "error" | "skipped";
+
+export interface ChunkMetaTier2AuditRecord {
+  id: string;
+  sourceId: string;
+  chunkId: string;
+  jobId?: string;
+  tier: "tier2";
+  status: ChunkMetaTier2AuditStatus;
+  providerKind?: "chat";
+  reason?: string;
+  sectionSummaryChars?: number;
+  chunkSummaryChars?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChunkMetaTier2AuditFilter {
+  sourceId?: string;
+  jobId?: string;
+  status?: ChunkMetaTier2AuditStatus;
+  limit?: number;
+}
+
 export interface SourceContextPackResult {
   query?: string;
   sources: SourceContextPackSource[];
@@ -1228,6 +1257,9 @@ export type EngineRequest =
   | { kind: "getActiveEmbeddingModel" }
   | { kind: "getJobStatus"; status?: JobStatus; limit?: number }
   | { kind: "runJob"; id: string }
+  | { kind: "enqueueChunkMetaTier2Job"; payload: EnqueueChunkMetaTier2JobPayload }
+  | { kind: "listChunkMetaTier2Audit"; filter?: ChunkMetaTier2AuditFilter }
+  | { kind: "clearChunkMetaTier2Audit"; filter: ChunkMetaTier2AuditFilter }
   | { kind: "reindex"; scope: "fts" }
   | { kind: "reindex"; scope: "embeddings"; model: EmbeddingReindexModelDescriptor }
   | { kind: "resolveAnchor"; memoryId: string }
@@ -1359,106 +1391,124 @@ export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health
                                                                 ? ActiveEmbeddingModelSummary | null
                                                                 : T extends { kind: "getJobStatus" }
                                                                   ? GetJobStatusResult
-                                                                  : T extends { kind: "runJob" }
+                                                                  : T extends {
+                                                                        kind:
+                                                                          | "runJob"
+                                                                          | "enqueueChunkMetaTier2Job";
+                                                                      }
                                                                     ? JobSummary
-                                                                    : T extends { kind: "reindex" }
-                                                                      ? ReindexResult
+                                                                    : T extends {
+                                                                          kind: "listChunkMetaTier2Audit";
+                                                                        }
+                                                                      ? {
+                                                                          items: ChunkMetaTier2AuditRecord[];
+                                                                        }
                                                                       : T extends {
-                                                                            kind: "resolveAnchor";
+                                                                            kind: "clearChunkMetaTier2Audit";
                                                                           }
-                                                                        ? AnchorResolveResult
+                                                                        ? {
+                                                                            cleared: number;
+                                                                          }
                                                                         : T extends {
-                                                                              kind: "createChatSession";
+                                                                              kind: "reindex";
                                                                             }
-                                                                          ? ChatSessionSummary
+                                                                          ? ReindexResult
                                                                           : T extends {
-                                                                                kind: "listChatSessions";
+                                                                                kind: "resolveAnchor";
                                                                               }
-                                                                            ? ListChatSessionsResult
+                                                                            ? AnchorResolveResult
                                                                             : T extends {
-                                                                                  kind:
-                                                                                    | "loadChatSession"
-                                                                                    | "recoverInterruptedChatSession";
+                                                                                  kind: "createChatSession";
                                                                                 }
-                                                                              ? ChatSessionDetail | null
+                                                                              ? ChatSessionSummary
                                                                               : T extends {
-                                                                                    kind:
-                                                                                      | "claimChatSession"
-                                                                                      | "heartbeatChatSession"
-                                                                                      | "releaseChatSession";
+                                                                                    kind: "listChatSessions";
                                                                                   }
-                                                                                ? SessionLeaseResult
+                                                                                ? ListChatSessionsResult
                                                                                 : T extends {
-                                                                                      kind: "appendSessionEvidence";
+                                                                                      kind:
+                                                                                        | "loadChatSession"
+                                                                                        | "recoverInterruptedChatSession";
                                                                                     }
-                                                                                  ? SessionEvidenceRecord
+                                                                                  ? ChatSessionDetail | null
                                                                                   : T extends {
-                                                                                        kind: "appendCompaction";
+                                                                                        kind:
+                                                                                          | "claimChatSession"
+                                                                                          | "heartbeatChatSession"
+                                                                                          | "releaseChatSession";
                                                                                       }
-                                                                                    ? CompactionRecord
+                                                                                    ? SessionLeaseResult
                                                                                     : T extends {
-                                                                                          kind: "listCompactions";
+                                                                                          kind: "appendSessionEvidence";
                                                                                         }
-                                                                                      ? {
-                                                                                          items: CompactionRecord[];
-                                                                                        }
+                                                                                      ? SessionEvidenceRecord
                                                                                       : T extends {
-                                                                                            kind: "getLatestCompaction";
+                                                                                            kind: "appendCompaction";
                                                                                           }
-                                                                                        ? CompactionRecord | null
+                                                                                        ? CompactionRecord
                                                                                         : T extends {
-                                                                                              kind:
-                                                                                                | "upsertChatMessage"
-                                                                                                | "updateChatMessage";
+                                                                                              kind: "listCompactions";
                                                                                             }
-                                                                                          ? ChatMessageRecord
+                                                                                          ? {
+                                                                                              items: CompactionRecord[];
+                                                                                            }
                                                                                           : T extends {
-                                                                                                kind: "deleteChatMessage";
+                                                                                                kind: "getLatestCompaction";
                                                                                               }
-                                                                                            ? {
-                                                                                                deleted: boolean;
-                                                                                              }
+                                                                                            ? CompactionRecord | null
                                                                                             : T extends {
-                                                                                                  kind: "clearQueuedChatMessages";
+                                                                                                  kind:
+                                                                                                    | "upsertChatMessage"
+                                                                                                    | "updateChatMessage";
                                                                                                 }
-                                                                                              ? {
-                                                                                                  cleared: number;
-                                                                                                }
+                                                                                              ? ChatMessageRecord
                                                                                               : T extends {
-                                                                                                    kind: "listWebSearchHistory";
+                                                                                                    kind: "deleteChatMessage";
                                                                                                   }
-                                                                                                ? ListWebSearchHistoryResult
+                                                                                                ? {
+                                                                                                    deleted: boolean;
+                                                                                                  }
                                                                                                 : T extends {
-                                                                                                      kind: "appendWebSearchHistory";
+                                                                                                      kind: "clearQueuedChatMessages";
                                                                                                     }
-                                                                                                  ? WebSearchHistoryRecord
+                                                                                                  ? {
+                                                                                                      cleared: number;
+                                                                                                    }
                                                                                                   : T extends {
-                                                                                                        kind: "deleteWebSearchHistory";
+                                                                                                        kind: "listWebSearchHistory";
                                                                                                       }
-                                                                                                    ? {
-                                                                                                        deleted: boolean;
-                                                                                                      }
+                                                                                                    ? ListWebSearchHistoryResult
                                                                                                     : T extends {
-                                                                                                          kind: "clearWebSearchHistory";
+                                                                                                          kind: "appendWebSearchHistory";
                                                                                                         }
-                                                                                                      ? {
-                                                                                                          cleared: number;
-                                                                                                        }
+                                                                                                      ? WebSearchHistoryRecord
                                                                                                       : T extends {
-                                                                                                            kind: "listImageGenerationHistory";
+                                                                                                            kind: "deleteWebSearchHistory";
                                                                                                           }
-                                                                                                        ? ListImageGenerationHistoryResult
+                                                                                                        ? {
+                                                                                                            deleted: boolean;
+                                                                                                          }
                                                                                                         : T extends {
-                                                                                                              kind: "appendImageGenerationHistory";
+                                                                                                              kind: "clearWebSearchHistory";
                                                                                                             }
-                                                                                                          ? ImageGenerationHistoryRecord
+                                                                                                          ? {
+                                                                                                              cleared: number;
+                                                                                                            }
                                                                                                           : T extends {
-                                                                                                                kind: "deleteImageGenerationHistory";
+                                                                                                                kind: "listImageGenerationHistory";
                                                                                                               }
-                                                                                                            ? {
-                                                                                                                deleted: boolean;
-                                                                                                              }
-                                                                                                            : never;
+                                                                                                            ? ListImageGenerationHistoryResult
+                                                                                                            : T extends {
+                                                                                                                  kind: "appendImageGenerationHistory";
+                                                                                                                }
+                                                                                                              ? ImageGenerationHistoryRecord
+                                                                                                              : T extends {
+                                                                                                                    kind: "deleteImageGenerationHistory";
+                                                                                                                  }
+                                                                                                                ? {
+                                                                                                                    deleted: boolean;
+                                                                                                                  }
+                                                                                                                : never;
 
 export type EngineResponse<T = unknown> =
   | { ok: true; value: T }
@@ -2195,6 +2245,12 @@ function isEngineRequest(value: unknown): value is EngineRequest {
       );
     case "runJob":
       return typeof value.id === "string";
+    case "enqueueChunkMetaTier2Job":
+      return isEnqueueChunkMetaTier2JobPayload(value.payload);
+    case "listChunkMetaTier2Audit":
+      return value.filter === undefined || isChunkMetaTier2AuditFilter(value.filter, false);
+    case "clearChunkMetaTier2Audit":
+      return isChunkMetaTier2AuditFilter(value.filter, true);
     case "reindex":
       if (value.scope === "fts") return true;
       if (value.scope === "embeddings") return isEmbeddingReindexModelDescriptor(value.model);
@@ -2493,8 +2549,45 @@ function isSourceContextMapArtifactFilter(value: unknown): value is SourceContex
   );
 }
 
+function isEnqueueChunkMetaTier2JobPayload(
+  value: unknown,
+): value is EnqueueChunkMetaTier2JobPayload {
+  return (
+    isRecord(value) &&
+    typeof value.sourceId === "string" &&
+    value.sourceId.trim().length > 0 &&
+    isOptionalPositiveInteger(value.maxChunks)
+  );
+}
+
+function isChunkMetaTier2AuditFilter(
+  value: unknown,
+  requireSourceOrJob: boolean,
+): value is ChunkMetaTier2AuditFilter {
+  if (!isRecord(value)) return false;
+  const hasSource = typeof value.sourceId === "string" && value.sourceId.trim().length > 0;
+  const hasJob = typeof value.jobId === "string" && value.jobId.trim().length > 0;
+  return (
+    (!requireSourceOrJob || hasSource || hasJob) &&
+    (value.sourceId === undefined || hasSource) &&
+    (value.jobId === undefined || hasJob) &&
+    (value.status === undefined || isChunkMetaTier2AuditStatus(value.status)) &&
+    isOptionalFiniteNumber(value.limit)
+  );
+}
+
+function isChunkMetaTier2AuditStatus(value: unknown): value is ChunkMetaTier2AuditStatus {
+  return (
+    value === "summarized" || value === "unavailable" || value === "error" || value === "skipped"
+  );
+}
+
 function isOptionalFiniteNumber(value: unknown) {
   return value === undefined || (typeof value === "number" && Number.isFinite(value));
+}
+
+function isOptionalPositiveInteger(value: unknown) {
+  return value === undefined || (typeof value === "number" && Number.isInteger(value) && value > 0);
 }
 
 function isRetrieveSourcesPayload(value: unknown): value is RetrieveSourcesPayload {

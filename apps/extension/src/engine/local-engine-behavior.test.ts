@@ -344,30 +344,42 @@ describe("local engine behavior harness", () => {
 
   it("marks explicit Tier2 chunk meta as unavailable when no summarizer is installed", async () => {
     const harness = createHarness();
+    const sourceText = ragText("tier2 missing provider fallback", 8);
     const capture = await harness.request({
       kind: "capturePage",
       payload: pagePayload({
         sourceUrl: "https://example.test/tier2-missing",
         sourceTitle: "Tier2 Missing Provider",
-        normalizedText: ragText("tier2 missing provider fallback", 8),
+        normalizedText: sourceText,
       }),
     });
     const sourceId = capture.memory.id;
-    const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
-    harness.exec("UPDATE jobs SET payload_json = ? WHERE id = ?", [
-      JSON.stringify({
-        sourceId,
-        stages: ["chunk_meta", "embedding"],
-        chunkMetaTier2: { enabled: true, maxChunks: 32 },
-      }),
-      queued.jobs[0]?.id ?? "",
+    const queued = await harness.request({
+      kind: "enqueueChunkMetaTier2Job",
+      payload: { sourceId, maxChunks: 32 },
+    });
+    expect(queued.type).toBe("post_capture_hardening");
+    const queuedRow = harness.selectObject("SELECT payload_json FROM jobs WHERE id = ? LIMIT 1", [
+      queued.id,
     ]);
+    const queuedPayload = JSON.parse(String(queuedRow?.payload_json ?? "{}")) as {
+      sourceId?: string;
+      stages?: string[];
+      chunkMetaTier2?: { enabled?: boolean; maxChunks?: number };
+      trigger?: string;
+    };
+    expect(queuedPayload).toMatchObject({
+      sourceId,
+      stages: ["chunk_meta", "embedding"],
+      chunkMetaTier2: { enabled: true, maxChunks: 32 },
+      trigger: "manual_tier2_ui",
+    });
 
-    const job = await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+    const job = await harness.request({ kind: "runJob", id: queued.id });
     expect(job.status).toBe("done");
 
     const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
-      queued.jobs[0]?.id ?? "",
+      queued.id,
     ]);
     const jobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
       chunkMeta?: {
@@ -390,6 +402,34 @@ describe("local engine behavior harness", () => {
     expect(metaHead.selectedTier).toBe("tier1");
     expect(metaHead.tiers?.tier2?.status).toBe("unavailable");
     expect(metaHead.tiers?.tier2?.reason).toBe("chunk_meta_summarizer_unavailable");
+
+    const audit = await harness.request({
+      kind: "listChunkMetaTier2Audit",
+      filter: { jobId: queued.id, status: "unavailable", limit: 20 },
+    });
+    expect(audit.items.length).toBeGreaterThan(0);
+    expect(audit.items[0]).toMatchObject({
+      sourceId,
+      jobId: queued.id,
+      tier: "tier2",
+      status: "unavailable",
+      reason: "chunk_meta_summarizer_unavailable",
+    });
+    const auditJson = JSON.stringify(audit);
+    expect(auditJson).not.toContain(sourceText);
+    expect(auditJson).not.toContain("normalizedText");
+    expect(auditJson).not.toContain("apiKey");
+
+    const cleared = await harness.request({
+      kind: "clearChunkMetaTier2Audit",
+      filter: { jobId: queued.id },
+    });
+    expect(cleared.cleared).toBeGreaterThanOrEqual(audit.items.length);
+    const afterClear = await harness.request({
+      kind: "listChunkMetaTier2Audit",
+      filter: { jobId: queued.id, limit: 20 },
+    });
+    expect(afterClear.items).toEqual([]);
   });
 
   it("promotes successful explicit Tier2 chunk summaries before embedding", async () => {
@@ -458,6 +498,29 @@ describe("local engine behavior harness", () => {
       "Remote chunk summary improves the embedding prefix.",
     );
 
+    const audit = await harness.request({
+      kind: "listChunkMetaTier2Audit",
+      filter: { jobId: queued.jobs[0]?.id ?? "", status: "summarized", limit: 20 },
+    });
+    expect(audit.items.length).toBeGreaterThan(0);
+    expect(audit.items[0]).toMatchObject({
+      sourceId,
+      jobId: queued.jobs[0]?.id ?? "",
+      tier: "tier2",
+      status: "summarized",
+      providerKind: "chat",
+    });
+    expect(audit.items[0]?.sectionSummaryChars).toBe(
+      "Remote section summary for bounded retrieval.".length,
+    );
+    expect(audit.items[0]?.chunkSummaryChars).toBe(
+      "Remote chunk summary improves the embedding prefix.".length,
+    );
+    const auditJson = JSON.stringify(audit);
+    expect(auditJson).not.toContain("Remote chunk summary improves the embedding prefix.");
+    expect(auditJson).not.toContain("Tier2 success local chunk evidence");
+    expect(auditJson).not.toContain("apiKey");
+
     const embedding = harness.selectObject(
       "SELECT text_hash FROM source_embeddings WHERE source_id = ? AND target_kind = 'chunk' ORDER BY target_id ASC LIMIT 1",
       [sourceId],
@@ -523,6 +586,67 @@ describe("local engine behavior harness", () => {
     expect(metaHead.selectedTier).toBe("tier1");
     expect(metaHead.tiers?.tier2?.status).toBe("error");
     expect(metaHead.tiers?.tier2?.reason).toBe("provider_json_failed");
+
+    const audit = await harness.request({
+      kind: "listChunkMetaTier2Audit",
+      filter: { jobId: queued.jobs[0]?.id ?? "", status: "error", limit: 20 },
+    });
+    expect(audit.items.length).toBeGreaterThan(0);
+    expect(audit.items[0]).toMatchObject({
+      sourceId,
+      jobId: queued.jobs[0]?.id ?? "",
+      tier: "tier2",
+      status: "error",
+      providerKind: "chat",
+      reason: "provider_json_failed",
+    });
+    expect(JSON.stringify(audit)).not.toContain("tier2 error fallback stays tier1");
+  });
+
+  it("records skipped Tier2 audit rows when maxChunks bounds the batch", async () => {
+    const calls: ChunkMetaSummaryInput[] = [];
+    const summarizer: ChunkMetaSummarizer = {
+      async summarize(input) {
+        calls.push(input);
+        return {
+          status: "summarized",
+          providerKind: "chat",
+          sectionSummary: "One bounded section summary.",
+          chunkSummary: "One bounded chunk summary.",
+        };
+      },
+    };
+    const harness = createHarness({ chunkMetaSummarizer: summarizer });
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/tier2-skipped",
+        sourceTitle: "Tier2 Skipped",
+        normalizedText: ragText("tier2 skipped audit batch bounds", 260),
+      }),
+    });
+    const sourceId = capture.memory.id;
+    const queued = await harness.request({
+      kind: "enqueueChunkMetaTier2Job",
+      payload: { sourceId, maxChunks: 1 },
+    });
+
+    const job = await harness.request({ kind: "runJob", id: queued.id });
+    expect(job.status).toBe("done");
+    expect(calls).toHaveLength(1);
+
+    const skippedAudit = await harness.request({
+      kind: "listChunkMetaTier2Audit",
+      filter: { jobId: queued.id, status: "skipped", limit: 20 },
+    });
+    expect(skippedAudit.items.length).toBeGreaterThan(0);
+    expect(skippedAudit.items[0]).toMatchObject({
+      sourceId,
+      jobId: queued.id,
+      tier: "tier2",
+      status: "skipped",
+      reason: "chunk_meta_tier2_max_chunks_exceeded",
+    });
   });
 
   it("materializes section-aware chunk meta and repairs it before embedding", async () => {
@@ -1454,9 +1578,38 @@ describe("local engine behavior harness", () => {
         ],
       },
     });
+    const chunkForAudit = harness.selectObject(
+      "SELECT id FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
+      [sourceId],
+    );
+    harness.exec(
+      `INSERT INTO chunk_meta_tier2_audit (
+        id,
+        source_id,
+        chunk_id,
+        job_id,
+        tier,
+        status,
+        provider_kind,
+        reason,
+        section_summary_chars,
+        chunk_summary_chars,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, 'tier2', 'summarized', 'chat', NULL, 24, 26, ?, ?)`,
+      [
+        "audit-cleanup-delete",
+        sourceId,
+        String(chunkForAudit?.id ?? ""),
+        queued.jobs[0]?.id ?? null,
+        "2026-07-07T00:00:01.000Z",
+        "2026-07-07T00:00:01.000Z",
+      ],
+    );
     expect(harness.count("source_working_set", "source_id = ?", [sourceId])).toBe(1);
     expect(harness.count("source_context_compression_logs", "source_id = ?", [sourceId])).toBe(1);
     expect(harness.count("source_context_map_artifacts")).toBe(1);
+    expect(harness.count("chunk_meta_tier2_audit", "source_id = ?", [sourceId])).toBe(1);
 
     const deleted = await harness.request({ kind: "deleteMemory", id: sourceId });
     expect(deleted.deleted).toBe(true);
@@ -1468,6 +1621,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("source_working_set", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_context_compression_logs", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_context_map_artifacts")).toBe(0);
+    expect(harness.count("chunk_meta_tier2_audit", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("source_metadata", "source_id = ?", [sourceId])).toBe(0);
     expect(harness.count("anchors", "memory_id = ?", [sourceId])).toBe(0);
 
@@ -1519,10 +1673,38 @@ describe("local engine behavior harness", () => {
         ],
       },
     });
+    const resetChunkForAudit = harness.selectObject(
+      "SELECT id FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
+      [resetSource.memory.id],
+    );
+    harness.exec(
+      `INSERT INTO chunk_meta_tier2_audit (
+        id,
+        source_id,
+        chunk_id,
+        job_id,
+        tier,
+        status,
+        provider_kind,
+        reason,
+        section_summary_chars,
+        chunk_summary_chars,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, NULL, 'tier2', 'skipped', NULL, 'chunk_meta_tier2_max_chunks_exceeded', NULL, NULL, ?, ?)`,
+      [
+        "audit-cleanup-reset",
+        resetSource.memory.id,
+        String(resetChunkForAudit?.id ?? ""),
+        "2026-07-07T00:00:02.000Z",
+        "2026-07-07T00:00:02.000Z",
+      ],
+    );
     expect(harness.count("sources", "lifecycle_status <> 'deleted'")).toBe(1);
     expect(harness.count("source_working_set")).toBe(1);
     expect(harness.count("source_context_compression_logs")).toBe(1);
     expect(harness.count("source_context_map_artifacts")).toBe(1);
+    expect(harness.count("chunk_meta_tier2_audit")).toBe(1);
 
     const reset = await harness.request({ kind: "repair", action: "reset_library" });
     expect(reset.action).toBe("reset_library");
@@ -1536,6 +1718,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("source_working_set")).toBe(0);
     expect(harness.count("source_context_compression_logs")).toBe(0);
     expect(harness.count("source_context_map_artifacts")).toBe(0);
+    expect(harness.count("chunk_meta_tier2_audit")).toBe(0);
     expect(harness.count("source_metadata")).toBe(0);
     expect(harness.count("anchors")).toBe(0);
     expect(harness.count("jobs")).toBe(0);

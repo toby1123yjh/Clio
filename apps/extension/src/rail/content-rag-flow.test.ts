@@ -264,6 +264,57 @@ describe("content local RAG flow", () => {
     expect(artifactPanelSection).not.toContain("requestEngine");
   });
 
+  it("exposes explicit Tier2 chunk summary scheduling through content-owned RPCs", () => {
+    const contentStateSection = contentSource.slice(
+      contentSource.indexOf("function ClioContentApp()"),
+      contentSource.indexOf("React.useEffect(() => {"),
+    );
+    const contentAuditLoadSection = contentSource.slice(
+      contentSource.indexOf("const loadChunkMetaTier2Audit = React.useCallback"),
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+    );
+    const loadLibrarySection = contentSource.slice(
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+      contentSource.indexOf("const pinWorkingSetSource = React.useCallback"),
+    );
+    const contentRunSection = contentSource.slice(
+      contentSource.indexOf("const runChunkMetaTier2Job = React.useCallback"),
+      contentSource.indexOf("const selectSourceContextPlannerSource = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const auditPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function ChunkMetaTier2AuditPanel"),
+      railShellSource.indexOf("function SourceContextMapArtifactPanel"),
+    );
+    const memoryListSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryList"),
+      railShellSource.indexOf("function MemoryDetailPanel"),
+    );
+
+    expect(contentStateSection).toContain("ChunkMetaTier2AuditRecord[]");
+    expect(contentAuditLoadSection).toContain('kind: "listChunkMetaTier2Audit"');
+    expect(contentAuditLoadSection).toContain("filter: { limit: 30 }");
+    expect(loadLibrarySection).toContain('kind: "listChunkMetaTier2Audit"');
+    expect(contentRunSection).toContain('kind: "enqueueChunkMetaTier2Job"');
+    expect(contentRunSection).toContain('kind: "runJob"');
+    expect(contentRunSection).toContain("payload: { sourceId, maxChunks }");
+    expect(contentRunSection).toContain("await loadChunkMetaTier2Audit()");
+    expect(railPropsSection).toContain("chunkMetaTier2Audit={chunkMetaTier2Audit}");
+    expect(railPropsSection).toContain("onRunChunkMetaTier2Job=");
+    expect(railPropsSection).toContain("onRefreshChunkMetaTier2Audit=");
+    expect(auditPanelSection).toContain('data-clio-chunk-meta-tier2-audit="true"');
+    expect(auditPanelSection).toContain("Explicit chat-provider summaries");
+    expect(auditPanelSection).toContain("chunkMetaTier2AuditLengthLabel(row)");
+    expect(railShellSource).toContain("row.sectionSummaryChars");
+    expect(railShellSource).toContain("row.chunkSummaryChars");
+    expect(memoryListSection).toContain("onRunChunkMetaTier2Job(item.id, 8)");
+    expect(auditPanelSection).not.toContain("requestEngine");
+    expect(memoryListSection).not.toContain("requestEngine");
+  });
+
   it("exposes explicit source context planner UI through content-owned pack preview", () => {
     const contentPlannerPreviewSection = contentSource.slice(
       contentSource.indexOf("const previewSourceContextPlanner = React.useCallback"),

@@ -164,6 +164,7 @@ import {
   type ChatMessageRecord,
   type ChatSessionDetail,
   type ChatSessionSummary,
+  type ChunkMetaTier2AuditRecord,
   type ClioImageGenerationEvent,
   type ClioWebSearchEvent,
   type ClioWebSearchResult,
@@ -1126,6 +1127,9 @@ function ClioContentApp() {
   const [sourceContextMapArtifacts, setSourceContextMapArtifacts] = React.useState<
     SourceContextMapArtifactRecord[]
   >([]);
+  const [chunkMetaTier2Audit, setChunkMetaTier2Audit] = React.useState<ChunkMetaTier2AuditRecord[]>(
+    [],
+  );
   const [sourceContextPlanner, setSourceContextPlanner] = React.useState<SourceContextPlannerState>(
     {
       selectedSourceIds: [],
@@ -1424,6 +1428,18 @@ function ClioContentApp() {
     }
   }, []);
 
+  const loadChunkMetaTier2Audit = React.useCallback(async () => {
+    try {
+      const result = await requestEngine({
+        kind: "listChunkMetaTier2Audit",
+        filter: { limit: 30 },
+      });
+      setChunkMetaTier2Audit(result.items);
+    } catch {
+      setChunkMetaTier2Audit([]);
+    }
+  }, []);
+
   const loadLibrary = React.useCallback(
     async (nextQuery = railState.query) => {
       dispatch({ type: "SET_LOADING", loading: true });
@@ -1452,9 +1468,14 @@ function ClioContentApp() {
           },
         });
         const workingSet = await requestEngine({ kind: "getWorkingSetStatus" });
+        const tier2Audit = await requestEngine({
+          kind: "listChunkMetaTier2Audit",
+          filter: { limit: 30 },
+        });
         setTopicPages(topicResult.items);
         setWikiCompileJobs(wikiJobsResult.jobs);
         setWorkingSetStatus(workingSet);
+        setChunkMetaTier2Audit(tier2Audit.items);
         if (wikiJobsResult.jobs[0] !== undefined) {
           await loadWikiCompileJobEvents(wikiJobsResult.jobs[0].id);
         } else {
@@ -1536,6 +1557,34 @@ function ClioContentApp() {
       }
     },
     [showToast],
+  );
+
+  const runChunkMetaTier2Job = React.useCallback(
+    async (sourceId: string, maxChunks = 8) => {
+      dispatch({ type: "SET_LOADING", loading: true });
+      try {
+        const queued = await requestEngine({
+          kind: "enqueueChunkMetaTier2Job",
+          payload: { sourceId, maxChunks },
+        });
+        const completed = await requestEngine({ kind: "runJob", id: queued.id });
+        await loadLibrary(railState.query);
+        await loadChunkMetaTier2Audit();
+        showToast({
+          tone: completed.status === "done" ? "success" : "warning",
+          message:
+            completed.status === "done"
+              ? "Tier2 summaries finished. Audit stores summary lengths only."
+              : "Tier2 summary job did not finish. Check the audit panel.",
+        });
+      } catch (error) {
+        await loadChunkMetaTier2Audit();
+        showToast(errorToast(error));
+      } finally {
+        dispatch({ type: "SET_LOADING", loading: false });
+      }
+    },
+    [loadChunkMetaTier2Audit, loadLibrary, railState.query, showToast],
   );
 
   const selectSourceContextPlannerSource = React.useCallback((sourceId: string) => {
@@ -4241,6 +4290,7 @@ function ClioContentApp() {
         knowledgeBaseFilter={knowledgeBaseFilter}
         knowledgeBaseRetrieveFilter={knowledgeBaseRetrieveFilter}
         workingSetStatus={workingSetStatus}
+        chunkMetaTier2Audit={chunkMetaTier2Audit}
         sourceContextCompressionLogs={sourceContextCompressionLogs}
         sourceContextMapArtifacts={sourceContextMapArtifacts}
         sourceContextPlanner={sourceContextPlanner}
@@ -4317,6 +4367,10 @@ function ClioContentApp() {
         onReloadWorkingSetSource={(sourceId, loadDepth) =>
           void reloadWorkingSetSource(sourceId, loadDepth)
         }
+        onRunChunkMetaTier2Job={(sourceId, maxChunks) =>
+          void runChunkMetaTier2Job(sourceId, maxChunks)
+        }
+        onRefreshChunkMetaTier2Audit={() => void loadChunkMetaTier2Audit()}
         onRefreshSourceContextCompressionLogs={() =>
           void loadSourceContextCompressionLogs(railState.activeSessionId)
         }

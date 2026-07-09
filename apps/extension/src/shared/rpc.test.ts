@@ -1290,6 +1290,108 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts Tier2 chunk meta audit requests and rejects unsafe filters", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "enqueueChunkMetaTier2Job",
+          payload: { sourceId: "source-1", maxChunks: 8 },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listChunkMetaTier2Audit",
+          filter: { sourceId: "source-1", jobId: "job-1", status: "summarized", limit: 20 },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "clearChunkMetaTier2Audit",
+          filter: { sourceId: "source-1" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "clearChunkMetaTier2Audit",
+          filter: { jobId: "job-1" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "enqueueChunkMetaTier2Job",
+          payload: { sourceId: "", maxChunks: 8 },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "enqueueChunkMetaTier2Job",
+          payload: { sourceId: "source-1", maxChunks: Number.POSITIVE_INFINITY },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "enqueueChunkMetaTier2Job",
+          payload: { sourceId: "source-1", maxChunks: -1 },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "enqueueChunkMetaTier2Job",
+          payload: { sourceId: "source-1", maxChunks: 1.5 },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listChunkMetaTier2Audit",
+          filter: { status: "available" },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "clearChunkMetaTier2Audit",
+          filter: { status: "error" },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts source retrieval requests", () => {
     expect(
       isEngineRequestMessage({
