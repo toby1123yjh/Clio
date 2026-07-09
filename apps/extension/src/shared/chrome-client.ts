@@ -1,6 +1,7 @@
 import {
   CLIO_CONTENT_COMMAND,
   CLIO_ENGINE_REQUEST,
+  CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
   CLIO_PROVIDER_CONFIG_REQUEST,
   CLIO_PROVIDER_REQUEST,
   CLIO_UI_REQUEST,
@@ -8,6 +9,8 @@ import {
   type EngineRequest,
   type EngineResponse,
   type EngineResultFor,
+  type KnowledgeBaseClusterLabelRefinementRequest,
+  type KnowledgeBaseClusterLabelRefinementResult,
   type ProviderConfigResult,
   type ProviderRequest,
   type ProviderResponse,
@@ -15,6 +18,8 @@ import {
   type UiRequest,
   type UiResponse,
   type UiResultFor,
+  createRequestId,
+  isKnowledgeBaseClusterLabelRefinementResponseMessage,
   unwrapEngineResponse,
 } from "./rpc";
 
@@ -53,6 +58,24 @@ export async function requestProviderConfig(): Promise<ProviderConfigResult> {
     request: { kind: "readActiveProviderConfig" },
   })) as EngineResponse<ProviderConfigResult>;
   return unwrapEngineResponse(response);
+}
+
+export async function requestKnowledgeBaseClusterLabelRefinement(
+  request: KnowledgeBaseClusterLabelRefinementRequest,
+): Promise<KnowledgeBaseClusterLabelRefinementResult> {
+  const requestId = createRequestId();
+  const message = await chrome.runtime.sendMessage({
+    type: CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
+    requestId,
+    request,
+  });
+  if (
+    !isKnowledgeBaseClusterLabelRefinementResponseMessage(message) ||
+    message.requestId !== requestId
+  ) {
+    throw new Error("Knowledge Base cluster label refinement did not return a valid response.");
+  }
+  return unwrapEngineResponse(message.response);
 }
 
 export async function requestUi<T extends UiRequest>(request: T): Promise<UiResultFor<T>> {

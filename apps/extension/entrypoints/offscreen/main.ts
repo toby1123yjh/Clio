@@ -4,6 +4,7 @@ import { PiAgentCompactionRuntime } from "@/src/agent-runtime/compaction-context
 import { ClioEmbeddingProviderRuntime } from "@/src/agent-runtime/embedding-provider-runtime";
 import { ProviderBackedFigureVisionAnalyzer } from "@/src/agent-runtime/figure-vision-analyzer";
 import { ClioImageGenerationRuntime } from "@/src/agent-runtime/image-generation-runtime";
+import { ProviderBackedKnowledgeBaseClusterLabelRefiner } from "@/src/agent-runtime/knowledge-base-cluster-label-refiner";
 import { PiAgentCoreRunAdapter } from "@/src/agent-runtime/pi-agent-core-run-adapter";
 import { type ProviderId, defaultActiveProvider } from "@/src/agent-runtime/provider-settings";
 import { ProviderBackedSemanticCitationJudge } from "@/src/agent-runtime/semantic-citation-judge";
@@ -15,6 +16,7 @@ import {
   type AgentRunRequest,
   CLIO_AGENT_RUN_EVENT,
   CLIO_IMAGE_GENERATION_RUN_EVENT,
+  CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
   CLIO_WEB_SEARCH_RUN_EVENT,
   CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
   CLIO_WORKER_EMBEDDING_RESPONSE,
@@ -30,6 +32,7 @@ import {
   engineErrorFromUnknown,
   isAgentRunRequestMessage,
   isImageGenerationRunRequestMessage,
+  isKnowledgeBaseClusterLabelRefinementRequestMessage,
   isOffscreenRequestMessage,
   isWebSearchRunRequestMessage,
   isWorkerChunkMetaSummaryRequestMessage,
@@ -124,6 +127,11 @@ const figureVisionAnalyzer = new ProviderBackedFigureVisionAnalyzer({
   loadActiveProviderConfig: () => requestProviderConfig(),
   ensureProviderPermission: (provider, config) => hasVisionProviderHostPermission(provider, config),
 });
+const knowledgeBaseClusterLabelRefiner = new ProviderBackedKnowledgeBaseClusterLabelRefiner({
+  loadConfig: () => requestProviderConfig(),
+  loadProviderId: async () => (await requestProviderConfig())?.provider ?? defaultActiveProvider,
+  ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
+});
 const activeImageGenerationRuns = new Map<string, AbortController>();
 
 function hasProviderHostPermission(
@@ -211,6 +219,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({
           ok: false,
           error: engineErrorFromUnknown(error, "OFFSCREEN_IMAGE_GENERATION_ERROR"),
+        }),
+      );
+    return true;
+  }
+
+  if (isKnowledgeBaseClusterLabelRefinementRequestMessage(message)) {
+    knowledgeBaseClusterLabelRefiner
+      .refine(message.request)
+      .then((value) =>
+        sendResponse({
+          type: CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
+          requestId: message.requestId,
+          response: { ok: true, value },
+        }),
+      )
+      .catch((error) =>
+        sendResponse({
+          type: CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
+          requestId: message.requestId,
+          response: {
+            ok: false,
+            error: engineErrorFromUnknown(error, "KB_CLUSTER_LABEL_REFINEMENT_PROVIDER_ERROR"),
+          },
         }),
       );
     return true;

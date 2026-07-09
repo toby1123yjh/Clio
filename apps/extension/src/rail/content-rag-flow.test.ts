@@ -93,7 +93,7 @@ describe("content local RAG flow", () => {
     expect(loadLibrarySection).toContain("{ filter: knowledgeBaseRetrieveFilter }");
     expect(loadLibrarySection).toContain("knowledgeBaseClusteringPayload === undefined");
     expect(loadLibrarySection).toContain("{ clustering: knowledgeBaseClusteringPayload }");
-    expect(loadLibrarySection).toContain("knowledgeBaseClusterGroups(result.clusters, nextItems)");
+    expect(loadLibrarySection).toContain("knowledgeBaseClusterGroups(nextClusters, nextItems)");
     expect(loadLibrarySection).not.toContain('kind: "searchMemory"');
     expect(loadLibrarySection).not.toContain('kind: "listMemories"');
   });
@@ -157,11 +157,17 @@ describe("content local RAG flow", () => {
       railShellSource.indexOf("function MemoryList"),
       railShellSource.indexOf("function MemoryDetailPanel"),
     );
+    const refinementSection = contentSource.slice(
+      contentSource.indexOf("async function refineKnowledgeBaseClusterLabels"),
+      contentSource.indexOf("function knowledgeUploadKindForFile"),
+    );
 
     expect(contentStateSection).toContain("React.useState<KnowledgeBaseClusteringState>");
     expect(contentStateSection).toContain("KnowledgeBaseClusterGroup[]");
     expect(loadLibrarySection).toContain("knowledgeBaseClusteringPayload");
     expect(loadLibrarySection).toContain("result.clusters");
+    expect(loadLibrarySection).toContain("shouldRefineKnowledgeBaseClusterLabels");
+    expect(loadLibrarySection).toContain("refineKnowledgeBaseClusterLabels(result.clusters");
     expect(railPropsSection).toContain("knowledgeBaseClustering={knowledgeBaseClustering}");
     expect(railPropsSection).toContain("knowledgeBaseClusters={knowledgeBaseClusters}");
     expect(railPropsSection).toContain(
@@ -171,6 +177,10 @@ describe("content local RAG flow", () => {
     expect(clusteringControlsSection).toContain('id="clio-kb-cluster-by"');
     expect(clusteringControlsSection).toContain('id="clio-kb-cluster-granularity"');
     expect(clusteringControlsSection).toContain('id="clio-kb-cluster-semantic-backend"');
+    expect(clusteringControlsSection).toContain('id="clio-kb-cluster-llm-labels"');
+    expect(clusteringControlsSection).toContain("providerBackedLabels");
+    expect(clusteringControlsSection).toContain("providerBackedLabels: false");
+    expect(clusteringControlsSection).toContain("disabled={disabled || !topicEnabled}");
     expect(clusteringControlsSection).toContain("knowledgeBaseSemanticClusterBackendOptions");
     expect(clusteringControlsSection).toContain("knowledgeBaseClusterByOptions");
     expect(railShellSource).toContain('{ value: "topic", label: "Topic" }');
@@ -179,6 +189,10 @@ describe("content local RAG flow", () => {
     expect(memoryListSection).toContain('data-clio-knowledge-cluster-summary="true"');
     expect(memoryListSection).toContain('data-clio-knowledge-cluster-trace="true"');
     expect(memoryListSection).toContain("knowledgeBaseClusterTraceLabel(cluster.trace)");
+    expect(memoryListSection).toContain("cluster.deterministicLabel");
+    expect(contentSource).toContain("requestKnowledgeBaseClusterLabelRefinement(request)");
+    expect(contentSource).toContain("abstractSnippet: excerpt(item.excerpt, 360)");
+    expect(refinementSection).not.toContain('kind: "getMemory"');
     expect(clusteringControlsSection).not.toContain("requestEngine");
     expect(memoryListSection).not.toContain("requestEngine");
   });

@@ -721,4 +721,17 @@ describe("local engine source-native storage foundation", () => {
     expect(evidenceWindowSection).not.toContain("meta_head_json");
     expect(evidenceWindowSection).not.toContain("docContext");
   });
+
+  it("keeps provider-backed Knowledge Base cluster label refinement out of the Worker", () => {
+    expect(rpcSource).toContain("CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST");
+    expect(rpcSource).toContain("forbiddenKnowledgeBaseClusterLabelRefinementFields");
+    expect(rpcSource).toContain('"apiKey"');
+    expect(rpcSource).toContain('"fullText"');
+    expect(rpcSource).toContain('"normalizedText"');
+    expect(rpcSource).toContain('"chunkText"');
+    expect(rpcSource).toContain('"rawProviderResponse"');
+    expect(workerSource).not.toContain("CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST");
+    expect(workerSource).not.toContain("KnowledgeBaseClusterLabelRefiner");
+    expect(workerSource).not.toContain("ProviderBackedKnowledgeBaseClusterLabelRefiner");
+  });
 });

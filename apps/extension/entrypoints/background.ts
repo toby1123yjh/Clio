@@ -59,6 +59,7 @@ import {
   CLIO_IMAGE_GENERATION_RUN_REQUEST,
   CLIO_IMAGE_GENERATION_STREAM_EVENT,
   CLIO_IMAGE_GENERATION_STREAM_PORT,
+  CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
   CLIO_OFFSCREEN_REQUEST,
   CLIO_WEB_SEARCH_RUN_REQUEST,
   CLIO_WEB_SEARCH_STREAM_EVENT,
@@ -69,6 +70,7 @@ import {
   EngineRpcError,
   type ImageGenerationRunRequest,
   type ImageGenerationStreamEventMessage,
+  type KnowledgeBaseClusterLabelRefinementRequestMessage,
   type ProviderRequest,
   type ReindexResult,
   type UiRequest,
@@ -84,6 +86,7 @@ import {
   isImageGenerationRunEventMessage,
   isImageGenerationStreamCancelMessage,
   isImageGenerationStreamRequestMessage,
+  isKnowledgeBaseClusterLabelRefinementRequestMessage,
   isProviderConfigRequestMessage,
   isProviderRequestMessage,
   isUiRequestMessage,
@@ -194,6 +197,22 @@ export default defineBackground(() => {
     if (isImageGenerationRunEventMessage(message)) {
       dispatchImageGenerationRunEvent(message.event);
       return false;
+    }
+
+    if (isKnowledgeBaseClusterLabelRefinementRequestMessage(message)) {
+      routeKnowledgeBaseClusterLabelRefinementRequest(message)
+        .then((response) => sendResponse(response))
+        .catch((error) =>
+          sendResponse({
+            type: CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
+            requestId: message.requestId,
+            response: {
+              ok: false,
+              error: engineErrorFromUnknown(error, "KB_CLUSTER_LABEL_REFINEMENT_ROUTE_ERROR"),
+            },
+          }),
+        );
+      return true;
     }
 
     if (isUiRequestMessage(message)) {
@@ -582,6 +601,13 @@ async function routeEngineRequest(request: EngineRequest) {
     type: CLIO_OFFSCREEN_REQUEST,
     request,
   })) as EngineResponse;
+}
+
+async function routeKnowledgeBaseClusterLabelRefinementRequest(
+  message: KnowledgeBaseClusterLabelRefinementRequestMessage,
+) {
+  await ensureOffscreen();
+  return await chrome.runtime.sendMessage(message);
 }
 
 async function routeUiRequest(request: UiRequest) {

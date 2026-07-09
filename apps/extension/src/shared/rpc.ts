@@ -21,6 +21,10 @@ import type {
   ImageGenerationSettings,
   SaveImageGenerationSettingsInput,
 } from "@/src/agent-runtime/image-generation-settings";
+import type {
+  KnowledgeBaseClusterLabelRefinementInput,
+  KnowledgeBaseClusterLabelRefinementResult as KnowledgeBaseClusterLabelRefinementRuntimeResult,
+} from "@/src/agent-runtime/knowledge-base-cluster-label-refiner";
 import type { ProviderId, ProviderSettings } from "@/src/agent-runtime/provider-settings";
 import type {
   SearchOpenAICompatibleOverrideSettings,
@@ -55,6 +59,7 @@ export const CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST = "clio:worker:chunk-meta-su
 export const CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE = "clio:worker:chunk-meta-summary:response";
 export const CLIO_WORKER_VISION_ANALYSIS_REQUEST = "clio:worker:vision-analysis:request";
 export const CLIO_WORKER_VISION_ANALYSIS_RESPONSE = "clio:worker:vision-analysis:response";
+export const CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST = "clio:kb-cluster-label-refinement:request";
 export const CLIO_CONTENT_COMMAND = "clio:content:command";
 export const CLIO_PROVIDER_REQUEST = "clio:provider:request";
 export const CLIO_PROVIDER_CONFIG_REQUEST = "clio:provider-config:request";
@@ -321,6 +326,9 @@ export interface KnowledgeBaseClusteringOptions {
   clusterBy: KnowledgeBaseEngineClusterBy;
   granularity?: KnowledgeBaseClusterGranularity;
   semanticBackend?: KnowledgeBaseSemanticClusterBackend;
+  refinement?: {
+    providerBackedLabels?: boolean;
+  };
 }
 
 export interface KnowledgeBaseSourceClusterTrace {
@@ -328,6 +336,11 @@ export interface KnowledgeBaseSourceClusterTrace {
   method: KnowledgeBaseClusterTraceMethod;
   vectorCount?: number;
   fallbackReason?: KnowledgeBaseSemanticClusterFallbackReason;
+  labelRefinement?: {
+    status: "refined" | "unavailable" | "error";
+    method: "provider_llm";
+    reason?: string;
+  };
 }
 
 export interface KnowledgeBaseSourceCluster {
@@ -338,6 +351,8 @@ export interface KnowledgeBaseSourceCluster {
   sourceCount: number;
   score: number;
   summary?: string;
+  deterministicLabel?: string;
+  deterministicSummary?: string;
   trace?: KnowledgeBaseSourceClusterTrace;
 }
 
@@ -2022,6 +2037,22 @@ export interface WorkerVisionAnalysisResponseMessage {
   response: EngineResponse<FigureVisionAnalysisResult>;
 }
 
+export type KnowledgeBaseClusterLabelRefinementRequest = KnowledgeBaseClusterLabelRefinementInput;
+export type KnowledgeBaseClusterLabelRefinementResult =
+  KnowledgeBaseClusterLabelRefinementRuntimeResult;
+
+export interface KnowledgeBaseClusterLabelRefinementRequestMessage {
+  type: typeof CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST;
+  requestId: string;
+  request: KnowledgeBaseClusterLabelRefinementRequest;
+}
+
+export interface KnowledgeBaseClusterLabelRefinementResponseMessage {
+  type: typeof CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST;
+  requestId: string;
+  response: EngineResponse<KnowledgeBaseClusterLabelRefinementResult>;
+}
+
 export type ContentCommand =
   | { action: "toggleRail" }
   | { action: "openRail"; query?: string; memoryId?: string }
@@ -2279,6 +2310,28 @@ export function isWorkerVisionAnalysisResponseMessage(
     value.type === CLIO_WORKER_VISION_ANALYSIS_RESPONSE &&
     typeof value.requestId === "string" &&
     isFigureVisionAnalysisResponse(value.response)
+  );
+}
+
+export function isKnowledgeBaseClusterLabelRefinementRequestMessage(
+  value: unknown,
+): value is KnowledgeBaseClusterLabelRefinementRequestMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST &&
+    typeof value.requestId === "string" &&
+    isKnowledgeBaseClusterLabelRefinementRequest(value.request)
+  );
+}
+
+export function isKnowledgeBaseClusterLabelRefinementResponseMessage(
+  value: unknown,
+): value is KnowledgeBaseClusterLabelRefinementResponseMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST &&
+    typeof value.requestId === "string" &&
+    isKnowledgeBaseClusterLabelRefinementResponse(value.response)
   );
 }
 
@@ -3121,7 +3174,17 @@ function isKnowledgeBaseClusteringOptions(value: unknown): value is KnowledgeBas
     (value.granularity === undefined || isKnowledgeBaseClusterGranularity(value.granularity)) &&
     (value.semanticBackend === undefined || value.clusterBy === "semantic") &&
     (value.semanticBackend === undefined ||
-      isKnowledgeBaseSemanticClusterBackend(value.semanticBackend))
+      isKnowledgeBaseSemanticClusterBackend(value.semanticBackend)) &&
+    (value.refinement === undefined || isKnowledgeBaseClusterRefinementOptions(value.refinement))
+  );
+}
+
+function isKnowledgeBaseClusterRefinementOptions(
+  value: unknown,
+): value is NonNullable<KnowledgeBaseClusteringOptions["refinement"]> {
+  return (
+    isRecord(value) &&
+    (value.providerBackedLabels === undefined || typeof value.providerBackedLabels === "boolean")
   );
 }
 
@@ -4258,6 +4321,69 @@ function isWorkerVisionAnalysisRequest(value: unknown): value is WorkerVisionAna
   );
 }
 
+const forbiddenKnowledgeBaseClusterLabelRefinementFields = [
+  "apiKey",
+  "fullText",
+  "normalizedText",
+  "chunkText",
+  "pdfBytes",
+  "rawBytes",
+  "rawProviderResponse",
+] as const;
+
+function hasForbiddenKnowledgeBaseClusterLabelRefinementField(value: Record<string, unknown>) {
+  return forbiddenKnowledgeBaseClusterLabelRefinementFields.some((field) => field in value);
+}
+
+function isKnowledgeBaseClusterLabelRefinementRequest(
+  value: unknown,
+): value is KnowledgeBaseClusterLabelRefinementRequest {
+  return (
+    isRecord(value) &&
+    !hasForbiddenKnowledgeBaseClusterLabelRefinementField(value) &&
+    Array.isArray(value.clusters) &&
+    value.clusters.length > 0 &&
+    value.clusters.every(isKnowledgeBaseClusterLabelRefinementClusterInput)
+  );
+}
+
+function isKnowledgeBaseClusterLabelRefinementClusterInput(value: unknown) {
+  return (
+    isRecord(value) &&
+    !hasForbiddenKnowledgeBaseClusterLabelRefinementField(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    typeof value.label === "string" &&
+    value.label.length > 0 &&
+    (value.summary === undefined || typeof value.summary === "string") &&
+    value.clusterBy === "topic" &&
+    typeof value.sourceCount === "number" &&
+    Number.isFinite(value.sourceCount) &&
+    value.sourceCount > 0 &&
+    Array.isArray(value.examples) &&
+    value.examples.every(isKnowledgeBaseClusterLabelRefinementExample)
+  );
+}
+
+function isKnowledgeBaseClusterLabelRefinementExample(value: unknown) {
+  return (
+    isRecord(value) &&
+    !hasForbiddenKnowledgeBaseClusterLabelRefinementField(value) &&
+    typeof value.sourceId === "string" &&
+    value.sourceId.length > 0 &&
+    (value.title === undefined || typeof value.title === "string") &&
+    (value.sourceType === undefined || typeof value.sourceType === "string") &&
+    (value.year === undefined || (typeof value.year === "number" && Number.isFinite(value.year))) &&
+    (value.venue === undefined || typeof value.venue === "string") &&
+    (value.authors === undefined ||
+      (Array.isArray(value.authors) && value.authors.every((item) => typeof item === "string"))) &&
+    (value.abstractSnippet === undefined || typeof value.abstractSnippet === "string") &&
+    (value.topicTerms === undefined ||
+      (Array.isArray(value.topicTerms) &&
+        value.topicTerms.every((item) => typeof item === "string")))
+  );
+}
+
 function isChunkMetaSummaryResponse(
   value: unknown,
 ): value is EngineResponse<ChunkMetaSummaryResult> {
@@ -4352,6 +4478,47 @@ function isFigureVisionClaim(value: unknown) {
     typeof value.claimId === "string" &&
     typeof value.text === "string" &&
     (value.confidence === "low" || value.confidence === "medium" || value.confidence === "high")
+  );
+}
+
+function isKnowledgeBaseClusterLabelRefinementResponse(
+  value: unknown,
+): value is EngineResponse<KnowledgeBaseClusterLabelRefinementResult> {
+  if (!isRecord(value) || typeof value.ok !== "boolean") return false;
+  if (!value.ok) {
+    return (
+      isRecord(value.error) &&
+      typeof value.error.code === "string" &&
+      typeof value.error.message === "string" &&
+      (value.error.detail === undefined || typeof value.error.detail === "string")
+    );
+  }
+  const result = value.value;
+  return (
+    isRecord(result) &&
+    (result.status === "refined" || result.status === "unavailable" || result.status === "error") &&
+    (result.providerKind === undefined || result.providerKind === "chat") &&
+    Array.isArray(result.clusters) &&
+    result.clusters.every(isKnowledgeBaseClusterLabelRefinementItem) &&
+    (result.reason === undefined || typeof result.reason === "string")
+  );
+}
+
+function isKnowledgeBaseClusterLabelRefinementItem(value: unknown) {
+  return (
+    isRecord(value) &&
+    typeof value.clusterId === "string" &&
+    value.clusterId.length > 0 &&
+    (value.status === "refined" || value.status === "unavailable" || value.status === "error") &&
+    (value.providerKind === undefined || value.providerKind === "chat") &&
+    (value.label === undefined || typeof value.label === "string") &&
+    (value.summary === undefined || typeof value.summary === "string") &&
+    (value.confidence === undefined ||
+      (typeof value.confidence === "number" &&
+        Number.isFinite(value.confidence) &&
+        value.confidence >= 0 &&
+        value.confidence <= 1)) &&
+    (value.reason === undefined || typeof value.reason === "string")
   );
 }
 

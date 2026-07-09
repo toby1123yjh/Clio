@@ -427,6 +427,7 @@ export interface KnowledgeBaseClusteringState {
   clusterBy: KnowledgeBaseClusterBy;
   granularity: KnowledgeBaseClusterGranularity;
   semanticBackend: KnowledgeBaseSemanticClusterBackend;
+  providerBackedLabels: boolean;
 }
 
 export interface KnowledgeBaseClusterGroup {
@@ -436,6 +437,8 @@ export interface KnowledgeBaseClusterGroup {
   sourceCount: number;
   score: number;
   summary?: string;
+  deterministicLabel?: string;
+  deterministicSummary?: string;
   trace?: KnowledgeBaseSourceClusterTrace;
   items: SearchMemoryItem[];
 }
@@ -5437,6 +5440,7 @@ function KnowledgeBaseClusteringControls({
 }) {
   const groupingEnabled = clustering.clusterBy !== "none";
   const semanticEnabled = clustering.clusterBy === "semantic";
+  const topicEnabled = clustering.clusterBy === "topic";
   return (
     <section
       className="grid gap-2 rounded-lg border border-border bg-surface px-3 py-3"
@@ -5458,9 +5462,13 @@ function KnowledgeBaseClusteringControls({
             className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
             disabled={disabled}
             id="clio-kb-cluster-by"
-            onChange={(event) =>
-              onClusteringChange({ clusterBy: event.target.value as KnowledgeBaseClusterBy })
-            }
+            onChange={(event) => {
+              const clusterBy = event.target.value as KnowledgeBaseClusterBy;
+              onClusteringChange({
+                clusterBy,
+                ...(clusterBy === "topic" ? {} : { providerBackedLabels: false }),
+              });
+            }}
             value={clustering.clusterBy}
           >
             {knowledgeBaseClusterByOptions.map((option) => (
@@ -5513,6 +5521,29 @@ function KnowledgeBaseClusteringControls({
             ))}
           </select>
         </label>
+        <label
+          className="col-span-2 flex items-center gap-2 rounded-lg border border-border bg-background px-2.5 py-2 text-[11px] text-muted-foreground"
+          htmlFor="clio-kb-cluster-llm-labels"
+        >
+          <input
+            checked={clustering.providerBackedLabels}
+            className="size-3.5 accent-primary"
+            disabled={disabled || !topicEnabled}
+            id="clio-kb-cluster-llm-labels"
+            onChange={(event) =>
+              onClusteringChange({
+                providerBackedLabels: event.target.checked,
+              })
+            }
+            type="checkbox"
+          />
+          <span className="min-w-0">
+            <span className="font-medium text-foreground">Refine topic labels with LLM</span>
+            <span className="block text-[10px]">
+              Display-only, bounded metadata, no retrieval changes
+            </span>
+          </span>
+        </label>
       </div>
     </section>
   );
@@ -5525,6 +5556,15 @@ function knowledgeBaseClusterByLabel(clusterBy: KnowledgeBaseClusterBy) {
 }
 
 function knowledgeBaseClusterTraceLabel(trace: KnowledgeBaseSourceClusterTrace) {
+  if (trace.labelRefinement !== undefined) {
+    const suffix =
+      trace.labelRefinement.status === "refined"
+        ? "LLM refined"
+        : `LLM ${trace.labelRefinement.status}`;
+    return trace.labelRefinement.reason === undefined
+      ? suffix
+      : `${suffix} / ${trace.labelRefinement.reason}`;
+  }
   if (trace.method === "metadata_topic_label") return "Topic labels / bounded metadata";
   const backend = trace.backend === "embedding" ? "Embedding KMeans" : "Metadata fallback";
   if (trace.backend === "embedding") {
@@ -7248,6 +7288,9 @@ function MemoryList({
                 <h3 className="truncate text-[13px] font-semibold leading-5">{cluster.label}</h3>
                 <p className="text-[11px] text-muted-foreground">
                   {knowledgeBaseClusterByLabel(cluster.clusterBy)}
+                  {cluster.deterministicLabel === undefined
+                    ? ""
+                    : ` / from ${cluster.deterministicLabel}`}
                 </p>
                 {cluster.summary === undefined ? null : (
                   <p

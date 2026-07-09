@@ -13,6 +13,7 @@ import {
   CLIO_IMAGE_GENERATION_STREAM_CANCEL,
   CLIO_IMAGE_GENERATION_STREAM_EVENT,
   CLIO_IMAGE_GENERATION_STREAM_REQUEST,
+  CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
   CLIO_PROVIDER_CONFIG_REQUEST,
   CLIO_PROVIDER_REQUEST,
   CLIO_UI_REQUEST,
@@ -40,6 +41,8 @@ import {
   isImageGenerationStreamCancelMessage,
   isImageGenerationStreamEventMessage,
   isImageGenerationStreamRequestMessage,
+  isKnowledgeBaseClusterLabelRefinementRequestMessage,
+  isKnowledgeBaseClusterLabelRefinementResponseMessage,
   isProviderConfigRequestMessage,
   isProviderRequestMessage,
   isUiRequestMessage,
@@ -1751,6 +1754,9 @@ describe("session engine RPC guards", () => {
             clustering: {
               clusterBy: "topic",
               granularity: "coarse",
+              refinement: {
+                providerBackedLabels: true,
+              },
             },
           },
         },
@@ -1873,6 +1879,118 @@ describe("session engine RPC guards", () => {
               clusterBy: "year",
               semanticBackend: "embedding",
             },
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts bounded Knowledge Base cluster label refinement and rejects secret or full text payloads", () => {
+    const request = {
+      type: CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
+      requestId: "req-kb-labels",
+      request: {
+        clusters: [
+          {
+            id: "cluster:retrieval",
+            label: "Retrieval",
+            summary: "Sources about retrieval.",
+            clusterBy: "topic",
+            sourceCount: 2,
+            examples: [
+              {
+                sourceId: "source:1",
+                title: "Retrieval Evaluation Study",
+                sourceType: "paper",
+                year: 2026,
+                venue: "Local RAG Symposium",
+                authors: ["Ada Lovelace"],
+                abstractSnippet: "Evaluates bounded local RAG retrieval.",
+                topicTerms: ["retrieval", "evaluation"],
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    expect(isKnowledgeBaseClusterLabelRefinementRequestMessage(request)).toBe(true);
+    expect(
+      isKnowledgeBaseClusterLabelRefinementResponseMessage({
+        type: CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
+        requestId: "req-kb-labels",
+        response: {
+          ok: true,
+          value: {
+            status: "refined",
+            providerKind: "chat",
+            clusters: [
+              {
+                clusterId: "cluster:retrieval",
+                status: "refined",
+                providerKind: "chat",
+                label: "Retrieval Evaluation",
+                summary: "Papers about bounded retrieval evaluation.",
+                confidence: 0.82,
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isKnowledgeBaseClusterLabelRefinementRequestMessage({
+        ...request,
+        request: {
+          ...request.request,
+          apiKey: "sk-test",
+        },
+      }),
+    ).toBe(false);
+
+    const [cluster] = request.request.clusters;
+    if (cluster === undefined) throw new Error("Expected a refinement cluster.");
+    const [example] = cluster.examples;
+    if (example === undefined) throw new Error("Expected a refinement example.");
+
+    expect(
+      isKnowledgeBaseClusterLabelRefinementRequestMessage({
+        ...request,
+        request: {
+          clusters: [
+            {
+              ...cluster,
+              examples: [
+                {
+                  ...example,
+                  normalizedText: "full source text must not be accepted",
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isKnowledgeBaseClusterLabelRefinementResponseMessage({
+        type: CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
+        requestId: "req-kb-labels",
+        response: {
+          ok: true,
+          value: {
+            status: "refined",
+            providerKind: "chat",
+            clusters: [
+              {
+                clusterId: "cluster:retrieval",
+                status: "refined",
+                providerKind: "chat",
+                label: "Retrieval Evaluation",
+                confidence: 2,
+              },
+            ],
           },
         },
       }),

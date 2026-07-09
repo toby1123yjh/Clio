@@ -156,7 +156,11 @@ import {
   storePendingHighlight,
   storePendingHighlightFromAnchor,
 } from "@/src/rail/page/source-highlight";
-import { requestEngine, requestProvider } from "@/src/shared/chrome-client";
+import {
+  requestEngine,
+  requestKnowledgeBaseClusterLabelRefinement,
+  requestProvider,
+} from "@/src/shared/chrome-client";
 import { sourceUrlsMatch } from "@/src/shared/reliability";
 import {
   type ActiveEmbeddingModelSummary,
@@ -173,8 +177,10 @@ import {
   type EngineHealth,
   type GetMemoryEvidenceWindowAnchor,
   type ImageGenerationHistoryRecord,
+  type KnowledgeBaseClusterLabelRefinementRequest,
   type KnowledgeBaseClusteringOptions,
   type KnowledgeBaseSourceCluster,
+  type KnowledgeBaseSourceClusterTrace,
   type MemoryDetail,
   type MemoryEvidenceWindow,
   type OrchestrationEvent,
@@ -333,6 +339,7 @@ const defaultKnowledgeBaseClustering: KnowledgeBaseClusteringState = {
   clusterBy: "none",
   granularity: "medium",
   semanticBackend: "auto",
+  providerBackedLabels: false,
 };
 
 type KnowledgeUploadKind = "markdown" | "pdf";
@@ -427,6 +434,9 @@ function clusteringPayloadForKnowledgeBase(
     clusterBy: clustering.clusterBy,
     granularity: clustering.granularity,
     ...(clustering.clusterBy === "semantic" ? { semanticBackend: clustering.semanticBackend } : {}),
+    ...(clustering.clusterBy === "topic" && clustering.providerBackedLabels
+      ? { refinement: { providerBackedLabels: true } }
+      : {}),
   };
 }
 
@@ -450,11 +460,140 @@ function knowledgeBaseClusterGroups(
         sourceCount: cluster.sourceCount,
         score: cluster.score,
         ...(cluster.summary === undefined ? {} : { summary: cluster.summary }),
+        ...(cluster.deterministicLabel === undefined
+          ? {}
+          : { deterministicLabel: cluster.deterministicLabel }),
+        ...(cluster.deterministicSummary === undefined
+          ? {}
+          : { deterministicSummary: cluster.deterministicSummary }),
         ...(cluster.trace === undefined ? {} : { trace: cluster.trace }),
         items: clusterItems,
       },
     ];
   });
+}
+
+function shouldRefineKnowledgeBaseClusterLabels(clustering: KnowledgeBaseClusteringState) {
+  return clustering.clusterBy === "topic" && clustering.providerBackedLabels;
+}
+
+function knowledgeBaseClusterLabelRefinementTrace(
+  cluster: KnowledgeBaseSourceCluster,
+  status: "unavailable" | "error",
+  reason?: string,
+): KnowledgeBaseSourceClusterTrace {
+  return {
+    backend: cluster.trace?.backend ?? "metadata",
+    method: cluster.trace?.method ?? "metadata_topic_label",
+    ...(cluster.trace?.vectorCount === undefined ? {} : { vectorCount: cluster.trace.vectorCount }),
+    ...(cluster.trace?.fallbackReason === undefined
+      ? {}
+      : { fallbackReason: cluster.trace.fallbackReason }),
+    labelRefinement: {
+      status,
+      method: "provider_llm",
+      ...(reason === undefined ? {} : { reason: excerpt(reason, 180) }),
+    },
+  };
+}
+
+function knowledgeBaseClustersWithLabelRefinementTrace(
+  clusters: KnowledgeBaseSourceCluster[] | undefined,
+  status: "unavailable" | "error",
+  reason?: string,
+): KnowledgeBaseSourceCluster[] | undefined {
+  return clusters?.map((cluster) => ({
+    ...cluster,
+    trace: knowledgeBaseClusterLabelRefinementTrace(cluster, status, reason),
+  }));
+}
+
+async function refineKnowledgeBaseClusterLabels(
+  clusters: KnowledgeBaseSourceCluster[] | undefined,
+  items: SearchMemoryItem[],
+): Promise<KnowledgeBaseSourceCluster[] | undefined> {
+  if (clusters === undefined || clusters.length === 0) return clusters;
+  const request = knowledgeBaseClusterLabelRefinementRequest(clusters, items);
+  if (request === undefined) return clusters;
+  const result = await requestKnowledgeBaseClusterLabelRefinement(request);
+  const refinementByClusterId = new Map(
+    result.clusters.map((cluster) => [cluster.clusterId, cluster]),
+  );
+  return clusters.map((cluster): KnowledgeBaseSourceCluster => {
+    const refinement = refinementByClusterId.get(cluster.id);
+    if (refinement?.status !== "refined" || refinement.label === undefined) {
+      const status =
+        refinement?.status === "error" || refinement?.status === "unavailable"
+          ? refinement.status
+          : result.status === "error"
+            ? "error"
+            : "unavailable";
+      return {
+        ...cluster,
+        trace: knowledgeBaseClusterLabelRefinementTrace(
+          cluster,
+          status,
+          refinement?.reason ?? result.reason,
+        ),
+      };
+    }
+    return {
+      ...cluster,
+      deterministicLabel: cluster.deterministicLabel ?? cluster.label,
+      ...(cluster.summary === undefined
+        ? {}
+        : { deterministicSummary: cluster.deterministicSummary ?? cluster.summary }),
+      label: refinement.label,
+      ...(refinement.summary === undefined ? {} : { summary: refinement.summary }),
+      ...(cluster.trace === undefined
+        ? {}
+        : {
+            trace: {
+              ...knowledgeBaseClusterLabelRefinementTrace(cluster, "unavailable"),
+              labelRefinement: {
+                status: "refined",
+                method: "provider_llm",
+              },
+            },
+          }),
+    };
+  });
+}
+
+function knowledgeBaseClusterLabelRefinementRequest(
+  clusters: KnowledgeBaseSourceCluster[],
+  items: SearchMemoryItem[],
+): KnowledgeBaseClusterLabelRefinementRequest | undefined {
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  const requestClusters = clusters.flatMap((cluster) => {
+    if (cluster.clusterBy !== "topic") return [];
+    const examples = cluster.sourceIds
+      .flatMap((sourceId) => {
+        const item = itemById.get(sourceId);
+        if (item === undefined) return [];
+        return [
+          {
+            sourceId: item.id,
+            title: item.sourceTitle,
+            sourceType: item.sourceKind,
+            abstractSnippet: excerpt(item.excerpt, 360),
+          },
+        ];
+      })
+      .slice(0, 4);
+    if (examples.length === 0) return [];
+    return [
+      {
+        id: cluster.id,
+        label: cluster.label,
+        ...(cluster.summary === undefined ? {} : { summary: cluster.summary }),
+        clusterBy: "topic" as const,
+        sourceCount: cluster.sourceCount,
+        examples,
+      },
+    ];
+  });
+  return requestClusters.length === 0 ? undefined : { clusters: requestClusters };
 }
 
 function knowledgeUploadKindForFile(file: File): KnowledgeUploadKind | null {
@@ -1574,8 +1713,17 @@ function ClioContentApp() {
           setWikiCompileJobEvents([]);
         }
         const nextItems = result.items.map(toKnowledgeBaseSearchItem);
+        const nextClusters = shouldRefineKnowledgeBaseClusterLabels(knowledgeBaseClustering)
+          ? await refineKnowledgeBaseClusterLabels(result.clusters, nextItems).catch(() =>
+              knowledgeBaseClustersWithLabelRefinementTrace(
+                result.clusters,
+                "error",
+                "kb_cluster_label_refinement_rpc_error",
+              ),
+            )
+          : result.clusters;
         setItems(nextItems);
-        setKnowledgeBaseClusters(knowledgeBaseClusterGroups(result.clusters, nextItems));
+        setKnowledgeBaseClusters(knowledgeBaseClusterGroups(nextClusters, nextItems));
       } catch (error) {
         showToast(errorToast(error));
       } finally {
@@ -1584,6 +1732,7 @@ function ClioContentApp() {
     },
     [
       knowledgeBaseClusteringPayload,
+      knowledgeBaseClustering,
       knowledgeBaseRetrieveFilter,
       loadOrchestrationEvents,
       loadWikiCompileJobEvents,
