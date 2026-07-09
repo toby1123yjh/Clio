@@ -1368,6 +1368,11 @@ describe("local engine behavior harness", () => {
       semantic.clusters?.find((cluster) => cluster.label === "2026 / Local RAG Symposium")
         ?.sourceCount,
     ).toBe(2);
+    expect(semantic.clusters?.[0]?.trace).toMatchObject({
+      backend: "metadata",
+      method: "metadata_fallback",
+      fallbackReason: "insufficient_embeddings",
+    });
 
     const sourceType = await harness.request({
       kind: "searchKnowledgeBase",
@@ -1397,6 +1402,134 @@ describe("local engine behavior harness", () => {
     expect(coarseClusters.reduce((sum, cluster) => sum + cluster.sourceCount, 0)).toBe(
       coarseVenue.items.length,
     );
+    expect(harness.count("graph_nodes")).toBe(0);
+    expect(harness.count("graph_edges")).toBe(0);
+  });
+
+  it("clusters knowledge base semantic groups from existing source meta embeddings", async () => {
+    const harness = createHarness();
+    const fixture = [
+      {
+        title: "Vector Alpha",
+        sourceType: "paper",
+        year: 2026,
+        venue: "Vector Retrieval",
+        vectorIndex: 0,
+      },
+      {
+        title: "Vector Beta",
+        sourceType: "paper",
+        year: 2026,
+        venue: "Vector Retrieval",
+        vectorIndex: 0,
+      },
+      {
+        title: "Citation Gamma",
+        sourceType: "pdf",
+        year: 2025,
+        venue: "Citation Research",
+        vectorIndex: 1,
+      },
+      {
+        title: "Citation Delta",
+        sourceType: "pdf",
+        year: 2025,
+        venue: "Citation Research",
+        vectorIndex: 1,
+      },
+    ];
+    const sourceIds: string[] = [];
+
+    for (const item of fixture) {
+      const capture = await harness.request({
+        kind: "capturePage",
+        payload: pagePayload({
+          sourceTitle: item.title,
+          sourceUrl: `https://example.test/${item.title.toLowerCase().replace(/\s+/g, "-")}`,
+          normalizedText: ragText(`semantic vector cluster evidence ${item.title}`, 20),
+          metadata: {
+            title: item.title,
+            abstract: "Semantic vector cluster fixture.",
+            source_type: item.sourceType,
+            year: item.year,
+            venue: item.venue,
+          },
+        }),
+      });
+      sourceIds.push(capture.memory.id);
+    }
+
+    const now = "2026-07-09T00:00:00.000Z";
+    for (let index = 0; index < sourceIds.length; index += 1) {
+      const sourceId = sourceIds[index];
+      const item = fixture[index];
+      if (sourceId === undefined || item === undefined) continue;
+      harness.exec(
+        `INSERT INTO source_embeddings (
+          model_id,
+          target_kind,
+          target_id,
+          source_id,
+          vector_json,
+          text_hash,
+          created_at,
+          updated_at
+        ) VALUES ('clio-local-hash-v1', 'meta', ?, ?, ?, ?, ?, ?)`,
+        [
+          sourceId,
+          sourceId,
+          JSON.stringify(unitVector64(item.vectorIndex)),
+          hashText(`semantic-vector-${item.title}`),
+          now,
+          now,
+        ],
+      );
+    }
+
+    const semantic = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "semantic vector cluster evidence",
+        limit: 10,
+        includeChunks: 1,
+        clustering: {
+          clusterBy: "semantic",
+          granularity: "medium",
+          semanticBackend: "embedding",
+        },
+      },
+    });
+    const clusters = semantic.clusters ?? [];
+    expect(clusters).toHaveLength(2);
+    expect(clusters.every((cluster) => cluster.trace?.backend === "embedding")).toBe(true);
+    expect(clusters.every((cluster) => cluster.trace?.method === "kmeans_meta_embedding")).toBe(
+      true,
+    );
+    expect(clusters.every((cluster) => cluster.trace?.vectorCount === fixture.length)).toBe(true);
+    expect(clusters.map((cluster) => cluster.sourceCount).sort()).toEqual([2, 2]);
+    expect(clusters.map((cluster) => cluster.label)).toEqual(
+      expect.arrayContaining(["2026 / Vector Retrieval", "2025 / Citation Research"]),
+    );
+    expect(clusters.every((cluster) => cluster.summary?.includes("examples:"))).toBe(true);
+
+    const fallback = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "semantic vector cluster evidence",
+        limit: 10,
+        includeChunks: 1,
+        clustering: {
+          clusterBy: "semantic",
+          granularity: "fine",
+          semanticBackend: "metadata",
+        },
+      },
+    });
+    expect(fallback.clusters?.[0]?.trace).toMatchObject({
+      backend: "metadata",
+      method: "metadata_fallback",
+      fallbackReason: "metadata_backend_selected",
+    });
     expect(harness.count("graph_nodes")).toBe(0);
     expect(harness.count("graph_edges")).toBe(0);
   });
@@ -3778,6 +3911,10 @@ function createHarness(options: Omit<LocalEngineOptions, "openDatabase"> = {}) {
       return db.selectObjects(sql, bind);
     },
   };
+}
+
+function unitVector64(index: number) {
+  return Array.from({ length: 64 }, (_, vectorIndex) => (vectorIndex === index ? 1 : 0));
 }
 
 class MemoryPdfRawFileStore implements PdfRawFileStore {

@@ -73,6 +73,7 @@ describe("content local RAG flow", () => {
     expect(retrieveFilterSection).toContain('["webpage", "page", "selection"]');
     expect(retrieveFilterSection).toContain('if (clustering.clusterBy === "none")');
     expect(retrieveFilterSection).toContain("clusterBy: clustering.clusterBy");
+    expect(retrieveFilterSection).toContain("semanticBackend: clustering.semanticBackend");
     expect(retrieveFilterSection).toContain(
       "const years = normalizeKnowledgeBaseYears(filter.yearsText)",
     );
@@ -169,9 +170,13 @@ describe("content local RAG flow", () => {
     expect(clusteringControlsSection).toContain('data-clio-knowledge-clustering="true"');
     expect(clusteringControlsSection).toContain('id="clio-kb-cluster-by"');
     expect(clusteringControlsSection).toContain('id="clio-kb-cluster-granularity"');
+    expect(clusteringControlsSection).toContain('id="clio-kb-cluster-semantic-backend"');
+    expect(clusteringControlsSection).toContain("knowledgeBaseSemanticClusterBackendOptions");
     expect(clusteringControlsSection).toContain("knowledgeBaseClusterByOptions");
     expect(memoryListSection).toContain('data-clio-knowledge-cluster-list="true"');
     expect(memoryListSection).toContain('data-clio-knowledge-cluster="true"');
+    expect(memoryListSection).toContain('data-clio-knowledge-cluster-summary="true"');
+    expect(memoryListSection).toContain('data-clio-knowledge-cluster-trace="true"');
     expect(clusteringControlsSection).not.toContain("requestEngine");
     expect(memoryListSection).not.toContain("requestEngine");
   });

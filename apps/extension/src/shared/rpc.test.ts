@@ -1525,6 +1525,7 @@ describe("session engine RPC guards", () => {
             clustering: {
               clusterBy: "semantic",
               granularity: "medium",
+              semanticBackend: "embedding",
             },
           },
         },
@@ -1598,6 +1599,38 @@ describe("session engine RPC guards", () => {
             clustering: {
               clusterBy: "year",
               granularity: "tiny",
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "long context degradation",
+            clustering: {
+              clusterBy: "semantic",
+              semanticBackend: "unknown",
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "long context degradation",
+            clustering: {
+              clusterBy: "year",
+              semanticBackend: "embedding",
             },
           },
         },

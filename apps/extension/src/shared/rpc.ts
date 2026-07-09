@@ -260,10 +260,26 @@ export interface RetrieveSourcesResult {
 export type KnowledgeBaseClusterBy = "none" | "semantic" | "year" | "venue" | "source_type";
 export type KnowledgeBaseClusterGranularity = "coarse" | "medium" | "fine";
 export type KnowledgeBaseEngineClusterBy = Exclude<KnowledgeBaseClusterBy, "none">;
+export type KnowledgeBaseSemanticClusterBackend = "auto" | "embedding" | "metadata";
+export type KnowledgeBaseClusterTraceBackend = "embedding" | "metadata";
+export type KnowledgeBaseClusterTraceMethod = "kmeans_meta_embedding" | "metadata_fallback";
+export type KnowledgeBaseSemanticClusterFallbackReason =
+  | "metadata_backend_selected"
+  | "embedding_model_unavailable"
+  | "insufficient_embeddings"
+  | "invalid_embeddings";
 
 export interface KnowledgeBaseClusteringOptions {
   clusterBy: KnowledgeBaseEngineClusterBy;
   granularity?: KnowledgeBaseClusterGranularity;
+  semanticBackend?: KnowledgeBaseSemanticClusterBackend;
+}
+
+export interface KnowledgeBaseSourceClusterTrace {
+  backend: KnowledgeBaseClusterTraceBackend;
+  method: KnowledgeBaseClusterTraceMethod;
+  vectorCount?: number;
+  fallbackReason?: KnowledgeBaseSemanticClusterFallbackReason;
 }
 
 export interface KnowledgeBaseSourceCluster {
@@ -273,6 +289,8 @@ export interface KnowledgeBaseSourceCluster {
   sourceIds: string[];
   sourceCount: number;
   score: number;
+  summary?: string;
+  trace?: KnowledgeBaseSourceClusterTrace;
 }
 
 export interface SearchKnowledgeBasePayload {
@@ -2617,7 +2635,10 @@ function isKnowledgeBaseClusteringOptions(value: unknown): value is KnowledgeBas
   return (
     isRecord(value) &&
     isKnowledgeBaseEngineClusterBy(value.clusterBy) &&
-    (value.granularity === undefined || isKnowledgeBaseClusterGranularity(value.granularity))
+    (value.granularity === undefined || isKnowledgeBaseClusterGranularity(value.granularity)) &&
+    (value.semanticBackend === undefined || value.clusterBy === "semantic") &&
+    (value.semanticBackend === undefined ||
+      isKnowledgeBaseSemanticClusterBackend(value.semanticBackend))
   );
 }
 
@@ -2629,6 +2650,12 @@ function isKnowledgeBaseClusterGranularity(
   value: unknown,
 ): value is KnowledgeBaseClusterGranularity {
   return value === "coarse" || value === "medium" || value === "fine";
+}
+
+function isKnowledgeBaseSemanticClusterBackend(
+  value: unknown,
+): value is KnowledgeBaseSemanticClusterBackend {
+  return value === "auto" || value === "embedding" || value === "metadata";
 }
 
 function isRetrieveSourcesFilter(value: unknown): value is RetrieveSourcesFilter {

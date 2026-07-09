@@ -119,6 +119,8 @@ import type {
   ImageGenerationHistoryRecord,
   KnowledgeBaseClusterBy,
   KnowledgeBaseClusterGranularity,
+  KnowledgeBaseSemanticClusterBackend,
+  KnowledgeBaseSourceClusterTrace,
   MemoryDetail,
   RetrieveSourceLifecycleFilter,
   RetrieveSourcesFilter,
@@ -408,6 +410,7 @@ export interface KnowledgeBaseFilterState {
 export interface KnowledgeBaseClusteringState {
   clusterBy: KnowledgeBaseClusterBy;
   granularity: KnowledgeBaseClusterGranularity;
+  semanticBackend: KnowledgeBaseSemanticClusterBackend;
 }
 
 export interface KnowledgeBaseClusterGroup {
@@ -416,6 +419,8 @@ export interface KnowledgeBaseClusterGroup {
   clusterBy: Exclude<KnowledgeBaseClusterBy, "none">;
   sourceCount: number;
   score: number;
+  summary?: string;
+  trace?: KnowledgeBaseSourceClusterTrace;
   items: SearchMemoryItem[];
 }
 
@@ -454,7 +459,7 @@ const knowledgeBaseClusterByOptions: Array<{
   label: string;
 }> = [
   { value: "none", label: "No grouping" },
-  { value: "semantic", label: "Semantic fallback" },
+  { value: "semantic", label: "Semantic" },
   { value: "year", label: "Year" },
   { value: "venue", label: "Venue" },
   { value: "source_type", label: "Source type" },
@@ -467,6 +472,15 @@ const knowledgeBaseClusterGranularityOptions: Array<{
   { value: "coarse", label: "Coarse" },
   { value: "medium", label: "Medium" },
   { value: "fine", label: "Fine" },
+];
+
+const knowledgeBaseSemanticClusterBackendOptions: Array<{
+  value: KnowledgeBaseSemanticClusterBackend;
+  label: string;
+}> = [
+  { value: "auto", label: "Auto" },
+  { value: "embedding", label: "Embeddings" },
+  { value: "metadata", label: "Metadata" },
 ];
 
 function hasKnowledgeBaseAdvancedFilterText(filter: KnowledgeBaseFilterState) {
@@ -5239,6 +5253,7 @@ function KnowledgeBaseClusteringControls({
   onClusteringChange: (patch: Partial<KnowledgeBaseClusteringState>) => void;
 }) {
   const groupingEnabled = clustering.clusterBy !== "none";
+  const semanticEnabled = clustering.clusterBy === "semantic";
   return (
     <section
       className="grid gap-2 rounded-lg border border-border bg-surface px-3 py-3"
@@ -5292,6 +5307,29 @@ function KnowledgeBaseClusteringControls({
             ))}
           </select>
         </label>
+        <label
+          className="col-span-2 grid gap-1.5 text-[11px]"
+          htmlFor="clio-kb-cluster-semantic-backend"
+        >
+          <span className="font-medium text-muted-foreground">Semantic backend</span>
+          <select
+            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+            disabled={disabled || !semanticEnabled}
+            id="clio-kb-cluster-semantic-backend"
+            onChange={(event) =>
+              onClusteringChange({
+                semanticBackend: event.target.value as KnowledgeBaseSemanticClusterBackend,
+              })
+            }
+            value={clustering.semanticBackend}
+          >
+            {knowledgeBaseSemanticClusterBackendOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
     </section>
   );
@@ -5301,6 +5339,15 @@ function knowledgeBaseClusterByLabel(clusterBy: KnowledgeBaseClusterBy) {
   return (
     knowledgeBaseClusterByOptions.find((option) => option.value === clusterBy)?.label ?? "Unknown"
   );
+}
+
+function knowledgeBaseClusterTraceLabel(trace: KnowledgeBaseSourceClusterTrace) {
+  const backend = trace.backend === "embedding" ? "Embedding KMeans" : "Metadata fallback";
+  if (trace.backend === "embedding") {
+    return trace.vectorCount === undefined ? backend : `${backend} / ${trace.vectorCount} vectors`;
+  }
+  if (trace.fallbackReason === undefined) return backend;
+  return `${backend} / ${trace.fallbackReason.replace(/_/g, " ")}`;
 }
 
 function KnowledgeBaseWorkingSetPanel({
@@ -6697,6 +6744,22 @@ function MemoryList({
                 <p className="text-[11px] text-muted-foreground">
                   {knowledgeBaseClusterByLabel(cluster.clusterBy)}
                 </p>
+                {cluster.summary === undefined ? null : (
+                  <p
+                    className="mt-1 line-clamp-2 text-[11px] leading-4 text-muted-foreground"
+                    data-clio-knowledge-cluster-summary="true"
+                  >
+                    {cluster.summary}
+                  </p>
+                )}
+                {cluster.trace === undefined ? null : (
+                  <p
+                    className="mt-1 text-[10px] uppercase text-muted-foreground"
+                    data-clio-knowledge-cluster-trace="true"
+                  >
+                    {knowledgeBaseClusterTraceLabel(cluster.trace)}
+                  </p>
+                )}
               </div>
               <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
                 {cluster.sourceCount}

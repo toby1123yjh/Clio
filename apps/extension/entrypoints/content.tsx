@@ -328,6 +328,7 @@ const defaultKnowledgeBaseFilter: KnowledgeBaseFilterState = {
 const defaultKnowledgeBaseClustering: KnowledgeBaseClusteringState = {
   clusterBy: "none",
   granularity: "medium",
+  semanticBackend: "auto",
 };
 
 type KnowledgeUploadKind = "markdown" | "pdf";
@@ -421,6 +422,7 @@ function clusteringPayloadForKnowledgeBase(
   return {
     clusterBy: clustering.clusterBy,
     granularity: clustering.granularity,
+    ...(clustering.clusterBy === "semantic" ? { semanticBackend: clustering.semanticBackend } : {}),
   };
 }
 
@@ -443,6 +445,8 @@ function knowledgeBaseClusterGroups(
         clusterBy: cluster.clusterBy,
         sourceCount: cluster.sourceCount,
         score: cluster.score,
+        ...(cluster.summary === undefined ? {} : { summary: cluster.summary }),
+        ...(cluster.trace === undefined ? {} : { trace: cluster.trace }),
         items: clusterItems,
       },
     ];

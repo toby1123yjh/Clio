@@ -528,6 +528,8 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("function mergeRetrieveTracks"),
     );
     expect(knowledgeBaseClusterSection).toContain("loadKnowledgeBaseClusterMetadata");
+    expect(knowledgeBaseClusterSection).toContain("source_embeddings");
+    expect(knowledgeBaseClusterSection).not.toContain("source_chunks");
     expect(knowledgeBaseClusterSection).not.toContain("normalized_text");
     expect(knowledgeBaseClusterSection).not.toContain("graph_nodes");
     expect(knowledgeBaseClusterSection).not.toContain("graph_edges");
