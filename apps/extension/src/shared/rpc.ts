@@ -296,12 +296,21 @@ export interface RetrieveSourcesResult {
   };
 }
 
-export type KnowledgeBaseClusterBy = "none" | "semantic" | "year" | "venue" | "source_type";
+export type KnowledgeBaseClusterBy =
+  | "none"
+  | "semantic"
+  | "topic"
+  | "year"
+  | "venue"
+  | "source_type";
 export type KnowledgeBaseClusterGranularity = "coarse" | "medium" | "fine";
 export type KnowledgeBaseEngineClusterBy = Exclude<KnowledgeBaseClusterBy, "none">;
 export type KnowledgeBaseSemanticClusterBackend = "auto" | "embedding" | "metadata";
 export type KnowledgeBaseClusterTraceBackend = "embedding" | "metadata";
-export type KnowledgeBaseClusterTraceMethod = "kmeans_meta_embedding" | "metadata_fallback";
+export type KnowledgeBaseClusterTraceMethod =
+  | "kmeans_meta_embedding"
+  | "metadata_fallback"
+  | "metadata_topic_label";
 export type KnowledgeBaseSemanticClusterFallbackReason =
   | "metadata_backend_selected"
   | "embedding_model_unavailable"
@@ -3117,7 +3126,13 @@ function isKnowledgeBaseClusteringOptions(value: unknown): value is KnowledgeBas
 }
 
 function isKnowledgeBaseEngineClusterBy(value: unknown): value is KnowledgeBaseEngineClusterBy {
-  return value === "semantic" || value === "year" || value === "venue" || value === "source_type";
+  return (
+    value === "semantic" ||
+    value === "topic" ||
+    value === "year" ||
+    value === "venue" ||
+    value === "source_type"
+  );
 }
 
 function isKnowledgeBaseClusterGranularity(

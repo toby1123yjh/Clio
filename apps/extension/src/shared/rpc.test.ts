@@ -1747,9 +1747,41 @@ describe("session engine RPC guards", () => {
         request: {
           kind: "searchKnowledgeBase",
           payload: {
+            query: "topic grouping",
+            clustering: {
+              clusterBy: "topic",
+              granularity: "coarse",
+            },
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
             query: "long context degradation",
             filter: {
               lifecycleStatuses: ["deleted"],
+            },
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "long context degradation",
+            clustering: {
+              clusterBy: "topic",
+              semanticBackend: "metadata",
             },
           },
         },

@@ -14115,7 +14115,51 @@ function buildKnowledgeBaseSourceClusters(
   if (clustering.clusterBy === "semantic") {
     return buildKnowledgeBaseSemanticSourceClusters(db, items, clustering, metadataBySourceId);
   }
+  if (clustering.clusterBy === "topic") {
+    return buildKnowledgeBaseTopicSourceClusters(items, clustering, metadataBySourceId);
+  }
   return buildKnowledgeBaseMetadataSourceClusters(items, clustering, metadataBySourceId);
+}
+
+function buildKnowledgeBaseTopicSourceClusters(
+  items: RetrieveSourceItem[],
+  clustering: KnowledgeBaseClusteringOptions,
+  metadataBySourceId: Map<string, KnowledgeBaseClusterSourceMetadata>,
+): KnowledgeBaseSourceCluster[] {
+  const grouped = new Map<string, Array<{ item: RetrieveSourceItem; rank: number }>>();
+  items.forEach((item, index) => {
+    const topic = knowledgeBaseSourceTopicSignal(item, metadataBySourceId.get(item.id));
+    const existing = grouped.get(topic.key) ?? [];
+    existing.push({ item, rank: index + 1 });
+    grouped.set(topic.key, existing);
+  });
+
+  const trace: KnowledgeBaseSourceClusterTrace = {
+    backend: "metadata",
+    method: "metadata_topic_label",
+    vectorCount: items.length,
+  };
+  const drafts = Array.from(grouped.entries()).flatMap(([key, members]) => {
+    if (members.length === 0) return [];
+    const memberItems = members.map((member) => member.item);
+    const label = knowledgeBaseTopicClusterLabel(memberItems, metadataBySourceId);
+    return [
+      {
+        label,
+        sourceIds: memberItems.map((item) => item.id),
+        sourceCount: memberItems.length,
+        score: members.reduce((sum, member) => {
+          const score = Number.isFinite(member.item.score) ? member.item.score : 0;
+          return sum + score;
+        }, 0),
+        bestRank: Math.min(...members.map((member) => member.rank)),
+        summary: knowledgeBaseTopicClusterSummary(memberItems, metadataBySourceId),
+        trace,
+        idSeed: `${key}:${memberItems.map((item) => item.id).join("|")}`,
+      },
+    ];
+  });
+  return finalizeKnowledgeBaseClusterDrafts(drafts, clustering.clusterBy, clustering.granularity);
 }
 
 function buildKnowledgeBaseMetadataSourceClusters(
@@ -14484,6 +14528,169 @@ function sameClusterTrace(
   );
 }
 
+function knowledgeBaseSourceTopicSignal(
+  item: RetrieveSourceItem,
+  sourceMetadata: KnowledgeBaseClusterSourceMetadata | undefined,
+) {
+  const explicitSignals = knowledgeBaseExplicitTopicSignals(sourceMetadata);
+  const titleSignals = knowledgeBaseMetadataTextTerms(
+    [
+      sourceMetadata?.metaTitle,
+      sourceMetadata?.sourceTitle,
+      item.sourceTitle,
+      sourceMetadata?.abstract,
+    ],
+    3,
+  );
+  const signal = explicitSignals[0] ?? titleSignals[0];
+  if (signal !== undefined) {
+    const normalized = normalizeText(signal);
+    if (normalized.length > 0) {
+      return {
+        key: `topic:${normalized.toLowerCase()}`,
+        label: titleCaseClusterTerm(normalized),
+      };
+    }
+  }
+  return {
+    key: `fallback:${semanticFallbackClusterLabel(item, sourceMetadata).toLowerCase()}`,
+    label: semanticFallbackClusterLabel(item, sourceMetadata),
+  };
+}
+
+function knowledgeBaseTopicClusterLabel(
+  items: RetrieveSourceItem[],
+  metadataBySourceId: Map<string, KnowledgeBaseClusterSourceMetadata>,
+) {
+  const explicitSignals = mostFrequentKnowledgeBaseClusterValues(
+    items.flatMap((item) => knowledgeBaseExplicitTopicSignals(metadataBySourceId.get(item.id))),
+  );
+  const titleSignals = mostFrequentKnowledgeBaseClusterValues(
+    knowledgeBaseMetadataTextTerms(
+      items.flatMap((item) => {
+        const metadata = metadataBySourceId.get(item.id);
+        return [metadata?.metaTitle, metadata?.sourceTitle, item.sourceTitle, metadata?.abstract];
+      }),
+      8,
+    ),
+  );
+  const selected = explicitSignals[0]?.value ?? titleSignals[0]?.value;
+  if (selected !== undefined) {
+    return truncateKnowledgeBaseClusterText(
+      titleCaseClusterTerm(selected),
+      knowledgeBaseSemanticClusterLabelMaxChars,
+    );
+  }
+  return knowledgeBaseSemanticEmbeddingClusterLabel(items, metadataBySourceId);
+}
+
+function knowledgeBaseTopicClusterSummary(
+  items: RetrieveSourceItem[],
+  metadataBySourceId: Map<string, KnowledgeBaseClusterSourceMetadata>,
+) {
+  const signals = mostFrequentKnowledgeBaseClusterValues(
+    items.flatMap((item) => knowledgeBaseExplicitTopicSignals(metadataBySourceId.get(item.id))),
+  )
+    .slice(0, 3)
+    .map((signal) => signal.value);
+  const metadataSignals = knowledgeBaseClusterSignalParts(items, metadataBySourceId);
+  const examples = items
+    .map((item) => knowledgeBaseClusterSourceTitle(item, metadataBySourceId.get(item.id)))
+    .filter((title) => title.length > 0)
+    .slice(0, 2);
+  return truncateKnowledgeBaseClusterText(
+    [
+      `${items.length} source${items.length === 1 ? "" : "s"}`,
+      signals.length > 0 ? `topics: ${signals.join(", ")}` : "bounded metadata label",
+      metadataSignals.length > 0 ? `signals: ${metadataSignals.join(", ")}` : "",
+      examples.length > 0 ? `examples: ${examples.join("; ")}` : "",
+    ]
+      .filter((part) => part.length > 0)
+      .join(" / "),
+    knowledgeBaseSemanticClusterSummaryMaxChars,
+  );
+}
+
+function knowledgeBaseExplicitTopicSignals(
+  sourceMetadata: KnowledgeBaseClusterSourceMetadata | undefined,
+) {
+  if (sourceMetadata === undefined) return [];
+  const metadata = sourceMetadata.metadata;
+  const keys = [
+    "topic",
+    "topics",
+    "auto_topic",
+    "user_topic",
+    "keywords",
+    "keyword",
+    "tags",
+    "tag",
+    "concepts",
+    "concept",
+    "methods",
+    "method",
+    "datasets",
+    "dataset",
+    "domains",
+    "domain",
+    "categories",
+    "subjects",
+  ];
+  const signals = keys.flatMap((key) => knowledgeBaseMetadataSignalValues(metadata[key]));
+  return normalizeKnowledgeBaseTopicSignals(signals);
+}
+
+function knowledgeBaseMetadataSignalValues(value: unknown): string[] {
+  if (typeof value === "string") {
+    return value
+      .split(/[,;|]/u)
+      .map((part) => normalizeText(part))
+      .filter((part) => part.length > 0);
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => knowledgeBaseMetadataSignalValues(item));
+  }
+  if (isRecord(value)) {
+    const label = value.label ?? value.name ?? value.title ?? value.canonical ?? value.value;
+    return knowledgeBaseMetadataSignalValues(label);
+  }
+  return [];
+}
+
+function normalizeKnowledgeBaseTopicSignals(values: string[]) {
+  const seen = new Set<string>();
+  const signals: string[] = [];
+  for (const value of values) {
+    const normalized = truncateKnowledgeBaseClusterText(
+      value,
+      knowledgeBaseSemanticClusterLabelMaxChars,
+    );
+    if (normalized.length === 0) continue;
+    const lower = normalized.toLowerCase();
+    if (keywordIndexStopWords.has(lower) || /^\d+$/u.test(lower)) continue;
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    signals.push(normalized);
+    if (signals.length >= 6) break;
+  }
+  return signals;
+}
+
+function knowledgeBaseMetadataTextTerms(values: Array<string | undefined>, maxTerms: number) {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    const text = normalizeText(value ?? "").toLowerCase();
+    for (const term of text.match(/[\p{L}\p{N}][\p{L}\p{N}-]{2,}/gu) ?? []) {
+      if (keywordIndexStopWords.has(term) || /^\d+$/u.test(term)) continue;
+      counts.set(term, (counts.get(term) ?? 0) + 1);
+    }
+  }
+  return Array.from(counts.entries())
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, maxTerms)
+    .map(([term]) => term);
+}
+
 function knowledgeBaseSemanticEmbeddingClusterLabel(
   items: RetrieveSourceItem[],
   metadataBySourceId: Map<string, KnowledgeBaseClusterSourceMetadata>,
@@ -14708,6 +14915,8 @@ function knowledgeBaseClusterLabel(
       return sourceTypeClusterLabel(sourceMetadata?.sourceType, item.sourceKind);
     case "semantic":
       return semanticFallbackClusterLabel(item, sourceMetadata);
+    case "topic":
+      return knowledgeBaseSourceTopicSignal(item, sourceMetadata).label;
   }
 }
 

@@ -173,10 +173,12 @@ describe("content local RAG flow", () => {
     expect(clusteringControlsSection).toContain('id="clio-kb-cluster-semantic-backend"');
     expect(clusteringControlsSection).toContain("knowledgeBaseSemanticClusterBackendOptions");
     expect(clusteringControlsSection).toContain("knowledgeBaseClusterByOptions");
+    expect(railShellSource).toContain('{ value: "topic", label: "Topic" }');
     expect(memoryListSection).toContain('data-clio-knowledge-cluster-list="true"');
     expect(memoryListSection).toContain('data-clio-knowledge-cluster="true"');
     expect(memoryListSection).toContain('data-clio-knowledge-cluster-summary="true"');
     expect(memoryListSection).toContain('data-clio-knowledge-cluster-trace="true"');
+    expect(memoryListSection).toContain("knowledgeBaseClusterTraceLabel(cluster.trace)");
     expect(clusteringControlsSection).not.toContain("requestEngine");
     expect(memoryListSection).not.toContain("requestEngine");
   });

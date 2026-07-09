@@ -1491,6 +1491,29 @@ describe("local engine behavior harness", () => {
       expect.arrayContaining(["Paper", "PDF", "Markdown", "Webpage"]),
     );
 
+    const topic = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "clusterable knowledge evidence",
+        limit: 20,
+        includeChunks: 1,
+        clustering: { clusterBy: "topic", granularity: "fine" },
+      },
+    });
+    const topicClusters = topic.clusters ?? [];
+    expect(topicClusters.map((cluster) => cluster.label)).toEqual(
+      expect.arrayContaining(["Cluster"]),
+    );
+    expect(topicClusters.reduce((sum, cluster) => sum + cluster.sourceCount, 0)).toBe(
+      topic.items.length,
+    );
+    expect(topicClusters[0]?.trace).toMatchObject({
+      backend: "metadata",
+      method: "metadata_topic_label",
+      vectorCount: topic.items.length,
+    });
+    expect(topicClusters[0]?.summary).toContain("bounded metadata");
+
     const coarseVenue = await harness.request({
       kind: "searchKnowledgeBase",
       payload: {

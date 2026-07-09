@@ -476,6 +476,7 @@ const knowledgeBaseClusterByOptions: Array<{
 }> = [
   { value: "none", label: "No grouping" },
   { value: "semantic", label: "Semantic" },
+  { value: "topic", label: "Topic" },
   { value: "year", label: "Year" },
   { value: "venue", label: "Venue" },
   { value: "source_type", label: "Source type" },
@@ -5524,6 +5525,7 @@ function knowledgeBaseClusterByLabel(clusterBy: KnowledgeBaseClusterBy) {
 }
 
 function knowledgeBaseClusterTraceLabel(trace: KnowledgeBaseSourceClusterTrace) {
+  if (trace.method === "metadata_topic_label") return "Topic labels / bounded metadata";
   const backend = trace.backend === "embedding" ? "Embedding KMeans" : "Metadata fallback";
   if (trace.backend === "embedding") {
     return trace.vectorCount === undefined ? backend : `${backend} / ${trace.vectorCount} vectors`;
