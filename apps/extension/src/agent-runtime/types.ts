@@ -42,6 +42,7 @@ export interface SourceContextPackMapReduceOptions {
   enabled: boolean;
   maxGroups?: number;
   perGroupTokenBudget?: number;
+  maxConcurrentMaps?: number;
 }
 
 export type SourceContextPackLoadDepth = "meta" | "outline" | "chunks" | "full";

@@ -114,12 +114,16 @@ function readSourceContextPackMapReduceOptions(
   if (!isRecord(value) || typeof value.enabled !== "boolean") return undefined;
   if (!isOptionalFiniteNumber(value.maxGroups)) return undefined;
   if (!isOptionalFiniteNumber(value.perGroupTokenBudget)) return undefined;
+  if (!isOptionalFiniteNumber(value.maxConcurrentMaps)) return undefined;
   const output: SourceContextPackMapReduceOptions = {
     enabled: value.enabled,
   };
   if (typeof value.maxGroups === "number") output.maxGroups = value.maxGroups;
   if (typeof value.perGroupTokenBudget === "number") {
     output.perGroupTokenBudget = value.perGroupTokenBudget;
+  }
+  if (typeof value.maxConcurrentMaps === "number") {
+    output.maxConcurrentMaps = value.maxConcurrentMaps;
   }
   return output;
 }

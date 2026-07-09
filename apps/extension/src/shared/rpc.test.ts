@@ -600,6 +600,215 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts and rejects Source Context map scheduler RPCs", () => {
+    const step = {
+      groupId: "group-1",
+      groupIndex: 0,
+      sourceIds: ["source-1"],
+      windowRefs: [{ sourceId: "source-1", chunkId: "chunk-1", ord: 0 }],
+      evidenceIds: ["memory:source-1:chunk:chunk-1"],
+      tokenEstimate: 240,
+      inputSummary: "group=group-1; windows=1; tokens=240",
+      stepSignature: "step-signature-1",
+    };
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "createOrResumeSourceContextMapRun",
+          payload: {
+            id: "sctx-map-run-1",
+            sessionId: "session-1",
+            ownerRunId: "run-1",
+            mode: "research",
+            planSignature: "plan-signature-1",
+            maxConcurrentMaps: 2,
+            steps: [step],
+            createdAt: "2026-07-09T00:00:00.000Z",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listSourceContextMapRuns",
+          filter: { sessionId: "session-1", status: "running", limit: 8 },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "getSourceContextMapRun", id: "sctx-map-run-1" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listSourceContextMapEvents", runId: "sctx-map-run-1", limit: 20 },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "claimSourceContextMapStep", runId: "sctx-map-run-1" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "completeSourceContextMapStep",
+          payload: {
+            stepId: "sctx-map-step-1",
+            outputSummary: "bounded map finding",
+            artifactId: "artifact-1",
+            completedAt: "2026-07-09T00:00:01.000Z",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "failSourceContextMapStep",
+          payload: {
+            stepId: "sctx-map-step-1",
+            errorCode: "PROVIDER_ERROR",
+            errorMessage: "map failed",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "markSourceContextMapReduceStarted",
+          payload: {
+            runId: "sctx-map-run-1",
+            mapArtifactIds: ["artifact-1"],
+            inputSummary: "map artifacts=1",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "markSourceContextMapReduceCompleted",
+          payload: {
+            runId: "sctx-map-run-1",
+            outputSummary: "final bounded answer",
+            artifactId: "artifact-2",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "markSourceContextMapReduceFailed",
+          payload: {
+            runId: "sctx-map-run-1",
+            errorCode: "PROVIDER_ERROR",
+            errorMessage: "reduce failed",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "cancelSourceContextMapRun", id: "sctx-map-run-1" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "retrySourceContextMapRun", id: "sctx-map-run-1" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "resumeSourceContextMapRun", id: "sctx-map-run-1" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "createOrResumeSourceContextMapRun",
+          payload: {
+            ownerRunId: "run-1",
+            planSignature: "plan-signature-1",
+            maxConcurrentMaps: 0,
+            steps: [step],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "createOrResumeSourceContextMapRun",
+          payload: {
+            ownerRunId: "run-1",
+            planSignature: "plan-signature-1",
+            maxConcurrentMaps: Number.POSITIVE_INFINITY,
+            steps: [step],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "createOrResumeSourceContextMapRun",
+          payload: {
+            ownerRunId: "run-1",
+            planSignature: "plan-signature-1",
+            steps: [{ ...step, stepSignature: "" }],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listSourceContextMapRuns",
+          filter: { status: "paused" },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts typed agent stream subscribe messages", () => {
     expect(
       isAgentStreamSubscribeMessage({

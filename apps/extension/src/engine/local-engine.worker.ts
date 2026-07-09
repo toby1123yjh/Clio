@@ -37,8 +37,10 @@ import {
   type ChunkMetaTier2AuditRecord,
   type ChunkMetaTier2AuditStatus,
   type CompactionRecord,
+  type CompleteSourceContextMapStepPayload,
   type CreateChatSessionPayload,
   type CreateCompactionPayload,
+  type CreateOrResumeSourceContextMapRunPayload,
   type CreateOrchestrationRunPayload,
   type CreateTopicPagePayload,
   type CreateWikiCompileJobEventPayload,
@@ -49,6 +51,7 @@ import {
   type EngineHealth,
   type EngineRequest,
   EngineRpcError,
+  type FailSourceContextMapStepPayload,
   type GetJobStatusResult,
   type GetMemoryEvidenceWindowAnchor,
   type GetMemoryEvidenceWindowsPayload,
@@ -77,6 +80,11 @@ import {
   type KnowledgeBaseSourceCluster,
   type KnowledgeBaseSourceClusterTrace,
   type ListMemoriesResult,
+  type ListSourceContextMapEventsResult,
+  type ListSourceContextMapRunsResult,
+  type MarkSourceContextMapReduceCompletedPayload,
+  type MarkSourceContextMapReduceFailedPayload,
+  type MarkSourceContextMapReduceStartedPayload,
   type MemoryDetail,
   type MemoryEvidenceWindow,
   type MemorySummary,
@@ -112,6 +120,17 @@ import {
   type SourceContextMapArtifactRecord,
   type SourceContextMapArtifactStage,
   type SourceContextMapArtifactStatus,
+  type SourceContextMapClaimStepResult,
+  type SourceContextMapEvent,
+  type SourceContextMapEventKind,
+  type SourceContextMapEventLevel,
+  type SourceContextMapRunDetail,
+  type SourceContextMapRunFilter,
+  type SourceContextMapRunStatus,
+  type SourceContextMapRunSummary,
+  type SourceContextMapStepPlan,
+  type SourceContextMapStepRecord,
+  type SourceContextMapStepStatus,
   type SourceContextPackGroup,
   type SourceContextPackOutlineItem,
   type SourceContextPackResult,
@@ -818,6 +837,32 @@ export class LocalEngine {
         return await this.listSourceContextMapArtifacts(request.filter);
       case "clearSourceContextMapArtifacts":
         return await this.clearSourceContextMapArtifacts(request.filter);
+      case "createOrResumeSourceContextMapRun":
+        return await this.createOrResumeSourceContextMapRun(request.payload);
+      case "listSourceContextMapRuns":
+        return await this.listSourceContextMapRuns(request.filter);
+      case "getSourceContextMapRun":
+        return await this.getSourceContextMapRun(request.id);
+      case "cancelSourceContextMapRun":
+        return await this.cancelSourceContextMapRun(request.id);
+      case "retrySourceContextMapRun":
+        return await this.retrySourceContextMapRun(request.id);
+      case "resumeSourceContextMapRun":
+        return await this.resumeSourceContextMapRun(request.id);
+      case "listSourceContextMapEvents":
+        return await this.listSourceContextMapEvents(request.runId, request.limit);
+      case "claimSourceContextMapStep":
+        return await this.claimSourceContextMapStep(request.runId, request.now);
+      case "completeSourceContextMapStep":
+        return await this.completeSourceContextMapStep(request.payload);
+      case "failSourceContextMapStep":
+        return await this.failSourceContextMapStep(request.payload);
+      case "markSourceContextMapReduceStarted":
+        return await this.markSourceContextMapReduceStarted(request.payload);
+      case "markSourceContextMapReduceCompleted":
+        return await this.markSourceContextMapReduceCompleted(request.payload);
+      case "markSourceContextMapReduceFailed":
+        return await this.markSourceContextMapReduceFailed(request.payload);
       case "deleteMemory":
         return await this.delete(request.id);
       case "listTopicPages":
@@ -1966,6 +2011,108 @@ export class LocalEngine {
     return { cleared: Number(db.selectValue("SELECT changes()") ?? 0) };
   }
 
+  private async createOrResumeSourceContextMapRun(
+    payload: CreateOrResumeSourceContextMapRunPayload,
+  ): Promise<SourceContextMapRunDetail> {
+    const db = await this.ensureReady();
+    return createOrResumeSourceContextMapRun(db, payload);
+  }
+
+  private async listSourceContextMapRuns(
+    filter: SourceContextMapRunFilter = {},
+  ): Promise<ListSourceContextMapRunsResult> {
+    const db = await this.ensureReady();
+    const where = sourceContextMapRunWhereClause(filter);
+    const rows = db.selectObjects(
+      `SELECT *
+       FROM source_context_map_runs
+       ${where.sql}
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+      [...where.bind, clampOptionalLimit(filter.limit, 8, 50)],
+    );
+    return { runs: rows.map(sourceContextMapRunFromRow) };
+  }
+
+  private async getSourceContextMapRun(id: string): Promise<SourceContextMapRunDetail | null> {
+    const db = await this.ensureReady();
+    return loadSourceContextMapRunDetail(db, id);
+  }
+
+  private async cancelSourceContextMapRun(id: string): Promise<SourceContextMapRunSummary> {
+    const db = await this.ensureReady();
+    return cancelSourceContextMapRun(db, id);
+  }
+
+  private async retrySourceContextMapRun(id: string): Promise<SourceContextMapRunSummary> {
+    const db = await this.ensureReady();
+    return retrySourceContextMapRun(db, id);
+  }
+
+  private async resumeSourceContextMapRun(id: string): Promise<SourceContextMapRunSummary> {
+    const db = await this.ensureReady();
+    return resumeSourceContextMapRun(db, id);
+  }
+
+  private async listSourceContextMapEvents(
+    runId: string,
+    limit = 40,
+  ): Promise<ListSourceContextMapEventsResult> {
+    const db = await this.ensureReady();
+    const rows = db.selectObjects(
+      `SELECT *
+       FROM source_context_map_events
+       WHERE run_id = ?
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+      [normalizeText(runId), clampLimit(limit, 100)],
+    );
+    return { events: rows.map(sourceContextMapEventFromRow) };
+  }
+
+  private async claimSourceContextMapStep(
+    runId: string,
+    now?: string,
+  ): Promise<SourceContextMapClaimStepResult> {
+    const db = await this.ensureReady();
+    return claimSourceContextMapStep(db, runId, now);
+  }
+
+  private async completeSourceContextMapStep(
+    payload: CompleteSourceContextMapStepPayload,
+  ): Promise<SourceContextMapStepRecord> {
+    const db = await this.ensureReady();
+    return completeSourceContextMapStep(db, payload);
+  }
+
+  private async failSourceContextMapStep(
+    payload: FailSourceContextMapStepPayload,
+  ): Promise<SourceContextMapStepRecord> {
+    const db = await this.ensureReady();
+    return failSourceContextMapStep(db, payload);
+  }
+
+  private async markSourceContextMapReduceStarted(
+    payload: MarkSourceContextMapReduceStartedPayload,
+  ): Promise<SourceContextMapRunSummary> {
+    const db = await this.ensureReady();
+    return markSourceContextMapReduceStarted(db, payload);
+  }
+
+  private async markSourceContextMapReduceCompleted(
+    payload: MarkSourceContextMapReduceCompletedPayload,
+  ): Promise<SourceContextMapRunSummary> {
+    const db = await this.ensureReady();
+    return markSourceContextMapReduceCompleted(db, payload);
+  }
+
+  private async markSourceContextMapReduceFailed(
+    payload: MarkSourceContextMapReduceFailedPayload,
+  ): Promise<SourceContextMapRunSummary> {
+    const db = await this.ensureReady();
+    return markSourceContextMapReduceFailed(db, payload);
+  }
+
   private async pinWorkingSetSource(
     sourceId: string,
     loadDepth: WorkingSetLoadDepth = "meta",
@@ -2068,6 +2215,7 @@ export class LocalEngine {
         bind: [id],
       });
       deleteSourceContextMapArtifactsForSource(db, id);
+      deleteSourceContextMapSchedulerForSource(db, id);
       db.exec({
         sql: "DELETE FROM chunk_meta_tier2_audit WHERE source_id = ?",
         bind: [id],
@@ -3498,6 +3646,9 @@ export class LocalEngine {
       db.exec("DELETE FROM graph_nodes");
       db.exec("DELETE FROM source_context_compression_logs");
       db.exec("DELETE FROM source_context_map_artifacts");
+      db.exec("DELETE FROM source_context_map_events");
+      db.exec("DELETE FROM source_context_map_steps");
+      db.exec("DELETE FROM source_context_map_runs");
       db.exec("DELETE FROM chunk_meta_tier2_audit");
       db.exec("DELETE FROM source_working_set");
       db.exec("DELETE FROM source_metadata");
@@ -3536,6 +3687,7 @@ export class LocalEngine {
       migrate(db);
       recoverStaleJobs(db);
       recoverStaleOrchestrationRuns(db);
+      recoverStaleSourceContextMapRuns(db);
       const integrity = db.selectValue("PRAGMA integrity_check");
       if (integrity !== "ok") {
         this.healthState = {
@@ -4192,6 +4344,82 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS source_context_map_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      owner_run_id TEXT NOT NULL,
+      mode TEXT CHECK (mode IS NULL OR mode IN ('research', 'auto')),
+      status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'reducing', 'done', 'failed', 'cancelled')),
+      plan_signature TEXT NOT NULL,
+      source_ids_json TEXT NOT NULL DEFAULT '[]',
+      max_concurrent_maps INTEGER NOT NULL DEFAULT 1,
+      progress_current INTEGER NOT NULL DEFAULT 0,
+      progress_total INTEGER NOT NULL DEFAULT 0,
+      cancel_requested INTEGER NOT NULL DEFAULT 0,
+      retry_of_run_id TEXT REFERENCES source_context_map_runs(id) ON DELETE SET NULL,
+      reduce_map_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+      reduce_input_summary TEXT NOT NULL DEFAULT '',
+      reduce_output_summary TEXT NOT NULL DEFAULT '',
+      reduce_artifact_id TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS source_context_map_steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES source_context_map_runs(id) ON DELETE CASCADE,
+      group_id TEXT NOT NULL,
+      group_index INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+      step_signature TEXT NOT NULL,
+      source_ids_json TEXT NOT NULL DEFAULT '[]',
+      window_refs_json TEXT NOT NULL DEFAULT '[]',
+      evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+      token_estimate INTEGER,
+      input_summary TEXT NOT NULL DEFAULT '',
+      output_summary TEXT NOT NULL DEFAULT '',
+      artifact_id TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      claimed_at TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (run_id, group_index)
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS source_context_map_events (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES source_context_map_runs(id) ON DELETE CASCADE,
+      step_id TEXT REFERENCES source_context_map_steps(id) ON DELETE SET NULL,
+      kind TEXT NOT NULL CHECK (
+        kind IN (
+          'queued',
+          'resumed',
+          'step_claimed',
+          'step_completed',
+          'step_failed',
+          'reduce_started',
+          'reduce_completed',
+          'reduce_failed',
+          'cancel_requested',
+          'cancelled',
+          'retry_created'
+        )
+      ),
+      level TEXT NOT NULL CHECK (level IN ('info', 'warning', 'error')),
+      message TEXT NOT NULL,
+      detail_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS chunk_meta_tier2_audit (
       id TEXT PRIMARY KEY,
       source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -4420,6 +4648,34 @@ function migrate(db: SqliteDb) {
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_source_context_map_artifacts_status_created
      ON source_context_map_artifacts(status, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_runs_session_created
+     ON source_context_map_runs(session_id, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_runs_owner_plan
+     ON source_context_map_runs(owner_run_id, plan_signature, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_runs_status_created
+     ON source_context_map_runs(status, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_runs_retry
+     ON source_context_map_runs(retry_of_run_id)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_steps_run_status
+     ON source_context_map_steps(run_id, status, group_index)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_steps_run_group
+     ON source_context_map_steps(run_id, group_index)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_events_run_created
+     ON source_context_map_events(run_id, created_at DESC)`,
   );
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_chunk_meta_tier2_audit_source_created
@@ -7161,6 +7417,40 @@ function recoverStaleOrchestrationRuns(db: SqliteDb) {
   });
 }
 
+function recoverStaleSourceContextMapRuns(db: SqliteDb) {
+  const now = new Date().toISOString();
+  transaction(db, () => {
+    db.exec({
+      sql: `UPDATE source_context_map_steps
+            SET status = 'queued',
+                claimed_at = NULL,
+                updated_at = ?
+            WHERE status = 'running'`,
+      bind: [now],
+    });
+    db.exec({
+      sql: `UPDATE source_context_map_runs
+            SET status = 'cancelled',
+                updated_at = ?,
+                finished_at = ?,
+                last_error = NULL
+            WHERE status IN ('running', 'reducing')
+              AND cancel_requested <> 0`,
+      bind: [now, now],
+    });
+    db.exec({
+      sql: `UPDATE source_context_map_runs
+            SET status = 'queued',
+                started_at = NULL,
+                updated_at = ?,
+                last_error = COALESCE(last_error, 'Source context map run was active when the engine stopped.')
+            WHERE status IN ('running', 'reducing')
+              AND cancel_requested = 0`,
+      bind: [now],
+    });
+  });
+}
+
 function ensureDefaultEmbeddingModel(db: SqliteDb) {
   const now = new Date().toISOString();
   db.exec({
@@ -7583,6 +7873,533 @@ function finishCancelledOrchestrationRun(
     createdAt: now,
   });
   return loadOrchestrationRunOrThrow(db, runId);
+}
+
+function createOrResumeSourceContextMapRun(
+  db: SqliteDb,
+  payload: CreateOrResumeSourceContextMapRunPayload,
+): SourceContextMapRunDetail {
+  const ownerRunId = normalizeText(payload.ownerRunId);
+  const planSignature = normalizeText(payload.planSignature).slice(0, 512);
+  if (ownerRunId.length === 0 || planSignature.length === 0) {
+    throw new EngineRpcError("INVALID_SOURCE_CONTEXT_MAP_RUN", "Map run requires a plan.");
+  }
+  if (payload.sessionId !== undefined) assertChatSessionExists(db, payload.sessionId);
+
+  const steps = normalizeSourceContextMapStepPlans(payload.steps);
+  if (steps.length === 0) {
+    throw new EngineRpcError("INVALID_SOURCE_CONTEXT_MAP_RUN", "Map run requires steps.");
+  }
+
+  const existing = db.selectObject(
+    `SELECT *
+     FROM source_context_map_runs
+     WHERE owner_run_id = ?
+       AND plan_signature = ?
+       AND status NOT IN ('failed', 'cancelled')
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1`,
+    [ownerRunId, planSignature],
+  );
+  if (existing !== undefined) {
+    reconcileSourceContextMapRunSteps(db, stringField(existing, "id"), steps);
+    return loadSourceContextMapRunDetailOrThrow(db, stringField(existing, "id"));
+  }
+
+  const id = normalizeText(payload.id ?? "") || createId("sctx_map_run");
+  const now = payload.createdAt ?? new Date().toISOString();
+  const sourceIds = sourceContextMapPlanSourceIds(steps);
+  const maxConcurrentMaps = normalizeSourceContextMaxConcurrentMaps(payload.maxConcurrentMaps);
+  transaction(db, () => {
+    db.exec({
+      sql: `INSERT INTO source_context_map_runs (
+        id,
+        session_id,
+        owner_run_id,
+        mode,
+        status,
+        plan_signature,
+        source_ids_json,
+        max_concurrent_maps,
+        progress_current,
+        progress_total,
+        cancel_requested,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, 0, ?, ?)`,
+      bind: [
+        id,
+        payload.sessionId ?? null,
+        ownerRunId,
+        payload.mode ?? null,
+        planSignature,
+        JSON.stringify(sourceIds),
+        maxConcurrentMaps,
+        steps.length,
+        now,
+        now,
+      ],
+    });
+    for (const step of steps) insertSourceContextMapStep(db, id, step, now);
+    insertSourceContextMapEvent(db, {
+      runId: id,
+      kind: "queued",
+      message: "Source context map run queued.",
+      detail: { ownerRunId, stepCount: steps.length, maxConcurrentMaps },
+      createdAt: now,
+    });
+  });
+  return loadSourceContextMapRunDetailOrThrow(db, id);
+}
+
+function reconcileSourceContextMapRunSteps(
+  db: SqliteDb,
+  runId: string,
+  steps: SourceContextMapStepPlan[],
+) {
+  const now = new Date().toISOString();
+  for (const step of steps) {
+    const existing = db.selectObject(
+      "SELECT * FROM source_context_map_steps WHERE run_id = ? AND group_index = ? LIMIT 1",
+      [runId, step.groupIndex],
+    );
+    if (existing === undefined) {
+      insertSourceContextMapStep(db, runId, step, now);
+      continue;
+    }
+    if (stringField(existing, "step_signature") !== step.stepSignature) {
+      throw new EngineRpcError(
+        "SOURCE_CONTEXT_MAP_PLAN_MISMATCH",
+        `Map step signature changed for group ${step.groupIndex}.`,
+      );
+    }
+  }
+  refreshSourceContextMapRunProgress(db, runId, now);
+}
+
+function insertSourceContextMapStep(
+  db: SqliteDb,
+  runId: string,
+  step: SourceContextMapStepPlan,
+  createdAt: string,
+) {
+  db.exec({
+    sql: `INSERT INTO source_context_map_steps (
+      id,
+      run_id,
+      group_id,
+      group_index,
+      status,
+      step_signature,
+      source_ids_json,
+      window_refs_json,
+      evidence_ids_json,
+      token_estimate,
+      input_summary,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    bind: [
+      createId("sctx_map_step"),
+      runId,
+      step.groupId,
+      step.groupIndex,
+      step.stepSignature,
+      JSON.stringify(step.sourceIds),
+      JSON.stringify(step.windowRefs),
+      JSON.stringify(step.evidenceIds),
+      finiteNumberOrNull(step.tokenEstimate),
+      normalizeOptionalArtifactText(step.inputSummary, 2_000) ?? "",
+      createdAt,
+      createdAt,
+    ],
+  });
+}
+
+function claimSourceContextMapStep(
+  db: SqliteDb,
+  runIdInput: string,
+  nowInput?: string,
+): SourceContextMapClaimStepResult {
+  const runId = normalizeText(runIdInput);
+  const run = loadSourceContextMapRunOrThrow(db, runId);
+  if (isTerminalSourceContextMapRunStatus(run.status)) return { run };
+  if (run.cancelRequested) {
+    return {
+      run: finishCancelledSourceContextMapRun(db, runId, "Cancelled before next map step."),
+    };
+  }
+
+  const step = db.selectObject(
+    `SELECT *
+     FROM source_context_map_steps
+     WHERE run_id = ?
+       AND status = 'queued'
+     ORDER BY group_index ASC
+     LIMIT 1`,
+    [runId],
+  );
+  if (step === undefined) {
+    return { run: refreshSourceContextMapRunProgress(db, runId) };
+  }
+
+  const now = nowInput ?? new Date().toISOString();
+  const stepId = stringField(step, "id");
+  db.exec({
+    sql: `UPDATE source_context_map_steps
+          SET status = 'running',
+              attempt_count = attempt_count + 1,
+              claimed_at = ?,
+              updated_at = ?,
+              error_code = NULL,
+              error_message = NULL
+          WHERE id = ?
+            AND status = 'queued'`,
+    bind: [now, now, stepId],
+  });
+  if (Number(db.selectValue("SELECT changes()") ?? 0) === 0) {
+    return { run: loadSourceContextMapRunOrThrow(db, runId) };
+  }
+  db.exec({
+    sql: `UPDATE source_context_map_runs
+          SET status = 'running',
+              started_at = COALESCE(started_at, ?),
+              updated_at = ?
+          WHERE id = ?
+            AND status IN ('queued', 'running')`,
+    bind: [now, now, runId],
+  });
+  insertSourceContextMapEvent(db, {
+    runId,
+    stepId,
+    kind: "step_claimed",
+    message: "Map step claimed.",
+    detail: {
+      groupIndex: numberField(step, "group_index"),
+      groupId: stringField(step, "group_id"),
+    },
+    createdAt: now,
+  });
+  return {
+    run: refreshSourceContextMapRunProgress(db, runId, now),
+    step: loadSourceContextMapStepOrThrow(db, stepId),
+  };
+}
+
+function completeSourceContextMapStep(
+  db: SqliteDb,
+  payload: CompleteSourceContextMapStepPayload,
+): SourceContextMapStepRecord {
+  const stepId = normalizeText(payload.stepId);
+  const step = loadSourceContextMapStepOrThrow(db, stepId);
+  const runId = step.runId;
+  const now = payload.completedAt ?? new Date().toISOString();
+  db.exec({
+    sql: `UPDATE source_context_map_steps
+          SET status = 'completed',
+              output_summary = ?,
+              artifact_id = ?,
+              error_code = NULL,
+              error_message = NULL,
+              completed_at = ?,
+              updated_at = ?
+          WHERE id = ?`,
+    bind: [
+      boundedNormalizedText(payload.outputSummary, 2_000),
+      normalizeOptionalAuditId(payload.artifactId) ?? null,
+      now,
+      now,
+      stepId,
+    ],
+  });
+  insertSourceContextMapEvent(db, {
+    runId,
+    stepId,
+    kind: "step_completed",
+    message: "Map step completed.",
+    detail: { groupIndex: step.groupIndex, groupId: step.groupId },
+    createdAt: now,
+  });
+  const run = refreshSourceContextMapRunProgress(db, runId, now);
+  if (run.cancelRequested) {
+    finishCancelledSourceContextMapRun(db, runId, "Cancelled after the current map step.", now);
+  }
+  return loadSourceContextMapStepOrThrow(db, stepId);
+}
+
+function failSourceContextMapStep(
+  db: SqliteDb,
+  payload: FailSourceContextMapStepPayload,
+): SourceContextMapStepRecord {
+  const stepId = normalizeText(payload.stepId);
+  const step = loadSourceContextMapStepOrThrow(db, stepId);
+  const now = payload.failedAt ?? new Date().toISOString();
+  const errorMessage = boundedNormalizedText(payload.errorMessage, 1_000);
+  db.exec({
+    sql: `UPDATE source_context_map_steps
+          SET status = 'failed',
+              error_code = ?,
+              error_message = ?,
+              updated_at = ?
+          WHERE id = ?`,
+    bind: [normalizeOptionalAuditId(payload.errorCode) ?? null, errorMessage, now, stepId],
+  });
+  db.exec({
+    sql: `UPDATE source_context_map_runs
+          SET status = 'failed',
+              last_error = ?,
+              updated_at = ?,
+              finished_at = ?
+          WHERE id = ?`,
+    bind: [errorMessage, now, now, step.runId],
+  });
+  insertSourceContextMapEvent(db, {
+    runId: step.runId,
+    stepId,
+    kind: "step_failed",
+    level: "error",
+    message: errorMessage,
+    detail: { groupIndex: step.groupIndex, groupId: step.groupId, errorCode: payload.errorCode },
+    createdAt: now,
+  });
+  refreshSourceContextMapRunProgress(db, step.runId, now);
+  return loadSourceContextMapStepOrThrow(db, stepId);
+}
+
+function cancelSourceContextMapRun(db: SqliteDb, runIdInput: string): SourceContextMapRunSummary {
+  const runId = normalizeText(runIdInput);
+  const run = loadSourceContextMapRunOrThrow(db, runId);
+  if (isTerminalSourceContextMapRunStatus(run.status)) return run;
+  const now = new Date().toISOString();
+  insertSourceContextMapEvent(db, {
+    runId,
+    kind: "cancel_requested",
+    level: "warning",
+    message:
+      run.status === "running" || run.status === "reducing"
+        ? "Cancellation requested; active provider work resolves at the next boundary."
+        : "Cancellation requested before map execution.",
+    detail: { status: run.status },
+    createdAt: now,
+  });
+  db.exec({
+    sql: `UPDATE source_context_map_steps
+          SET status = 'cancelled',
+              updated_at = ?
+          WHERE run_id = ?
+            AND status IN ('queued', 'failed')`,
+    bind: [now, runId],
+  });
+  const runningStepCount = Number(
+    db.selectValue(
+      "SELECT COUNT(*) FROM source_context_map_steps WHERE run_id = ? AND status = 'running'",
+      [runId],
+    ) ?? 0,
+  );
+  if (runningStepCount > 0 || run.status === "reducing") {
+    db.exec({
+      sql: `UPDATE source_context_map_runs
+            SET cancel_requested = 1,
+                updated_at = ?
+            WHERE id = ?`,
+      bind: [now, runId],
+    });
+    return refreshSourceContextMapRunProgress(db, runId, now);
+  }
+  return finishCancelledSourceContextMapRun(db, runId, "Cancelled before map execution.", now);
+}
+
+function resumeSourceContextMapRun(db: SqliteDb, runIdInput: string): SourceContextMapRunSummary {
+  const runId = normalizeText(runIdInput);
+  const run = loadSourceContextMapRunOrThrow(db, runId);
+  if (run.status === "done" || run.status === "running" || run.status === "reducing") return run;
+  const now = new Date().toISOString();
+  transaction(db, () => {
+    db.exec({
+      sql: `UPDATE source_context_map_steps
+            SET status = 'queued',
+                error_code = NULL,
+                error_message = NULL,
+                updated_at = ?
+            WHERE run_id = ?
+              AND status IN ('failed', 'cancelled')`,
+      bind: [now, runId],
+    });
+    db.exec({
+      sql: `UPDATE source_context_map_runs
+            SET status = 'queued',
+                cancel_requested = 0,
+                last_error = NULL,
+                finished_at = NULL,
+                updated_at = ?
+            WHERE id = ?`,
+      bind: [now, runId],
+    });
+    insertSourceContextMapEvent(db, {
+      runId,
+      kind: "resumed",
+      message: "Source context map run marked resumable.",
+      detail: {},
+      createdAt: now,
+    });
+  });
+  return refreshSourceContextMapRunProgress(db, runId, now);
+}
+
+function retrySourceContextMapRun(db: SqliteDb, runIdInput: string): SourceContextMapRunSummary {
+  const runId = normalizeText(runIdInput);
+  const run = loadSourceContextMapRunOrThrow(db, runId);
+  if (run.status !== "failed" && run.status !== "cancelled") {
+    throw new EngineRpcError(
+      "SOURCE_CONTEXT_MAP_RETRY_NOT_ALLOWED",
+      `Only failed or cancelled source context map runs can be retried: ${runId}`,
+    );
+  }
+  const now = new Date().toISOString();
+  const retryId = createId("sctx_map_run");
+  const steps = loadSourceContextMapRunSteps(db, runId);
+  transaction(db, () => {
+    db.exec({
+      sql: `INSERT INTO source_context_map_runs (
+        id,
+        session_id,
+        owner_run_id,
+        mode,
+        status,
+        plan_signature,
+        source_ids_json,
+        max_concurrent_maps,
+        progress_current,
+        progress_total,
+        cancel_requested,
+        retry_of_run_id,
+        created_at,
+        updated_at
+      )
+      SELECT ?, session_id, owner_run_id, mode, 'queued', plan_signature, source_ids_json,
+             max_concurrent_maps, 0, progress_total, 0, id, ?, ?
+      FROM source_context_map_runs
+      WHERE id = ?`,
+      bind: [retryId, now, now, runId],
+    });
+    for (const step of steps) {
+      insertSourceContextMapStep(db, retryId, step, now);
+    }
+    insertSourceContextMapEvent(db, {
+      runId: retryId,
+      kind: "queued",
+      message: "Source context map retry queued.",
+      detail: { retryOfRunId: runId },
+      createdAt: now,
+    });
+    insertSourceContextMapEvent(db, {
+      runId,
+      kind: "retry_created",
+      message: "Retry source context map run created.",
+      detail: { retryRunId: retryId },
+      createdAt: now,
+    });
+  });
+  return loadSourceContextMapRunOrThrow(db, retryId);
+}
+
+function markSourceContextMapReduceStarted(
+  db: SqliteDb,
+  payload: MarkSourceContextMapReduceStartedPayload,
+): SourceContextMapRunSummary {
+  const runId = normalizeText(payload.runId);
+  const run = loadSourceContextMapRunOrThrow(db, runId);
+  if (isTerminalSourceContextMapRunStatus(run.status)) return run;
+  if (run.cancelRequested) {
+    return finishCancelledSourceContextMapRun(db, runId, "Cancelled before reduce.");
+  }
+  const now = payload.startedAt ?? new Date().toISOString();
+  const artifactIds = boundedArtifactStrings(payload.mapArtifactIds, 100);
+  db.exec({
+    sql: `UPDATE source_context_map_runs
+          SET status = 'reducing',
+              progress_current = progress_total,
+              reduce_map_artifact_ids_json = ?,
+              reduce_input_summary = ?,
+              updated_at = ?
+          WHERE id = ?`,
+    bind: [
+      JSON.stringify(artifactIds),
+      normalizeOptionalArtifactText(payload.inputSummary, 2_000) ?? "",
+      now,
+      runId,
+    ],
+  });
+  insertSourceContextMapEvent(db, {
+    runId,
+    kind: "reduce_started",
+    message: "Source context reduce started.",
+    detail: { mapArtifactCount: artifactIds.length, tokenEstimate: payload.tokenEstimate ?? 0 },
+    createdAt: now,
+  });
+  return loadSourceContextMapRunOrThrow(db, runId);
+}
+
+function markSourceContextMapReduceCompleted(
+  db: SqliteDb,
+  payload: MarkSourceContextMapReduceCompletedPayload,
+): SourceContextMapRunSummary {
+  const runId = normalizeText(payload.runId);
+  const now = payload.completedAt ?? new Date().toISOString();
+  db.exec({
+    sql: `UPDATE source_context_map_runs
+          SET status = 'done',
+              cancel_requested = 0,
+              progress_current = progress_total,
+              reduce_output_summary = ?,
+              reduce_artifact_id = ?,
+              last_error = NULL,
+              updated_at = ?,
+              finished_at = ?
+          WHERE id = ?`,
+    bind: [
+      normalizeOptionalArtifactText(payload.outputSummary, 2_000) ?? "",
+      normalizeOptionalAuditId(payload.artifactId) ?? null,
+      now,
+      now,
+      runId,
+    ],
+  });
+  insertSourceContextMapEvent(db, {
+    runId,
+    kind: "reduce_completed",
+    message: "Source context reduce completed.",
+    detail: { artifactId: payload.artifactId },
+    createdAt: now,
+  });
+  return loadSourceContextMapRunOrThrow(db, runId);
+}
+
+function markSourceContextMapReduceFailed(
+  db: SqliteDb,
+  payload: MarkSourceContextMapReduceFailedPayload,
+): SourceContextMapRunSummary {
+  const runId = normalizeText(payload.runId);
+  const now = payload.failedAt ?? new Date().toISOString();
+  const message = boundedNormalizedText(payload.errorMessage, 1_000);
+  db.exec({
+    sql: `UPDATE source_context_map_runs
+          SET status = 'failed',
+              last_error = ?,
+              updated_at = ?,
+              finished_at = ?
+          WHERE id = ?`,
+    bind: [message, now, now, runId],
+  });
+  insertSourceContextMapEvent(db, {
+    runId,
+    kind: "reduce_failed",
+    level: "error",
+    message,
+    detail: { errorCode: payload.errorCode },
+    createdAt: now,
+  });
+  return loadSourceContextMapRunOrThrow(db, runId);
 }
 
 async function runJob(
@@ -14163,6 +14980,310 @@ function isTerminalOrchestrationStatus(status: OrchestrationRunStatus) {
   return status === "done" || status === "failed" || status === "cancelled";
 }
 
+function sourceContextMapRunFromRow(row: SqlRow): SourceContextMapRunSummary {
+  const sessionId = optionalString(row, "session_id");
+  const mode = optionalSourceContextMapMode(row, "mode");
+  const retryOfRunId = optionalString(row, "retry_of_run_id");
+  const lastError = optionalString(row, "last_error");
+  const startedAt = optionalString(row, "started_at");
+  const finishedAt = optionalString(row, "finished_at");
+  return {
+    id: stringField(row, "id"),
+    ...(sessionId === undefined ? {} : { sessionId }),
+    ownerRunId: stringField(row, "owner_run_id"),
+    ...(mode === undefined ? {} : { mode }),
+    status: sourceContextMapRunStatusField(row, "status"),
+    planSignature: stringField(row, "plan_signature"),
+    maxConcurrentMaps: Math.max(1, numberField(row, "max_concurrent_maps")),
+    progressCurrent: Math.max(0, numberField(row, "progress_current")),
+    progressTotal: Math.max(0, numberField(row, "progress_total")),
+    cancelRequested: numberField(row, "cancel_requested") !== 0,
+    createdAt: stringField(row, "created_at"),
+    updatedAt: stringField(row, "updated_at"),
+    ...(retryOfRunId === undefined ? {} : { retryOfRunId }),
+    ...(lastError === undefined ? {} : { lastError }),
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(finishedAt === undefined ? {} : { finishedAt }),
+  };
+}
+
+function sourceContextMapStepFromRow(row: SqlRow): SourceContextMapStepRecord {
+  const outputSummary = optionalString(row, "output_summary");
+  const artifactId = optionalString(row, "artifact_id");
+  const errorCode = optionalString(row, "error_code");
+  const errorMessage = optionalString(row, "error_message");
+  const claimedAt = optionalString(row, "claimed_at");
+  const completedAt = optionalString(row, "completed_at");
+  return {
+    id: stringField(row, "id"),
+    runId: stringField(row, "run_id"),
+    groupId: stringField(row, "group_id"),
+    groupIndex: Math.max(0, numberField(row, "group_index")),
+    status: sourceContextMapStepStatusField(row, "status"),
+    stepSignature: stringField(row, "step_signature"),
+    sourceIds: parseStringArray(stringField(row, "source_ids_json")),
+    windowRefs: parseSourceContextMapArtifactWindowRefs(stringField(row, "window_refs_json")),
+    evidenceIds: parseStringArray(stringField(row, "evidence_ids_json")),
+    tokenEstimate: Math.max(0, numberField(row, "token_estimate")),
+    inputSummary: stringField(row, "input_summary"),
+    attemptCount: Math.max(0, numberField(row, "attempt_count")),
+    createdAt: stringField(row, "created_at"),
+    updatedAt: stringField(row, "updated_at"),
+    ...(outputSummary === undefined || outputSummary.length === 0 ? {} : { outputSummary }),
+    ...(artifactId === undefined ? {} : { artifactId }),
+    ...(errorCode === undefined ? {} : { errorCode }),
+    ...(errorMessage === undefined ? {} : { errorMessage }),
+    ...(claimedAt === undefined ? {} : { claimedAt }),
+    ...(completedAt === undefined ? {} : { completedAt }),
+  };
+}
+
+function sourceContextMapEventFromRow(row: SqlRow): SourceContextMapEvent {
+  const stepId = optionalString(row, "step_id");
+  return {
+    id: stringField(row, "id"),
+    runId: stringField(row, "run_id"),
+    ...(stepId === undefined ? {} : { stepId }),
+    kind: sourceContextMapEventKindField(row, "kind"),
+    level: sourceContextMapEventLevelField(row, "level"),
+    message: stringField(row, "message"),
+    detail: parseMetadata(stringField(row, "detail_json")),
+    createdAt: stringField(row, "created_at"),
+  };
+}
+
+function loadSourceContextMapRunDetail(
+  db: SqliteDb,
+  idInput: string,
+): SourceContextMapRunDetail | null {
+  const id = normalizeText(idInput);
+  const row = db.selectObject("SELECT * FROM source_context_map_runs WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) return null;
+  return {
+    ...sourceContextMapRunFromRow(row),
+    steps: loadSourceContextMapRunSteps(db, id),
+  };
+}
+
+function loadSourceContextMapRunDetailOrThrow(db: SqliteDb, id: string): SourceContextMapRunDetail {
+  const detail = loadSourceContextMapRunDetail(db, id);
+  if (detail === null) {
+    throw new EngineRpcError("SOURCE_CONTEXT_MAP_RUN_NOT_FOUND", `Map run not found: ${id}`);
+  }
+  return detail;
+}
+
+function loadSourceContextMapRunOrThrow(db: SqliteDb, idInput: string): SourceContextMapRunSummary {
+  const id = normalizeText(idInput);
+  const row = db.selectObject("SELECT * FROM source_context_map_runs WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) {
+    throw new EngineRpcError("SOURCE_CONTEXT_MAP_RUN_NOT_FOUND", `Map run not found: ${id}`);
+  }
+  return sourceContextMapRunFromRow(row);
+}
+
+function loadSourceContextMapStepOrThrow(
+  db: SqliteDb,
+  idInput: string,
+): SourceContextMapStepRecord {
+  const id = normalizeText(idInput);
+  const row = db.selectObject("SELECT * FROM source_context_map_steps WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) {
+    throw new EngineRpcError("SOURCE_CONTEXT_MAP_STEP_NOT_FOUND", `Map step not found: ${id}`);
+  }
+  return sourceContextMapStepFromRow(row);
+}
+
+function loadSourceContextMapRunSteps(db: SqliteDb, runId: string): SourceContextMapStepRecord[] {
+  const rows = db.selectObjects(
+    `SELECT *
+     FROM source_context_map_steps
+     WHERE run_id = ?
+     ORDER BY group_index ASC, created_at ASC`,
+    [runId],
+  );
+  return rows.map(sourceContextMapStepFromRow);
+}
+
+function sourceContextMapRunWhereClause(filter: SourceContextMapRunFilter) {
+  const clauses: string[] = [];
+  const bind: unknown[] = [];
+  if (filter.sessionId !== undefined && normalizeText(filter.sessionId).length > 0) {
+    clauses.push("session_id = ?");
+    bind.push(normalizeText(filter.sessionId));
+  }
+  if (filter.ownerRunId !== undefined && normalizeText(filter.ownerRunId).length > 0) {
+    clauses.push("owner_run_id = ?");
+    bind.push(normalizeText(filter.ownerRunId));
+  }
+  if (filter.status !== undefined) {
+    clauses.push("status = ?");
+    bind.push(filter.status);
+  }
+  return {
+    sql: clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`,
+    bind,
+  };
+}
+
+function insertSourceContextMapEvent(
+  db: SqliteDb,
+  input: {
+    runId: string;
+    stepId?: string;
+    kind: SourceContextMapEventKind;
+    level?: SourceContextMapEventLevel;
+    message: string;
+    detail?: Record<string, unknown>;
+    createdAt?: string;
+  },
+): SourceContextMapEvent {
+  const id = createId("sctx_map_evt");
+  const createdAt = input.createdAt ?? new Date().toISOString();
+  db.exec({
+    sql: `INSERT INTO source_context_map_events (
+      id,
+      run_id,
+      step_id,
+      kind,
+      level,
+      message,
+      detail_json,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    bind: [
+      id,
+      input.runId,
+      input.stepId ?? null,
+      input.kind,
+      input.level ?? "info",
+      boundedNormalizedText(input.message, 1_000),
+      JSON.stringify(boundAuditPayload(input.detail ?? {})),
+      createdAt,
+    ],
+  });
+  const row = db.selectObject("SELECT * FROM source_context_map_events WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) {
+    throw new EngineRpcError(
+      "SOURCE_CONTEXT_MAP_EVENT_CREATE_FAILED",
+      "Source context map event was not saved.",
+    );
+  }
+  return sourceContextMapEventFromRow(row);
+}
+
+function refreshSourceContextMapRunProgress(
+  db: SqliteDb,
+  runId: string,
+  now = new Date().toISOString(),
+): SourceContextMapRunSummary {
+  const completed = Number(
+    db.selectValue(
+      "SELECT COUNT(*) FROM source_context_map_steps WHERE run_id = ? AND status = 'completed'",
+      [runId],
+    ) ?? 0,
+  );
+  const total = Number(
+    db.selectValue("SELECT COUNT(*) FROM source_context_map_steps WHERE run_id = ?", [runId]) ?? 0,
+  );
+  db.exec({
+    sql: `UPDATE source_context_map_runs
+          SET progress_current = ?,
+              progress_total = ?,
+              updated_at = ?
+          WHERE id = ?`,
+    bind: [completed, total, now, runId],
+  });
+  return loadSourceContextMapRunOrThrow(db, runId);
+}
+
+function finishCancelledSourceContextMapRun(
+  db: SqliteDb,
+  runId: string,
+  message: string,
+  now = new Date().toISOString(),
+): SourceContextMapRunSummary {
+  db.exec({
+    sql: `UPDATE source_context_map_steps
+          SET status = 'cancelled',
+              updated_at = ?
+          WHERE run_id = ?
+            AND status IN ('queued', 'running', 'failed')`,
+    bind: [now, runId],
+  });
+  db.exec({
+    sql: `UPDATE source_context_map_runs
+          SET status = 'cancelled',
+              cancel_requested = 1,
+              updated_at = ?,
+              finished_at = ?,
+              last_error = NULL
+          WHERE id = ?`,
+    bind: [now, now, runId],
+  });
+  insertSourceContextMapEvent(db, {
+    runId,
+    kind: "cancelled",
+    level: "warning",
+    message,
+    detail: {},
+    createdAt: now,
+  });
+  return refreshSourceContextMapRunProgress(db, runId, now);
+}
+
+function normalizeSourceContextMapStepPlans(
+  steps: SourceContextMapStepPlan[],
+): SourceContextMapStepPlan[] {
+  const byGroupIndex = new Map<number, SourceContextMapStepPlan>();
+  for (const step of steps) {
+    const groupIndex = Math.max(0, Math.floor(step.groupIndex));
+    const groupId = normalizeText(step.groupId).slice(0, 160);
+    const stepSignature = normalizeText(step.stepSignature).slice(0, 512);
+    if (groupId.length === 0 || stepSignature.length === 0) continue;
+    byGroupIndex.set(groupIndex, {
+      groupId,
+      groupIndex,
+      sourceIds: boundedArtifactStrings(step.sourceIds, 100),
+      windowRefs: boundedSourceContextMapArtifactWindowRefs(step.windowRefs, 300),
+      evidenceIds: boundedArtifactStrings(step.evidenceIds, 300),
+      tokenEstimate: Math.max(0, Math.floor(step.tokenEstimate)),
+      inputSummary: normalizeOptionalArtifactText(step.inputSummary, 2_000),
+      stepSignature,
+    });
+  }
+  return [...byGroupIndex.values()].sort((left, right) => left.groupIndex - right.groupIndex);
+}
+
+function sourceContextMapPlanSourceIds(steps: SourceContextMapStepPlan[]) {
+  const seen = new Set<string>();
+  for (const step of steps) {
+    for (const sourceId of step.sourceIds) {
+      if (seen.size >= 200) break;
+      seen.add(sourceId);
+    }
+  }
+  return [...seen];
+}
+
+function normalizeSourceContextMaxConcurrentMaps(value: number | undefined) {
+  const raw = value ?? 1;
+  if (!Number.isFinite(raw) || raw <= 0) return 1;
+  return Math.max(1, Math.min(4, Math.floor(raw)));
+}
+
+function isTerminalSourceContextMapRunStatus(status: SourceContextMapRunStatus) {
+  return status === "done" || status === "failed" || status === "cancelled";
+}
+
+function assertChatSessionExists(db: SqliteDb, sessionId: string) {
+  const normalized = normalizeText(sessionId);
+  const session = db.selectObject("SELECT id FROM sessions WHERE id = ? LIMIT 1", [normalized]);
+  if (session === undefined) {
+    throw new EngineRpcError("SESSION_NOT_FOUND", `Chat session not found: ${normalized}`);
+  }
+}
+
 function chatSessionSummaryFromRow(row: SqlRow): ChatSessionSummary {
   const sourcePageUrl = optionalString(row, "source_page_url");
   const sourcePageTitle = optionalString(row, "source_page_title");
@@ -14717,6 +15838,61 @@ function orchestrationEventKindField(row: SqlRow, key: string): OrchestrationEve
 }
 
 function orchestrationEventLevelField(row: SqlRow, key: string): OrchestrationEventLevel {
+  const value = stringField(row, key);
+  if (value === "warning" || value === "error") return value;
+  return "info";
+}
+
+function optionalSourceContextMapMode(
+  row: SqlRow,
+  key: string,
+): SourceContextMapRunSummary["mode"] | undefined {
+  const value = optionalString(row, key);
+  return value === "research" || value === "auto" ? value : undefined;
+}
+
+function sourceContextMapRunStatusField(row: SqlRow, key: string): SourceContextMapRunStatus {
+  const value = stringField(row, key);
+  if (
+    value === "running" ||
+    value === "reducing" ||
+    value === "done" ||
+    value === "failed" ||
+    value === "cancelled"
+  ) {
+    return value;
+  }
+  return "queued";
+}
+
+function sourceContextMapStepStatusField(row: SqlRow, key: string): SourceContextMapStepStatus {
+  const value = stringField(row, key);
+  if (value === "running" || value === "completed" || value === "failed" || value === "cancelled") {
+    return value;
+  }
+  return "queued";
+}
+
+function sourceContextMapEventKindField(row: SqlRow, key: string): SourceContextMapEventKind {
+  const value = stringField(row, key);
+  if (
+    value === "resumed" ||
+    value === "step_claimed" ||
+    value === "step_completed" ||
+    value === "step_failed" ||
+    value === "reduce_started" ||
+    value === "reduce_completed" ||
+    value === "reduce_failed" ||
+    value === "cancel_requested" ||
+    value === "cancelled" ||
+    value === "retry_created"
+  ) {
+    return value;
+  }
+  return "queued";
+}
+
+function sourceContextMapEventLevelField(row: SqlRow, key: string): SourceContextMapEventLevel {
   const value = stringField(row, key);
   if (value === "warning" || value === "error") return value;
   return "info";
@@ -15313,6 +16489,21 @@ function deleteSourceContextMapArtifactsForSource(db: SqliteDb, sourceId: string
           WHERE source_ids_json LIKE ? ESCAPE '\\'
              OR window_refs_json LIKE ? ESCAPE '\\'`,
     bind: [pattern, pattern],
+  });
+}
+
+function deleteSourceContextMapSchedulerForSource(db: SqliteDb, sourceId: string) {
+  const pattern = sourceContextMapArtifactJsonLikePattern(sourceId);
+  db.exec({
+    sql: `DELETE FROM source_context_map_runs
+          WHERE source_ids_json LIKE ? ESCAPE '\\'
+             OR id IN (
+               SELECT run_id
+               FROM source_context_map_steps
+               WHERE source_ids_json LIKE ? ESCAPE '\\'
+                  OR window_refs_json LIKE ? ESCAPE '\\'
+             )`,
+    bind: [pattern, pattern, pattern],
   });
 }
 

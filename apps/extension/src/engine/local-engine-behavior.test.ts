@@ -10,6 +10,7 @@ import type {
   EngineRequest,
   EngineResultFor,
   RetrieveSourcesResult,
+  SourceContextMapRunDetail,
 } from "@/src/shared/rpc";
 import { hashText } from "@/src/shared/text";
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
@@ -2517,6 +2518,223 @@ describe("local engine behavior harness", () => {
     });
     expect(cleared.cleared).toBe(1);
     expect(harness.count("source_context_map_artifacts", "session_id = ?", [session.id])).toBe(1);
+  });
+
+  it("persists resumable source context map scheduler state", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/map-scheduler",
+        normalizedText: ragText("map scheduler bounded evidence", 8),
+      }),
+    });
+    const sourceId = capture.memory.id;
+    const session = await harness.request({
+      kind: "createChatSession",
+      payload: {
+        id: "session-map-scheduler",
+        title: "Map scheduler",
+        createdAt: "2026-07-09T00:00:00.000Z",
+      },
+    });
+    const step = {
+      groupId: "group-1",
+      groupIndex: 0,
+      sourceIds: [sourceId],
+      windowRefs: [{ sourceId, chunkId: "chunk-1", ord: 0 }],
+      evidenceIds: [`memory:${sourceId}:chunk:chunk-1`],
+      tokenEstimate: 240,
+      inputSummary: "group=group-1; windows=1; tokens=240",
+      stepSignature: `step:${sourceId}:chunk-1`,
+    };
+
+    const run = await harness.request({
+      kind: "createOrResumeSourceContextMapRun",
+      payload: {
+        id: "sctx-map-run-behavior",
+        sessionId: session.id,
+        ownerRunId: "run-map-scheduler",
+        mode: "research",
+        planSignature: "plan-signature-map-scheduler",
+        maxConcurrentMaps: 2,
+        steps: [step],
+        createdAt: "2026-07-09T00:00:01.000Z",
+      },
+    });
+    expect(run).toMatchObject({
+      id: "sctx-map-run-behavior",
+      sessionId: session.id,
+      ownerRunId: "run-map-scheduler",
+      mode: "research",
+      status: "queued",
+      maxConcurrentMaps: 2,
+      progressCurrent: 0,
+      progressTotal: 1,
+    });
+    expect(run.steps[0]).toMatchObject({
+      status: "queued",
+      sourceIds: [sourceId],
+      windowRefs: [{ sourceId, chunkId: "chunk-1", ord: 0 }],
+      evidenceIds: [`memory:${sourceId}:chunk:chunk-1`],
+    });
+
+    const claimed = await harness.request({
+      kind: "claimSourceContextMapStep",
+      runId: run.id,
+      now: "2026-07-09T00:00:02.000Z",
+    });
+    expect(claimed.run.status).toBe("running");
+    expect(claimed.step).toMatchObject({ status: "running", attemptCount: 1 });
+    const stepId = claimed.step?.id ?? "";
+
+    const completedStep = await harness.request({
+      kind: "completeSourceContextMapStep",
+      payload: {
+        stepId,
+        outputSummary: "bounded map finding",
+        artifactId: "artifact-map-1",
+        completedAt: "2026-07-09T00:00:03.000Z",
+      },
+    });
+    expect(completedStep).toMatchObject({
+      id: stepId,
+      status: "completed",
+      outputSummary: "bounded map finding",
+      artifactId: "artifact-map-1",
+    });
+
+    const reducing = await harness.request({
+      kind: "markSourceContextMapReduceStarted",
+      payload: {
+        runId: run.id,
+        mapArtifactIds: ["artifact-map-1"],
+        inputSummary: "map artifacts=1",
+        startedAt: "2026-07-09T00:00:04.000Z",
+      },
+    });
+    expect(reducing.status).toBe("reducing");
+    expect(reducing.progressCurrent).toBe(1);
+    expect(reducing.progressTotal).toBe(1);
+
+    const done = await harness.request({
+      kind: "markSourceContextMapReduceCompleted",
+      payload: {
+        runId: run.id,
+        outputSummary: "final bounded answer",
+        artifactId: "artifact-reduce-1",
+        completedAt: "2026-07-09T00:00:05.000Z",
+      },
+    });
+    expect(done).toMatchObject({
+      status: "done",
+      progressCurrent: 1,
+      progressTotal: 1,
+    });
+    const doneRow = harness.selectObject(
+      "SELECT reduce_output_summary, reduce_artifact_id FROM source_context_map_runs WHERE id = ? LIMIT 1",
+      [run.id],
+    );
+    expect(doneRow).toMatchObject({
+      reduce_output_summary: "final bounded answer",
+      reduce_artifact_id: "artifact-reduce-1",
+    });
+
+    const listed = await harness.request({
+      kind: "listSourceContextMapRuns",
+      filter: { sessionId: session.id, limit: 10 },
+    });
+    expect(listed.runs.map((item) => item.id)).toContain(run.id);
+    const detail = await harness.request({ kind: "getSourceContextMapRun", id: run.id });
+    expect(detail?.steps[0]?.outputSummary).toBe("bounded map finding");
+    const events = await harness.request({
+      kind: "listSourceContextMapEvents",
+      runId: run.id,
+      limit: 20,
+    });
+    expect(events.events.map((event) => event.kind)).toEqual(
+      expect.arrayContaining(["queued", "step_claimed", "step_completed", "reduce_completed"]),
+    );
+
+    await harness.request({ kind: "deleteMemory", id: sourceId });
+    expect(harness.count("source_context_map_runs", "id = ?", [run.id])).toBe(0);
+    expect(harness.count("source_context_map_steps", "run_id = ?", [run.id])).toBe(0);
+    expect(harness.count("source_context_map_events", "run_id = ?", [run.id])).toBe(0);
+  });
+
+  it("cancels retries resumes and resets source context map scheduler runs", async () => {
+    const harness = createHarness();
+    const session = await harness.request({
+      kind: "createChatSession",
+      payload: {
+        id: "session-map-scheduler-control",
+        title: "Map scheduler control",
+        createdAt: "2026-07-09T00:01:00.000Z",
+      },
+    });
+    const step = {
+      groupId: "group-control",
+      groupIndex: 0,
+      sourceIds: ["source-control"],
+      windowRefs: [{ sourceId: "source-control", chunkId: "chunk-control", ord: 0 }],
+      evidenceIds: ["memory:source-control:chunk:chunk-control"],
+      tokenEstimate: 120,
+      inputSummary: "control map input",
+      stepSignature: "step-control",
+    };
+    const run = (await harness.request({
+      kind: "createOrResumeSourceContextMapRun",
+      payload: {
+        sessionId: session.id,
+        ownerRunId: "run-map-scheduler-control",
+        planSignature: "plan-signature-map-scheduler-control",
+        maxConcurrentMaps: 1,
+        steps: [step],
+      },
+    })) as SourceContextMapRunDetail;
+    const runId = run.id;
+
+    const cancelled = await harness.request({ kind: "cancelSourceContextMapRun", id: runId });
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.cancelRequested).toBe(true);
+    expect(
+      harness.count("source_context_map_steps", "run_id = ? AND status = 'cancelled'", [runId]),
+    ).toBe(1);
+
+    const resumed = await harness.request({ kind: "resumeSourceContextMapRun", id: runId });
+    expect(resumed.status).toBe("queued");
+    expect(resumed.cancelRequested).toBe(false);
+    expect(
+      harness.count("source_context_map_steps", "run_id = ? AND status = 'queued'", [runId]),
+    ).toBe(1);
+
+    const claim = await harness.request({ kind: "claimSourceContextMapStep", runId });
+    const failedStep = await harness.request({
+      kind: "failSourceContextMapStep",
+      payload: {
+        stepId: claim.step?.id ?? "",
+        errorCode: "PROVIDER_ERROR",
+        errorMessage: "map failed",
+      },
+    });
+    expect(failedStep.status).toBe("failed");
+    const failed = await harness.request({ kind: "getSourceContextMapRun", id: runId });
+    expect(failed?.status).toBe("failed");
+
+    const retry = await harness.request({ kind: "retrySourceContextMapRun", id: runId });
+    expect(retry).toMatchObject({
+      status: "queued",
+      retryOfRunId: runId,
+      progressCurrent: 0,
+      progressTotal: 1,
+    });
+    expect(harness.count("source_context_map_runs", "retry_of_run_id = ?", [runId])).toBe(1);
+
+    const reset = await harness.request({ kind: "repair", action: "reset_library" });
+    expect(reset.action).toBe("reset_library");
+    expect(harness.count("source_context_map_runs")).toBe(0);
+    expect(harness.count("source_context_map_steps")).toBe(0);
+    expect(harness.count("source_context_map_events")).toBe(0);
   });
 
   it("returns recent sources and truthful skipped traces for empty query", async () => {

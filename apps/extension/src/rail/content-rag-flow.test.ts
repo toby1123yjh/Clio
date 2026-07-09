@@ -269,6 +269,53 @@ describe("content local RAG flow", () => {
     expect(artifactPanelSection).not.toContain("requestEngine");
   });
 
+  it("exposes source context map scheduler through content-owned controls", () => {
+    const contentSchedulerLoadSection = contentSource.slice(
+      contentSource.indexOf("const loadSourceContextMapEvents = React.useCallback"),
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+    );
+    const contentSchedulerControlSection = contentSource.slice(
+      contentSource.indexOf("const cancelSourceContextMapRun = React.useCallback"),
+      contentSource.indexOf("const loadChatHistory = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const schedulerPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function SourceContextMapSchedulerPanel"),
+      railShellSource.indexOf("function SourceContextMapArtifactPanel"),
+    );
+    const researchPlannerPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+      railShellSource.indexOf("function KnowledgeBaseFilterControls"),
+    );
+
+    expect(contentSchedulerLoadSection).toContain('kind: "listSourceContextMapRuns"');
+    expect(contentSchedulerLoadSection).toContain('kind: "listSourceContextMapEvents"');
+    expect(contentSchedulerLoadSection).toContain("filter: { sessionId, limit: 8 }");
+    expect(contentSchedulerControlSection).toContain('kind: "cancelSourceContextMapRun"');
+    expect(contentSchedulerControlSection).toContain('kind: "retrySourceContextMapRun"');
+    expect(contentSchedulerControlSection).toContain('kind: "resumeSourceContextMapRun"');
+    expect(contentSchedulerControlSection).not.toContain("startAgentRun(");
+    expect(railPropsSection).toContain("sourceContextMapRuns={sourceContextMapRuns}");
+    expect(railPropsSection).toContain("sourceContextMapEvents={sourceContextMapEvents}");
+    expect(railPropsSection).toContain("onCancelSourceContextMapRun=");
+    expect(railPropsSection).toContain("onRetrySourceContextMapRun=");
+    expect(railPropsSection).toContain("onResumeSourceContextMapRun=");
+    expect(railPropsSection).toContain("onRefreshSourceContextMapRuns=");
+    expect(schedulerPanelSection).toContain('data-clio-source-context-map-scheduler="true"');
+    expect(schedulerPanelSection).toContain("sourceContextMapRunStatusLabel");
+    expect(schedulerPanelSection).toContain("sourceContextMapEventLabel");
+    expect(schedulerPanelSection).toContain("onCancel");
+    expect(schedulerPanelSection).toContain("onRetry");
+    expect(schedulerPanelSection).toContain("onResume");
+    expect(schedulerPanelSection).not.toContain("requestEngine");
+    expect(schedulerPanelSection).not.toContain('kind: "getMemory"');
+    expect(researchPlannerPanelSection).toContain("SourceContextMapSchedulerPanel");
+    expect(researchPlannerPanelSection).not.toContain("requestEngine");
+  });
+
   it("exposes explicit Tier2 chunk summary scheduling through content-owned RPCs", () => {
     const contentStateSection = contentSource.slice(
       contentSource.indexOf("function ClioContentApp()"),

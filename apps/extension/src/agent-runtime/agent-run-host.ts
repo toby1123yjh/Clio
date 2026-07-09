@@ -7,10 +7,15 @@ import type {
   SessionEvidenceRecord,
   SourceContextMapArtifactEntry,
   SourceContextMapArtifactRecord,
+  SourceContextMapClaimStepResult,
+  SourceContextMapRunDetail,
+  SourceContextMapStepPlan,
+  SourceContextMapStepRecord,
   SourceContextPackGroup,
   SourceContextPackResult,
   SourceContextPackWindow,
 } from "@/src/shared/rpc";
+import { hashText } from "@/src/shared/text";
 import {
   buildSemanticCitationJudgeInput,
   citationValidatorErrorResult,
@@ -62,6 +67,7 @@ interface HostedAgentRun {
   citationRepairReason?: CitationValidationReason;
   worldKnowledge: string[];
   content: string;
+  sourceContextMapSchedulerRunId?: string;
   sourceContextReduceArtifact?: SourceContextReduceArtifactState;
 }
 
@@ -89,6 +95,15 @@ interface SourceContextMapResult {
   evidenceIds: string[];
   tokenEstimate: number;
   artifactId?: string;
+}
+
+interface SourceContextMapPlanGroup {
+  group: SourceContextPackGroup;
+  groupEvidence: EvidenceItem[];
+  groupId: string;
+  groupIndex: number;
+  groupCount: number;
+  stepPlan: SourceContextMapStepPlan;
 }
 
 interface SourceContextReduceArtifactState {
@@ -177,7 +192,11 @@ export class AgentRunHost {
   }
 
   cancel(runId: string) {
-    this.activeRuns.get(runId)?.abortController.abort();
+    const activeRun = this.activeRuns.get(runId);
+    activeRun?.abortController.abort();
+    if (activeRun?.sourceContextMapSchedulerRunId !== undefined) {
+      void this.cancelSourceContextMapSchedulerRun(activeRun);
+    }
     this.activeManualCompactions.get(runId)?.abortController.abort();
   }
 
@@ -345,6 +364,7 @@ export class AgentRunHost {
       }
     } catch (error) {
       if (run.abortController.signal.aborted) {
+        await this.cancelSourceContextMapSchedulerRun(run);
         if (run.providerStarted) {
           const event: AgentStreamEvent = {
             type: "run_cancelled",
@@ -384,6 +404,7 @@ export class AgentRunHost {
       terminalEventEmitted = true;
     } finally {
       if (run.abortController.signal.aborted && !terminalEventEmitted) {
+        await this.cancelSourceContextMapSchedulerRun(run);
         const event: AgentStreamEvent = {
           type: "run_cancelled",
           runId: run.request.runId,
@@ -619,92 +640,255 @@ export class AgentRunHost {
     baseRequest: AgentChatRequest,
     sourceContextPack: SourceContextPackPreparation,
   ): Promise<SourceContextMapResult[]> {
-    const groups = sourceContextPackExecutableGroups(sourceContextPack);
-    const results: SourceContextMapResult[] = [];
-    for (let index = 0; index < groups.length; index += 1) {
-      if (run.abortController.signal.aborted) throw new Error("Map-reduce was cancelled.");
-      const group = groups[index];
-      if (group === undefined) continue;
-      const groupEvidence = sourceContextGroupToEvidence(group);
+    const planGroups = sourceContextMapPlanGroups(baseRequest, sourceContextPack);
+    const schedulerRun = await this.createOrResumeSourceContextMapSchedulerRun(
+      baseRequest,
+      sourceContextPack,
+      planGroups,
+    );
+    run.sourceContextMapSchedulerRunId = schedulerRun.id;
+
+    const resultsByGroupIndex = new Map<number, SourceContextMapResult>();
+    const stepBySignature = new Map(
+      schedulerRun.steps.map((step) => [step.stepSignature, step] as const),
+    );
+    for (const planGroup of planGroups) {
+      const completedStep = stepBySignature.get(planGroup.stepPlan.stepSignature);
+      if (completedStep?.status !== "completed") continue;
+      resultsByGroupIndex.set(
+        planGroup.groupIndex,
+        sourceContextMapResultFromCompletedStep(planGroup, completedStep),
+      );
+    }
+
+    if (resultsByGroupIndex.size > 0) {
       this.emitEvent({
         type: "runtime_status",
         runId: baseRequest.runId,
-        message: sourceContextMapReduceMapStartedMessage(
-          group,
-          groupEvidence,
-          index,
-          groups.length,
-        ),
-        running: true,
-      });
-      await this.persistSourceContextMapArtifact(run, {
-        stage: "map",
-        status: "started",
-        groupId: sourceContextGroupId(group, index),
-        groupIndex: index,
-        sourceIds: group.sourceIds,
-        windowRefs: sourceContextMapArtifactWindowRefs(group),
-        evidenceIds: groupEvidence.map((item) => item.id),
-        tokenEstimate: group.tokenEstimate,
-        inputSummary: sourceContextMapArtifactInputSummary(group, groupEvidence, index),
-      });
-      const mapRequest = buildSourceContextMapRequest({
-        baseRequest,
-        group,
-        groupEvidence,
-        groupIndex: index,
-        options: sourceContextPack.options,
-      });
-      let result: SourceContextMapResult;
-      try {
-        result = await this.runSourceContextMapRequest(
-          run,
-          mapRequest,
-          group,
-          groupEvidence,
-          index,
-        );
-      } catch (error) {
-        const providerError = providerErrorFromUnknown(error);
-        await this.persistSourceContextMapArtifact(run, {
-          stage: "map",
-          status: "failed",
-          groupId: sourceContextGroupId(group, index),
-          groupIndex: index,
-          sourceIds: group.sourceIds,
-          windowRefs: sourceContextMapArtifactWindowRefs(group),
-          evidenceIds: groupEvidence.map((item) => item.id),
-          tokenEstimate: group.tokenEstimate,
-          inputSummary: sourceContextMapArtifactInputSummary(group, groupEvidence, index),
-          errorCode: providerError.code,
-          errorMessage: providerError.message,
-        });
-        throw error;
-      }
-      const artifact = await this.persistSourceContextMapArtifact(run, {
-        stage: "map",
-        status: "completed",
-        groupId: result.groupId,
-        groupIndex: index,
-        sourceIds: group.sourceIds,
-        windowRefs: sourceContextMapArtifactWindowRefs(group),
-        evidenceIds: result.evidenceIds,
-        tokenEstimate: result.tokenEstimate,
-        inputSummary: sourceContextMapArtifactInputSummary(group, groupEvidence, index),
-        outputSummary: truncatePromptText(result.text, 1800),
-      });
-      if (artifact !== undefined) {
-        result = { ...result, artifactId: artifact.id };
-      }
-      results.push(result);
-      this.emitEvent({
-        type: "runtime_status",
-        runId: baseRequest.runId,
-        message: sourceContextMapReduceMapCompletedMessage(result, index, groups.length),
+        message: `Map-reduce resumed ${resultsByGroupIndex.size}/${planGroups.length} completed map step(s).`,
         running: true,
       });
     }
-    return results;
+
+    await this.executeSourceContextMapSchedulerSteps(
+      run,
+      baseRequest,
+      sourceContextPack,
+      schedulerRun.id,
+      planGroups,
+      resultsByGroupIndex,
+    );
+
+    return planGroups.map((planGroup) => {
+      const result = resultsByGroupIndex.get(planGroup.groupIndex);
+      if (result === undefined) {
+        throw new SourceContextMapReduceStageError(
+          "map",
+          `Map scheduler did not produce group ${planGroup.groupIndex + 1}.`,
+        );
+      }
+      return result;
+    });
+  }
+
+  private async createOrResumeSourceContextMapSchedulerRun(
+    baseRequest: AgentChatRequest,
+    sourceContextPack: SourceContextPackPreparation,
+    planGroups: SourceContextMapPlanGroup[],
+  ): Promise<SourceContextMapRunDetail> {
+    return await this.requestEngine<SourceContextMapRunDetail>({
+      kind: "createOrResumeSourceContextMapRun",
+      payload: {
+        ...(baseRequest.sessionId === undefined ? {} : { sessionId: baseRequest.sessionId }),
+        ownerRunId: baseRequest.runId,
+        mode: sourceContextPack.options.mode,
+        planSignature: sourceContextMapPlanSignature(baseRequest, sourceContextPack, planGroups),
+        maxConcurrentMaps: sourceContextMapReduceConcurrencyLimit(sourceContextPack.options),
+        steps: planGroups.map((planGroup) => planGroup.stepPlan),
+      },
+    });
+  }
+
+  private async executeSourceContextMapSchedulerSteps(
+    run: HostedAgentRun,
+    baseRequest: AgentChatRequest,
+    sourceContextPack: SourceContextPackPreparation,
+    schedulerRunId: string,
+    planGroups: SourceContextMapPlanGroup[],
+    resultsByGroupIndex: Map<number, SourceContextMapResult>,
+  ) {
+    const planGroupBySignature = new Map(
+      planGroups.map((planGroup) => [planGroup.stepPlan.stepSignature, planGroup] as const),
+    );
+    const missingCount = planGroups.length - resultsByGroupIndex.size;
+    if (missingCount <= 0) return;
+
+    let firstError: unknown;
+    const workerCount = Math.min(
+      missingCount,
+      sourceContextMapReduceConcurrencyLimit(sourceContextPack.options),
+    );
+    const runWorker = async () => {
+      while (
+        firstError === undefined &&
+        !run.abortController.signal.aborted &&
+        resultsByGroupIndex.size < planGroups.length
+      ) {
+        const claim = await this.requestEngine<SourceContextMapClaimStepResult>({
+          kind: "claimSourceContextMapStep",
+          runId: schedulerRunId,
+        });
+        if (claim.step === undefined) return;
+        const planGroup = planGroupBySignature.get(claim.step.stepSignature);
+        if (planGroup === undefined) {
+          const error = new SourceContextMapReduceStageError(
+            "map",
+            `Map scheduler claimed an unknown step: ${claim.step.id}.`,
+          );
+          firstError ??= error;
+          await this.requestEngine<SourceContextMapStepRecord>({
+            kind: "failSourceContextMapStep",
+            payload: {
+              stepId: claim.step.id,
+              errorCode: "PLAN_MISMATCH",
+              errorMessage: error.message,
+            },
+          });
+          return;
+        }
+        if (resultsByGroupIndex.has(planGroup.groupIndex)) continue;
+        try {
+          const result = await this.executeClaimedSourceContextMapStep(
+            run,
+            baseRequest,
+            sourceContextPack,
+            planGroup,
+            claim.step,
+          );
+          resultsByGroupIndex.set(planGroup.groupIndex, result);
+        } catch (error) {
+          if (run.abortController.signal.aborted) {
+            await this.cancelSourceContextMapSchedulerRun(run);
+          }
+          firstError ??= error;
+          return;
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, runWorker));
+    if (firstError !== undefined) throw firstError;
+  }
+
+  private async executeClaimedSourceContextMapStep(
+    run: HostedAgentRun,
+    baseRequest: AgentChatRequest,
+    sourceContextPack: SourceContextPackPreparation,
+    planGroup: SourceContextMapPlanGroup,
+    step: SourceContextMapStepRecord,
+  ): Promise<SourceContextMapResult> {
+    if (run.abortController.signal.aborted) throw new Error("Map-reduce was cancelled.");
+    this.emitEvent({
+      type: "runtime_status",
+      runId: baseRequest.runId,
+      message: sourceContextMapReduceMapStartedMessage(
+        planGroup.group,
+        planGroup.groupEvidence,
+        planGroup.groupIndex,
+        planGroup.groupCount,
+      ),
+      running: true,
+    });
+    await this.persistSourceContextMapArtifact(run, {
+      stage: "map",
+      status: "started",
+      groupId: planGroup.groupId,
+      groupIndex: planGroup.groupIndex,
+      sourceIds: planGroup.stepPlan.sourceIds,
+      windowRefs: planGroup.stepPlan.windowRefs,
+      evidenceIds: planGroup.stepPlan.evidenceIds,
+      tokenEstimate: planGroup.stepPlan.tokenEstimate,
+      inputSummary: planGroup.stepPlan.inputSummary,
+    });
+
+    const mapRequest = buildSourceContextMapRequest({
+      baseRequest,
+      group: planGroup.group,
+      groupEvidence: planGroup.groupEvidence,
+      groupIndex: planGroup.groupIndex,
+      options: sourceContextPack.options,
+    });
+    let result: SourceContextMapResult;
+    try {
+      result = await this.runSourceContextMapRequest(
+        run,
+        mapRequest,
+        planGroup.group,
+        planGroup.groupEvidence,
+        planGroup.groupIndex,
+      );
+    } catch (error) {
+      if (run.abortController.signal.aborted) throw error;
+      const providerError = providerErrorFromUnknown(error);
+      await this.persistSourceContextMapArtifact(run, {
+        stage: "map",
+        status: "failed",
+        groupId: planGroup.groupId,
+        groupIndex: planGroup.groupIndex,
+        sourceIds: planGroup.stepPlan.sourceIds,
+        windowRefs: planGroup.stepPlan.windowRefs,
+        evidenceIds: planGroup.stepPlan.evidenceIds,
+        tokenEstimate: planGroup.stepPlan.tokenEstimate,
+        inputSummary: planGroup.stepPlan.inputSummary,
+        errorCode: providerError.code,
+        errorMessage: providerError.message,
+      });
+      await this.requestEngine<SourceContextMapStepRecord>({
+        kind: "failSourceContextMapStep",
+        payload: {
+          stepId: step.id,
+          errorCode: providerError.code,
+          errorMessage: providerError.message,
+        },
+      });
+      throw error;
+    }
+
+    const outputSummary = truncatePromptText(result.text, 1800);
+    const artifact = await this.persistSourceContextMapArtifact(run, {
+      stage: "map",
+      status: "completed",
+      groupId: result.groupId,
+      groupIndex: planGroup.groupIndex,
+      sourceIds: planGroup.stepPlan.sourceIds,
+      windowRefs: planGroup.stepPlan.windowRefs,
+      evidenceIds: result.evidenceIds,
+      tokenEstimate: result.tokenEstimate,
+      inputSummary: planGroup.stepPlan.inputSummary,
+      outputSummary,
+    });
+    if (artifact !== undefined) {
+      result = { ...result, artifactId: artifact.id };
+    }
+    await this.requestEngine<SourceContextMapStepRecord>({
+      kind: "completeSourceContextMapStep",
+      payload: {
+        stepId: step.id,
+        outputSummary,
+        ...(result.artifactId === undefined ? {} : { artifactId: result.artifactId }),
+      },
+    });
+    this.emitEvent({
+      type: "runtime_status",
+      runId: baseRequest.runId,
+      message: sourceContextMapReduceMapCompletedMessage(
+        result,
+        planGroup.groupIndex,
+        planGroup.groupCount,
+      ),
+      running: true,
+    });
+    return result;
   }
 
   private async runSourceContextMapRequest(
@@ -802,7 +986,78 @@ export class AgentRunHost {
     entry: SourceContextMapArtifactEntry,
   ): Promise<SourceContextMapArtifactRecord | undefined> {
     if (entry.mapArtifactIds === undefined || entry.mapArtifactIds.length === 0) return undefined;
-    return await this.persistSourceContextMapArtifact(run, entry);
+    const artifact = await this.persistSourceContextMapArtifact(run, entry);
+    await this.persistSourceContextMapReduceSchedulerState(run, entry, artifact?.id);
+    return artifact;
+  }
+
+  private async persistSourceContextMapReduceSchedulerState(
+    run: HostedAgentRun,
+    entry: SourceContextMapArtifactEntry,
+    artifactId?: string,
+  ) {
+    const schedulerRunId = run.sourceContextMapSchedulerRunId;
+    if (schedulerRunId === undefined || entry.stage !== "reduce") return;
+    try {
+      if (entry.status === "started") {
+        await this.requestEngine({
+          kind: "markSourceContextMapReduceStarted",
+          payload: {
+            runId: schedulerRunId,
+            mapArtifactIds: entry.mapArtifactIds,
+            inputSummary: entry.inputSummary,
+            tokenEstimate: entry.tokenEstimate,
+          },
+        });
+        return;
+      }
+      if (entry.status === "completed") {
+        await this.requestEngine({
+          kind: "markSourceContextMapReduceCompleted",
+          payload: {
+            runId: schedulerRunId,
+            outputSummary: entry.outputSummary,
+            ...(artifactId === undefined ? {} : { artifactId }),
+          },
+        });
+        return;
+      }
+      if (entry.errorCode === "CANCELLED") {
+        await this.cancelSourceContextMapSchedulerRun(run);
+        return;
+      }
+      await this.requestEngine({
+        kind: "markSourceContextMapReduceFailed",
+        payload: {
+          runId: schedulerRunId,
+          errorCode: entry.errorCode,
+          errorMessage: entry.errorMessage ?? "Source context reduce failed.",
+        },
+      });
+    } catch {
+      this.emitEvent({
+        type: "runtime_status",
+        runId: run.request.runId,
+        message: "Source context map scheduler state was not saved.",
+      });
+    }
+  }
+
+  private async cancelSourceContextMapSchedulerRun(run: HostedAgentRun) {
+    const schedulerRunId = run.sourceContextMapSchedulerRunId;
+    if (schedulerRunId === undefined) return;
+    try {
+      await this.requestEngine({
+        kind: "cancelSourceContextMapRun",
+        id: schedulerRunId,
+      });
+    } catch {
+      this.emitEvent({
+        type: "runtime_status",
+        runId: run.request.runId,
+        message: "Source context map scheduler cancel was not saved.",
+      });
+    }
   }
 
   private async pumpManualCompact(run: HostedManualCompactRun) {
@@ -1479,6 +1734,114 @@ function sourceContextPackExecutableGroups(preparation: SourceContextPackPrepara
   return preparation.pack.groups
     .filter((group) => sourceContextGroupToEvidence(group).length > 0)
     .slice(0, groupLimit);
+}
+
+function sourceContextMapPlanGroups(
+  baseRequest: AgentChatRequest,
+  preparation: SourceContextPackPreparation,
+): SourceContextMapPlanGroup[] {
+  const groups = sourceContextPackExecutableGroups(preparation);
+  return groups.map((group, groupIndex) => {
+    const groupEvidence = sourceContextGroupToEvidence(group);
+    const groupId = sourceContextGroupId(group, groupIndex);
+    const windowRefs = sourceContextMapArtifactWindowRefs(group);
+    const evidenceIds = groupEvidence.map((item) => item.id);
+    const inputSummary = sourceContextMapArtifactInputSummary(group, groupEvidence, groupIndex);
+    const stepPlan: SourceContextMapStepPlan = {
+      groupId,
+      groupIndex,
+      sourceIds: group.sourceIds,
+      windowRefs,
+      evidenceIds,
+      tokenEstimate: group.tokenEstimate,
+      inputSummary,
+      stepSignature: sourceContextMapStepSignature(baseRequest, preparation.options, {
+        groupId,
+        groupIndex,
+        sourceIds: group.sourceIds,
+        windowRefs,
+        evidenceIds,
+        tokenEstimate: group.tokenEstimate,
+      }),
+    };
+    return {
+      group,
+      groupEvidence,
+      groupId,
+      groupIndex,
+      groupCount: groups.length,
+      stepPlan,
+    };
+  });
+}
+
+function sourceContextMapPlanSignature(
+  baseRequest: AgentChatRequest,
+  preparation: SourceContextPackPreparation,
+  planGroups: SourceContextMapPlanGroup[],
+) {
+  return sourceContextMapSignature("plan", {
+    version: 1,
+    ownerRunId: baseRequest.runId,
+    questionHash: hashText(baseRequest.question),
+    mode: preparation.options.mode,
+    mapReduce: sourceContextMapReduceSignatureOptions(preparation.options),
+    steps: planGroups.map((planGroup) => planGroup.stepPlan.stepSignature),
+  });
+}
+
+function sourceContextMapStepSignature(
+  baseRequest: AgentChatRequest,
+  options: NonNullable<AgentChatRequest["sourceContextPack"]>,
+  input: Pick<
+    SourceContextMapStepPlan,
+    "groupId" | "groupIndex" | "sourceIds" | "windowRefs" | "evidenceIds" | "tokenEstimate"
+  >,
+) {
+  return sourceContextMapSignature("step", {
+    version: 1,
+    questionHash: hashText(baseRequest.question),
+    mode: options.mode,
+    mapReduce: sourceContextMapReduceSignatureOptions(options),
+    ...input,
+  });
+}
+
+function sourceContextMapSignature(kind: "plan" | "step", value: unknown) {
+  return `source-context-map-${kind}-v1:${hashText(JSON.stringify(value))}`;
+}
+
+function sourceContextMapReduceSignatureOptions(
+  options: NonNullable<AgentChatRequest["sourceContextPack"]>,
+) {
+  return {
+    enabled: options.mapReduce?.enabled === true,
+    maxGroups: sourceContextMapReduceGroupLimit(options),
+    perGroupTokenBudget: sourceContextMapReduceTokenBudget(options),
+    maxConcurrentMaps: sourceContextMapReduceConcurrencyLimit(options),
+  };
+}
+
+function sourceContextMapReduceConcurrencyLimit(
+  options: NonNullable<AgentChatRequest["sourceContextPack"]>,
+) {
+  const rawLimit = options.mapReduce?.maxConcurrentMaps ?? 1;
+  if (!Number.isFinite(rawLimit) || rawLimit <= 0) return 1;
+  return Math.max(1, Math.min(4, Math.floor(rawLimit)));
+}
+
+function sourceContextMapResultFromCompletedStep(
+  planGroup: SourceContextMapPlanGroup,
+  step: SourceContextMapStepRecord,
+): SourceContextMapResult {
+  return {
+    groupId: planGroup.groupId,
+    text: step.outputSummary ?? "",
+    citations: [],
+    evidenceIds: step.evidenceIds,
+    tokenEstimate: step.tokenEstimate,
+    ...(step.artifactId === undefined ? {} : { artifactId: step.artifactId }),
+  };
 }
 
 function sourceContextMapReduceGroupLimit(

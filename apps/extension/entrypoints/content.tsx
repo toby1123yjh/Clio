@@ -185,6 +185,8 @@ import {
   type SearchMemoryItem,
   type SourceContextCompressionLogRecord,
   type SourceContextMapArtifactRecord,
+  type SourceContextMapEvent,
+  type SourceContextMapRunSummary,
   type SourceContextPackResult,
   type TopicGraphEdge,
   type TopicPageDetail,
@@ -1133,6 +1135,12 @@ function ClioContentApp() {
   const [sourceContextMapArtifacts, setSourceContextMapArtifacts] = React.useState<
     SourceContextMapArtifactRecord[]
   >([]);
+  const [sourceContextMapRuns, setSourceContextMapRuns] = React.useState<
+    SourceContextMapRunSummary[]
+  >([]);
+  const [sourceContextMapEvents, setSourceContextMapEvents] = React.useState<
+    SourceContextMapEvent[]
+  >([]);
   const [chunkMetaTier2Audit, setChunkMetaTier2Audit] = React.useState<ChunkMetaTier2AuditRecord[]>(
     [],
   );
@@ -1436,6 +1444,45 @@ function ClioContentApp() {
     }
   }, []);
 
+  const loadSourceContextMapEvents = React.useCallback(async (runId?: string) => {
+    if (runId === undefined) {
+      setSourceContextMapEvents([]);
+      return;
+    }
+    try {
+      const result = await requestEngine({
+        kind: "listSourceContextMapEvents",
+        runId,
+        limit: 40,
+      });
+      setSourceContextMapEvents(result.events);
+    } catch {
+      setSourceContextMapEvents([]);
+    }
+  }, []);
+
+  const loadSourceContextMapRuns = React.useCallback(
+    async (sessionId?: string) => {
+      if (sessionId === undefined) {
+        setSourceContextMapRuns([]);
+        setSourceContextMapEvents([]);
+        return;
+      }
+      try {
+        const result = await requestEngine({
+          kind: "listSourceContextMapRuns",
+          filter: { sessionId, limit: 8 },
+        });
+        setSourceContextMapRuns(result.runs);
+        await loadSourceContextMapEvents(result.runs[0]?.id);
+      } catch {
+        setSourceContextMapRuns([]);
+        setSourceContextMapEvents([]);
+      }
+    },
+    [loadSourceContextMapEvents],
+  );
+
   const loadChunkMetaTier2Audit = React.useCallback(async () => {
     try {
       const result = await requestEngine({
@@ -1693,6 +1740,59 @@ function ClioContentApp() {
     ],
   );
 
+  const cancelSourceContextMapRun = React.useCallback(
+    async (runId: string) => {
+      try {
+        await requestEngine({ kind: "cancelSourceContextMapRun", id: runId });
+        await loadSourceContextMapRuns(railState.activeSessionId);
+        showToast({ tone: "warning", message: "Map scheduler cancellation requested." });
+      } catch (error) {
+        showToast(errorToast(error));
+      }
+    },
+    [loadSourceContextMapRuns, railState.activeSessionId, showToast],
+  );
+
+  const retrySourceContextMapRun = React.useCallback(
+    async (runId: string) => {
+      try {
+        const retry = await requestEngine({ kind: "retrySourceContextMapRun", id: runId });
+        setSourceContextMapRuns((runs) => [retry, ...runs].slice(0, 8));
+        await loadSourceContextMapEvents(retry.id);
+        await loadSourceContextMapRuns(railState.activeSessionId);
+        showToast({
+          tone: "success",
+          message: "Map scheduler retry was queued. Start a research run to execute provider work.",
+        });
+      } catch (error) {
+        await loadSourceContextMapRuns(railState.activeSessionId);
+        showToast(errorToast(error));
+      }
+    },
+    [loadSourceContextMapEvents, loadSourceContextMapRuns, railState.activeSessionId, showToast],
+  );
+
+  const resumeSourceContextMapRun = React.useCallback(
+    async (runId: string) => {
+      try {
+        const resumed = await requestEngine({ kind: "resumeSourceContextMapRun", id: runId });
+        setSourceContextMapRuns((runs) =>
+          [resumed, ...runs.filter((run) => run.id !== resumed.id)].slice(0, 8),
+        );
+        await loadSourceContextMapEvents(resumed.id);
+        await loadSourceContextMapRuns(railState.activeSessionId);
+        showToast({
+          tone: "success",
+          message: "Map scheduler run is resumable. Start a research run to execute provider work.",
+        });
+      } catch (error) {
+        await loadSourceContextMapRuns(railState.activeSessionId);
+        showToast(errorToast(error));
+      }
+    },
+    [loadSourceContextMapEvents, loadSourceContextMapRuns, railState.activeSessionId, showToast],
+  );
+
   const selectSourceContextPlannerSource = React.useCallback((sourceId: string) => {
     setSourceContextPlanner((current) => {
       if (current.selectedSourceIds.includes(sourceId)) return current;
@@ -1892,6 +1992,7 @@ function ClioContentApp() {
                 void loadChatHistory();
                 void loadSourceContextCompressionLogs(session.id);
                 void loadSourceContextMapArtifacts(session.id);
+                void loadSourceContextMapRuns(session.id);
               })
               .catch(() => undefined);
           },
@@ -1910,6 +2011,7 @@ function ClioContentApp() {
       loadChatHistory,
       loadSourceContextCompressionLogs,
       loadSourceContextMapArtifacts,
+      loadSourceContextMapRuns,
       maybeAttachReplySuggestions,
     ],
   );
@@ -1950,7 +2052,13 @@ function ClioContentApp() {
   React.useEffect(() => {
     void loadSourceContextCompressionLogs(railState.activeSessionId);
     void loadSourceContextMapArtifacts(railState.activeSessionId);
-  }, [loadSourceContextCompressionLogs, loadSourceContextMapArtifacts, railState.activeSessionId]);
+    void loadSourceContextMapRuns(railState.activeSessionId);
+  }, [
+    loadSourceContextCompressionLogs,
+    loadSourceContextMapArtifacts,
+    loadSourceContextMapRuns,
+    railState.activeSessionId,
+  ]);
 
   const openHome = React.useCallback(async () => {
     setDetail(null);
@@ -4087,6 +4195,9 @@ function ClioContentApp() {
     }
     dispatch({ type: "CLEAR_DIALOGUE" });
     setSourceContextCompressionLogs([]);
+    setSourceContextMapArtifacts([]);
+    setSourceContextMapRuns([]);
+    setSourceContextMapEvents([]);
   }, [railState.activePageContext, railState.activeSessionId]);
 
   const handleRetryDialogue = React.useCallback(
@@ -4413,6 +4524,8 @@ function ClioContentApp() {
         orchestrationEvents={orchestrationEvents}
         sourceContextCompressionLogs={sourceContextCompressionLogs}
         sourceContextMapArtifacts={sourceContextMapArtifacts}
+        sourceContextMapRuns={sourceContextMapRuns}
+        sourceContextMapEvents={sourceContextMapEvents}
         sourceContextPlanner={sourceContextPlanner}
         topicDetail={topicDetail}
         topicForm={topicForm}
@@ -4500,6 +4613,12 @@ function ClioContentApp() {
         }
         onRefreshSourceContextMapArtifacts={() =>
           void loadSourceContextMapArtifacts(railState.activeSessionId)
+        }
+        onCancelSourceContextMapRun={(runId) => void cancelSourceContextMapRun(runId)}
+        onRetrySourceContextMapRun={(runId) => void retrySourceContextMapRun(runId)}
+        onResumeSourceContextMapRun={(runId) => void resumeSourceContextMapRun(runId)}
+        onRefreshSourceContextMapRuns={() =>
+          void loadSourceContextMapRuns(railState.activeSessionId)
         }
         onSelectSourceContextPlannerSource={selectSourceContextPlannerSource}
         onRemoveSourceContextPlannerSource={removeSourceContextPlannerSource}

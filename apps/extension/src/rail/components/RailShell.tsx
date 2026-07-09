@@ -129,6 +129,8 @@ import type {
   SearchMemoryItem,
   SourceContextCompressionLogRecord,
   SourceContextMapArtifactRecord,
+  SourceContextMapEvent,
+  SourceContextMapRunSummary,
   SourceContextPackResult,
   SourceContextPackSourceDepthOverride,
   TopicGraphEdge,
@@ -220,6 +222,8 @@ export interface RailShellProps {
   orchestrationEvents: OrchestrationEvent[];
   sourceContextCompressionLogs: SourceContextCompressionLogRecord[];
   sourceContextMapArtifacts: SourceContextMapArtifactRecord[];
+  sourceContextMapRuns: SourceContextMapRunSummary[];
+  sourceContextMapEvents: SourceContextMapEvent[];
   sourceContextPlanner: SourceContextPlannerState;
   topicPages: TopicPageSummary[];
   relatedItems: SearchMemoryItem[];
@@ -308,6 +312,10 @@ export interface RailShellProps {
   onRefreshChunkMetaTier2Audit: () => void;
   onRefreshSourceContextCompressionLogs: () => void;
   onRefreshSourceContextMapArtifacts: () => void;
+  onCancelSourceContextMapRun: (runId: string) => void;
+  onRetrySourceContextMapRun: (runId: string) => void;
+  onResumeSourceContextMapRun: (runId: string) => void;
+  onRefreshSourceContextMapRuns: () => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
   onRemoveSourceContextPlannerSource: (sourceId: string) => void;
   onSetSourceContextPlannerSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
@@ -5083,6 +5091,16 @@ function KnowledgeBasePanel(props: RailShellProps) {
               disabled={props.state.loading}
               onRefresh={props.onRefreshChunkMetaTier2Audit}
             />
+            <SourceContextMapSchedulerPanel
+              disabled={props.state.loading}
+              events={props.sourceContextMapEvents}
+              runs={props.sourceContextMapRuns}
+              sessionId={props.state.activeSessionId}
+              onCancel={props.onCancelSourceContextMapRun}
+              onRefresh={props.onRefreshSourceContextMapRuns}
+              onResume={props.onResumeSourceContextMapRun}
+              onRetry={props.onRetrySourceContextMapRun}
+            />
             <SourceContextMapArtifactPanel
               artifacts={props.sourceContextMapArtifacts}
               disabled={props.state.loading}
@@ -5175,6 +5193,16 @@ function ResearchPlannerPanel(props: RailShellProps) {
               disabled={props.state.loading}
               sessionId={props.state.activeSessionId}
               onRefresh={props.onRefreshSourceContextMapArtifacts}
+            />
+            <SourceContextMapSchedulerPanel
+              disabled={props.state.loading}
+              events={props.sourceContextMapEvents}
+              runs={props.sourceContextMapRuns}
+              sessionId={props.state.activeSessionId}
+              onCancel={props.onCancelSourceContextMapRun}
+              onRefresh={props.onRefreshSourceContextMapRuns}
+              onResume={props.onResumeSourceContextMapRun}
+              onRetry={props.onRetrySourceContextMapRun}
             />
             <OrchestrationDiagnosticsPanel
               disabled={props.state.loading}
@@ -6139,6 +6167,149 @@ function ChunkMetaTier2AuditPanel({
   );
 }
 
+function SourceContextMapSchedulerPanel({
+  disabled,
+  events,
+  runs,
+  sessionId,
+  onCancel,
+  onRefresh,
+  onResume,
+  onRetry,
+}: {
+  disabled: boolean;
+  events: SourceContextMapEvent[];
+  runs: SourceContextMapRunSummary[];
+  sessionId?: string;
+  onCancel: (runId: string) => void;
+  onRefresh: () => void;
+  onResume: (runId: string) => void;
+  onRetry: (runId: string) => void;
+}) {
+  const activeRun = runs[0];
+  return (
+    <section
+      className="rounded-lg border border-border bg-surface px-4 py-3"
+      data-clio-source-context-map-scheduler="true"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">Source context scheduler</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Resumable map/reduce control state
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Badge className="border-border bg-surface-subtle text-muted-foreground">
+            {runs.length}
+          </Badge>
+          <Button
+            aria-label="Refresh source context map scheduler"
+            disabled={disabled || sessionId === undefined}
+            onClick={onRefresh}
+            size="icon"
+            title="Refresh"
+            variant="ghost"
+          >
+            <RefreshCw size={14} />
+          </Button>
+        </div>
+      </div>
+      {sessionId === undefined ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No active conversation.</p>
+      ) : activeRun === undefined ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No scheduler runs yet.</p>
+      ) : (
+        <div className="mt-3 grid gap-3">
+          <div className="rounded-md border border-border bg-surface-subtle p-3">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <h4 className="line-clamp-1 text-[12.5px] font-semibold leading-5">
+                  {sourceContextMapRunStatusLabel(activeRun)}
+                </h4>
+                <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                  Run {compactId(activeRun.ownerRunId)}
+                </p>
+              </div>
+              <Badge className="shrink-0 border-border bg-surface text-muted-foreground">
+                {formatDate(activeRun.updatedAt)}
+              </Badge>
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+              <span className="truncate">
+                Progress {activeRun.progressCurrent}/{activeRun.progressTotal}
+              </span>
+              <span className="truncate">Concurrency {activeRun.maxConcurrentMaps}</span>
+              <span className="truncate">Mode {activeRun.mode ?? "n/a"}</span>
+              <span className="truncate">
+                Cancel {activeRun.cancelRequested ? "requested" : "no"}
+              </span>
+            </div>
+            {activeRun.lastError === undefined ? null : (
+              <p className="mt-2 line-clamp-2 text-[11px] text-danger">{activeRun.lastError}</p>
+            )}
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              <Button
+                disabled={disabled || sourceContextMapRunIsTerminal(activeRun)}
+                onClick={() => onCancel(activeRun.id)}
+                size="sm"
+                title="Cancel map scheduler"
+                variant="subtle"
+              >
+                <X size={13} />
+                Cancel
+              </Button>
+              <Button
+                disabled={
+                  disabled || (activeRun.status !== "failed" && activeRun.status !== "cancelled")
+                }
+                onClick={() => onRetry(activeRun.id)}
+                size="sm"
+                title="Create retry scheduler run"
+                variant="subtle"
+              >
+                <Sparkles size={13} />
+                Retry
+              </Button>
+              <Button
+                disabled={
+                  disabled || (activeRun.status !== "failed" && activeRun.status !== "cancelled")
+                }
+                onClick={() => onResume(activeRun.id)}
+                size="sm"
+                title="Mark this scheduler run resumable"
+                variant="subtle"
+              >
+                <RefreshCw size={13} />
+                Resume
+              </Button>
+            </div>
+          </div>
+          {events.length === 0 ? (
+            <p className="text-[12px] text-muted-foreground">No scheduler events recorded.</p>
+          ) : (
+            <ul className="divide-y divide-border">
+              {events.slice(0, 5).map((event) => (
+                <li className="grid gap-1.5 py-2 first:pt-0 last:pb-0" key={event.id}>
+                  <div className="flex min-w-0 items-center justify-between gap-2">
+                    <span className="truncate text-[12px] font-medium">
+                      {sourceContextMapEventLabel(event)}
+                    </span>
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      {formatDate(event.createdAt)}
+                    </span>
+                  </div>
+                  <p className="line-clamp-2 text-[11px] text-muted-foreground">{event.message}</p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function SourceContextMapArtifactPanel({
   artifacts,
   disabled,
@@ -6338,6 +6509,33 @@ function orchestrationEventLabel(event: OrchestrationEvent) {
   if (event.kind === "progress") return "Progress";
   if (event.kind === "cancelled") return "Cancelled";
   if (event.kind === "failed") return "Failed";
+  return "Queued";
+}
+
+function sourceContextMapRunStatusLabel(run: SourceContextMapRunSummary) {
+  if (run.status === "done") return "Done";
+  if (run.status === "failed") return "Failed";
+  if (run.status === "cancelled") return "Cancelled";
+  if (run.status === "running") return "Mapping";
+  if (run.status === "reducing") return "Reducing";
+  return "Queued";
+}
+
+function sourceContextMapRunIsTerminal(run: SourceContextMapRunSummary) {
+  return run.status === "done" || run.status === "failed" || run.status === "cancelled";
+}
+
+function sourceContextMapEventLabel(event: SourceContextMapEvent) {
+  if (event.kind === "step_claimed") return "Step claimed";
+  if (event.kind === "step_completed") return "Step completed";
+  if (event.kind === "step_failed") return "Step failed";
+  if (event.kind === "reduce_started") return "Reduce started";
+  if (event.kind === "reduce_completed") return "Reduce completed";
+  if (event.kind === "reduce_failed") return "Reduce failed";
+  if (event.kind === "cancel_requested") return "Cancel requested";
+  if (event.kind === "cancelled") return "Cancelled";
+  if (event.kind === "retry_created") return "Retry created";
+  if (event.kind === "resumed") return "Resumed";
   return "Queued";
 }
 

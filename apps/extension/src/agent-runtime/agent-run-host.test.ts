@@ -4,6 +4,9 @@ import type {
   CompactionRecord,
   CreateCompactionPayload,
   EngineRequest,
+  SourceContextMapRunDetail,
+  SourceContextMapRunSummary,
+  SourceContextMapStepRecord,
   SourceContextPackResult,
 } from "@/src/shared/rpc";
 import { describe, expect, it } from "vitest";
@@ -273,6 +276,188 @@ function sourceContextMapArtifactAppendResponse<T>(
       createdAt: entry.createdAt ?? request.payload.createdAt ?? "2026-05-22T00:00:00.000Z",
     })),
   } as T;
+}
+
+function sourceContextMapSchedulerHarness(seed?: {
+  completedSteps?: Record<number, { outputSummary: string; artifactId?: string }>;
+}) {
+  let run: SourceContextMapRunDetail | undefined;
+  const createdAt = "2026-05-22T00:00:00.000Z";
+  const summary = (detail: SourceContextMapRunDetail): SourceContextMapRunSummary => {
+    const { steps: _steps, ...runSummary } = detail;
+    return runSummary;
+  };
+  const refresh = () => {
+    if (run === undefined) return;
+    run = {
+      ...run,
+      progressCurrent: run.steps.filter((step) => step.status === "completed").length,
+      progressTotal: run.steps.length,
+      updatedAt: createdAt,
+    };
+  };
+  const findStep = (stepId: string) => {
+    const step = run?.steps.find((item) => item.id === stepId);
+    if (step === undefined) throw new Error(`scheduler step not found: ${stepId}`);
+    return step;
+  };
+  return {
+    handle<T>(engineRequest: EngineRequest): { handled: true; value: T } | { handled: false } {
+      if (engineRequest.kind === "createOrResumeSourceContextMapRun") {
+        if (run === undefined) {
+          const runId = engineRequest.payload.id ?? "sctx-map-run-1";
+          const completedSteps = seed?.completedSteps ?? {};
+          const steps = engineRequest.payload.steps.map(
+            (step, index): SourceContextMapStepRecord => {
+              const completed = completedSteps[step.groupIndex];
+              const base = {
+                ...step,
+                id: `sctx-map-step-${index + 1}`,
+                runId,
+                status: completed === undefined ? ("queued" as const) : ("completed" as const),
+                attemptCount: completed === undefined ? 0 : 1,
+                createdAt,
+                updatedAt: createdAt,
+              };
+              return completed === undefined
+                ? base
+                : {
+                    ...base,
+                    outputSummary: completed.outputSummary,
+                    ...(completed.artifactId === undefined
+                      ? {}
+                      : { artifactId: completed.artifactId }),
+                    completedAt: createdAt,
+                  };
+            },
+          );
+          run = {
+            id: runId,
+            ...(engineRequest.payload.sessionId === undefined
+              ? {}
+              : { sessionId: engineRequest.payload.sessionId }),
+            ownerRunId: engineRequest.payload.ownerRunId,
+            ...(engineRequest.payload.mode === undefined
+              ? {}
+              : { mode: engineRequest.payload.mode }),
+            status: "queued",
+            planSignature: engineRequest.payload.planSignature,
+            maxConcurrentMaps: engineRequest.payload.maxConcurrentMaps ?? 1,
+            progressCurrent: steps.filter((step) => step.status === "completed").length,
+            progressTotal: steps.length,
+            cancelRequested: false,
+            createdAt,
+            updatedAt: createdAt,
+            steps,
+          };
+        }
+        return { handled: true, value: run as T };
+      }
+      if (run === undefined) return { handled: false };
+      if (engineRequest.kind === "claimSourceContextMapStep") {
+        const next = run.steps.find((step) => step.status === "queued");
+        if (next === undefined || run.status === "failed" || run.status === "cancelled") {
+          refresh();
+          return { handled: true, value: { run: summary(run) } as T };
+        }
+        const updated: SourceContextMapStepRecord = {
+          ...next,
+          status: "running",
+          attemptCount: next.attemptCount + 1,
+          claimedAt: createdAt,
+          updatedAt: createdAt,
+        };
+        run = {
+          ...run,
+          status: "running",
+          updatedAt: createdAt,
+          startedAt: run.startedAt ?? createdAt,
+          steps: run.steps.map((step) => (step.id === updated.id ? updated : step)),
+        };
+        return { handled: true, value: { run: summary(run), step: updated } as T };
+      }
+      if (engineRequest.kind === "completeSourceContextMapStep") {
+        const step = findStep(engineRequest.payload.stepId);
+        const updated: SourceContextMapStepRecord = {
+          ...step,
+          status: "completed",
+          outputSummary: engineRequest.payload.outputSummary,
+          ...(engineRequest.payload.artifactId === undefined
+            ? {}
+            : { artifactId: engineRequest.payload.artifactId }),
+          completedAt: createdAt,
+          updatedAt: createdAt,
+        };
+        run = {
+          ...run,
+          steps: run.steps.map((item) => (item.id === updated.id ? updated : item)),
+        };
+        refresh();
+        return { handled: true, value: updated as T };
+      }
+      if (engineRequest.kind === "failSourceContextMapStep") {
+        const step = findStep(engineRequest.payload.stepId);
+        const updated: SourceContextMapStepRecord = {
+          ...step,
+          status: "failed",
+          ...(engineRequest.payload.errorCode === undefined
+            ? {}
+            : { errorCode: engineRequest.payload.errorCode }),
+          errorMessage: engineRequest.payload.errorMessage,
+          updatedAt: createdAt,
+        };
+        run = {
+          ...run,
+          status: "failed",
+          lastError: engineRequest.payload.errorMessage,
+          finishedAt: createdAt,
+          updatedAt: createdAt,
+          steps: run.steps.map((item) => (item.id === updated.id ? updated : item)),
+        };
+        return { handled: true, value: updated as T };
+      }
+      if (engineRequest.kind === "markSourceContextMapReduceStarted") {
+        run = { ...run, status: "reducing", updatedAt: createdAt };
+        return { handled: true, value: summary(run) as T };
+      }
+      if (engineRequest.kind === "markSourceContextMapReduceCompleted") {
+        run = {
+          ...run,
+          status: "done",
+          progressCurrent: run.progressTotal,
+          finishedAt: createdAt,
+          updatedAt: createdAt,
+        };
+        return { handled: true, value: summary(run) as T };
+      }
+      if (engineRequest.kind === "markSourceContextMapReduceFailed") {
+        run = {
+          ...run,
+          status: "failed",
+          lastError: engineRequest.payload.errorMessage,
+          finishedAt: createdAt,
+          updatedAt: createdAt,
+        };
+        return { handled: true, value: summary(run) as T };
+      }
+      if (engineRequest.kind === "cancelSourceContextMapRun") {
+        run = {
+          ...run,
+          status: "cancelled",
+          cancelRequested: true,
+          finishedAt: createdAt,
+          updatedAt: createdAt,
+          steps: run.steps.map((step) =>
+            step.status === "queued" || step.status === "running"
+              ? { ...step, status: "cancelled", updatedAt: createdAt }
+              : step,
+          ),
+        };
+        return { handled: true, value: summary(run) as T };
+      }
+      return { handled: false };
+    },
+  };
 }
 
 function session(overrides: Partial<ChatSessionDetail> = {}): ChatSessionDetail {
@@ -626,6 +811,7 @@ describe("AgentRunHost", () => {
         if (engineRequest.kind === "loadChatSession") return null as T;
         return {} as T;
       },
+      semanticCitationJudge: supportedSemanticCitationJudge,
       emitEvent: (event) => emitted.push(event),
     });
 
@@ -702,6 +888,7 @@ describe("AgentRunHost", () => {
         if (engineRequest.kind === "loadChatSession") return null as T;
         return {} as T;
       },
+      semanticCitationJudge: supportedSemanticCitationJudge,
       emitEvent: (event) => emitted.push(event),
     });
 
@@ -812,6 +999,7 @@ describe("AgentRunHost", () => {
 
   it("executes source context map-reduce with bounded group evidence", async () => {
     let artifactId = 0;
+    const scheduler = sourceContextMapSchedulerHarness();
     const calls: EngineRequest[] = [];
     const providerRequests: AgentChatRequest[] = [];
     const emitted: AgentStreamEvent[] = [];
@@ -859,6 +1047,8 @@ describe("AgentRunHost", () => {
       },
       requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
         calls.push(engineRequest);
+        const schedulerResponse = scheduler.handle<T>(engineRequest);
+        if (schedulerResponse.handled) return schedulerResponse.value;
         if (engineRequest.kind === "buildSourceContextPack")
           return multiGroupSourceContextPack as T;
         if (engineRequest.kind === "appendSourceContextMapArtifacts") {
@@ -965,10 +1155,191 @@ describe("AgentRunHost", () => {
     const artifactPayloadText = JSON.stringify(artifactCalls.map((call) => call.payload.entries));
     expect(artifactPayloadText).not.toContain("  Bounded   source context text. ");
     expect(artifactPayloadText).not.toContain("sourceUrl");
+    expect(calls.map((call) => call.kind)).toEqual(
+      expect.arrayContaining([
+        "createOrResumeSourceContextMapRun",
+        "claimSourceContextMapStep",
+        "completeSourceContextMapStep",
+        "markSourceContextMapReduceStarted",
+        "markSourceContextMapReduceCompleted",
+      ]),
+    );
+    const createRunCall = calls.find(
+      (
+        engineRequest,
+      ): engineRequest is Extract<EngineRequest, { kind: "createOrResumeSourceContextMapRun" }> =>
+        engineRequest.kind === "createOrResumeSourceContextMapRun",
+    );
+    expect(createRunCall?.payload).toMatchObject({
+      ownerRunId: "run-1",
+      sessionId: "session-1",
+      maxConcurrentMaps: 1,
+    });
+    expect(createRunCall?.payload.steps).toHaveLength(2);
+    expect(JSON.stringify(createRunCall?.payload)).not.toContain(
+      "  Bounded   source context text. ",
+    );
+  });
+
+  it("reuses completed source context map scheduler steps on resume", async () => {
+    let artifactId = 0;
+    const scheduler = sourceContextMapSchedulerHarness({
+      completedSteps: {
+        0: {
+          outputSummary: "resumed map-one finding",
+          artifactId: "artifact-resumed-map-1",
+        },
+      },
+    });
+    const calls: EngineRequest[] = [];
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          providerRequests.push(agentRequest);
+          if (agentRequest.runId.includes(":map:")) {
+            yield {
+              type: "text_delta",
+              runId: agentRequest.runId,
+              delta: "fresh map-two finding",
+            } satisfies AgentStreamEvent;
+            yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+            return;
+          }
+          yield {
+            type: "text_delta",
+            runId: agentRequest.runId,
+            delta: "Second bounded source context.",
+          } satisfies AgentStreamEvent;
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
+        const schedulerResponse = scheduler.handle<T>(engineRequest);
+        if (schedulerResponse.handled) return schedulerResponse.value;
+        if (engineRequest.kind === "buildSourceContextPack")
+          return multiGroupSourceContextPack as T;
+        if (engineRequest.kind === "appendSourceContextMapArtifacts") {
+          return sourceContextMapArtifactAppendResponse(engineRequest, () => {
+            artifactId += 1;
+            return `artifact-resume-${artifactId}`;
+          });
+        }
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      semanticCitationJudge: supportedSemanticCitationJudge,
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: { mode: "research", mapReduce: { enabled: true } },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(
+      providerRequests.filter((item) => item.runId.includes(":map:")).map((item) => item.runId),
+    ).toEqual(["run-1:map:2:group-2"]);
+    expect(providerRequests.some((item) => item.runId === "run-1")).toBe(true);
+    const reduceRequest = providerRequests.find((item) =>
+      item.question.includes("Group analyses:"),
+    );
+    expect(reduceRequest?.question).toContain("resumed map-one finding");
+    expect(reduceRequest?.question).toContain("fresh map-two finding");
+    expect(calls.filter((call) => call.kind === "claimSourceContextMapStep")).toHaveLength(1);
+    expect(calls.filter((call) => call.kind === "completeSourceContextMapStep")).toHaveLength(1);
+    const reduceStarted = calls.find(
+      (
+        engineRequest,
+      ): engineRequest is Extract<EngineRequest, { kind: "markSourceContextMapReduceStarted" }> =>
+        engineRequest.kind === "markSourceContextMapReduceStarted",
+    );
+    expect(reduceStarted?.payload.mapArtifactIds).toEqual([
+      "artifact-resumed-map-1",
+      "artifact-resume-2",
+    ]);
+  });
+
+  it("limits source context map provider concurrency", async () => {
+    const scheduler = sourceContextMapSchedulerHarness();
+    const calls: EngineRequest[] = [];
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    let activeMaps = 0;
+    let maxActiveMaps = 0;
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          providerRequests.push(agentRequest);
+          if (agentRequest.runId.includes(":map:")) {
+            activeMaps += 1;
+            maxActiveMaps = Math.max(maxActiveMaps, activeMaps);
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            yield {
+              type: "text_delta",
+              runId: agentRequest.runId,
+              delta: `${agentRequest.runId} finding`,
+            } satisfies AgentStreamEvent;
+            activeMaps -= 1;
+            yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+            return;
+          }
+          yield {
+            type: "text_delta",
+            runId: agentRequest.runId,
+            delta: "Reduced answer.",
+          } satisfies AgentStreamEvent;
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
+        const schedulerResponse = scheduler.handle<T>(engineRequest);
+        if (schedulerResponse.handled) return schedulerResponse.value;
+        if (engineRequest.kind === "buildSourceContextPack")
+          return multiGroupSourceContextPack as T;
+        if (engineRequest.kind === "appendSourceContextMapArtifacts") {
+          return sourceContextMapArtifactAppendResponse(engineRequest, () => "artifact-concurrent");
+        }
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: {
+          mode: "research",
+          mapReduce: { enabled: true, maxConcurrentMaps: 2 },
+        },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(providerRequests.filter((item) => item.runId.includes(":map:"))).toHaveLength(2);
+    expect(maxActiveMaps).toBeLessThanOrEqual(2);
+    expect(
+      calls.find(
+        (
+          engineRequest,
+        ): engineRequest is Extract<EngineRequest, { kind: "createOrResumeSourceContextMapRun" }> =>
+          engineRequest.kind === "createOrResumeSourceContextMapRun",
+      )?.payload.maxConcurrentMaps,
+    ).toBe(2);
   });
 
   it("falls back to single-pass source context when a map call fails", async () => {
     let artifactId = 0;
+    const scheduler = sourceContextMapSchedulerHarness();
     const calls: EngineRequest[] = [];
     const providerRequests: AgentChatRequest[] = [];
     const emitted: AgentStreamEvent[] = [];
@@ -1001,6 +1372,8 @@ describe("AgentRunHost", () => {
       },
       requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
         calls.push(engineRequest);
+        const schedulerResponse = scheduler.handle<T>(engineRequest);
+        if (schedulerResponse.handled) return schedulerResponse.value;
         if (engineRequest.kind === "buildSourceContextPack")
           return multiGroupSourceContextPack as T;
         if (engineRequest.kind === "appendSourceContextMapArtifacts") {
@@ -1060,6 +1433,7 @@ describe("AgentRunHost", () => {
 
   it("falls back to single-pass source context when reduce fails before visible output", async () => {
     let artifactId = 0;
+    const scheduler = sourceContextMapSchedulerHarness();
     const calls: EngineRequest[] = [];
     const providerRequests: AgentChatRequest[] = [];
     const emitted: AgentStreamEvent[] = [];
@@ -1101,6 +1475,8 @@ describe("AgentRunHost", () => {
       },
       requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
         calls.push(engineRequest);
+        const schedulerResponse = scheduler.handle<T>(engineRequest);
+        if (schedulerResponse.handled) return schedulerResponse.value;
         if (engineRequest.kind === "buildSourceContextPack")
           return multiGroupSourceContextPack as T;
         if (engineRequest.kind === "appendSourceContextMapArtifacts") {
@@ -1167,6 +1543,7 @@ describe("AgentRunHost", () => {
   });
 
   it("cancels during source context map without falling back", async () => {
+    const scheduler = sourceContextMapSchedulerHarness();
     const providerRequests: AgentChatRequest[] = [];
     const emitted: AgentStreamEvent[] = [];
     const host = new AgentRunHost({
@@ -1188,6 +1565,8 @@ describe("AgentRunHost", () => {
         },
       },
       requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        const schedulerResponse = scheduler.handle<T>(engineRequest);
+        if (schedulerResponse.handled) return schedulerResponse.value;
         if (engineRequest.kind === "buildSourceContextPack")
           return multiGroupSourceContextPack as T;
         if (engineRequest.kind === "loadChatSession") return null as T;
