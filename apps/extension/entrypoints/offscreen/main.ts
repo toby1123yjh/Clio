@@ -1,4 +1,5 @@
 import { AgentRunHost } from "@/src/agent-runtime/agent-run-host";
+import { ProviderBackedChunkMetaSummarizer } from "@/src/agent-runtime/chunk-meta-summary";
 import { PiAgentCompactionRuntime } from "@/src/agent-runtime/compaction-context";
 import { ClioEmbeddingProviderRuntime } from "@/src/agent-runtime/embedding-provider-runtime";
 import { ProviderBackedFigureVisionAnalyzer } from "@/src/agent-runtime/figure-vision-analyzer";
@@ -15,6 +16,7 @@ import {
   CLIO_AGENT_RUN_EVENT,
   CLIO_IMAGE_GENERATION_RUN_EVENT,
   CLIO_WEB_SEARCH_RUN_EVENT,
+  CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
   CLIO_WORKER_EMBEDDING_RESPONSE,
   CLIO_WORKER_REQUEST,
   CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
@@ -30,6 +32,7 @@ import {
   isImageGenerationRunRequestMessage,
   isOffscreenRequestMessage,
   isWebSearchRunRequestMessage,
+  isWorkerChunkMetaSummaryRequestMessage,
   isWorkerEmbeddingRequestMessage,
   isWorkerResponseMessage,
   isWorkerVisionAnalysisRequestMessage,
@@ -110,6 +113,11 @@ const embeddingProviderRuntime = new ClioEmbeddingProviderRuntime({
     })
       .then(() => true)
       .catch(() => false),
+});
+const chunkMetaSummarizer = new ProviderBackedChunkMetaSummarizer({
+  loadConfig: () => requestProviderConfig(),
+  loadProviderId: async () => (await requestProviderConfig())?.provider ?? defaultActiveProvider,
+  ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
 });
 const figureVisionAnalyzer = new ProviderBackedFigureVisionAnalyzer({
   loadVisionProviderSettings: () => requestProvider({ kind: "getVisionProviderSettings" }),
@@ -370,6 +378,10 @@ function ensureWorker() {
       void handleWorkerEmbeddingRequest(worker as Worker, event.data);
       return;
     }
+    if (isWorkerChunkMetaSummaryRequestMessage(event.data)) {
+      void handleWorkerChunkMetaSummaryRequest(worker as Worker, event.data);
+      return;
+    }
     if (isWorkerVisionAnalysisRequestMessage(event.data)) {
       void handleWorkerVisionAnalysisRequest(worker as Worker, event.data);
       return;
@@ -412,6 +424,29 @@ async function handleWorkerEmbeddingRequest(
       response: {
         ok: false,
         error: engineErrorFromUnknown(error, "EMBEDDING_PROVIDER_ERROR"),
+      },
+    });
+  }
+}
+
+async function handleWorkerChunkMetaSummaryRequest(
+  engineWorker: Worker,
+  message: import("@/src/shared/rpc").WorkerChunkMetaSummaryRequestMessage,
+) {
+  try {
+    const result = await chunkMetaSummarizer.summarize(message.request);
+    engineWorker.postMessage({
+      type: CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
+      requestId: message.requestId,
+      response: { ok: true, value: result },
+    });
+  } catch (error) {
+    engineWorker.postMessage({
+      type: CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
+      requestId: message.requestId,
+      response: {
+        ok: false,
+        error: engineErrorFromUnknown(error, "CHUNK_META_SUMMARY_PROVIDER_ERROR"),
       },
     });
   }

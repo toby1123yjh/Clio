@@ -239,6 +239,31 @@ describe("content local RAG flow", () => {
     expect(compressionPanelSection).not.toContain("requestEngine");
   });
 
+  it("exposes source context map artifacts as non-citeable Rail diagnostics", () => {
+    const contentMapArtifactSection = contentSource.slice(
+      contentSource.indexOf("const loadSourceContextMapArtifacts = React.useCallback"),
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const artifactPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function SourceContextMapArtifactPanel"),
+      railShellSource.indexOf("interface SourceContextPlannerSelectedItem"),
+    );
+
+    expect(contentMapArtifactSection).toContain('kind: "listSourceContextMapArtifacts"');
+    expect(contentMapArtifactSection).toContain("filter: { sessionId, limit: 30 }");
+    expect(railPropsSection).toContain("sourceContextMapArtifacts={sourceContextMapArtifacts}");
+    expect(railPropsSection).toContain("onRefreshSourceContextMapArtifacts=");
+    expect(artifactPanelSection).toContain('data-clio-source-context-map-artifacts="true"');
+    expect(artifactPanelSection).toContain("Non-citeable map/reduce diagnostics");
+    expect(artifactPanelSection).toContain("sourceContextMapArtifactTitle");
+    expect(artifactPanelSection).toContain("sourceContextMapArtifactSummary");
+    expect(artifactPanelSection).not.toContain("requestEngine");
+  });
+
   it("exposes explicit source context planner UI through content-owned pack preview", () => {
     const contentPlannerPreviewSection = contentSource.slice(
       contentSource.indexOf("const previewSourceContextPlanner = React.useCallback"),
@@ -264,11 +289,15 @@ describe("content local RAG flow", () => {
     expect(contentSource).toContain("React.useState<SourceContextPlannerState>");
     expect(contentPlannerPreviewSection).toContain('kind: "buildSourceContextPack"');
     expect(contentPlannerPreviewSection).toContain("sourceIds,");
+    expect(contentPlannerPreviewSection).toContain("sourceDepthOverrides");
     expect(contentPlannerPreviewSection).toContain("useWorkingSet: false");
     expect(contentPlannerPreviewSection).toContain("sourceContextPlanner.budget");
     expect(contentPlannerPreviewSection).not.toContain("openAgentStream");
     expect(contentPlannerStartSection).toContain("sourceContextPackOptionsFromPlanner");
     expect(contentPlannerStartSection).toContain("sourceIds,");
+    expect(contentPlannerStartSection).toContain(
+      "sourceDepthOverrides: sourceContextPlanner.sourceDepthOverrides",
+    );
     expect(contentPlannerStartSection).toContain("budget: sourceContextPlanner.budget");
     expect(contentPlannerStartSection).toContain("startAgentRun(normalizedQuestion");
     expect(railPropsSection).toContain("sourceContextPlanner={sourceContextPlanner}");
@@ -278,10 +307,14 @@ describe("content local RAG flow", () => {
     expect(railPropsSection).toContain(
       "onPreviewSourceContextPlanner={(query) => void previewSourceContextPlanner(query)}",
     );
+    expect(railPropsSection).toContain(
+      "onSetSourceContextPlannerSourceDepth={setSourceContextPlannerSourceDepth}",
+    );
     expect(plannerPanelSection).toContain('data-clio-source-context-planner="true"');
     expect(plannerPanelSection).toContain("SourceContextPlannerBudgetInput");
     expect(plannerPanelSection).toContain("SourceContextPlannerPreviewSummary");
     expect(plannerPanelSection).toContain("workingSetLoadDepthLabel");
+    expect(plannerPanelSection).toContain("onSetSourceDepth");
     expect(plannerPanelSection).not.toContain("requestEngine");
     expect(plannerPanelSection).not.toContain('kind: "getMemory"');
     expect(memoryListSection).toContain("onSelectSourceContextPlannerSource(item.id)");

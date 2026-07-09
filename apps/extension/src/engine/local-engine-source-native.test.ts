@@ -6,6 +6,7 @@ const workerSource = readFileSync(
   fileURLToPath(new URL("./local-engine.worker.ts", import.meta.url)),
   "utf8",
 );
+const rpcSource = readFileSync(fileURLToPath(new URL("../shared/rpc.ts", import.meta.url)), "utf8");
 
 function sourceSection(start: string, end: string) {
   const startIndex = workerSource.indexOf(start);
@@ -398,12 +399,21 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("source_context_pack_v1");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_context_compression_logs");
     expect(workerSource).toContain('case "appendSourceContextCompressionLogs"');
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_context_map_artifacts");
+    expect(workerSource).toContain('case "appendSourceContextMapArtifacts"');
+    expect(workerSource).toContain('case "listSourceContextMapArtifacts"');
+    expect(workerSource).toContain('case "clearSourceContextMapArtifacts"');
 
     const handlerSection = sourceSection(
       "private async buildSourceContextPack",
       "private async pinWorkingSetSource",
     );
     expect(handlerSection).not.toContain("normalized_text");
+    const mapArtifactSection = sourceSection(
+      "private async appendSourceContextMapArtifacts",
+      "private async pinWorkingSetSource",
+    );
+    expect(mapArtifactSection).not.toContain("normalized_text");
     const packSection = sourceSection("function buildSourceContextPack", "function insertAnchor");
     expect(packSection).not.toContain("normalized_text");
     expect(packSection).not.toContain("getMemory(");
@@ -592,6 +602,16 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("function buildLocalChunkMetaSemanticRelations");
     expect(workerSource).toContain("function normalizeChunkMetaSemanticRelations");
     expect(workerSource).toContain("function selectedChunkMetaTierState");
+    expect(workerSource).toContain("type ChunkMetaSummarizerFactory");
+    expect(workerSource).toContain("createWorkerChunkMetaSummarizer");
+    expect(workerSource).toContain("CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST");
+    expect(workerSource).toContain("isWorkerChunkMetaSummaryResponseMessage");
+    expect(workerSource).toContain("chunkMetaTier2");
+    expect(workerSource).toContain("chunk_meta_summarizer_unavailable");
+    expect(workerSource).toContain("chunk_meta_tier2_max_chunks_exceeded");
+    expect(workerSource).toContain("applyChunkMetaTier2Result");
+    expect(workerSource).toContain('selectedTier: "tier2"');
+    expect(workerSource).toContain('summarySource: "remote_llm"');
     expect(workerSource).toContain("function sectionHeadingRanges");
     expect(workerSource).toContain("function sectionPathForChunk");
     expect(workerSource).toContain("function sectionOutlineFromJson");
@@ -638,6 +658,14 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("function buildChunkEmbeddingInput");
     expect(workerSource).toContain("function buildChunkMetaEmbeddingPrefix");
     expect(workerSource).toContain('Relations: ${relationHints.join("; ")}');
+    expect(rpcSource).toContain("CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST");
+    expect(rpcSource).toContain("isWorkerChunkMetaSummaryRequestMessage");
+    expect(rpcSource).toContain("forbiddenWorkerChunkMetaSummaryFields");
+    expect(rpcSource).toContain('"apiKey"');
+    expect(rpcSource).toContain('"fullText"');
+    expect(rpcSource).toContain('"normalizedText"');
+    expect(rpcSource).toContain('"pdfBytes"');
+    expect(rpcSource).toContain('"rawBytes"');
 
     const evidenceWindowSection = workerSource.slice(
       workerSource.indexOf("function loadSourceEvidenceWindow"),

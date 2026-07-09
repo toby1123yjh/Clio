@@ -181,6 +181,7 @@ import {
   type RetrieveSourcesResult,
   type SearchMemoryItem,
   type SourceContextCompressionLogRecord,
+  type SourceContextMapArtifactRecord,
   type SourceContextPackResult,
   type TopicGraphEdge,
   type TopicPageDetail,
@@ -870,13 +871,16 @@ function planDefaultSourceContextPack(
 
 function sourceContextPackOptionsFromPlanner(input: {
   sourceIds: string[];
+  sourceDepthOverrides: SourceContextPlannerState["sourceDepthOverrides"];
   budget: SourceContextPlannerBudget;
 }): AgentChatRequest["sourceContextPack"] {
+  const sourceDepthOverrides = sourceContextPlannerDepthOverridesForSelection(input);
   return {
     mode: "research",
     planner: "source_context_planner_v1",
     triggerReason: "explicit_source_picker_planning",
     sourceIds: input.sourceIds,
+    ...(sourceDepthOverrides.length === 0 ? {} : { sourceDepthOverrides }),
     useWorkingSet: false,
     ...input.budget,
     mapReduce: {
@@ -885,6 +889,19 @@ function sourceContextPackOptionsFromPlanner(input: {
       perGroupTokenBudget: input.budget.maxGroupTokens,
     },
   };
+}
+
+function sourceContextPlannerDepthOverridesForSelection(input: {
+  sourceIds: string[];
+  sourceDepthOverrides: SourceContextPlannerState["sourceDepthOverrides"];
+}) {
+  const overrideBySourceId = new Map(
+    input.sourceDepthOverrides.map((override) => [override.sourceId, override.loadDepth]),
+  );
+  return input.sourceIds.flatMap((sourceId) => {
+    const loadDepth = overrideBySourceId.get(sourceId);
+    return loadDepth === undefined ? [] : [{ sourceId, loadDepth }];
+  });
 }
 
 function sourceContextPackPreviewSummary(pack: SourceContextPackResult) {
@@ -1106,9 +1123,13 @@ function ClioContentApp() {
   const [sourceContextCompressionLogs, setSourceContextCompressionLogs] = React.useState<
     SourceContextCompressionLogRecord[]
   >([]);
+  const [sourceContextMapArtifacts, setSourceContextMapArtifacts] = React.useState<
+    SourceContextMapArtifactRecord[]
+  >([]);
   const [sourceContextPlanner, setSourceContextPlanner] = React.useState<SourceContextPlannerState>(
     {
       selectedSourceIds: [],
+      sourceDepthOverrides: [],
       budget: { ...defaultSourceContextPlannerBudget },
       preview: null,
       previewLoading: false,
@@ -1387,6 +1408,22 @@ function ClioContentApp() {
     }
   }, []);
 
+  const loadSourceContextMapArtifacts = React.useCallback(async (sessionId?: string) => {
+    if (sessionId === undefined) {
+      setSourceContextMapArtifacts([]);
+      return;
+    }
+    try {
+      const result = await requestEngine({
+        kind: "listSourceContextMapArtifacts",
+        filter: { sessionId, limit: 30 },
+      });
+      setSourceContextMapArtifacts(result.items);
+    } catch {
+      setSourceContextMapArtifacts([]);
+    }
+  }, []);
+
   const loadLibrary = React.useCallback(
     async (nextQuery = railState.query) => {
       dispatch({ type: "SET_LOADING", loading: true });
@@ -1517,10 +1554,31 @@ function ClioContentApp() {
     setSourceContextPlanner((current) => ({
       ...current,
       selectedSourceIds: current.selectedSourceIds.filter((id) => id !== sourceId),
+      sourceDepthOverrides: current.sourceDepthOverrides.filter(
+        (override) => override.sourceId !== sourceId,
+      ),
       preview: null,
       previewError: undefined,
     }));
   }, []);
+
+  const setSourceContextPlannerSourceDepth = React.useCallback(
+    (sourceId: string, loadDepth: WorkingSetLoadDepth) => {
+      setSourceContextPlanner((current) => {
+        if (!current.selectedSourceIds.includes(sourceId)) return current;
+        return {
+          ...current,
+          sourceDepthOverrides: [
+            ...current.sourceDepthOverrides.filter((override) => override.sourceId !== sourceId),
+            { sourceId, loadDepth },
+          ],
+          preview: null,
+          previewError: undefined,
+        };
+      });
+    },
+    [],
+  );
 
   const changeSourceContextPlannerBudget = React.useCallback(
     (budget: SourceContextPlannerBudget) => {
@@ -1561,12 +1619,17 @@ function ClioContentApp() {
         previewLoading: true,
         previewError: undefined,
       }));
+      const sourceDepthOverrides = sourceContextPlannerDepthOverridesForSelection({
+        sourceIds,
+        sourceDepthOverrides: sourceContextPlanner.sourceDepthOverrides,
+      });
       try {
         const pack = await requestEngine({
           kind: "buildSourceContextPack",
           payload: {
             query: normalizedQuery,
             sourceIds,
+            ...(sourceDepthOverrides.length === 0 ? {} : { sourceDepthOverrides }),
             useWorkingSet: false,
             ...sourceContextPlanner.budget,
           },
@@ -1591,7 +1654,12 @@ function ClioContentApp() {
         showToast(errorToast(error));
       }
     },
-    [showToast, sourceContextPlanner.budget, sourceContextPlanner.selectedSourceIds],
+    [
+      showToast,
+      sourceContextPlanner.budget,
+      sourceContextPlanner.selectedSourceIds,
+      sourceContextPlanner.sourceDepthOverrides,
+    ],
   );
 
   const loadChatHistory = React.useCallback(async () => {
@@ -1668,6 +1736,7 @@ function ClioContentApp() {
                 }
                 void loadChatHistory();
                 void loadSourceContextCompressionLogs(session.id);
+                void loadSourceContextMapArtifacts(session.id);
               })
               .catch(() => undefined);
           },
@@ -1682,7 +1751,12 @@ function ClioContentApp() {
         },
       );
     },
-    [loadChatHistory, loadSourceContextCompressionLogs, maybeAttachReplySuggestions],
+    [
+      loadChatHistory,
+      loadSourceContextCompressionLogs,
+      loadSourceContextMapArtifacts,
+      maybeAttachReplySuggestions,
+    ],
   );
 
   const loadChatSession = React.useCallback(
@@ -1720,7 +1794,8 @@ function ClioContentApp() {
 
   React.useEffect(() => {
     void loadSourceContextCompressionLogs(railState.activeSessionId);
-  }, [loadSourceContextCompressionLogs, railState.activeSessionId]);
+    void loadSourceContextMapArtifacts(railState.activeSessionId);
+  }, [loadSourceContextCompressionLogs, loadSourceContextMapArtifacts, railState.activeSessionId]);
 
   const openHome = React.useCallback(async () => {
     setDetail(null);
@@ -3771,11 +3846,17 @@ function ClioContentApp() {
       void startAgentRun(normalizedQuestion, undefined, "general", undefined, {
         sourceContextPack: sourceContextPackOptionsFromPlanner({
           sourceIds,
+          sourceDepthOverrides: sourceContextPlanner.sourceDepthOverrides,
           budget: sourceContextPlanner.budget,
         }),
       });
     },
-    [sourceContextPlanner.budget, sourceContextPlanner.selectedSourceIds, startAgentRun],
+    [
+      sourceContextPlanner.budget,
+      sourceContextPlanner.selectedSourceIds,
+      sourceContextPlanner.sourceDepthOverrides,
+      startAgentRun,
+    ],
   );
 
   const handleSubmitDialogue = React.useCallback(
@@ -4161,6 +4242,7 @@ function ClioContentApp() {
         knowledgeBaseRetrieveFilter={knowledgeBaseRetrieveFilter}
         workingSetStatus={workingSetStatus}
         sourceContextCompressionLogs={sourceContextCompressionLogs}
+        sourceContextMapArtifacts={sourceContextMapArtifacts}
         sourceContextPlanner={sourceContextPlanner}
         topicDetail={topicDetail}
         topicForm={topicForm}
@@ -4238,8 +4320,12 @@ function ClioContentApp() {
         onRefreshSourceContextCompressionLogs={() =>
           void loadSourceContextCompressionLogs(railState.activeSessionId)
         }
+        onRefreshSourceContextMapArtifacts={() =>
+          void loadSourceContextMapArtifacts(railState.activeSessionId)
+        }
         onSelectSourceContextPlannerSource={selectSourceContextPlannerSource}
         onRemoveSourceContextPlannerSource={removeSourceContextPlannerSource}
+        onSetSourceContextPlannerSourceDepth={setSourceContextPlannerSourceDepth}
         onSourceContextPlannerBudgetChange={changeSourceContextPlannerBudget}
         onPreviewSourceContextPlanner={(query) => void previewSourceContextPlanner(query)}
         onStartSourceContextPlannerResearch={startSourceContextPlannerResearch}

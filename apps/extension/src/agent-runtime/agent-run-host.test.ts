@@ -9,6 +9,7 @@ import type {
 import { describe, expect, it } from "vitest";
 import { AgentRunHost } from "./agent-run-host";
 import type { IClioCompactionRuntime } from "./compaction-context";
+import type { SemanticCitationJudge } from "./semantic-citation-judge";
 import type { AgentChatRequest, AgentStreamEvent, IAgentRuntime, LocalCitation } from "./types";
 
 function request(overrides: Partial<AgentChatRequest> = {}): AgentChatRequest {
@@ -45,6 +46,29 @@ function memoryCitation(overrides: Partial<LocalCitation> = {}): LocalCitation {
     sourceUrl: memoryEvidence.sourceUrl,
     sourceTitle: memoryEvidence.sourceTitle,
     excerpt: memoryEvidence.excerpt,
+    ...overrides,
+  };
+}
+
+function sourceContextCitation(
+  evidenceId = "memory:source-1:chunk:chunk-1",
+  overrides: Partial<LocalCitation> = {},
+): LocalCitation {
+  return {
+    id: `run-1:citation:${evidenceId}`,
+    evidenceId,
+    label: "Saved Memory",
+    sourceKind: "memory",
+    sourceUrl:
+      evidenceId === "memory:source-2:chunk:chunk-2"
+        ? "https://example.com/notes"
+        : "https://example.com/paper.pdf",
+    sourceTitle:
+      evidenceId === "memory:source-2:chunk:chunk-2" ? "Persistence Notes" : "Persistence Paper",
+    excerpt:
+      evidenceId === "memory:source-2:chunk:chunk-2"
+        ? "Second bounded source context."
+        : "Bounded source context text.",
     ...overrides,
   };
 }
@@ -105,6 +129,66 @@ const sourceContextPack = {
   },
 } satisfies SourceContextPackResult;
 
+function primarySourceContextGroup(): SourceContextPackResult["groups"][number] {
+  const group = sourceContextPack.groups[0];
+  if (group === undefined) {
+    throw new Error("source context pack fixture must include a primary group");
+  }
+  return group;
+}
+
+const multiGroupSourceContextPack = {
+  query: "Explain persistence",
+  sources: [
+    ...sourceContextPack.sources,
+    {
+      id: "source-2",
+      sourceKind: "page",
+      sourceUrl: "https://example.com/notes",
+      sourceTitle: "Persistence Notes",
+      capturedAt: "2026-05-21T00:00:00.000Z",
+      sourceType: "html",
+      sectionOutline: [],
+      chunkCount: 2,
+      tokenEstimate: 200,
+      selectedTokenEstimate: 18,
+      requestedLoadDepth: "chunks",
+      selectedLoadDepth: "chunks",
+      windowCount: 1,
+    },
+  ],
+  groups: [
+    primarySourceContextGroup(),
+    {
+      id: "group-2",
+      sourceIds: ["source-2"],
+      tokenEstimate: 18,
+      windows: [
+        {
+          sourceId: "source-2",
+          chunkId: "chunk-2",
+          ord: 0,
+          text: "Second bounded source context.",
+          tokenCount: 18,
+          sourceKind: "page",
+          sourceUrl: "https://example.com/notes",
+          sourceTitle: "Persistence Notes",
+          sourceType: "html",
+          priority: "query",
+        },
+      ],
+    },
+  ],
+  compressionLog: sourceContextPack.compressionLog,
+  trace: {
+    strategy: "source_context_pack_v1",
+    requestedSourceCount: 2,
+    packedSourceCount: 2,
+    totalTokenEstimate: 42,
+    budget: 10_000,
+  },
+} satisfies SourceContextPackResult;
+
 const emptySourceContextPack = {
   query: "Explain persistence",
   sources: [],
@@ -124,6 +208,7 @@ const queuedSourceContextPack = {
   planner: "source_context_planner_v1",
   triggerReason: "default_chat_long_context_intent",
   sourceIds: ["source-1"],
+  sourceDepthOverrides: [{ sourceId: "source-1", loadDepth: "full" }],
   useWorkingSet: false,
   maxTotalTokens: 6_000,
   maxGroups: 2,
@@ -149,6 +234,15 @@ function runtimeFrom(events: AgentStreamEvent[]): IAgentRuntime {
   };
 }
 
+const supportedSemanticCitationJudge: SemanticCitationJudge = {
+  judge: async (input) => ({
+    status: "supported",
+    checkedClaimCount: input.claims.length,
+    unsupportedClaimIds: [],
+    providerKind: "chat",
+  }),
+};
+
 function engineRecorder() {
   const calls: EngineRequest[] = [];
   return {
@@ -159,6 +253,26 @@ function engineRecorder() {
       return {} as T;
     },
   };
+}
+
+type AppendSourceContextMapArtifactsRequest = Extract<
+  EngineRequest,
+  { kind: "appendSourceContextMapArtifacts" }
+>;
+
+function sourceContextMapArtifactAppendResponse<T>(
+  request: AppendSourceContextMapArtifactsRequest,
+  nextId: () => string,
+): T {
+  return {
+    items: request.payload.entries.map((entry) => ({
+      ...entry,
+      id: nextId(),
+      ...(request.payload.sessionId === undefined ? {} : { sessionId: request.payload.sessionId }),
+      runId: request.payload.runId,
+      createdAt: entry.createdAt ?? request.payload.createdAt ?? "2026-05-22T00:00:00.000Z",
+    })),
+  } as T;
 }
 
 function session(overrides: Partial<ChatSessionDetail> = {}): ChatSessionDetail {
@@ -597,6 +711,10 @@ describe("AgentRunHost", () => {
         sourceContextPack: {
           mode: "research",
           sourceIds: ["source-1", "source-2"],
+          sourceDepthOverrides: [
+            { sourceId: "source-1", loadDepth: "meta" },
+            { sourceId: "source-2", loadDepth: "full" },
+          ],
           useWorkingSet: false,
           maxTotalTokens: 8_000,
           maxSources: 2,
@@ -612,6 +730,10 @@ describe("AgentRunHost", () => {
         payload: expect.objectContaining({
           query: "Explain persistence",
           sourceIds: ["source-1", "source-2"],
+          sourceDepthOverrides: [
+            { sourceId: "source-1", loadDepth: "meta" },
+            { sourceId: "source-2", loadDepth: "full" },
+          ],
           useWorkingSet: false,
           maxTotalTokens: 8_000,
           maxSources: 2,
@@ -686,6 +808,417 @@ describe("AgentRunHost", () => {
           "group-1: 1 source(s), 24 token(s), 1 window(s).",
       }),
     );
+  });
+
+  it("executes source context map-reduce with bounded group evidence", async () => {
+    let artifactId = 0;
+    const calls: EngineRequest[] = [];
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          providerRequests.push(agentRequest);
+          if (agentRequest.runId === "run-1:map:1:group-1") {
+            yield {
+              type: "text_delta",
+              runId: agentRequest.runId,
+              delta: "map-one finding",
+            } satisfies AgentStreamEvent;
+            yield {
+              type: "citation",
+              runId: agentRequest.runId,
+              citation: sourceContextCitation("memory:source-1:chunk:chunk-1"),
+            } satisfies AgentStreamEvent;
+            yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+            return;
+          }
+          if (agentRequest.runId === "run-1:map:2:group-2") {
+            yield {
+              type: "text_delta",
+              runId: agentRequest.runId,
+              delta: "map-two finding",
+            } satisfies AgentStreamEvent;
+            yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+            return;
+          }
+          yield {
+            type: "text_delta",
+            runId: agentRequest.runId,
+            delta: "Second bounded source context.",
+          } satisfies AgentStreamEvent;
+          yield {
+            type: "citation",
+            runId: agentRequest.runId,
+            citation: sourceContextCitation("memory:source-2:chunk:chunk-2", {
+              outputOffset: "Second bounded source context.".length,
+            }),
+          } satisfies AgentStreamEvent;
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
+        if (engineRequest.kind === "buildSourceContextPack")
+          return multiGroupSourceContextPack as T;
+        if (engineRequest.kind === "appendSourceContextMapArtifacts") {
+          return sourceContextMapArtifactAppendResponse(engineRequest, () => {
+            artifactId += 1;
+            return `artifact-${artifactId}`;
+          });
+        }
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      semanticCitationJudge: supportedSemanticCitationJudge,
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: {
+          mode: "auto",
+          mapReduce: { enabled: true, maxGroups: 2, perGroupTokenBudget: 500 },
+        },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(providerRequests).toHaveLength(3);
+    expect(providerRequests[0]?.evidence.map((item) => item.id)).toEqual([
+      "memory:source-1:chunk:chunk-1",
+    ]);
+    expect(providerRequests[1]?.evidence.map((item) => item.id)).toEqual([
+      "memory:source-2:chunk:chunk-2",
+    ]);
+    expect(providerRequests[2]?.runId).toBe("run-1");
+    expect(providerRequests[2]?.question).toContain("Group analyses:");
+    expect(providerRequests[2]?.question).toContain("map-one finding");
+    expect(providerRequests[2]?.question).toContain("map-two finding");
+    expect(providerRequests[2]?.evidence.map((item) => item.id)).toEqual([
+      "memory:source-1:chunk:chunk-1",
+      "memory:source-2:chunk:chunk-2",
+    ]);
+    expect(
+      emitted
+        .filter((event): event is Extract<AgentStreamEvent, { type: "text_delta" }> => {
+          return event.type === "text_delta";
+        })
+        .map((event) => event.delta),
+    ).toEqual(["Second bounded source context."]);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "runtime_status",
+        message: "Map-reduce reducing 2 group result(s).",
+      }),
+    );
+    expect(emitted.find((event) => event.type === "citation_validation")).toMatchObject({
+      validation: {
+        memoryEvidenceCount: 2,
+        citationCount: 1,
+      },
+    });
+    const artifactCalls = calls.filter(
+      (
+        engineRequest,
+      ): engineRequest is Extract<EngineRequest, { kind: "appendSourceContextMapArtifacts" }> =>
+        engineRequest.kind === "appendSourceContextMapArtifacts",
+    );
+    expect(artifactCalls.map((call) => call.payload.entries[0]?.stage)).toEqual([
+      "map",
+      "map",
+      "map",
+      "map",
+      "reduce",
+      "reduce",
+    ]);
+    expect(artifactCalls.map((call) => call.payload.entries[0]?.status)).toEqual([
+      "started",
+      "completed",
+      "started",
+      "completed",
+      "started",
+      "completed",
+    ]);
+    expect(artifactCalls[1]?.payload.entries[0]).toMatchObject({
+      stage: "map",
+      status: "completed",
+      groupId: "group-1",
+      sourceIds: ["source-1"],
+      windowRefs: [{ sourceId: "source-1", chunkId: "chunk-1", ord: 0 }],
+      evidenceIds: ["memory:source-1:chunk:chunk-1"],
+      outputSummary: "map-one finding",
+    });
+    expect(artifactCalls[4]?.payload.entries[0]).toMatchObject({
+      stage: "reduce",
+      status: "started",
+      mapArtifactIds: ["artifact-2", "artifact-4"],
+    });
+    expect(artifactCalls[5]?.payload.entries[0]).toMatchObject({
+      stage: "reduce",
+      status: "completed",
+      mapArtifactIds: ["artifact-2", "artifact-4"],
+      outputSummary: "Second bounded source context.",
+    });
+    const artifactPayloadText = JSON.stringify(artifactCalls.map((call) => call.payload.entries));
+    expect(artifactPayloadText).not.toContain("  Bounded   source context text. ");
+    expect(artifactPayloadText).not.toContain("sourceUrl");
+  });
+
+  it("falls back to single-pass source context when a map call fails", async () => {
+    let artifactId = 0;
+    const calls: EngineRequest[] = [];
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          providerRequests.push(agentRequest);
+          if (agentRequest.runId.includes(":map:")) {
+            yield {
+              type: "run_failed",
+              runId: agentRequest.runId,
+              error: { code: "PROVIDER_ERROR", message: "map failed" },
+            } satisfies AgentStreamEvent;
+            return;
+          }
+          yield {
+            type: "text_delta",
+            runId: agentRequest.runId,
+            delta: "Bounded source context text.",
+          } satisfies AgentStreamEvent;
+          yield {
+            type: "citation",
+            runId: agentRequest.runId,
+            citation: sourceContextCitation("memory:source-1:chunk:chunk-1", {
+              outputOffset: "Bounded source context text.".length,
+            }),
+          } satisfies AgentStreamEvent;
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
+        if (engineRequest.kind === "buildSourceContextPack")
+          return multiGroupSourceContextPack as T;
+        if (engineRequest.kind === "appendSourceContextMapArtifacts") {
+          return sourceContextMapArtifactAppendResponse(engineRequest, () => {
+            artifactId += 1;
+            return `artifact-failed-map-${artifactId}`;
+          });
+        }
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      semanticCitationJudge: supportedSemanticCitationJudge,
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: { mode: "research", mapReduce: { enabled: true } },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(providerRequests).toHaveLength(2);
+    expect(providerRequests[1]?.runId).toBe("run-1");
+    expect(providerRequests[1]?.question).toBe("Explain persistence");
+    expect(providerRequests[1]?.evidence.map((item) => item.id)).toEqual([
+      "memory:source-1:chunk:chunk-1",
+      "memory:source-2:chunk:chunk-2",
+    ]);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "runtime_status",
+        message:
+          "Map-reduce fallback: map stage failed; using single-pass source context. Reason: map failed",
+      }),
+    );
+    const artifactCalls = calls.filter(
+      (
+        engineRequest,
+      ): engineRequest is Extract<EngineRequest, { kind: "appendSourceContextMapArtifacts" }> =>
+        engineRequest.kind === "appendSourceContextMapArtifacts",
+    );
+    expect(artifactCalls.map((call) => call.payload.entries[0]?.status)).toEqual([
+      "started",
+      "failed",
+    ]);
+    expect(artifactCalls[1]?.payload.entries[0]).toMatchObject({
+      stage: "map",
+      status: "failed",
+      errorCode: "PROVIDER_ERROR",
+      errorMessage: "map failed",
+    });
+    expect(artifactCalls.some((call) => call.payload.entries[0]?.stage === "reduce")).toBe(false);
+  });
+
+  it("falls back to single-pass source context when reduce fails before visible output", async () => {
+    let artifactId = 0;
+    const calls: EngineRequest[] = [];
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest) {
+          providerRequests.push(agentRequest);
+          if (agentRequest.runId.includes(":map:")) {
+            yield {
+              type: "text_delta",
+              runId: agentRequest.runId,
+              delta: `${agentRequest.runId} map finding`,
+            } satisfies AgentStreamEvent;
+            yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+            return;
+          }
+          if (agentRequest.question.includes("Group analyses:")) {
+            yield {
+              type: "run_failed",
+              runId: agentRequest.runId,
+              error: { code: "PROVIDER_ERROR", message: "reduce failed" },
+            } satisfies AgentStreamEvent;
+            return;
+          }
+          yield {
+            type: "text_delta",
+            runId: agentRequest.runId,
+            delta: "Bounded source context text.",
+          } satisfies AgentStreamEvent;
+          yield {
+            type: "citation",
+            runId: agentRequest.runId,
+            citation: sourceContextCitation("memory:source-1:chunk:chunk-1", {
+              outputOffset: "Bounded source context text.".length,
+            }),
+          } satisfies AgentStreamEvent;
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        calls.push(engineRequest);
+        if (engineRequest.kind === "buildSourceContextPack")
+          return multiGroupSourceContextPack as T;
+        if (engineRequest.kind === "appendSourceContextMapArtifacts") {
+          return sourceContextMapArtifactAppendResponse(engineRequest, () => {
+            artifactId += 1;
+            return `artifact-failed-reduce-${artifactId}`;
+          });
+        }
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      semanticCitationJudge: supportedSemanticCitationJudge,
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: { mode: "research", mapReduce: { enabled: true } },
+      }),
+    );
+
+    await waitFor(() => emitted.some((event) => event.type === "run_completed"));
+
+    expect(providerRequests).toHaveLength(4);
+    expect(providerRequests[2]?.question).toContain("Group analyses:");
+    expect(providerRequests[3]?.question).toBe("Explain persistence");
+    expect(
+      emitted
+        .filter((event): event is Extract<AgentStreamEvent, { type: "text_delta" }> => {
+          return event.type === "text_delta";
+        })
+        .map((event) => event.delta),
+    ).toEqual(["Bounded source context text."]);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "runtime_status",
+        message:
+          "Map-reduce fallback: reduce stage failed; using single-pass source context. Reason: reduce failed",
+      }),
+    );
+    expect(emitted.some((event) => event.type === "run_failed")).toBe(false);
+    const artifactCalls = calls.filter(
+      (
+        engineRequest,
+      ): engineRequest is Extract<EngineRequest, { kind: "appendSourceContextMapArtifacts" }> =>
+        engineRequest.kind === "appendSourceContextMapArtifacts",
+    );
+    expect(artifactCalls.map((call) => call.payload.entries[0]?.status)).toEqual([
+      "started",
+      "completed",
+      "started",
+      "completed",
+      "started",
+      "failed",
+    ]);
+    expect(artifactCalls[5]?.payload.entries[0]).toMatchObject({
+      stage: "reduce",
+      status: "failed",
+      mapArtifactIds: ["artifact-failed-reduce-2", "artifact-failed-reduce-4"],
+      errorCode: "PROVIDER_ERROR",
+      errorMessage: "reduce failed",
+    });
+  });
+
+  it("cancels during source context map without falling back", async () => {
+    const providerRequests: AgentChatRequest[] = [];
+    const emitted: AgentStreamEvent[] = [];
+    const host = new AgentRunHost({
+      runtime: {
+        streamChat: async function* (agentRequest, options) {
+          providerRequests.push(agentRequest);
+          if (agentRequest.runId.includes(":map:")) {
+            while (options?.signal?.aborted !== true) {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+            yield {
+              type: "run_cancelled",
+              runId: agentRequest.runId,
+              reason: "User stopped the response.",
+            } satisfies AgentStreamEvent;
+            return;
+          }
+          yield { type: "run_completed", runId: agentRequest.runId } satisfies AgentStreamEvent;
+        },
+      },
+      requestEngine: async <T>(engineRequest: EngineRequest): Promise<T> => {
+        if (engineRequest.kind === "buildSourceContextPack")
+          return multiGroupSourceContextPack as T;
+        if (engineRequest.kind === "loadChatSession") return null as T;
+        return {} as T;
+      },
+      emitEvent: (event) => emitted.push(event),
+    });
+
+    host.start(
+      request({
+        scope: "general",
+        sourceContextPack: { mode: "research", mapReduce: { enabled: true } },
+      }),
+    );
+
+    await waitFor(() => providerRequests.length === 1);
+    host.cancel("run-1");
+    await waitFor(() => emitted.some((event) => event.type === "run_cancelled"));
+
+    expect(providerRequests).toHaveLength(1);
+    expect(emitted).toContainEqual({
+      type: "run_cancelled",
+      runId: "run-1",
+      reason: "User stopped the response.",
+    });
+    expect(
+      emitted.some(
+        (event) =>
+          event.type === "runtime_status" && event.message.startsWith("Map-reduce fallback"),
+      ),
+    ).toBe(false);
   });
 
   it("passes explicit source context pack budget overrides to the Engine", async () => {

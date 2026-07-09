@@ -44,11 +44,19 @@ export interface SourceContextPackMapReduceOptions {
   perGroupTokenBudget?: number;
 }
 
+export type SourceContextPackLoadDepth = "meta" | "outline" | "chunks" | "full";
+
+export interface SourceContextPackSourceDepthOverride {
+  sourceId: string;
+  loadDepth: SourceContextPackLoadDepth;
+}
+
 export interface SourceContextPackRequestOptions {
   mode: SourceContextPackMode;
   planner?: SourceContextPlannerKind;
   triggerReason?: string;
   sourceIds?: string[];
+  sourceDepthOverrides?: SourceContextPackSourceDepthOverride[];
   useWorkingSet?: boolean;
   maxTotalTokens?: number;
   maxGroups?: number;

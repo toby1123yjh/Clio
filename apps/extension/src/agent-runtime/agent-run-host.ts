@@ -5,6 +5,9 @@ import type {
   CompactionRecord,
   EngineRequest,
   SessionEvidenceRecord,
+  SourceContextMapArtifactEntry,
+  SourceContextMapArtifactRecord,
+  SourceContextPackGroup,
   SourceContextPackResult,
   SourceContextPackWindow,
 } from "@/src/shared/rpc";
@@ -26,6 +29,7 @@ import {
 } from "./source-context-pack-options";
 import type {
   AgentChatRequest,
+  AgentErrorInfo,
   AgentStreamEvent,
   CitationValidationReason,
   CitationValidationResult,
@@ -58,12 +62,51 @@ interface HostedAgentRun {
   citationRepairReason?: CitationValidationReason;
   worldKnowledge: string[];
   content: string;
+  sourceContextReduceArtifact?: SourceContextReduceArtifactState;
 }
 
 interface HostedManualCompactRun {
   runId: string;
   sessionId?: string;
   abortController: AbortController;
+}
+
+interface SourceContextPackPreparation {
+  pack: SourceContextPackResult;
+  evidence: EvidenceItem[];
+  options: NonNullable<AgentChatRequest["sourceContextPack"]>;
+}
+
+interface PreparedProviderRequest {
+  request: AgentChatRequest;
+  sourceContextPack?: SourceContextPackPreparation;
+}
+
+interface SourceContextMapResult {
+  groupId: string;
+  text: string;
+  citations: LocalCitation[];
+  evidenceIds: string[];
+  tokenEstimate: number;
+  artifactId?: string;
+}
+
+interface SourceContextReduceArtifactState {
+  mapArtifactIds: string[];
+  inputSummary: string;
+  tokenEstimate: number;
+}
+
+class SourceContextMapReduceStageError extends Error {
+  readonly stage: "map" | "reduce";
+  readonly providerError?: AgentErrorInfo;
+
+  constructor(stage: "map" | "reduce", message: string, providerError?: AgentErrorInfo) {
+    super(message);
+    this.name = "SourceContextMapReduceStageError";
+    this.stage = stage;
+    this.providerError = providerError;
+  }
 }
 
 export class AgentRunHost {
@@ -166,38 +209,138 @@ export class AgentRunHost {
 
   private async pump(run: HostedAgentRun) {
     let terminalEventEmitted = false;
+    let reduceFailureFallbackRequest: AgentChatRequest | undefined;
+    let visibleAnswerStarted = false;
     try {
-      const preparedRequest = await this.prepareProviderRequest(run);
-      if (preparedRequest === undefined) {
+      const prepared = await this.prepareProviderRequest(run);
+      if (prepared === undefined) {
         terminalEventEmitted = true;
         return;
       }
 
-      run.request = preparedRequest;
       run.providerStarted = true;
+      const providerPreparation = await this.prepareMapReduceProviderRequest(run, prepared);
+      run.request = providerPreparation.request;
+      reduceFailureFallbackRequest = providerPreparation.reduceFailureFallbackRequest;
       providerAttempts: while (!run.abortController.signal.aborted) {
-        for await (const event of this.runtime.streamChat(run.request, {
-          signal: run.abortController.signal,
-        })) {
-          if (event.type === "run_completed") {
-            const validationEvent = await this.buildCitationValidationEvent(run);
-            if (this.shouldRepairCitationValidation(run, validationEvent.validation)) {
-              await this.startCitationRepair(run, validationEvent.validation);
+        try {
+          for await (const event of this.runtime.streamChat(run.request, {
+            signal: run.abortController.signal,
+          })) {
+            if (
+              event.type === "run_failed" &&
+              reduceFailureFallbackRequest !== undefined &&
+              !visibleAnswerStarted &&
+              !run.abortController.signal.aborted
+            ) {
+              await this.persistSourceContextReduceArtifact(run, {
+                stage: "reduce",
+                status: "failed",
+                mapArtifactIds: run.sourceContextReduceArtifact?.mapArtifactIds,
+                inputSummary: run.sourceContextReduceArtifact?.inputSummary,
+                tokenEstimate: run.sourceContextReduceArtifact?.tokenEstimate,
+                errorCode: event.error.code,
+                errorMessage: event.error.message,
+              });
+              run.sourceContextReduceArtifact = undefined;
+              this.emitEvent({
+                type: "runtime_status",
+                runId: run.request.runId,
+                message: sourceContextMapReduceFallbackMessage("reduce", event.error),
+              });
+              run.request = reduceFailureFallbackRequest;
+              reduceFailureFallbackRequest = undefined;
+              visibleAnswerStarted = false;
               continue providerAttempts;
             }
-            await this.persistEvent(run, validationEvent);
-            this.emitEvent(validationEvent);
-          }
-          await this.persistEvent(run, event);
-          if (isTerminalAgentEvent(event)) {
-            terminalEventEmitted = true;
+            if (isVisibleAssistantAnswerEvent(event)) {
+              visibleAnswerStarted = true;
+            }
+            if (event.type === "run_failed" && run.sourceContextReduceArtifact !== undefined) {
+              await this.persistSourceContextReduceArtifact(run, {
+                stage: "reduce",
+                status: "failed",
+                mapArtifactIds: run.sourceContextReduceArtifact.mapArtifactIds,
+                inputSummary: run.sourceContextReduceArtifact.inputSummary,
+                tokenEstimate: run.sourceContextReduceArtifact.tokenEstimate,
+                errorCode: event.error.code,
+                errorMessage: event.error.message,
+              });
+              run.sourceContextReduceArtifact = undefined;
+              reduceFailureFallbackRequest = undefined;
+            }
+            if (event.type === "run_cancelled" && run.sourceContextReduceArtifact !== undefined) {
+              await this.persistSourceContextReduceArtifact(run, {
+                stage: "reduce",
+                status: "failed",
+                mapArtifactIds: run.sourceContextReduceArtifact.mapArtifactIds,
+                inputSummary: run.sourceContextReduceArtifact.inputSummary,
+                tokenEstimate: run.sourceContextReduceArtifact.tokenEstimate,
+                errorCode: "CANCELLED",
+                errorMessage: event.reason ?? "Map-reduce reduce stage was cancelled.",
+              });
+              run.sourceContextReduceArtifact = undefined;
+              reduceFailureFallbackRequest = undefined;
+            }
             if (event.type === "run_completed") {
-              await this.startNextQueuedFollowUp(run);
+              const validationEvent = await this.buildCitationValidationEvent(run);
+              if (this.shouldRepairCitationValidation(run, validationEvent.validation)) {
+                reduceFailureFallbackRequest = undefined;
+                await this.startCitationRepair(run, validationEvent.validation);
+                visibleAnswerStarted = false;
+                continue providerAttempts;
+              }
+              await this.persistSourceContextReduceArtifact(run, {
+                stage: "reduce",
+                status: "completed",
+                mapArtifactIds: run.sourceContextReduceArtifact?.mapArtifactIds,
+                inputSummary: run.sourceContextReduceArtifact?.inputSummary,
+                outputSummary: truncatePromptText(run.content, 1800),
+                tokenEstimate: run.sourceContextReduceArtifact?.tokenEstimate,
+              });
+              run.sourceContextReduceArtifact = undefined;
+              await this.persistEvent(run, validationEvent);
+              this.emitEvent(validationEvent);
+            }
+            await this.persistEvent(run, event);
+            if (isTerminalAgentEvent(event)) {
+              terminalEventEmitted = true;
+              if (event.type === "run_completed") {
+                await this.startNextQueuedFollowUp(run);
+              }
+              this.emitEvent(event);
+              return;
             }
             this.emitEvent(event);
-            return;
           }
-          this.emitEvent(event);
+        } catch (error) {
+          if (
+            reduceFailureFallbackRequest !== undefined &&
+            !visibleAnswerStarted &&
+            !run.abortController.signal.aborted
+          ) {
+            const providerError = providerErrorFromUnknown(error);
+            await this.persistSourceContextReduceArtifact(run, {
+              stage: "reduce",
+              status: "failed",
+              mapArtifactIds: run.sourceContextReduceArtifact?.mapArtifactIds,
+              inputSummary: run.sourceContextReduceArtifact?.inputSummary,
+              tokenEstimate: run.sourceContextReduceArtifact?.tokenEstimate,
+              errorCode: providerError.code,
+              errorMessage: providerError.message,
+            });
+            run.sourceContextReduceArtifact = undefined;
+            this.emitEvent({
+              type: "runtime_status",
+              runId: run.request.runId,
+              message: sourceContextMapReduceFallbackMessage("reduce", providerError),
+            });
+            run.request = reduceFailureFallbackRequest;
+            reduceFailureFallbackRequest = undefined;
+            visibleAnswerStarted = false;
+            continue;
+          }
+          throw error;
         }
       }
     } catch (error) {
@@ -224,6 +367,18 @@ export class AgentRunHost {
           message: error instanceof Error ? error.message : String(error),
         },
       };
+      if (run.sourceContextReduceArtifact !== undefined) {
+        await this.persistSourceContextReduceArtifact(run, {
+          stage: "reduce",
+          status: "failed",
+          mapArtifactIds: run.sourceContextReduceArtifact.mapArtifactIds,
+          inputSummary: run.sourceContextReduceArtifact.inputSummary,
+          tokenEstimate: run.sourceContextReduceArtifact.tokenEstimate,
+          errorCode: event.error.code,
+          errorMessage: event.error.message,
+        });
+        run.sourceContextReduceArtifact = undefined;
+      }
       await this.persistEvent(run, event);
       this.emitEvent(event);
       terminalEventEmitted = true;
@@ -241,23 +396,26 @@ export class AgentRunHost {
     }
   }
 
-  private async prepareProviderRequest(run: HostedAgentRun): Promise<AgentChatRequest | undefined> {
-    const sourceContextRequest = await this.buildSourceContextPackRequest(run);
+  private async prepareProviderRequest(
+    run: HostedAgentRun,
+  ): Promise<PreparedProviderRequest | undefined> {
+    const sourceContextPreparation = await this.buildSourceContextPackRequest(run);
     if (run.abortController.signal.aborted) {
       await this.resolvePreProviderStop(run);
       return undefined;
     }
 
+    const sourceContextRequest = sourceContextPreparation.request;
     const { sessionId } = sourceContextRequest;
     if (this.compactionRuntime === undefined || sessionId === undefined) {
-      return sourceContextRequest;
+      return sourceContextPreparation;
     }
 
     const session = await this.requestEngine<ChatSessionDetail | null>({
       kind: "loadChatSession",
       sessionId,
     });
-    if (session === null) return sourceContextRequest;
+    if (session === null) return sourceContextPreparation;
 
     let latestCompaction = await this.requestEngine<CompactionRecord | null>({
       kind: "getLatestCompaction",
@@ -326,12 +484,17 @@ export class AgentRunHost {
       return undefined;
     }
 
-    return requestWithContext;
+    return {
+      ...sourceContextPreparation,
+      request: requestWithContext,
+    };
   }
 
-  private async buildSourceContextPackRequest(run: HostedAgentRun): Promise<AgentChatRequest> {
+  private async buildSourceContextPackRequest(
+    run: HostedAgentRun,
+  ): Promise<PreparedProviderRequest> {
     const sourceContextPackOptions = run.request.sourceContextPack;
-    if (sourceContextPackOptions === undefined) return run.request;
+    if (sourceContextPackOptions === undefined) return { request: run.request };
 
     this.emitEvent({
       type: "runtime_status",
@@ -353,7 +516,7 @@ export class AgentRunHost {
           runId: run.request.runId,
           message: "No source context found; continuing without it.",
         });
-        return run.request;
+        return { request: run.request };
       }
 
       this.emitEvent({
@@ -370,8 +533,15 @@ export class AgentRunHost {
       }
 
       return {
-        ...run.request,
-        evidence: mergeEvidence(run.request.evidence, packEvidence),
+        request: {
+          ...run.request,
+          evidence: mergeEvidence(run.request.evidence, packEvidence),
+        },
+        sourceContextPack: {
+          pack,
+          evidence: packEvidence,
+          options: sourceContextPackOptions,
+        },
       };
     } catch {
       this.emitEvent({
@@ -379,8 +549,205 @@ export class AgentRunHost {
         runId: run.request.runId,
         message: "Source context unavailable; continuing without it.",
       });
-      return run.request;
+      return { request: run.request };
     }
+  }
+
+  private async prepareMapReduceProviderRequest(
+    run: HostedAgentRun,
+    prepared: PreparedProviderRequest,
+  ): Promise<{ request: AgentChatRequest; reduceFailureFallbackRequest?: AgentChatRequest }> {
+    const sourceContextPack = prepared.sourceContextPack;
+    if (
+      sourceContextPack === undefined ||
+      sourceContextPack.options.mapReduce?.enabled !== true ||
+      sourceContextPackExecutableGroups(sourceContextPack).length === 0
+    ) {
+      return { request: prepared.request };
+    }
+
+    const fallbackRequest = sourceContextSinglePassRequest(
+      prepared.request,
+      sourceContextPack.evidence,
+    );
+    try {
+      const mapResults = await this.executeSourceContextMapStage(
+        run,
+        prepared.request,
+        sourceContextPack,
+      );
+      if (run.abortController.signal.aborted) throw new Error("Map-reduce was cancelled.");
+      this.emitEvent({
+        type: "runtime_status",
+        runId: prepared.request.runId,
+        message: sourceContextMapReduceReduceStartedMessage(mapResults),
+        running: true,
+      });
+      const reduceArtifact = await this.persistSourceContextReduceArtifact(run, {
+        stage: "reduce",
+        status: "started",
+        mapArtifactIds: sourceContextMapArtifactIds(mapResults),
+        inputSummary: sourceContextReduceArtifactInputSummary(mapResults),
+        tokenEstimate: mapResults.reduce((total, result) => total + result.tokenEstimate, 0),
+      });
+      run.sourceContextReduceArtifact = {
+        mapArtifactIds: reduceArtifact?.mapArtifactIds ?? sourceContextMapArtifactIds(mapResults),
+        inputSummary: sourceContextReduceArtifactInputSummary(mapResults),
+        tokenEstimate: mapResults.reduce((total, result) => total + result.tokenEstimate, 0),
+      };
+      return {
+        request: buildSourceContextReduceRequest(prepared.request, sourceContextPack, mapResults),
+        reduceFailureFallbackRequest: fallbackRequest,
+      };
+    } catch (error) {
+      if (run.abortController.signal.aborted) throw error;
+      const providerError =
+        error instanceof SourceContextMapReduceStageError
+          ? error.providerError
+          : providerErrorFromUnknown(error);
+      this.emitEvent({
+        type: "runtime_status",
+        runId: prepared.request.runId,
+        message: sourceContextMapReduceFallbackMessage("map", providerError),
+      });
+      return { request: fallbackRequest };
+    }
+  }
+
+  private async executeSourceContextMapStage(
+    run: HostedAgentRun,
+    baseRequest: AgentChatRequest,
+    sourceContextPack: SourceContextPackPreparation,
+  ): Promise<SourceContextMapResult[]> {
+    const groups = sourceContextPackExecutableGroups(sourceContextPack);
+    const results: SourceContextMapResult[] = [];
+    for (let index = 0; index < groups.length; index += 1) {
+      if (run.abortController.signal.aborted) throw new Error("Map-reduce was cancelled.");
+      const group = groups[index];
+      if (group === undefined) continue;
+      const groupEvidence = sourceContextGroupToEvidence(group);
+      this.emitEvent({
+        type: "runtime_status",
+        runId: baseRequest.runId,
+        message: sourceContextMapReduceMapStartedMessage(
+          group,
+          groupEvidence,
+          index,
+          groups.length,
+        ),
+        running: true,
+      });
+      await this.persistSourceContextMapArtifact(run, {
+        stage: "map",
+        status: "started",
+        groupId: sourceContextGroupId(group, index),
+        groupIndex: index,
+        sourceIds: group.sourceIds,
+        windowRefs: sourceContextMapArtifactWindowRefs(group),
+        evidenceIds: groupEvidence.map((item) => item.id),
+        tokenEstimate: group.tokenEstimate,
+        inputSummary: sourceContextMapArtifactInputSummary(group, groupEvidence, index),
+      });
+      const mapRequest = buildSourceContextMapRequest({
+        baseRequest,
+        group,
+        groupEvidence,
+        groupIndex: index,
+        options: sourceContextPack.options,
+      });
+      let result: SourceContextMapResult;
+      try {
+        result = await this.runSourceContextMapRequest(
+          run,
+          mapRequest,
+          group,
+          groupEvidence,
+          index,
+        );
+      } catch (error) {
+        const providerError = providerErrorFromUnknown(error);
+        await this.persistSourceContextMapArtifact(run, {
+          stage: "map",
+          status: "failed",
+          groupId: sourceContextGroupId(group, index),
+          groupIndex: index,
+          sourceIds: group.sourceIds,
+          windowRefs: sourceContextMapArtifactWindowRefs(group),
+          evidenceIds: groupEvidence.map((item) => item.id),
+          tokenEstimate: group.tokenEstimate,
+          inputSummary: sourceContextMapArtifactInputSummary(group, groupEvidence, index),
+          errorCode: providerError.code,
+          errorMessage: providerError.message,
+        });
+        throw error;
+      }
+      const artifact = await this.persistSourceContextMapArtifact(run, {
+        stage: "map",
+        status: "completed",
+        groupId: result.groupId,
+        groupIndex: index,
+        sourceIds: group.sourceIds,
+        windowRefs: sourceContextMapArtifactWindowRefs(group),
+        evidenceIds: result.evidenceIds,
+        tokenEstimate: result.tokenEstimate,
+        inputSummary: sourceContextMapArtifactInputSummary(group, groupEvidence, index),
+        outputSummary: truncatePromptText(result.text, 1800),
+      });
+      if (artifact !== undefined) {
+        result = { ...result, artifactId: artifact.id };
+      }
+      results.push(result);
+      this.emitEvent({
+        type: "runtime_status",
+        runId: baseRequest.runId,
+        message: sourceContextMapReduceMapCompletedMessage(result, index, groups.length),
+        running: true,
+      });
+    }
+    return results;
+  }
+
+  private async runSourceContextMapRequest(
+    run: HostedAgentRun,
+    mapRequest: AgentChatRequest,
+    group: SourceContextPackGroup,
+    groupEvidence: EvidenceItem[],
+    groupIndex: number,
+  ): Promise<SourceContextMapResult> {
+    let text = "";
+    const citations: LocalCitation[] = [];
+    for await (const event of this.runtime.streamChat(mapRequest, {
+      signal: run.abortController.signal,
+    })) {
+      if (run.abortController.signal.aborted) {
+        throw new Error("Map-reduce was cancelled.");
+      }
+      if (event.type === "text_delta") {
+        text = `${text}${event.delta}`;
+        continue;
+      }
+      if (event.type === "citation") {
+        citations.push(event.citation);
+        continue;
+      }
+      if (event.type === "run_failed") {
+        throw new SourceContextMapReduceStageError("map", event.error.message, event.error);
+      }
+      if (event.type === "run_cancelled") {
+        run.abortController.abort();
+        throw new Error(event.reason ?? "Map-reduce was cancelled.");
+      }
+      if (event.type === "run_completed") {
+        return {
+          groupId: sourceContextGroupId(group, groupIndex),
+          text: text.trim(),
+          citations,
+          evidenceIds: groupEvidence.map((item) => item.id),
+          tokenEstimate: group.tokenEstimate,
+        };
+      }
+    }
+    throw new SourceContextMapReduceStageError("map", "Map provider ended before completion.");
   }
 
   private async persistSourceContextCompressionLogs(
@@ -404,6 +771,38 @@ export class AgentRunHost {
         message: "Source context compression log was not saved.",
       });
     }
+  }
+
+  private async persistSourceContextMapArtifact(
+    run: HostedAgentRun,
+    entry: SourceContextMapArtifactEntry,
+  ): Promise<SourceContextMapArtifactRecord | undefined> {
+    try {
+      const result = await this.requestEngine<{ items: SourceContextMapArtifactRecord[] }>({
+        kind: "appendSourceContextMapArtifacts",
+        payload: {
+          ...(run.request.sessionId === undefined ? {} : { sessionId: run.request.sessionId }),
+          runId: run.request.runId,
+          entries: [entry],
+        },
+      });
+      return result.items[0];
+    } catch {
+      this.emitEvent({
+        type: "runtime_status",
+        runId: run.request.runId,
+        message: "Source context map artifact was not saved.",
+      });
+      return undefined;
+    }
+  }
+
+  private async persistSourceContextReduceArtifact(
+    run: HostedAgentRun,
+    entry: SourceContextMapArtifactEntry,
+  ): Promise<SourceContextMapArtifactRecord | undefined> {
+    if (entry.mapArtifactIds === undefined || entry.mapArtifactIds.length === 0) return undefined;
+    return await this.persistSourceContextMapArtifact(run, entry);
   }
 
   private async pumpManualCompact(run: HostedManualCompactRun) {
@@ -994,6 +1393,9 @@ function sourceContextPackPayload(request: AgentChatRequest): BuildSourceContext
   return {
     query: request.question,
     ...(sourceIds === undefined ? {} : { sourceIds }),
+    ...(options?.sourceDepthOverrides === undefined
+      ? {}
+      : { sourceDepthOverrides: options.sourceDepthOverrides }),
     useWorkingSet: options?.useWorkingSet ?? sourceIds === undefined,
     maxTotalTokens: options?.maxTotalTokens ?? defaults.maxTotalTokens,
     maxGroups: options?.maxGroups ?? defaults.maxGroups,
@@ -1071,14 +1473,263 @@ function sourceContextPackStatusMessage(pack: SourceContextPackResult, evidenceC
   return `${prefix}; groups ${groupIds}; depths ${depths}; adjusted ${reasons}.`;
 }
 
+function sourceContextPackExecutableGroups(preparation: SourceContextPackPreparation) {
+  const groupLimit = sourceContextMapReduceGroupLimit(preparation.options);
+  if (groupLimit <= 0) return [];
+  return preparation.pack.groups
+    .filter((group) => sourceContextGroupToEvidence(group).length > 0)
+    .slice(0, groupLimit);
+}
+
+function sourceContextMapReduceGroupLimit(
+  options: NonNullable<AgentChatRequest["sourceContextPack"]>,
+) {
+  const defaults = sourceContextPackBudgetDefaults(options);
+  const rawLimit = options.mapReduce?.maxGroups ?? options.maxGroups ?? defaults.maxGroups;
+  if (!Number.isFinite(rawLimit) || rawLimit <= 0) return 0;
+  return Math.floor(rawLimit);
+}
+
+function sourceContextMapReduceTokenBudget(
+  options: NonNullable<AgentChatRequest["sourceContextPack"]>,
+) {
+  const defaults = sourceContextPackBudgetDefaults(options);
+  const rawBudget =
+    options.mapReduce?.perGroupTokenBudget ?? options.maxGroupTokens ?? defaults.maxGroupTokens;
+  if (!Number.isFinite(rawBudget) || rawBudget <= 0) return defaults.maxGroupTokens;
+  return Math.floor(rawBudget);
+}
+
+function sourceContextGroupToEvidence(group: SourceContextPackGroup): EvidenceItem[] {
+  const seen = new Set<string>();
+  return group.windows.flatMap((window) => {
+    const evidence = sourceContextWindowToEvidence(window);
+    if (seen.has(evidence.id)) return [];
+    seen.add(evidence.id);
+    return [evidence];
+  });
+}
+
+function sourceContextGroupId(group: SourceContextPackGroup, groupIndex: number) {
+  const id = group.id.trim();
+  return id.length > 0 ? id : `group-${groupIndex + 1}`;
+}
+
+function sourceContextMapArtifactWindowRefs(group: SourceContextPackGroup) {
+  return group.windows.map((window) => ({
+    sourceId: window.sourceId,
+    chunkId: window.chunkId,
+    ord: window.ord,
+  }));
+}
+
+function sourceContextMapArtifactInputSummary(
+  group: SourceContextPackGroup,
+  evidence: EvidenceItem[],
+  groupIndex: number,
+) {
+  return (
+    `group=${sourceContextGroupId(group, groupIndex)}; ` +
+    `sources=${group.sourceIds.length}; windows=${group.windows.length}; ` +
+    `evidence=${evidence.length}; tokens=${group.tokenEstimate}`
+  );
+}
+
+function sourceContextMapArtifactIds(mapResults: SourceContextMapResult[]) {
+  return mapResults.flatMap((result) =>
+    result.artifactId === undefined ? [] : [result.artifactId],
+  );
+}
+
+function sourceContextReduceArtifactInputSummary(mapResults: SourceContextMapResult[]) {
+  const tokenEstimate = mapResults.reduce((total, result) => total + result.tokenEstimate, 0);
+  return `map artifacts=${sourceContextMapArtifactIds(mapResults).length}; groups=${mapResults.length}; tokens=${tokenEstimate}`;
+}
+
+function buildSourceContextMapRequest(input: {
+  baseRequest: AgentChatRequest;
+  group: SourceContextPackGroup;
+  groupEvidence: EvidenceItem[];
+  groupIndex: number;
+  options: NonNullable<AgentChatRequest["sourceContextPack"]>;
+}) {
+  const groupId = sourceContextGroupId(input.group, input.groupIndex);
+  return withRequestEvidence(
+    {
+      ...input.baseRequest,
+      runId: sourceContextMapRunId(input.baseRequest.runId, groupId, input.groupIndex),
+      question: buildSourceContextMapPrompt(input),
+      createdAt: new Date().toISOString(),
+    },
+    input.groupEvidence,
+  );
+}
+
+function buildSourceContextReduceRequest(
+  baseRequest: AgentChatRequest,
+  sourceContextPack: SourceContextPackPreparation,
+  mapResults: SourceContextMapResult[],
+) {
+  const evidence = sourceContextSinglePassEvidence(baseRequest, sourceContextPack.evidence);
+  return withRequestEvidence(
+    {
+      ...baseRequest,
+      question: buildSourceContextReducePrompt(baseRequest.question, mapResults),
+      createdAt: new Date().toISOString(),
+    },
+    evidence,
+  );
+}
+
+function sourceContextSinglePassRequest(
+  request: AgentChatRequest,
+  sourceContextEvidence: EvidenceItem[],
+) {
+  return withRequestEvidence(
+    request,
+    sourceContextSinglePassEvidence(request, sourceContextEvidence),
+  );
+}
+
+function sourceContextSinglePassEvidence(
+  request: AgentChatRequest,
+  sourceContextEvidence: EvidenceItem[],
+) {
+  return mergeEvidence(citationEvidenceForRequest(request), sourceContextEvidence);
+}
+
+function withRequestEvidence(
+  request: AgentChatRequest,
+  evidence: EvidenceItem[],
+): AgentChatRequest {
+  if (request.providerContext === undefined) {
+    return {
+      ...request,
+      evidence,
+    };
+  }
+  return {
+    ...request,
+    evidence,
+    providerContext: {
+      ...request.providerContext,
+      evidence,
+    },
+  };
+}
+
+function buildSourceContextMapPrompt(input: {
+  baseRequest: AgentChatRequest;
+  group: SourceContextPackGroup;
+  groupEvidence: EvidenceItem[];
+  groupIndex: number;
+  options: NonNullable<AgentChatRequest["sourceContextPack"]>;
+}) {
+  const groupId = sourceContextGroupId(input.group, input.groupIndex);
+  const tokenBudget = sourceContextMapReduceTokenBudget(input.options);
+  return [
+    "Analyze only this bounded source context group for the original question.",
+    "Return concise findings grounded in this group's evidence.",
+    "Use citation markers with exact evidence ids when making factual claims.",
+    "Do not use outside knowledge, full documents, other groups, or unlisted citation ids.",
+    `Group: ${groupId}; source count=${input.group.sourceIds.length}; ` +
+      `window count=${input.group.windows.length}; token estimate=${input.group.tokenEstimate}; ` +
+      `group token budget=${tokenBudget}.`,
+    "",
+    "Available evidence ids:",
+    evidenceIdList(input.groupEvidence),
+    "",
+    "Original question:",
+    truncatePromptText(input.baseRequest.question, 1200),
+  ].join("\n");
+}
+
+function buildSourceContextReducePrompt(
+  originalQuestion: string,
+  mapResults: SourceContextMapResult[],
+) {
+  return [
+    "Synthesize the bounded group analyses into the final answer.",
+    "Use only the concrete source evidence attached to this request for citation markers.",
+    "Cite only original evidence ids from the attached evidence blocks; do not cite group ids or map summaries.",
+    "Do not use outside knowledge, full documents, or unlisted citation ids.",
+    "",
+    "Original question:",
+    truncatePromptText(originalQuestion, 1200),
+    "",
+    "Group analyses:",
+    mapResults
+      .map((result, index) =>
+        [
+          `${index + 1}. ${result.groupId}; token estimate=${result.tokenEstimate}; ` +
+            `evidence ids=${result.evidenceIds.join(", ") || "none"}; ` +
+            `map citation count=${result.citations.length}`,
+          truncatePromptText(result.text, 1800) || "No supported findings returned.",
+        ].join("\n"),
+      )
+      .join("\n\n"),
+  ].join("\n");
+}
+
+function evidenceIdList(evidence: EvidenceItem[]) {
+  return evidence.length === 0 ? "none" : evidence.map((item) => `- ${item.id}`).join("\n");
+}
+
+function sourceContextMapRunId(runId: string, groupId: string, groupIndex: number) {
+  const safeGroupId = groupId.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return `${runId}:map:${groupIndex + 1}:${(safeGroupId || "group").slice(0, 64)}`;
+}
+
+function sourceContextMapReduceMapStartedMessage(
+  group: SourceContextPackGroup,
+  groupEvidence: EvidenceItem[],
+  groupIndex: number,
+  groupCount: number,
+) {
+  return (
+    `Map-reduce mapping ${groupIndex + 1}/${groupCount}: ` +
+    `${sourceContextGroupId(group, groupIndex)}; ${group.sourceIds.length} source(s), ` +
+    `${groupEvidence.length} evidence window(s), ${group.tokenEstimate} token(s).`
+  );
+}
+
+function sourceContextMapReduceMapCompletedMessage(
+  result: SourceContextMapResult,
+  groupIndex: number,
+  groupCount: number,
+) {
+  return (
+    `Map-reduce mapped ${groupIndex + 1}/${groupCount}: ${result.groupId}; ` +
+    `${result.text.length} char(s), ${result.citations.length} citation(s).`
+  );
+}
+
+function sourceContextMapReduceReduceStartedMessage(mapResults: SourceContextMapResult[]) {
+  return `Map-reduce reducing ${mapResults.length} group result(s).`;
+}
+
+function sourceContextMapReduceFallbackMessage(stage: "map" | "reduce", error?: AgentErrorInfo) {
+  const reason = error?.message?.trim();
+  const suffix = reason === undefined || reason.length === 0 ? "" : ` Reason: ${reason}`;
+  return `Map-reduce fallback: ${stage} stage failed; using single-pass source context.${suffix}`;
+}
+
+function providerErrorFromUnknown(error: unknown): AgentErrorInfo {
+  if (error instanceof SourceContextMapReduceStageError && error.providerError !== undefined) {
+    return error.providerError;
+  }
+  return {
+    code: "PROVIDER_ERROR",
+    message: error instanceof Error ? error.message : String(error),
+  };
+}
+
 function sourceContextPackMapReducePlanMessage(
   pack: SourceContextPackResult,
   options: NonNullable<AgentChatRequest["sourceContextPack"]>,
 ) {
-  const defaults = sourceContextPackBudgetDefaults(options);
-  const groupLimit = options.mapReduce?.maxGroups ?? options.maxGroups ?? defaults.maxGroups;
-  const tokenBudget =
-    options.mapReduce?.perGroupTokenBudget ?? options.maxGroupTokens ?? defaults.maxGroupTokens;
+  const groupLimit = sourceContextMapReduceGroupLimit(options);
+  const tokenBudget = sourceContextMapReduceTokenBudget(options);
   const groupSummaries = pack.groups
     .slice(0, groupLimit)
     .map(
@@ -1157,5 +1808,11 @@ function isTerminalAgentEvent(event: AgentStreamEvent) {
     event.type === "run_failed" ||
     event.type === "run_cancelled" ||
     event.type === "run_resolved"
+  );
+}
+
+function isVisibleAssistantAnswerEvent(event: AgentStreamEvent) {
+  return (
+    event.type === "text_delta" || event.type === "citation" || event.type === "world_knowledge"
   );
 }

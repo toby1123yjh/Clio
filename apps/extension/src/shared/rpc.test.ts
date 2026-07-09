@@ -20,6 +20,8 @@ import {
   CLIO_WEB_SEARCH_RUN_REQUEST,
   CLIO_WEB_SEARCH_STREAM_EVENT,
   CLIO_WEB_SEARCH_STREAM_REQUEST,
+  CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST,
+  CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
   CLIO_WORKER_EMBEDDING_REQUEST,
   CLIO_WORKER_EMBEDDING_RESPONSE,
   CLIO_WORKER_VISION_ANALYSIS_REQUEST,
@@ -45,6 +47,8 @@ import {
   isWebSearchRunRequestMessage,
   isWebSearchStreamEventMessage,
   isWebSearchStreamRequestMessage,
+  isWorkerChunkMetaSummaryRequestMessage,
+  isWorkerChunkMetaSummaryResponseMessage,
   isWorkerEmbeddingRequestMessage,
   isWorkerEmbeddingResponseMessage,
   isWorkerVisionAnalysisRequestMessage,
@@ -958,6 +962,10 @@ describe("session engine RPC guards", () => {
           payload: {
             query: "bounded source context",
             sourceIds: ["source-1", "source-2"],
+            sourceDepthOverrides: [
+              { sourceId: "source-1", loadDepth: "meta" },
+              { sourceId: "source-2", loadDepth: "full" },
+            ],
             anchors: [
               { memoryId: "source-1", chunkId: "chunk-1" },
               { memoryId: "source-2", ord: 4 },
@@ -1018,6 +1026,30 @@ describe("session engine RPC guards", () => {
           kind: "buildSourceContextPack",
           payload: {
             maxGroupTokens: "large",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceContextPack",
+          payload: {
+            sourceDepthOverrides: [{ sourceId: "source-1", loadDepth: "document" }],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceContextPack",
+          payload: {
+            sourceDepthOverrides: [{ sourceId: "", loadDepth: "chunks" }],
           },
         },
       }),
@@ -1118,6 +1150,138 @@ describe("session engine RPC guards", () => {
                 reason: "chunk_window_omitted",
                 message: "bad numeric payload",
                 omittedWindowCount: Number.POSITIVE_INFINITY,
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts source context map artifact requests and rejects invalid payloads", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextMapArtifacts",
+          payload: {
+            sessionId: "session-1",
+            runId: "run-1",
+            entries: [
+              {
+                stage: "map",
+                status: "completed",
+                groupId: "group-1",
+                groupIndex: 0,
+                sourceIds: ["source-1"],
+                windowRefs: [{ sourceId: "source-1", chunkId: "chunk-1", ord: 0 }],
+                evidenceIds: ["memory:source-1:chunk:chunk-1"],
+                tokenEstimate: 400,
+                inputSummary: "group=group-1; windows=1",
+                outputSummary: "bounded finding",
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listSourceContextMapArtifacts",
+          filter: {
+            sessionId: "session-1",
+            runId: "run-1",
+            stage: "map",
+            status: "completed",
+            sourceId: "source-1",
+            limit: 20,
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "clearSourceContextMapArtifacts",
+          filter: { sessionId: "session-1", stage: "reduce" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextMapArtifacts",
+          payload: {
+            entries: [{ stage: "map", status: "started" }],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextMapArtifacts",
+          payload: {
+            runId: "run-1",
+            entries: [{ stage: "load", status: "started" }],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextMapArtifacts",
+          payload: {
+            runId: "run-1",
+            entries: [{ stage: "reduce", status: "done" }],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextMapArtifacts",
+          payload: {
+            runId: "run-1",
+            entries: [
+              {
+                stage: "map",
+                status: "completed",
+                windowRefs: [{ sourceId: "source-1", ord: 0 }],
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendSourceContextMapArtifacts",
+          payload: {
+            runId: "run-1",
+            entries: [
+              {
+                stage: "map",
+                status: "completed",
+                tokenEstimate: Number.POSITIVE_INFINITY,
               },
             ],
           },
@@ -1941,6 +2105,86 @@ describe("session engine RPC guards", () => {
           error: {
             code: "PROVIDER_AUTH_ERROR",
             message: "Embedding provider auth failed.",
+          },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts bounded worker chunk meta summary messages and rejects prompt boundary leaks", () => {
+    const request = {
+      type: CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST,
+      requestId: "chunk-meta-summary-request-1",
+      request: {
+        sourceId: "source:1",
+        chunkId: "chunk:1",
+        ord: 1,
+        role: "child",
+        sourceTitle: "Bounded Retrieval Study",
+        sourceType: "paper",
+        docContext: "Title: Bounded Retrieval Study",
+        sectionPath: "Methods",
+        chunkTextExcerpt: "The chunk describes bounded local retrieval context.",
+      },
+    };
+
+    expect(isWorkerChunkMetaSummaryRequestMessage(request)).toBe(true);
+
+    expect(
+      isWorkerChunkMetaSummaryRequestMessage({
+        ...request,
+        request: {
+          ...request.request,
+          apiKey: "sk-leak",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerChunkMetaSummaryRequestMessage({
+        ...request,
+        request: {
+          ...request.request,
+          normalizedText: "The full source text must not cross this bridge.",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerChunkMetaSummaryRequestMessage({
+        ...request,
+        request: {
+          ...request.request,
+          fullText: "The full document must not cross this bridge.",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerChunkMetaSummaryResponseMessage({
+        type: CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
+        requestId: "chunk-meta-summary-request-1",
+        response: {
+          ok: true,
+          value: {
+            status: "summarized",
+            providerKind: "chat",
+            sectionSummary: "Methods describe bounded retrieval.",
+            chunkSummary: "The chunk explains local retrieval context.",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isWorkerChunkMetaSummaryResponseMessage({
+        type: CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
+        requestId: "chunk-meta-summary-request-1",
+        response: {
+          ok: false,
+          error: {
+            code: "CHUNK_META_SUMMARY_PROVIDER_ERROR",
+            message: "Chunk meta summary provider failed.",
           },
         },
       }),

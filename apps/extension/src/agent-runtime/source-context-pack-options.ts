@@ -1,4 +1,9 @@
-import type { SourceContextPackMapReduceOptions, SourceContextPackRequestOptions } from "./types";
+import type {
+  SourceContextPackLoadDepth,
+  SourceContextPackMapReduceOptions,
+  SourceContextPackRequestOptions,
+  SourceContextPackSourceDepthOverride,
+} from "./types";
 
 export const sourceContextPackResearchBudgetDefaults = {
   maxTotalTokens: 10_000,
@@ -55,6 +60,13 @@ export function readSourceContextPackRequestOptions(
   ) {
     return undefined;
   }
+  const sourceDepthOverrides =
+    value.sourceDepthOverrides === undefined
+      ? undefined
+      : readSourceDepthOverrides(value.sourceDepthOverrides);
+  if (value.sourceDepthOverrides !== undefined && sourceDepthOverrides === undefined) {
+    return undefined;
+  }
   if (value.useWorkingSet !== undefined && typeof value.useWorkingSet !== "boolean") {
     return undefined;
   }
@@ -74,10 +86,26 @@ export function readSourceContextPackRequestOptions(
     ...(value.planner === undefined ? {} : { planner: value.planner }),
     ...(value.triggerReason === undefined ? {} : { triggerReason: value.triggerReason }),
     ...(value.sourceIds === undefined ? {} : { sourceIds: value.sourceIds }),
+    ...(sourceDepthOverrides === undefined ? {} : { sourceDepthOverrides }),
     ...(value.useWorkingSet === undefined ? {} : { useWorkingSet: value.useWorkingSet }),
     ...copyOptionalNumberFields(value, numericSourceContextPackFields),
     ...(mapReduce === undefined ? {} : { mapReduce }),
   };
+}
+
+function readSourceDepthOverrides(
+  value: unknown,
+): SourceContextPackSourceDepthOverride[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const bySourceId = new Map<string, SourceContextPackSourceDepthOverride>();
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.sourceId !== "string") return undefined;
+    const sourceId = item.sourceId.trim();
+    if (sourceId.length === 0 || !isSourceContextPackLoadDepth(item.loadDepth)) return undefined;
+    bySourceId.delete(sourceId);
+    bySourceId.set(sourceId, { sourceId, loadDepth: item.loadDepth });
+  }
+  return [...bySourceId.values()];
 }
 
 function readSourceContextPackMapReduceOptions(
@@ -112,6 +140,10 @@ function copyOptionalNumberFields<TKey extends readonly (keyof SourceContextPack
 
 function isOptionalFiniteNumber(value: unknown) {
   return value === undefined || (typeof value === "number" && Number.isFinite(value));
+}
+
+function isSourceContextPackLoadDepth(value: unknown): value is SourceContextPackLoadDepth {
+  return value === "meta" || value === "outline" || value === "chunks" || value === "full";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

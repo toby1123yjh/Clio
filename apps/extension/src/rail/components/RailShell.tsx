@@ -123,7 +123,9 @@ import type {
   RetrieveSourcesFilter,
   SearchMemoryItem,
   SourceContextCompressionLogRecord,
+  SourceContextMapArtifactRecord,
   SourceContextPackResult,
+  SourceContextPackSourceDepthOverride,
   TopicGraphEdge,
   TopicPageDetail,
   TopicPageSummary,
@@ -209,6 +211,7 @@ export interface RailShellProps {
   knowledgeBaseClusters: KnowledgeBaseClusterGroup[];
   workingSetStatus: WorkingSetStatusResult | null;
   sourceContextCompressionLogs: SourceContextCompressionLogRecord[];
+  sourceContextMapArtifacts: SourceContextMapArtifactRecord[];
   sourceContextPlanner: SourceContextPlannerState;
   topicPages: TopicPageSummary[];
   relatedItems: SearchMemoryItem[];
@@ -290,8 +293,10 @@ export interface RailShellProps {
   onSetWorkingSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
   onReloadWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRefreshSourceContextCompressionLogs: () => void;
+  onRefreshSourceContextMapArtifacts: () => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
   onRemoveSourceContextPlannerSource: (sourceId: string) => void;
+  onSetSourceContextPlannerSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
   onSourceContextPlannerBudgetChange: (budget: SourceContextPlannerBudget) => void;
   onPreviewSourceContextPlanner: (query: string) => void;
   onStartSourceContextPlannerResearch: (query: string) => void;
@@ -544,6 +549,7 @@ export interface SourceContextPlannerBudget {
 
 export interface SourceContextPlannerState {
   selectedSourceIds: string[];
+  sourceDepthOverrides: SourceContextPackSourceDepthOverride[];
   budget: SourceContextPlannerBudget;
   preview: SourceContextPackResult | null;
   previewLoading: boolean;
@@ -5012,6 +5018,7 @@ function KnowledgeBasePanel(props: RailShellProps) {
               onBudgetChange={props.onSourceContextPlannerBudgetChange}
               onPreview={props.onPreviewSourceContextPlanner}
               onRemoveSource={props.onRemoveSourceContextPlannerSource}
+              onSetSourceDepth={props.onSetSourceContextPlannerSourceDepth}
               onStartResearch={props.onStartSourceContextPlannerResearch}
             />
             <SourceContextCompressionLogPanel
@@ -5019,6 +5026,12 @@ function KnowledgeBasePanel(props: RailShellProps) {
               logs={props.sourceContextCompressionLogs}
               sessionId={props.state.activeSessionId}
               onRefresh={props.onRefreshSourceContextCompressionLogs}
+            />
+            <SourceContextMapArtifactPanel
+              artifacts={props.sourceContextMapArtifacts}
+              disabled={props.state.loading}
+              sessionId={props.state.activeSessionId}
+              onRefresh={props.onRefreshSourceContextMapArtifacts}
             />
             <MemoryList
               clusters={props.knowledgeBaseClusters}
@@ -5393,6 +5406,7 @@ function SourceContextPlannerPanel({
   onBudgetChange,
   onPreview,
   onRemoveSource,
+  onSetSourceDepth,
   onStartResearch,
 }: {
   disabled: boolean;
@@ -5403,10 +5417,12 @@ function SourceContextPlannerPanel({
   onBudgetChange: (budget: SourceContextPlannerBudget) => void;
   onPreview: (query: string) => void;
   onRemoveSource: (sourceId: string) => void;
+  onSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
   onStartResearch: (query: string) => void;
 }) {
   const selectedItems = sourceContextPlannerSelectedItems(
     state.selectedSourceIds,
+    state.sourceDepthOverrides,
     items,
     workingSetStatus,
   );
@@ -5447,25 +5463,44 @@ function SourceContextPlannerPanel({
                 <p className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
                   <span>{item.sourceKind}</span>
                   <span>
-                    {item.loadDepth === undefined
-                      ? "Depth default"
-                      : workingSetLoadDepthLabel(item.loadDepth)}
+                    {item.depthSource === "override"
+                      ? "Planner depth"
+                      : item.depthSource === "working-set"
+                        ? "Working Set depth"
+                        : "Default depth"}
                   </span>
                   {item.tokenEstimate === undefined ? null : (
                     <span>{formatWorkingSetTokenCount(item.tokenEstimate)} tokens</span>
                   )}
                 </p>
               </div>
-              <Button
-                aria-label={`Remove ${item.title} from source planner`}
-                disabled={disabled}
-                onClick={() => onRemoveSource(item.id)}
-                size="icon"
-                title="Remove"
-                variant="ghost"
-              >
-                <X size={14} />
-              </Button>
+              <div className="flex shrink-0 items-center gap-2">
+                <select
+                  aria-label={`Source planner depth for ${item.title}`}
+                  className="h-8 w-28 rounded-md border border-border bg-background px-2 text-[12px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+                  disabled={disabled}
+                  onChange={(event) =>
+                    onSetSourceDepth(item.id, event.target.value as WorkingSetLoadDepth)
+                  }
+                  value={item.loadDepth}
+                >
+                  {workingSetLoadDepthOptions.map((depth) => (
+                    <option key={depth} value={depth}>
+                      {workingSetLoadDepthLabel(depth)}
+                    </option>
+                  ))}
+                </select>
+                <Button
+                  aria-label={`Remove ${item.title} from source planner`}
+                  disabled={disabled}
+                  onClick={() => onRemoveSource(item.id)}
+                  size="icon"
+                  title="Remove"
+                  variant="ghost"
+                >
+                  <X size={14} />
+                </Button>
+              </div>
             </li>
           ))}
         </ul>
@@ -5690,31 +5725,126 @@ function SourceContextCompressionLogPanel({
   );
 }
 
+function SourceContextMapArtifactPanel({
+  artifacts,
+  disabled,
+  sessionId,
+  onRefresh,
+}: {
+  artifacts: SourceContextMapArtifactRecord[];
+  disabled: boolean;
+  sessionId?: string;
+  onRefresh: () => void;
+}) {
+  return (
+    <section
+      className="rounded-lg border border-border bg-surface px-4 py-3"
+      data-clio-source-context-map-artifacts="true"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">Source context map artifacts</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Non-citeable map/reduce diagnostics
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Badge className="border-border bg-surface-subtle text-muted-foreground">
+            {artifacts.length}
+          </Badge>
+          <Button
+            aria-label="Refresh source context map artifacts"
+            disabled={disabled || sessionId === undefined}
+            onClick={onRefresh}
+            size="icon"
+            title="Refresh"
+            variant="ghost"
+          >
+            <RefreshCw size={14} />
+          </Button>
+        </div>
+      </div>
+      {sessionId === undefined ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No active conversation.</p>
+      ) : artifacts.length === 0 ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No map artifacts yet.</p>
+      ) : (
+        <ul className="mt-3 divide-y divide-border">
+          {artifacts.slice(0, 6).map((artifact) => (
+            <li className="grid gap-2 py-3 first:pt-0 last:pb-0" key={artifact.id}>
+              <div className="flex min-w-0 items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <h4 className="line-clamp-1 text-[12.5px] font-semibold leading-5">
+                    {sourceContextMapArtifactTitle(artifact)}
+                  </h4>
+                  <p className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">
+                    {sourceContextMapArtifactSummary(artifact)}
+                  </p>
+                </div>
+                <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
+                  {formatDate(artifact.createdAt)}
+                </Badge>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+                <span className="min-w-0 truncate">
+                  Sources {artifact.sourceIds?.length || "n/a"}
+                </span>
+                <span className="min-w-0 truncate">
+                  Windows {artifact.windowRefs?.length || "n/a"}
+                </span>
+                <span className="min-w-0 truncate">
+                  Evidence {artifact.evidenceIds?.length || "n/a"}
+                </span>
+                <span className="min-w-0 truncate">
+                  Tokens {formatWorkingSetTokenCount(artifact.tokenEstimate ?? 0)}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 interface SourceContextPlannerSelectedItem {
   id: string;
   title: string;
   sourceKind: string;
-  loadDepth?: WorkingSetLoadDepth;
+  loadDepth: WorkingSetLoadDepth;
+  depthSource: "default" | "override" | "working-set";
   tokenEstimate?: number;
 }
 
 function sourceContextPlannerSelectedItems(
   sourceIds: string[],
+  sourceDepthOverrides: SourceContextPackSourceDepthOverride[],
   items: SearchMemoryItem[],
   workingSetStatus: WorkingSetStatusResult | null,
 ): SourceContextPlannerSelectedItem[] {
   const itemById = new Map(items.map((item) => [item.id, item]));
+  const overrideBySourceId = new Map(
+    sourceDepthOverrides.map((override) => [override.sourceId, override.loadDepth]),
+  );
   const workingSetEntryById = new Map(
     (workingSetStatus?.entries ?? []).map((entry) => [entry.source.id, entry]),
   );
   return sourceIds.map((sourceId) => {
     const item = itemById.get(sourceId);
     const workingSetEntry = workingSetEntryById.get(sourceId);
+    const overrideDepth = overrideBySourceId.get(sourceId);
+    const loadDepth = overrideDepth ?? workingSetEntry?.loadDepth ?? "chunks";
     return {
       id: sourceId,
       title: item?.sourceTitle ?? workingSetEntry?.source.sourceTitle ?? sourceId,
       sourceKind: item?.sourceKind ?? workingSetEntry?.source.sourceKind ?? "source",
-      ...(workingSetEntry === undefined ? {} : { loadDepth: workingSetEntry.loadDepth }),
+      loadDepth,
+      depthSource:
+        overrideDepth !== undefined
+          ? "override"
+          : workingSetEntry === undefined
+            ? "default"
+            : "working-set",
       ...(workingSetEntry === undefined ? {} : { tokenEstimate: workingSetEntry.tokenEstimate }),
     };
   });
@@ -5764,6 +5894,18 @@ function sourceContextCompressionReasonLabel(reason: SourceContextCompressionLog
   if (reason === "parent_context_selected") return "Parent context selected";
   if (reason === "full_depth_bounded") return "Full depth bounded";
   return "Group limit reached";
+}
+
+function sourceContextMapArtifactTitle(artifact: SourceContextMapArtifactRecord) {
+  const group = artifact.groupId ?? artifact.stage;
+  return `${artifact.stage} ${artifact.status}: ${group}`;
+}
+
+function sourceContextMapArtifactSummary(artifact: SourceContextMapArtifactRecord) {
+  if (artifact.status === "failed") {
+    return artifact.errorMessage ?? artifact.errorCode ?? "Failed without provider detail.";
+  }
+  return artifact.outputSummary ?? artifact.inputSummary ?? "Bounded artifact metadata only.";
 }
 
 function sourceContextCompressionSourceLabel(log: SourceContextCompressionLogRecord) {

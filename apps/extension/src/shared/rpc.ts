@@ -1,3 +1,7 @@
+import type {
+  ChunkMetaSummaryInput,
+  ChunkMetaSummaryResult,
+} from "@/src/agent-runtime/chunk-meta-summary";
 import {
   isCitationValidationReason,
   isCitationValidationResult,
@@ -47,6 +51,8 @@ export const CLIO_WORKER_REQUEST = "clio:worker:request";
 export const CLIO_WORKER_RESPONSE = "clio:worker:response";
 export const CLIO_WORKER_EMBEDDING_REQUEST = "clio:worker:embedding:request";
 export const CLIO_WORKER_EMBEDDING_RESPONSE = "clio:worker:embedding:response";
+export const CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST = "clio:worker:chunk-meta-summary:request";
+export const CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE = "clio:worker:chunk-meta-summary:response";
 export const CLIO_WORKER_VISION_ANALYSIS_REQUEST = "clio:worker:vision-analysis:request";
 export const CLIO_WORKER_VISION_ANALYSIS_RESPONSE = "clio:worker:vision-analysis:response";
 export const CLIO_CONTENT_COMMAND = "clio:content:command";
@@ -339,9 +345,15 @@ export interface SetWorkingSetSourceDepthPayload {
   loadDepth: WorkingSetLoadDepth;
 }
 
+export interface SourceContextPackSourceDepthOverride {
+  sourceId: string;
+  loadDepth: WorkingSetLoadDepth;
+}
+
 export interface BuildSourceContextPackPayload {
   query?: string;
   sourceIds?: string[];
+  sourceDepthOverrides?: SourceContextPackSourceDepthOverride[];
   anchors?: GetMemoryEvidenceWindowAnchor[];
   useWorkingSet?: boolean;
   maxTotalTokens?: number;
@@ -452,6 +464,53 @@ export interface AppendSourceContextCompressionLogsPayload {
 export interface SourceContextCompressionLogFilter {
   sessionId?: string;
   runId?: string;
+  sourceId?: string;
+  limit?: number;
+}
+
+export type SourceContextMapArtifactStage = "map" | "reduce";
+export type SourceContextMapArtifactStatus = "started" | "completed" | "failed";
+
+export interface SourceContextMapArtifactEntry {
+  stage: SourceContextMapArtifactStage;
+  status: SourceContextMapArtifactStatus;
+  groupId?: string;
+  groupIndex?: number;
+  sourceIds?: string[];
+  windowRefs?: Array<{
+    sourceId: string;
+    chunkId: string;
+    ord?: number;
+  }>;
+  evidenceIds?: string[];
+  tokenEstimate?: number;
+  inputSummary?: string;
+  outputSummary?: string;
+  mapArtifactIds?: string[];
+  errorCode?: string;
+  errorMessage?: string;
+  createdAt?: string;
+}
+
+export interface SourceContextMapArtifactRecord extends SourceContextMapArtifactEntry {
+  id: string;
+  sessionId?: string;
+  runId: string;
+  createdAt: string;
+}
+
+export interface AppendSourceContextMapArtifactsPayload {
+  sessionId?: string;
+  runId: string;
+  entries: SourceContextMapArtifactEntry[];
+  createdAt?: string;
+}
+
+export interface SourceContextMapArtifactFilter {
+  sessionId?: string;
+  runId?: string;
+  stage?: SourceContextMapArtifactStage;
+  status?: SourceContextMapArtifactStatus;
   sourceId?: string;
   limit?: number;
 }
@@ -1139,6 +1198,12 @@ export type EngineRequest =
     }
   | { kind: "listSourceContextCompressionLogs"; filter?: SourceContextCompressionLogFilter }
   | { kind: "clearSourceContextCompressionLogs"; filter?: SourceContextCompressionLogFilter }
+  | {
+      kind: "appendSourceContextMapArtifacts";
+      payload: AppendSourceContextMapArtifactsPayload;
+    }
+  | { kind: "listSourceContextMapArtifacts"; filter?: SourceContextMapArtifactFilter }
+  | { kind: "clearSourceContextMapArtifacts"; filter?: SourceContextMapArtifactFilter }
   | { kind: "deleteMemory"; id: string }
   | { kind: "listTopicPages"; query?: string; limit?: number }
   | { kind: "getTopicPage"; id: string }
@@ -1231,157 +1296,169 @@ export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health
                           ? {
                               cleared: number;
                             }
-                          : T extends { kind: "deleteMemory" }
-                            ? DeleteMemoryResult
-                            : T extends { kind: "listTopicPages" }
-                              ? ListTopicPagesResult
-                              : T extends { kind: "getTopicPage" | "updateTopicPage" }
-                                ? TopicPageDetail | null
-                                : T extends { kind: "createTopicPage" }
-                                  ? TopicPageDetail
-                                  : T extends { kind: "deleteTopicPage" }
-                                    ? DeleteTopicPageResult
-                                    : T extends { kind: "enqueueWikiCompile" }
-                                      ? WikiCompileJobSummary
-                                      : T extends { kind: "listWikiCompileJobs" }
-                                        ? ListWikiCompileJobsResult
-                                        : T extends { kind: "appendWikiCompileJobEvent" }
-                                          ? WikiCompileJobEvent
-                                          : T extends { kind: "listWikiCompileJobEvents" }
-                                            ? ListWikiCompileJobEventsResult
-                                            : T extends {
-                                                  kind:
-                                                    | "getWikiCompileJob"
-                                                    | "claimNextWikiCompileJob";
-                                                }
-                                              ? WikiCompileJobSummary | null
-                                              : T extends { kind: "completeWikiCompileJob" }
-                                                ? {
-                                                    job: WikiCompileJobSummary;
-                                                    topic: TopicPageDetail;
-                                                  }
-                                                : T extends { kind: "failWikiCompileJob" }
+                          : T extends {
+                                kind:
+                                  | "appendSourceContextMapArtifacts"
+                                  | "listSourceContextMapArtifacts";
+                              }
+                            ? {
+                                items: SourceContextMapArtifactRecord[];
+                              }
+                            : T extends { kind: "clearSourceContextMapArtifacts" }
+                              ? {
+                                  cleared: number;
+                                }
+                              : T extends { kind: "deleteMemory" }
+                                ? DeleteMemoryResult
+                                : T extends { kind: "listTopicPages" }
+                                  ? ListTopicPagesResult
+                                  : T extends { kind: "getTopicPage" | "updateTopicPage" }
+                                    ? TopicPageDetail | null
+                                    : T extends { kind: "createTopicPage" }
+                                      ? TopicPageDetail
+                                      : T extends { kind: "deleteTopicPage" }
+                                        ? DeleteTopicPageResult
+                                        : T extends { kind: "enqueueWikiCompile" }
+                                          ? WikiCompileJobSummary
+                                          : T extends { kind: "listWikiCompileJobs" }
+                                            ? ListWikiCompileJobsResult
+                                            : T extends { kind: "appendWikiCompileJobEvent" }
+                                              ? WikiCompileJobEvent
+                                              : T extends { kind: "listWikiCompileJobEvents" }
+                                                ? ListWikiCompileJobEventsResult
+                                                : T extends {
+                                                      kind:
+                                                        | "getWikiCompileJob"
+                                                        | "claimNextWikiCompileJob";
+                                                    }
                                                   ? WikiCompileJobSummary | null
-                                                  : T extends { kind: "listTopicGraphEdges" }
-                                                    ? ListTopicGraphEdgesResult
-                                                    : T extends { kind: "buildSourceGraph" }
-                                                      ? BuildSourceGraphResult
-                                                      : T extends {
-                                                            kind:
-                                                              | "queryGraphNeighbors"
-                                                              | "queryGraphSubgraph"
-                                                              | "queryGraphPath"
-                                                              | "queryGraphTimeline";
-                                                          }
-                                                        ? GraphQueryResult
-                                                        : T extends { kind: "repair" }
-                                                          ? RepairResult
+                                                  : T extends { kind: "completeWikiCompileJob" }
+                                                    ? {
+                                                        job: WikiCompileJobSummary;
+                                                        topic: TopicPageDetail;
+                                                      }
+                                                    : T extends { kind: "failWikiCompileJob" }
+                                                      ? WikiCompileJobSummary | null
+                                                      : T extends { kind: "listTopicGraphEdges" }
+                                                        ? ListTopicGraphEdgesResult
+                                                        : T extends { kind: "buildSourceGraph" }
+                                                          ? BuildSourceGraphResult
                                                           : T extends {
-                                                                kind: "getActiveEmbeddingModel";
+                                                                kind:
+                                                                  | "queryGraphNeighbors"
+                                                                  | "queryGraphSubgraph"
+                                                                  | "queryGraphPath"
+                                                                  | "queryGraphTimeline";
                                                               }
-                                                            ? ActiveEmbeddingModelSummary | null
-                                                            : T extends { kind: "getJobStatus" }
-                                                              ? GetJobStatusResult
-                                                              : T extends { kind: "runJob" }
-                                                                ? JobSummary
-                                                                : T extends { kind: "reindex" }
-                                                                  ? ReindexResult
-                                                                  : T extends {
-                                                                        kind: "resolveAnchor";
-                                                                      }
-                                                                    ? AnchorResolveResult
-                                                                    : T extends {
-                                                                          kind: "createChatSession";
-                                                                        }
-                                                                      ? ChatSessionSummary
+                                                            ? GraphQueryResult
+                                                            : T extends { kind: "repair" }
+                                                              ? RepairResult
+                                                              : T extends {
+                                                                    kind: "getActiveEmbeddingModel";
+                                                                  }
+                                                                ? ActiveEmbeddingModelSummary | null
+                                                                : T extends { kind: "getJobStatus" }
+                                                                  ? GetJobStatusResult
+                                                                  : T extends { kind: "runJob" }
+                                                                    ? JobSummary
+                                                                    : T extends { kind: "reindex" }
+                                                                      ? ReindexResult
                                                                       : T extends {
-                                                                            kind: "listChatSessions";
+                                                                            kind: "resolveAnchor";
                                                                           }
-                                                                        ? ListChatSessionsResult
+                                                                        ? AnchorResolveResult
                                                                         : T extends {
-                                                                              kind:
-                                                                                | "loadChatSession"
-                                                                                | "recoverInterruptedChatSession";
+                                                                              kind: "createChatSession";
                                                                             }
-                                                                          ? ChatSessionDetail | null
+                                                                          ? ChatSessionSummary
                                                                           : T extends {
-                                                                                kind:
-                                                                                  | "claimChatSession"
-                                                                                  | "heartbeatChatSession"
-                                                                                  | "releaseChatSession";
+                                                                                kind: "listChatSessions";
                                                                               }
-                                                                            ? SessionLeaseResult
+                                                                            ? ListChatSessionsResult
                                                                             : T extends {
-                                                                                  kind: "appendSessionEvidence";
+                                                                                  kind:
+                                                                                    | "loadChatSession"
+                                                                                    | "recoverInterruptedChatSession";
                                                                                 }
-                                                                              ? SessionEvidenceRecord
+                                                                              ? ChatSessionDetail | null
                                                                               : T extends {
-                                                                                    kind: "appendCompaction";
+                                                                                    kind:
+                                                                                      | "claimChatSession"
+                                                                                      | "heartbeatChatSession"
+                                                                                      | "releaseChatSession";
                                                                                   }
-                                                                                ? CompactionRecord
+                                                                                ? SessionLeaseResult
                                                                                 : T extends {
-                                                                                      kind: "listCompactions";
+                                                                                      kind: "appendSessionEvidence";
                                                                                     }
-                                                                                  ? {
-                                                                                      items: CompactionRecord[];
-                                                                                    }
+                                                                                  ? SessionEvidenceRecord
                                                                                   : T extends {
-                                                                                        kind: "getLatestCompaction";
+                                                                                        kind: "appendCompaction";
                                                                                       }
-                                                                                    ? CompactionRecord | null
+                                                                                    ? CompactionRecord
                                                                                     : T extends {
-                                                                                          kind:
-                                                                                            | "upsertChatMessage"
-                                                                                            | "updateChatMessage";
+                                                                                          kind: "listCompactions";
                                                                                         }
-                                                                                      ? ChatMessageRecord
+                                                                                      ? {
+                                                                                          items: CompactionRecord[];
+                                                                                        }
                                                                                       : T extends {
-                                                                                            kind: "deleteChatMessage";
+                                                                                            kind: "getLatestCompaction";
                                                                                           }
-                                                                                        ? {
-                                                                                            deleted: boolean;
-                                                                                          }
+                                                                                        ? CompactionRecord | null
                                                                                         : T extends {
-                                                                                              kind: "clearQueuedChatMessages";
+                                                                                              kind:
+                                                                                                | "upsertChatMessage"
+                                                                                                | "updateChatMessage";
                                                                                             }
-                                                                                          ? {
-                                                                                              cleared: number;
-                                                                                            }
+                                                                                          ? ChatMessageRecord
                                                                                           : T extends {
-                                                                                                kind: "listWebSearchHistory";
+                                                                                                kind: "deleteChatMessage";
                                                                                               }
-                                                                                            ? ListWebSearchHistoryResult
+                                                                                            ? {
+                                                                                                deleted: boolean;
+                                                                                              }
                                                                                             : T extends {
-                                                                                                  kind: "appendWebSearchHistory";
+                                                                                                  kind: "clearQueuedChatMessages";
                                                                                                 }
-                                                                                              ? WebSearchHistoryRecord
+                                                                                              ? {
+                                                                                                  cleared: number;
+                                                                                                }
                                                                                               : T extends {
-                                                                                                    kind: "deleteWebSearchHistory";
+                                                                                                    kind: "listWebSearchHistory";
                                                                                                   }
-                                                                                                ? {
-                                                                                                    deleted: boolean;
-                                                                                                  }
+                                                                                                ? ListWebSearchHistoryResult
                                                                                                 : T extends {
-                                                                                                      kind: "clearWebSearchHistory";
+                                                                                                      kind: "appendWebSearchHistory";
                                                                                                     }
-                                                                                                  ? {
-                                                                                                      cleared: number;
-                                                                                                    }
+                                                                                                  ? WebSearchHistoryRecord
                                                                                                   : T extends {
-                                                                                                        kind: "listImageGenerationHistory";
+                                                                                                        kind: "deleteWebSearchHistory";
                                                                                                       }
-                                                                                                    ? ListImageGenerationHistoryResult
+                                                                                                    ? {
+                                                                                                        deleted: boolean;
+                                                                                                      }
                                                                                                     : T extends {
-                                                                                                          kind: "appendImageGenerationHistory";
+                                                                                                          kind: "clearWebSearchHistory";
                                                                                                         }
-                                                                                                      ? ImageGenerationHistoryRecord
+                                                                                                      ? {
+                                                                                                          cleared: number;
+                                                                                                        }
                                                                                                       : T extends {
-                                                                                                            kind: "deleteImageGenerationHistory";
+                                                                                                            kind: "listImageGenerationHistory";
                                                                                                           }
-                                                                                                        ? {
-                                                                                                            deleted: boolean;
-                                                                                                          }
-                                                                                                        : never;
+                                                                                                        ? ListImageGenerationHistoryResult
+                                                                                                        : T extends {
+                                                                                                              kind: "appendImageGenerationHistory";
+                                                                                                            }
+                                                                                                          ? ImageGenerationHistoryRecord
+                                                                                                          : T extends {
+                                                                                                                kind: "deleteImageGenerationHistory";
+                                                                                                              }
+                                                                                                            ? {
+                                                                                                                deleted: boolean;
+                                                                                                              }
+                                                                                                            : never;
 
 export type EngineResponse<T = unknown> =
   | { ok: true; value: T }
@@ -1535,6 +1612,20 @@ export interface WorkerEmbeddingResponseMessage {
   type: typeof CLIO_WORKER_EMBEDDING_RESPONSE;
   requestId: string;
   response: EngineResponse<number[][]>;
+}
+
+export type WorkerChunkMetaSummaryRequest = ChunkMetaSummaryInput;
+
+export interface WorkerChunkMetaSummaryRequestMessage {
+  type: typeof CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST;
+  requestId: string;
+  request: WorkerChunkMetaSummaryRequest;
+}
+
+export interface WorkerChunkMetaSummaryResponseMessage {
+  type: typeof CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE;
+  requestId: string;
+  response: EngineResponse<ChunkMetaSummaryResult>;
 }
 
 export type WorkerVisionAnalysisRequest = FigureVisionAnalysisInput;
@@ -1764,6 +1855,28 @@ export function isWorkerEmbeddingResponseMessage(
     value.type === CLIO_WORKER_EMBEDDING_RESPONSE &&
     typeof value.requestId === "string" &&
     isEmbeddingVectorBatchResponse(value.response)
+  );
+}
+
+export function isWorkerChunkMetaSummaryRequestMessage(
+  value: unknown,
+): value is WorkerChunkMetaSummaryRequestMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST &&
+    typeof value.requestId === "string" &&
+    isWorkerChunkMetaSummaryRequest(value.request)
+  );
+}
+
+export function isWorkerChunkMetaSummaryResponseMessage(
+  value: unknown,
+): value is WorkerChunkMetaSummaryResponseMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE &&
+    typeof value.requestId === "string" &&
+    isChunkMetaSummaryResponse(value.response)
   );
 }
 
@@ -2008,6 +2121,11 @@ function isEngineRequest(value: unknown): value is EngineRequest {
     case "listSourceContextCompressionLogs":
     case "clearSourceContextCompressionLogs":
       return value.filter === undefined || isSourceContextCompressionLogFilter(value.filter);
+    case "appendSourceContextMapArtifacts":
+      return isAppendSourceContextMapArtifactsPayload(value.payload);
+    case "listSourceContextMapArtifacts":
+    case "clearSourceContextMapArtifacts":
+      return value.filter === undefined || isSourceContextMapArtifactFilter(value.filter);
     case "deleteMemory":
       return typeof value.id === "string";
     case "listTopicPages":
@@ -2207,6 +2325,9 @@ function isBuildSourceContextPackPayload(value: unknown): value is BuildSourceCo
     (value.sourceIds === undefined ||
       (Array.isArray(value.sourceIds) &&
         value.sourceIds.every((item) => typeof item === "string"))) &&
+    (value.sourceDepthOverrides === undefined ||
+      (Array.isArray(value.sourceDepthOverrides) &&
+        value.sourceDepthOverrides.every(isSourceContextPackSourceDepthOverride))) &&
     (value.anchors === undefined ||
       (Array.isArray(value.anchors) && value.anchors.every(isGetMemoryEvidenceWindowAnchor))) &&
     (value.useWorkingSet === undefined || typeof value.useWorkingSet === "boolean") &&
@@ -2217,6 +2338,17 @@ function isBuildSourceContextPackPayload(value: unknown): value is BuildSourceCo
     (value.maxWindowsPerSource === undefined || typeof value.maxWindowsPerSource === "number") &&
     (value.contextChunksBefore === undefined || typeof value.contextChunksBefore === "number") &&
     (value.contextChunksAfter === undefined || typeof value.contextChunksAfter === "number")
+  );
+}
+
+function isSourceContextPackSourceDepthOverride(
+  value: unknown,
+): value is SourceContextPackSourceDepthOverride {
+  return (
+    isRecord(value) &&
+    typeof value.sourceId === "string" &&
+    value.sourceId.trim().length > 0 &&
+    isWorkingSetLoadDepth(value.loadDepth)
   );
 }
 
@@ -2286,6 +2418,76 @@ function isSourceContextCompressionLogFilter(
     isRecord(value) &&
     (value.sessionId === undefined || typeof value.sessionId === "string") &&
     (value.runId === undefined || typeof value.runId === "string") &&
+    (value.sourceId === undefined || typeof value.sourceId === "string") &&
+    isOptionalFiniteNumber(value.limit)
+  );
+}
+
+function isAppendSourceContextMapArtifactsPayload(
+  value: unknown,
+): value is AppendSourceContextMapArtifactsPayload {
+  return (
+    isRecord(value) &&
+    typeof value.runId === "string" &&
+    (value.sessionId === undefined || typeof value.sessionId === "string") &&
+    Array.isArray(value.entries) &&
+    value.entries.every(isSourceContextMapArtifactEntry) &&
+    (value.createdAt === undefined || typeof value.createdAt === "string")
+  );
+}
+
+function isSourceContextMapArtifactEntry(value: unknown): value is SourceContextMapArtifactEntry {
+  return (
+    isRecord(value) &&
+    isSourceContextMapArtifactStage(value.stage) &&
+    isSourceContextMapArtifactStatus(value.status) &&
+    (value.groupId === undefined || typeof value.groupId === "string") &&
+    isOptionalFiniteNumber(value.groupIndex) &&
+    (value.sourceIds === undefined ||
+      (Array.isArray(value.sourceIds) &&
+        value.sourceIds.every((item) => typeof item === "string"))) &&
+    (value.windowRefs === undefined ||
+      (Array.isArray(value.windowRefs) &&
+        value.windowRefs.every(isSourceContextMapArtifactWindowRef))) &&
+    (value.evidenceIds === undefined ||
+      (Array.isArray(value.evidenceIds) &&
+        value.evidenceIds.every((item) => typeof item === "string"))) &&
+    isOptionalFiniteNumber(value.tokenEstimate) &&
+    (value.inputSummary === undefined || typeof value.inputSummary === "string") &&
+    (value.outputSummary === undefined || typeof value.outputSummary === "string") &&
+    (value.mapArtifactIds === undefined ||
+      (Array.isArray(value.mapArtifactIds) &&
+        value.mapArtifactIds.every((item) => typeof item === "string"))) &&
+    (value.errorCode === undefined || typeof value.errorCode === "string") &&
+    (value.errorMessage === undefined || typeof value.errorMessage === "string") &&
+    (value.createdAt === undefined || typeof value.createdAt === "string")
+  );
+}
+
+function isSourceContextMapArtifactWindowRef(value: unknown) {
+  return (
+    isRecord(value) &&
+    typeof value.sourceId === "string" &&
+    typeof value.chunkId === "string" &&
+    isOptionalFiniteNumber(value.ord)
+  );
+}
+
+function isSourceContextMapArtifactStage(value: unknown): value is SourceContextMapArtifactStage {
+  return value === "map" || value === "reduce";
+}
+
+function isSourceContextMapArtifactStatus(value: unknown): value is SourceContextMapArtifactStatus {
+  return value === "started" || value === "completed" || value === "failed";
+}
+
+function isSourceContextMapArtifactFilter(value: unknown): value is SourceContextMapArtifactFilter {
+  return (
+    isRecord(value) &&
+    (value.sessionId === undefined || typeof value.sessionId === "string") &&
+    (value.runId === undefined || typeof value.runId === "string") &&
+    (value.stage === undefined || isSourceContextMapArtifactStage(value.stage)) &&
+    (value.status === undefined || isSourceContextMapArtifactStatus(value.status)) &&
     (value.sourceId === undefined || typeof value.sourceId === "string") &&
     isOptionalFiniteNumber(value.limit)
   );
@@ -3356,6 +3558,38 @@ function isWorkerEmbeddingRequest(value: unknown): value is WorkerEmbeddingReque
   );
 }
 
+const forbiddenWorkerChunkMetaSummaryFields = [
+  "apiKey",
+  "fullText",
+  "normalizedText",
+  "pdfBytes",
+  "rawBytes",
+] as const;
+
+function hasForbiddenWorkerChunkMetaSummaryField(value: Record<string, unknown>) {
+  return forbiddenWorkerChunkMetaSummaryFields.some((field) => field in value);
+}
+
+function isWorkerChunkMetaSummaryRequest(value: unknown): value is WorkerChunkMetaSummaryRequest {
+  if (!isRecord(value) || hasForbiddenWorkerChunkMetaSummaryField(value)) return false;
+  return (
+    typeof value.sourceId === "string" &&
+    value.sourceId.length > 0 &&
+    typeof value.chunkId === "string" &&
+    value.chunkId.length > 0 &&
+    typeof value.ord === "number" &&
+    Number.isFinite(value.ord) &&
+    typeof value.role === "string" &&
+    value.role.length > 0 &&
+    typeof value.chunkTextExcerpt === "string" &&
+    value.chunkTextExcerpt.length > 0 &&
+    (value.sourceTitle === undefined || typeof value.sourceTitle === "string") &&
+    (value.sourceType === undefined || typeof value.sourceType === "string") &&
+    (value.docContext === undefined || typeof value.docContext === "string") &&
+    (value.sectionPath === undefined || typeof value.sectionPath === "string")
+  );
+}
+
 function isWorkerVisionAnalysisRequest(value: unknown): value is WorkerVisionAnalysisRequest {
   if (!isRecord(value) || !isRecord(value.image)) return false;
   return (
@@ -3378,6 +3612,31 @@ function isWorkerVisionAnalysisRequest(value: unknown): value is WorkerVisionAna
     !("apiKey" in value) &&
     !("pdfBytes" in value) &&
     !("fullText" in value)
+  );
+}
+
+function isChunkMetaSummaryResponse(
+  value: unknown,
+): value is EngineResponse<ChunkMetaSummaryResult> {
+  if (!isRecord(value) || typeof value.ok !== "boolean") return false;
+  if (!value.ok) {
+    return (
+      isRecord(value.error) &&
+      typeof value.error.code === "string" &&
+      typeof value.error.message === "string" &&
+      (value.error.detail === undefined || typeof value.error.detail === "string")
+    );
+  }
+  const result = value.value;
+  return (
+    isRecord(result) &&
+    (result.status === "summarized" ||
+      result.status === "unavailable" ||
+      result.status === "error") &&
+    (result.providerKind === undefined || result.providerKind === "chat") &&
+    (result.sectionSummary === undefined || typeof result.sectionSummary === "string") &&
+    (result.chunkSummary === undefined || typeof result.chunkSummary === "string") &&
+    (result.reason === undefined || typeof result.reason === "string")
   );
 }
 

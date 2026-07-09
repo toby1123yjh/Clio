@@ -1,4 +1,9 @@
 import type {
+  ChunkMetaSummarizer,
+  ChunkMetaSummaryInput,
+  ChunkMetaSummaryResult,
+} from "@/src/agent-runtime/chunk-meta-summary";
+import type {
   FigureVisionAnalysisInput,
   FigureVisionAnalysisResult,
   FigureVisionAnalyzer,
@@ -10,9 +15,11 @@ import {
   type AnchorResolveResult,
   type AppendSessionEvidencePayload,
   type AppendSourceContextCompressionLogsPayload,
+  type AppendSourceContextMapArtifactsPayload,
   type BuildSourceContextPackPayload,
   type BuildSourceGraphPayload,
   type BuildSourceGraphResult,
+  CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST,
   CLIO_WORKER_EMBEDDING_REQUEST,
   CLIO_WORKER_RESPONSE,
   CLIO_WORKER_VISION_ANALYSIS_REQUEST,
@@ -87,10 +94,16 @@ import {
   type SourceContextCompressionLogFilter,
   type SourceContextCompressionLogRecord,
   type SourceContextLostInfoType,
+  type SourceContextMapArtifactEntry,
+  type SourceContextMapArtifactFilter,
+  type SourceContextMapArtifactRecord,
+  type SourceContextMapArtifactStage,
+  type SourceContextMapArtifactStatus,
   type SourceContextPackGroup,
   type SourceContextPackOutlineItem,
   type SourceContextPackResult,
   type SourceContextPackSource,
+  type SourceContextPackSourceDepthOverride,
   type SourceContextPackWindow,
   type SourceContextPackWindowPriority,
   type SourceKind,
@@ -113,6 +126,7 @@ import {
   type WorkingSetStatusResult,
   createRequestId,
   engineErrorFromUnknown,
+  isWorkerChunkMetaSummaryResponseMessage,
   isWorkerEmbeddingResponseMessage,
   isWorkerRequestMessage,
   isWorkerVisionAnalysisResponseMessage,
@@ -299,11 +313,14 @@ type PdfDocumentParser = (bytes: Uint8Array | ArrayBuffer) => Promise<ParsedPdfD
 type PdfFigureVisionImageExtractor = (
   input: PdfFigureVisionImageExtractionInput,
 ) => Promise<PdfFigureVisionImageExtractionResult>;
+export type ChunkMetaSummarizerFactory = () => ChunkMetaSummarizer | null;
 export type FigureVisionAnalyzerFactory = () => FigureVisionAnalyzer | null;
 export interface LocalEngineOptions {
   openDatabase?: LocalEngineDatabaseOpener;
   embeddingProvider?: EmbeddingProvider;
   embeddingProviderFactory?: EmbeddingProviderFactory;
+  chunkMetaSummarizer?: ChunkMetaSummarizer;
+  chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory;
   figureVisionAnalyzer?: FigureVisionAnalyzer;
   figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory;
   pdfParser?: PdfDocumentParser;
@@ -361,6 +378,10 @@ const sourceContextPackParentWindowMaxChars = 900;
 const figureVisionBridgeTimeoutMs = 60_000;
 const figureVisionMaxPageContextChars = 1_200;
 const figureVisionMaxAnalysesPerJob = 8;
+const chunkMetaSummaryBridgeTimeoutMs = 60_000;
+const defaultChunkMetaTier2MaxChunks = 8;
+const maxChunkMetaTier2MaxChunks = 32;
+const chunkMetaSummaryExcerptMaxChars = 1_800;
 const defaultEmbeddingProvider = {
   modelId: "clio-local-hash-v1",
   provider: "local-deterministic",
@@ -502,6 +523,7 @@ interface SourceContextPackOptions {
   query: string;
   ftsQuery: string;
   sourceIds: string[];
+  sourceDepthOverrides: SourceContextPackSourceDepthOverride[];
   anchors: GetMemoryEvidenceWindowAnchor[];
   useWorkingSet: boolean;
   maxTotalTokens: number;
@@ -519,6 +541,7 @@ interface SourceContextPackCandidate {
   explicit: boolean;
   anchored: boolean;
   query: boolean;
+  loadDepthOverride?: WorkingSetLoadDepth;
   workingSet?: {
     loadDepth: WorkingSetLoadDepth;
     pinStatus: WorkingSetStatusResult["entries"][number]["pinStatus"];
@@ -649,7 +672,7 @@ interface ChunkMetaHeadV1 {
 
 type ChunkMetaTierV1 = "tier0" | "tier1" | "tier2";
 type ChunkMetaSummarySourceV1 = "deterministic" | "local_extractive" | "remote_llm" | "unavailable";
-type ChunkMetaTierStatusV1 = "available" | "disabled" | "unavailable";
+type ChunkMetaTierStatusV1 = "available" | "disabled" | "unavailable" | "error";
 
 interface ChunkMetaTierStateV1 {
   status: ChunkMetaTierStatusV1;
@@ -697,6 +720,7 @@ export class LocalEngine {
   private readonly openDatabase: LocalEngineDatabaseOpener;
   private readonly embeddingProviderOverride?: EmbeddingProvider;
   private readonly embeddingProviderFactory?: EmbeddingProviderFactory;
+  private readonly chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory;
   private readonly figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory;
   private readonly pdfParser: PdfDocumentParser;
   private readonly pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor;
@@ -706,6 +730,10 @@ export class LocalEngine {
     this.openDatabase = options.openDatabase ?? openProductionDatabase;
     this.embeddingProviderOverride = options.embeddingProvider;
     this.embeddingProviderFactory = options.embeddingProviderFactory;
+    this.chunkMetaSummarizerFactory =
+      options.chunkMetaSummarizer === undefined
+        ? options.chunkMetaSummarizerFactory
+        : () => options.chunkMetaSummarizer ?? null;
     this.figureVisionAnalyzerFactory =
       options.figureVisionAnalyzer === undefined
         ? options.figureVisionAnalyzerFactory
@@ -767,6 +795,12 @@ export class LocalEngine {
         return await this.listSourceContextCompressionLogs(request.filter);
       case "clearSourceContextCompressionLogs":
         return await this.clearSourceContextCompressionLogs(request.filter);
+      case "appendSourceContextMapArtifacts":
+        return await this.appendSourceContextMapArtifacts(request.payload);
+      case "listSourceContextMapArtifacts":
+        return await this.listSourceContextMapArtifacts(request.filter);
+      case "clearSourceContextMapArtifacts":
+        return await this.clearSourceContextMapArtifacts(request.filter);
       case "deleteMemory":
         return await this.delete(request.id);
       case "listTopicPages":
@@ -1794,6 +1828,109 @@ export class LocalEngine {
     return { cleared: Number(db.selectValue("SELECT changes()") ?? 0) };
   }
 
+  private async appendSourceContextMapArtifacts(
+    payload: AppendSourceContextMapArtifactsPayload,
+  ): Promise<{ items: SourceContextMapArtifactRecord[] }> {
+    if (payload.entries.length === 0) return { items: [] };
+    const db = await this.ensureReady();
+    if (payload.sessionId !== undefined) {
+      const session = db.selectObject("SELECT id FROM sessions WHERE id = ? LIMIT 1", [
+        payload.sessionId,
+      ]);
+      if (session === undefined) {
+        throw new EngineRpcError(
+          "SESSION_NOT_FOUND",
+          `Chat session not found: ${payload.sessionId}`,
+        );
+      }
+    }
+
+    const createdAt = payload.createdAt ?? new Date().toISOString();
+    const ids = payload.entries.map(() => createId("sctx_map"));
+    transaction(db, () => {
+      payload.entries.forEach((entry, index) => {
+        const sourceIds = boundedArtifactStrings(entry.sourceIds, 100);
+        const windowRefs = boundedSourceContextMapArtifactWindowRefs(entry.windowRefs, 300);
+        const evidenceIds = boundedArtifactStrings(entry.evidenceIds, 300);
+        const mapArtifactIds = boundedArtifactStrings(entry.mapArtifactIds, 100);
+        db.exec({
+          sql: `INSERT INTO source_context_map_artifacts (
+            id,
+            session_id,
+            run_id,
+            stage,
+            status,
+            group_id,
+            group_index,
+            source_ids_json,
+            window_refs_json,
+            evidence_ids_json,
+            token_estimate,
+            input_summary,
+            output_summary,
+            map_artifact_ids_json,
+            error_code,
+            error_message,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          bind: [
+            ids[index],
+            payload.sessionId ?? null,
+            payload.runId,
+            entry.stage,
+            entry.status,
+            normalizeOptionalArtifactText(entry.groupId, 160) ?? null,
+            finiteNumberOrNull(entry.groupIndex),
+            JSON.stringify(sourceIds),
+            JSON.stringify(windowRefs),
+            JSON.stringify(evidenceIds),
+            finiteNumberOrNull(entry.tokenEstimate),
+            normalizeOptionalArtifactText(entry.inputSummary, 2_000) ?? "",
+            normalizeOptionalArtifactText(entry.outputSummary, 2_000) ?? "",
+            JSON.stringify(mapArtifactIds),
+            normalizeOptionalArtifactText(entry.errorCode, 120) ?? null,
+            normalizeOptionalArtifactText(entry.errorMessage, 1_000) ?? null,
+            entry.createdAt ?? createdAt,
+          ],
+        });
+      });
+    });
+
+    const rows = ids.flatMap((id) => {
+      const row = db.selectObject("SELECT * FROM source_context_map_artifacts WHERE id = ?", [id]);
+      return row === undefined ? [] : [row];
+    });
+    return { items: rows.map(sourceContextMapArtifactRecordFromRow) };
+  }
+
+  private async listSourceContextMapArtifacts(
+    filter: SourceContextMapArtifactFilter = {},
+  ): Promise<{ items: SourceContextMapArtifactRecord[] }> {
+    const db = await this.ensureReady();
+    const where = sourceContextMapArtifactWhereClause(filter);
+    const rows = db.selectObjects(
+      `SELECT *
+       FROM source_context_map_artifacts
+       ${where.sql}
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+      [...where.bind, clampOptionalLimit(filter.limit, 30, 100)],
+    );
+    return { items: rows.map(sourceContextMapArtifactRecordFromRow) };
+  }
+
+  private async clearSourceContextMapArtifacts(
+    filter: SourceContextMapArtifactFilter = {},
+  ): Promise<{ cleared: number }> {
+    const db = await this.ensureReady();
+    const where = sourceContextMapArtifactWhereClause(filter);
+    db.exec({
+      sql: `DELETE FROM source_context_map_artifacts ${where.sql}`,
+      bind: where.bind,
+    });
+    return { cleared: Number(db.selectValue("SELECT changes()") ?? 0) };
+  }
+
   private async pinWorkingSetSource(
     sourceId: string,
     loadDepth: WorkingSetLoadDepth = "meta",
@@ -1895,6 +2032,7 @@ export class LocalEngine {
         sql: "DELETE FROM source_context_compression_logs WHERE source_id = ?",
         bind: [id],
       });
+      deleteSourceContextMapArtifactsForSource(db, id);
       db.exec({ sql: "DELETE FROM source_embeddings WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_working_set WHERE source_id = ?", bind: [id] });
       db.exec({ sql: "DELETE FROM source_metadata_fts WHERE source_id = ?", bind: [id] });
@@ -2398,6 +2536,7 @@ export class LocalEngine {
       id,
       this.embeddingProviderOverride,
       this.embeddingProviderFactory,
+      this.chunkMetaSummarizerFactory,
       this.figureVisionAnalyzerFactory,
       this.pdfRawFileStore,
       this.pdfFigureVisionImageExtractor,
@@ -2421,6 +2560,7 @@ export class LocalEngine {
       jobId,
       this.embeddingProviderOverride,
       this.embeddingProviderFactory,
+      this.chunkMetaSummarizerFactory,
       this.figureVisionAnalyzerFactory,
       this.pdfRawFileStore,
       this.pdfFigureVisionImageExtractor,
@@ -3188,6 +3328,7 @@ export class LocalEngine {
       db.exec("DELETE FROM graph_edges");
       db.exec("DELETE FROM graph_nodes");
       db.exec("DELETE FROM source_context_compression_logs");
+      db.exec("DELETE FROM source_context_map_artifacts");
       db.exec("DELETE FROM source_working_set");
       db.exec("DELETE FROM source_metadata");
       db.exec("DELETE FROM keyword_index_sources");
@@ -3359,6 +3500,59 @@ function isBridgeEmbeddingProvider(provider: string) {
   return provider === "openai" || provider === "openai-compatible";
 }
 
+function createWorkerChunkMetaSummarizer(workerSelf: LocalEngineWorkerGlobal): ChunkMetaSummarizer {
+  const pending = new Map<
+    string,
+    {
+      resolve: (result: ChunkMetaSummaryResult) => void;
+      reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+
+  workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (!isWorkerChunkMetaSummaryResponseMessage(event.data)) return;
+    const entry = pending.get(event.data.requestId);
+    if (entry === undefined) return;
+    clearTimeout(entry.timer);
+    pending.delete(event.data.requestId);
+    if (event.data.response.ok) {
+      entry.resolve(event.data.response.value);
+      return;
+    }
+    entry.reject(
+      new EngineRpcError(
+        event.data.response.error.code,
+        event.data.response.error.message,
+        event.data.response.error.detail,
+      ),
+    );
+  });
+
+  return {
+    summarize(input: ChunkMetaSummaryInput) {
+      const requestId = createRequestId();
+      return new Promise<ChunkMetaSummaryResult>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(requestId);
+          reject(
+            new EngineRpcError(
+              "CHUNK_META_SUMMARY_BRIDGE_TIMEOUT",
+              "Chunk meta summary request timed out.",
+            ),
+          );
+        }, chunkMetaSummaryBridgeTimeoutMs);
+        pending.set(requestId, { resolve, reject, timer });
+        workerSelf.postMessage({
+          type: CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST,
+          requestId,
+          request: input,
+        });
+      });
+    },
+  };
+}
+
 function createWorkerFigureVisionAnalyzer(
   workerSelf: LocalEngineWorkerGlobal,
 ): FigureVisionAnalyzer {
@@ -3454,6 +3648,7 @@ if (workerSelf !== null) {
     workerSelf,
     new LocalEngine({
       embeddingProviderFactory: createWorkerEmbeddingProviderFactory(workerSelf),
+      chunkMetaSummarizer: createWorkerChunkMetaSummarizer(workerSelf),
       figureVisionAnalyzer: createWorkerFigureVisionAnalyzer(workerSelf),
     }),
   );
@@ -3765,6 +3960,27 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS source_context_map_artifacts (
+      id TEXT PRIMARY KEY,
+      session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      run_id TEXT NOT NULL,
+      stage TEXT NOT NULL CHECK (stage IN ('map', 'reduce')),
+      status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'failed')),
+      group_id TEXT,
+      group_index INTEGER,
+      source_ids_json TEXT NOT NULL DEFAULT '[]',
+      window_refs_json TEXT NOT NULL DEFAULT '[]',
+      evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+      token_estimate INTEGER,
+      input_summary TEXT NOT NULL DEFAULT '',
+      output_summary TEXT NOT NULL DEFAULT '',
+      map_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+      error_code TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS web_search_history (
       id TEXT PRIMARY KEY,
       query TEXT NOT NULL,
@@ -3951,6 +4167,18 @@ function migrate(db: SqliteDb) {
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_source_context_compression_logs_source_created
      ON source_context_compression_logs(source_id, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_artifacts_session_created
+     ON source_context_map_artifacts(session_id, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_artifacts_run_stage_created
+     ON source_context_map_artifacts(run_id, stage, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_source_context_map_artifacts_status_created
+     ON source_context_map_artifacts(status, created_at DESC)`,
   );
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_web_search_history_created ON web_search_history(created_at DESC)",
@@ -6781,6 +7009,7 @@ async function runJob(
   jobId: string,
   embeddingProviderOverride?: EmbeddingProvider,
   embeddingProviderFactory?: EmbeddingProviderFactory,
+  chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory,
   figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory,
   pdfRawFileStore?: PdfRawFileStore,
   pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor = extractPdfFigureVisionImageInput,
@@ -6822,6 +7051,7 @@ async function runJob(
         stringField(job, "payload_json"),
         embeddingProviderOverride,
         embeddingProviderFactory,
+        chunkMetaSummarizerFactory,
         figureVisionAnalyzerFactory,
         pdfRawFileStore,
         pdfFigureVisionImageExtractor,
@@ -7076,6 +7306,7 @@ async function runPostCaptureHardeningJob(
   payloadJson: string,
   embeddingProviderOverride?: EmbeddingProvider,
   embeddingProviderFactory?: EmbeddingProviderFactory,
+  chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory,
   figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory,
   pdfRawFileStore?: PdfRawFileStore,
   pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor = extractPdfFigureVisionImageInput,
@@ -7094,7 +7325,10 @@ async function runPostCaptureHardeningJob(
     ? runPaperMetadataStageForSource(db, payload.sourceId)
     : { skipped: true, reason: "stage_not_requested" };
   const chunkMeta = shouldRunChunkMeta
-    ? runChunkMetaStageForSource(db, payload.sourceId)
+    ? await runChunkMetaStageForSource(db, payload.sourceId, {
+        tier2: payload.chunkMetaTier2,
+        summarizerFactory: chunkMetaSummarizerFactory,
+      })
     : { skipped: true, reason: "stage_not_requested" };
   const embeddingResult = shouldRunEmbedding
     ? await runEmbeddingStageForSource(
@@ -7139,7 +7373,17 @@ function parsePostCaptureHardeningPayload(payloadJson: string) {
     ? payload.stages.flatMap((stage) => (isPostCaptureStageName(stage) ? [stage] : []))
     : [];
   const graphBuildMode = payload.graphBuildMode === "deterministic" ? "deterministic" : undefined;
-  return { sourceId, stages, graphBuildMode };
+  const rawChunkMetaTier2 = isRecord(payload.chunkMetaTier2) ? payload.chunkMetaTier2 : undefined;
+  const chunkMetaTier2 = {
+    enabled: rawChunkMetaTier2?.enabled === true,
+    maxChunks: clampChunkMetaTier2MaxChunks(rawChunkMetaTier2?.maxChunks),
+  };
+  return { sourceId, stages, graphBuildMode, chunkMetaTier2 };
+}
+
+function clampChunkMetaTier2MaxChunks(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return defaultChunkMetaTier2MaxChunks;
+  return Math.max(0, Math.min(maxChunkMetaTier2MaxChunks, Math.floor(value)));
 }
 
 function isPostCaptureStageName(value: unknown): value is PostCaptureStageName {
@@ -7711,7 +7955,28 @@ function metadataBoundingBox(value: unknown): ParsedPdfImageArtifact["bbox"] | u
   return { xMin, yMin, xMax, yMax, unit: "pdf_user_space" };
 }
 
-function runChunkMetaStageForSource(db: SqliteDb, sourceId: string): Record<string, unknown> {
+interface RunChunkMetaStageOptions {
+  tier2: {
+    enabled: boolean;
+    maxChunks: number;
+  };
+  summarizerFactory?: ChunkMetaSummarizerFactory;
+}
+
+interface ChunkMetaStageRow {
+  id: string;
+  ord: number;
+  row: SqlRow;
+  role: string;
+  sectionPath: string | null;
+  metaHeadJson: string;
+}
+
+async function runChunkMetaStageForSource(
+  db: SqliteDb,
+  sourceId: string,
+  options: RunChunkMetaStageOptions,
+): Promise<Record<string, unknown>> {
   const source = db.selectObject(
     `SELECT
        s.id,
@@ -7764,6 +8029,12 @@ function runChunkMetaStageForSource(db: SqliteDb, sourceId: string): Record<stri
   });
   const childChunks = resolvedChunks.filter((chunk) => chunk.role === "child");
   const childIndexById = new Map(childChunks.map((chunk, index) => [chunk.id, index]));
+  const sourceTitle = stringField(source, "meta_title") || stringField(source, "source_title");
+  const sourceType =
+    stringField(source, "meta_source_type") ||
+    stringField(source, "source_type") ||
+    sourceKindField(source, "source_kind");
+  const chunkMetaRows: ChunkMetaStageRow[] = [];
   transaction(db, () => {
     for (const chunk of resolvedChunks) {
       const relations: ChunkMetaRelationV1[] = [];
@@ -7789,11 +8060,8 @@ function runChunkMetaStageForSource(db: SqliteDb, sourceId: string): Record<stri
         }
       }
       const metaHeadJson = buildChunkMetaHeadJsonFromSourceMetadata({
-        sourceTitle: stringField(source, "meta_title") || stringField(source, "source_title"),
-        sourceType:
-          stringField(source, "meta_source_type") ||
-          stringField(source, "source_type") ||
-          sourceKindField(source, "source_kind"),
+        sourceTitle,
+        sourceType,
         metadataJson: stringField(source, "metadata_json"),
         chunkText: stringField(chunk.row, "text"),
         sectionPath: chunk.sectionPath,
@@ -7805,10 +8073,18 @@ function runChunkMetaStageForSource(db: SqliteDb, sourceId: string): Record<stri
         sql: "UPDATE source_chunks SET section_path = ?, meta_head_json = ? WHERE id = ?",
         bind: [chunk.sectionPath, metaHeadJson, chunk.id],
       });
+      chunkMetaRows.push({
+        id: chunk.id,
+        ord: numberField(chunk.row, "ord"),
+        row: chunk.row,
+        role: chunk.role,
+        sectionPath: chunk.sectionPath,
+        metaHeadJson,
+      });
     }
   });
   const childChunkCount = chunks.filter((chunk) => stringField(chunk, "role") === "child").length;
-  return {
+  const baseResult = {
     tier: "tier1",
     selectedTier: "tier1",
     chunkCount: childChunkCount,
@@ -7817,6 +8093,287 @@ function runChunkMetaStageForSource(db: SqliteDb, sourceId: string): Record<stri
     tier2DisabledCount: chunks.length,
     tier2Reason: "explicit_llm_chunk_meta_not_configured",
   };
+  if (!options.tier2.enabled) return baseResult;
+
+  const maxChunks = options.tier2.maxChunks;
+  if (maxChunks <= 0) {
+    updateChunkMetaTier2StateForRows(db, chunkMetaRows, {
+      status: "disabled",
+      reason: "chunk_meta_tier2_max_chunks_zero",
+    });
+    return {
+      ...baseResult,
+      tier2Enabled: true,
+      tier2DisabledCount: chunks.length,
+      tier2UnavailableCount: 0,
+      tier2ErrorCount: 0,
+      tier2SummarizedCount: 0,
+      tier2SkippedCount: chunks.length,
+      tier2Reason: "chunk_meta_tier2_max_chunks_zero",
+    };
+  }
+
+  const summarizer = options.summarizerFactory?.() ?? null;
+  if (summarizer === null) {
+    updateChunkMetaTier2StateForRows(db, chunkMetaRows, {
+      status: "unavailable",
+      reason: "chunk_meta_summarizer_unavailable",
+    });
+    return {
+      ...baseResult,
+      tier2Enabled: true,
+      tier2DisabledCount: 0,
+      tier2UnavailableCount: chunks.length,
+      tier2ErrorCount: 0,
+      tier2SummarizedCount: 0,
+      tier2SkippedCount: 0,
+      tier2Reason: "chunk_meta_summarizer_unavailable",
+    };
+  }
+
+  let summarizedCount = 0;
+  let unavailableCount = 0;
+  let errorCount = 0;
+  const selectedRows = chunkMetaRows.slice(0, maxChunks);
+  const skippedRows = chunkMetaRows.slice(maxChunks);
+  for (const chunk of selectedRows) {
+    const result = await summarizeChunkMetaRow(
+      summarizer,
+      sourceId,
+      sourceTitle,
+      sourceType,
+      chunk,
+    );
+    const updated = applyChunkMetaTier2Result(chunk.metaHeadJson, result);
+    db.exec({
+      sql: "UPDATE source_chunks SET meta_head_json = ? WHERE id = ?",
+      bind: [updated, chunk.id],
+    });
+    if (result.status === "summarized") summarizedCount += 1;
+    else if (result.status === "unavailable") unavailableCount += 1;
+    else errorCount += 1;
+  }
+  if (skippedRows.length > 0) {
+    updateChunkMetaTier2StateForRows(db, skippedRows, {
+      status: "disabled",
+      reason: "chunk_meta_tier2_max_chunks_exceeded",
+    });
+  }
+
+  const tier2FullySelected = summarizedCount > 0 && summarizedCount === chunkMetaRows.length;
+  return {
+    ...baseResult,
+    tier: tier2FullySelected ? "tier2" : "tier1",
+    selectedTier: tier2FullySelected ? "tier2" : "tier1",
+    tier2Enabled: true,
+    tier2DisabledCount: skippedRows.length,
+    tier2UnavailableCount: unavailableCount,
+    tier2ErrorCount: errorCount,
+    tier2SummarizedCount: summarizedCount,
+    tier2SkippedCount: skippedRows.length,
+    tier2MaxChunks: maxChunks,
+    ...(summarizedCount === 0
+      ? {
+          tier2Reason: firstChunkMetaTier2FailureReason(
+            unavailableCount,
+            errorCount,
+            skippedRows.length,
+          ),
+        }
+      : {}),
+  };
+}
+
+async function summarizeChunkMetaRow(
+  summarizer: ChunkMetaSummarizer,
+  sourceId: string,
+  sourceTitle: string,
+  sourceType: string,
+  chunk: ChunkMetaStageRow,
+): Promise<ChunkMetaSummaryResult> {
+  const metaHead = parseMetadata(chunk.metaHeadJson);
+  try {
+    return await summarizer.summarize({
+      sourceId,
+      chunkId: chunk.id,
+      ord: chunk.ord,
+      role: chunk.role,
+      sourceTitle,
+      sourceType,
+      docContext: stringMetadataField(metaHead, "docContext") ?? undefined,
+      sectionPath: chunk.sectionPath ?? undefined,
+      chunkTextExcerpt: boundedNormalizedText(
+        stringField(chunk.row, "text"),
+        chunkMetaSummaryExcerptMaxChars,
+      ),
+    });
+  } catch (error) {
+    return {
+      status: "error",
+      providerKind: "chat",
+      reason: boundedNormalizedText(
+        error instanceof Error ? error.message : "chunk_meta_summary_error",
+        240,
+      ),
+    };
+  }
+}
+
+function updateChunkMetaTier2StateForRows(
+  db: SqliteDb,
+  rows: ChunkMetaStageRow[],
+  input: {
+    status: Extract<ChunkMetaTierStatusV1, "disabled" | "unavailable" | "error">;
+    reason: string;
+  },
+) {
+  transaction(db, () => {
+    for (const row of rows) {
+      db.exec({
+        sql: "UPDATE source_chunks SET meta_head_json = ? WHERE id = ?",
+        bind: [applyChunkMetaTier2Fallback(row.metaHeadJson, input.status, input.reason), row.id],
+      });
+    }
+  });
+}
+
+function applyChunkMetaTier2Result(metaHeadJson: string, result: ChunkMetaSummaryResult): string {
+  if (result.status !== "summarized") {
+    return applyChunkMetaTier2Fallback(
+      metaHeadJson,
+      result.status === "error" ? "error" : "unavailable",
+      result.reason ?? `chunk_meta_summary_${result.status}`,
+    );
+  }
+
+  const metaHead = parseMetadata(metaHeadJson);
+  const tiers = isRecord(metaHead.tiers) ? metaHead.tiers : {};
+  const fallbackTier = fallbackChunkMetaTier(metaHead);
+  const fallbackState = selectedChunkMetaTierState(metaHead, fallbackTier);
+  const sectionSummary =
+    result.sectionSummary ??
+    stringMetadataField(fallbackState, "sectionSummary") ??
+    stringMetadataField(metaHead, "sectionSummary");
+  const chunkSummary =
+    result.chunkSummary ??
+    stringMetadataField(fallbackState, "chunkSummary") ??
+    stringMetadataField(metaHead, "chunkSummary");
+  const relations = parseChunkMetaRelations(metaHeadJson);
+  const semanticRelations = chunkMetaSemanticRelationsFromState(fallbackState);
+  const updated: ChunkMetaHeadV1 = {
+    ...(metaHead as unknown as ChunkMetaHeadV1),
+    version: chunkMetaHeadVersion,
+    tier: "tier2",
+    selectedTier: "tier2",
+    summarySource: "remote_llm",
+    sectionSummary: sectionSummary ?? null,
+    chunkSummary: chunkSummary ?? null,
+    relations,
+    semanticRelations,
+    tiers: {
+      ...(tiers as Record<ChunkMetaTierV1, ChunkMetaTierStateV1>),
+      tier2: {
+        status: "available",
+        summarySource: "remote_llm",
+        fallbackTier,
+        sectionSummary: sectionSummary ?? null,
+        chunkSummary: chunkSummary ?? null,
+        relations,
+        semanticRelations,
+      },
+    },
+  };
+  return JSON.stringify(updated);
+}
+
+function applyChunkMetaTier2Fallback(
+  metaHeadJson: string,
+  status: Extract<ChunkMetaTierStatusV1, "disabled" | "unavailable" | "error">,
+  reason: string,
+) {
+  const metaHead = parseMetadata(metaHeadJson);
+  const tiers = isRecord(metaHead.tiers) ? metaHead.tiers : {};
+  const fallbackTier = fallbackChunkMetaTier(metaHead);
+  const fallbackState = selectedChunkMetaTierState(metaHead, fallbackTier);
+  const fallbackSummarySource: ChunkMetaSummarySourceV1 =
+    fallbackTier === "tier1" ? "local_extractive" : "deterministic";
+  const updated: ChunkMetaHeadV1 = {
+    ...(metaHead as unknown as ChunkMetaHeadV1),
+    version: chunkMetaHeadVersion,
+    tier: fallbackTier,
+    selectedTier: fallbackTier,
+    summarySource: fallbackSummarySource,
+    sectionSummary:
+      stringMetadataField(fallbackState, "sectionSummary") ??
+      stringMetadataField(metaHead, "sectionSummary") ??
+      null,
+    chunkSummary:
+      stringMetadataField(fallbackState, "chunkSummary") ??
+      stringMetadataField(metaHead, "chunkSummary") ??
+      null,
+    semanticRelations: chunkMetaSemanticRelationsFromState(fallbackState),
+    tiers: {
+      ...(tiers as Record<ChunkMetaTierV1, ChunkMetaTierStateV1>),
+      tier2: {
+        status,
+        summarySource: "unavailable",
+        reason: boundedNormalizedText(reason, 240),
+        fallbackTier,
+        sectionSummary: null,
+        chunkSummary: null,
+        relations: [],
+        semanticRelations: [],
+      },
+    },
+  };
+  return JSON.stringify(updated);
+}
+
+function fallbackChunkMetaTier(metaHead: Record<string, unknown>): ChunkMetaTierV1 {
+  const tiers = isRecord(metaHead.tiers) ? metaHead.tiers : {};
+  const tier1 = tiers.tier1;
+  if (isRecord(tier1) && tier1.status === "available") return "tier1";
+  return "tier0";
+}
+
+function chunkMetaSemanticRelationsFromState(
+  state: Record<string, unknown>,
+): ChunkMetaSemanticRelationV1[] {
+  if (!Array.isArray(state.semanticRelations)) return [];
+  return normalizeChunkMetaSemanticRelations(
+    state.semanticRelations.flatMap((relation): ChunkMetaSemanticRelationV1[] => {
+      if (!isRecord(relation)) return [];
+      if (!isChunkMetaSemanticRelationKind(relation.kind)) return [];
+      const target = typeof relation.target === "string" ? relation.target : "";
+      if (target.length === 0) return [];
+      return [
+        {
+          kind: relation.kind,
+          target,
+          label: typeof relation.label === "string" ? relation.label : null,
+          confidence:
+            typeof relation.confidence === "number" && Number.isFinite(relation.confidence)
+              ? relation.confidence
+              : 0.5,
+          source:
+            relation.source === "local_extractive" || relation.source === "deterministic"
+              ? relation.source
+              : "local_extractive",
+        },
+      ];
+    }),
+  );
+}
+
+function firstChunkMetaTier2FailureReason(
+  unavailableCount: number,
+  errorCount: number,
+  skippedCount: number,
+) {
+  if (errorCount > 0) return "chunk_meta_summary_error";
+  if (unavailableCount > 0) return "chunk_meta_summary_unavailable";
+  if (skippedCount > 0) return "chunk_meta_tier2_max_chunks_exceeded";
+  return "chunk_meta_summary_not_run";
 }
 
 async function runEmbeddingStageForSource(
@@ -9540,6 +10097,38 @@ function sourceContextCompressionLogWhereClause(
   };
 }
 
+function sourceContextMapArtifactWhereClause(
+  filter: SourceContextMapArtifactFilter,
+): SqlWhereClause {
+  const conditions: string[] = [];
+  const bind: unknown[] = [];
+  if (filter.sessionId !== undefined) {
+    conditions.push("session_id = ?");
+    bind.push(filter.sessionId);
+  }
+  if (filter.runId !== undefined) {
+    conditions.push("run_id = ?");
+    bind.push(filter.runId);
+  }
+  if (filter.stage !== undefined) {
+    conditions.push("stage = ?");
+    bind.push(filter.stage);
+  }
+  if (filter.status !== undefined) {
+    conditions.push("status = ?");
+    bind.push(filter.status);
+  }
+  if (filter.sourceId !== undefined) {
+    const pattern = sourceContextMapArtifactJsonLikePattern(filter.sourceId);
+    conditions.push("(source_ids_json LIKE ? ESCAPE '\\' OR window_refs_json LIKE ? ESCAPE '\\')");
+    bind.push(pattern, pattern);
+  }
+  return {
+    sql: conditions.length === 0 ? "" : `WHERE ${conditions.join(" AND ")}`,
+    bind,
+  };
+}
+
 function sourceContextLostInfoTypesForEntry(
   entry: SourceContextCompressionLogEntry,
 ): SourceContextLostInfoType[] {
@@ -9656,6 +10245,10 @@ function normalizeSourceContextPackOptions(
     query,
     ftsQuery: buildFtsQuery(query),
     sourceIds: boundedUniqueStrings(payload.sourceIds, maxSourceContextPackSources),
+    sourceDepthOverrides: normalizeSourceContextPackDepthOverrides(
+      payload.sourceDepthOverrides,
+      maxSourceContextPackSources,
+    ),
     anchors: boundedEvidenceWindowAnchors(payload.anchors, 80),
     useWorkingSet: payload.useWorkingSet !== false,
     maxTotalTokens,
@@ -9680,6 +10273,26 @@ function normalizeSourceContextPackOptions(
   };
 }
 
+function normalizeSourceContextPackDepthOverrides(
+  value: SourceContextPackSourceDepthOverride[] | undefined,
+  limit: number,
+): SourceContextPackSourceDepthOverride[] {
+  const bySourceId = new Map<string, WorkingSetLoadDepth>();
+  for (const override of value ?? []) {
+    const sourceId = normalizeText(override.sourceId);
+    if (sourceId.length === 0 || !isWorkingSetLoadDepthValue(override.loadDepth)) continue;
+    bySourceId.delete(sourceId);
+    bySourceId.set(sourceId, override.loadDepth);
+  }
+  return [...bySourceId.entries()]
+    .slice(0, Math.max(0, Math.floor(limit)))
+    .map(([sourceId, loadDepth]) => ({ sourceId, loadDepth }));
+}
+
+function isWorkingSetLoadDepthValue(value: unknown): value is WorkingSetLoadDepth {
+  return value === "meta" || value === "outline" || value === "chunks" || value === "full";
+}
+
 function clampTokenBudget(value: number | undefined, fallback: number, max: number) {
   if (value === undefined || !Number.isFinite(value)) return fallback;
   return Math.max(1, Math.min(Math.floor(value), max));
@@ -9691,6 +10304,9 @@ function resolveSourceContextPackCandidates(
   compressionLog: SourceContextCompressionLogEntry[],
 ): SourceContextPackCandidate[] {
   const candidates = new Map<string, SourceContextPackCandidate>();
+  const loadDepthOverrideBySourceId = new Map(
+    options.sourceDepthOverrides.map((override) => [override.sourceId, override.loadDepth]),
+  );
 
   const touchCandidate = (
     sourceId: string,
@@ -9699,6 +10315,7 @@ function resolveSourceContextPackCandidates(
     const id = normalizeText(sourceId);
     if (id.length === 0) return;
     const existing = candidates.get(id);
+    const loadDepthOverride = loadDepthOverrideBySourceId.get(id);
     if (existing === undefined && candidates.size >= options.maxSources) return;
     if (existing === undefined) {
       candidates.set(id, {
@@ -9707,6 +10324,7 @@ function resolveSourceContextPackCandidates(
         explicit: update.explicit === true,
         anchored: update.anchored === true,
         query: update.query === true,
+        ...(loadDepthOverride === undefined ? {} : { loadDepthOverride }),
         ...(update.workingSet === undefined ? {} : { workingSet: update.workingSet }),
       });
       return;
@@ -9716,6 +10334,7 @@ function resolveSourceContextPackCandidates(
       explicit: existing.explicit || update.explicit === true,
       anchored: existing.anchored || update.anchored === true,
       query: existing.query || update.query === true,
+      loadDepthOverride: loadDepthOverride ?? existing.loadDepthOverride,
       workingSet: update.workingSet ?? existing.workingSet,
     });
   };
@@ -9882,9 +10501,10 @@ function loadSourceContextSourceStates(
       const sourceType =
         stringField(row, "meta_source_type") || stringField(row, "source_type") || "webpage";
       const requestedLoadDepth =
-        optionalString(row, "load_depth") === undefined
+        candidate.loadDepthOverride ??
+        (optionalString(row, "load_depth") === undefined
           ? "chunks"
-          : workingSetLoadDepthField(row, "load_depth");
+          : workingSetLoadDepthField(row, "load_depth"));
       const pinStatus =
         optionalString(row, "pin_status") === undefined
           ? undefined
@@ -12271,6 +12891,36 @@ function sourceContextCompressionLogRecordFromRow(row: SqlRow): SourceContextCom
   };
 }
 
+function sourceContextMapArtifactRecordFromRow(row: SqlRow): SourceContextMapArtifactRecord {
+  const sessionId = optionalString(row, "session_id");
+  const groupId = optionalString(row, "group_id");
+  const groupIndex = optionalNumber(row, "group_index");
+  const tokenEstimate = optionalNumber(row, "token_estimate");
+  const inputSummary = optionalString(row, "input_summary");
+  const outputSummary = optionalString(row, "output_summary");
+  const errorCode = optionalString(row, "error_code");
+  const errorMessage = optionalString(row, "error_message");
+  return {
+    id: stringField(row, "id"),
+    ...(sessionId === undefined ? {} : { sessionId }),
+    runId: stringField(row, "run_id"),
+    stage: sourceContextMapArtifactStageField(row, "stage"),
+    status: sourceContextMapArtifactStatusField(row, "status"),
+    ...(groupId === undefined ? {} : { groupId }),
+    ...(groupIndex === undefined ? {} : { groupIndex }),
+    sourceIds: parseStringArray(stringField(row, "source_ids_json")),
+    windowRefs: parseSourceContextMapArtifactWindowRefs(stringField(row, "window_refs_json")),
+    evidenceIds: parseStringArray(stringField(row, "evidence_ids_json")),
+    ...(tokenEstimate === undefined ? {} : { tokenEstimate }),
+    ...(inputSummary === undefined ? {} : { inputSummary }),
+    ...(outputSummary === undefined ? {} : { outputSummary }),
+    mapArtifactIds: parseStringArray(stringField(row, "map_artifact_ids_json")),
+    ...(errorCode === undefined ? {} : { errorCode }),
+    ...(errorMessage === undefined ? {} : { errorMessage }),
+    createdAt: stringField(row, "created_at"),
+  };
+}
+
 function chatMessageRecordFromRow(row: SqlRow): ChatMessageRecord {
   const pageUrl = optionalString(row, "page_url");
   const pageTitle = optionalString(row, "page_title");
@@ -12472,6 +13122,25 @@ function parseJsonArray(input: string): unknown[] {
 
 function parseStringArray(input: string): string[] {
   return parseJsonArray(input).flatMap((item) => (typeof item === "string" ? [item] : []));
+}
+
+function parseSourceContextMapArtifactWindowRefs(
+  input: string,
+): NonNullable<SourceContextMapArtifactEntry["windowRefs"]> {
+  return parseJsonArray(input).flatMap((item) => {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) return [];
+    const record = item as Record<string, unknown>;
+    if (typeof record.sourceId !== "string" || typeof record.chunkId !== "string") return [];
+    return [
+      {
+        sourceId: record.sourceId,
+        chunkId: record.chunkId,
+        ...(typeof record.ord === "number" && Number.isFinite(record.ord)
+          ? { ord: Math.floor(record.ord) }
+          : {}),
+      },
+    ];
+  });
 }
 
 function parseTopicSourceRefs(input: string): TopicPageSourceRef[] {
@@ -12709,6 +13378,23 @@ function sourceContextCompressionReasonField(
     return value;
   }
   return "chunk_window_omitted";
+}
+
+function sourceContextMapArtifactStageField(
+  row: SqlRow,
+  key: string,
+): SourceContextMapArtifactStage {
+  const value = stringField(row, key);
+  return value === "reduce" ? "reduce" : "map";
+}
+
+function sourceContextMapArtifactStatusField(
+  row: SqlRow,
+  key: string,
+): SourceContextMapArtifactStatus {
+  const value = stringField(row, key);
+  if (value === "completed" || value === "failed") return value;
+  return "started";
 }
 
 function agentScopeField(row: SqlRow, key: string): ChatMessageRecord["scope"] {
@@ -13133,6 +13819,63 @@ function normalizeOptionalIso(value: string | undefined) {
   if (value === undefined) return undefined;
   const normalized = normalizeText(value);
   return normalized.length === 0 ? undefined : normalized;
+}
+
+function normalizeOptionalArtifactText(value: string | undefined, maxLength: number) {
+  if (value === undefined) return undefined;
+  const normalized = normalizeText(value);
+  return normalized.length === 0 ? undefined : normalized.slice(0, maxLength);
+}
+
+function boundedArtifactStrings(values: string[] | undefined, max: number) {
+  if (values === undefined) return [];
+  const seen = new Set<string>();
+  return values.flatMap((value) => {
+    const normalized = normalizeText(value).slice(0, 240);
+    if (normalized.length === 0 || seen.has(normalized) || seen.size >= max) return [];
+    seen.add(normalized);
+    return [normalized];
+  });
+}
+
+function boundedSourceContextMapArtifactWindowRefs(
+  refs: SourceContextMapArtifactEntry["windowRefs"],
+  max: number,
+) {
+  if (refs === undefined) return [];
+  const seen = new Set<string>();
+  return refs.flatMap((ref) => {
+    const sourceId = normalizeText(ref.sourceId).slice(0, 240);
+    const chunkId = normalizeText(ref.chunkId).slice(0, 240);
+    const key = `${sourceId}\n${chunkId}\n${ref.ord ?? ""}`;
+    if (sourceId.length === 0 || chunkId.length === 0 || seen.has(key) || seen.size >= max) {
+      return [];
+    }
+    seen.add(key);
+    return [
+      {
+        sourceId,
+        chunkId,
+        ...(typeof ref.ord === "number" && Number.isFinite(ref.ord)
+          ? { ord: Math.floor(ref.ord) }
+          : {}),
+      },
+    ];
+  });
+}
+
+function sourceContextMapArtifactJsonLikePattern(value: string) {
+  return `%"${escapeLikePattern(value)}"%`;
+}
+
+function deleteSourceContextMapArtifactsForSource(db: SqliteDb, sourceId: string) {
+  const pattern = sourceContextMapArtifactJsonLikePattern(sourceId);
+  db.exec({
+    sql: `DELETE FROM source_context_map_artifacts
+          WHERE source_ids_json LIKE ? ESCAPE '\\'
+             OR window_refs_json LIKE ? ESCAPE '\\'`,
+    bind: [pattern, pattern],
+  });
 }
 
 function escapeLikePattern(value: string) {
