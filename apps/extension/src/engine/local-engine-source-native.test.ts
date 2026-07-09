@@ -18,7 +18,7 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 20");
+    expect(workerSource).toContain("const schemaVersion = 21");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
@@ -269,6 +269,8 @@ describe("local engine source-native storage foundation", () => {
     expect(deleteSection).toContain("this.pdfRawFileStore.delete(id).catch(() => undefined)");
 
     const resetSection = sourceSection("private async resetLibrary", "private async ensureReady");
+    expect(resetSection).toContain('db.exec("DELETE FROM orchestration_events")');
+    expect(resetSection).toContain('db.exec("DELETE FROM orchestration_runs")');
     expect(resetSection).toContain('db.exec("DELETE FROM jobs")');
     expect(resetSection).toContain('db.exec("DELETE FROM graph_edges")');
     expect(resetSection).toContain('db.exec("DELETE FROM graph_nodes")');
@@ -282,6 +284,33 @@ describe("local engine source-native storage foundation", () => {
     expect(resetSection).toContain('db.exec("DELETE FROM source_chunks")');
     expect(resetSection).toContain('db.exec("DELETE FROM sources")');
     expect(resetSection).toContain("this.pdfRawFileStore.clear().catch(() => undefined)");
+  });
+
+  it("defines independent orchestration storage without changing default retrieval", () => {
+    expect(rpcSource).toContain('export type OrchestrationKind = "post_capture_job"');
+    expect(rpcSource).toContain('"createOrchestrationRun"');
+    expect(rpcSource).toContain('"runOrchestration"');
+    expect(rpcSource).toContain('"cancelOrchestrationRun"');
+    expect(rpcSource).toContain('"retryOrchestrationRun"');
+    expect(rpcSource).toContain('"listOrchestrationEvents"');
+    expect(workerSource).toContain('case "createOrchestrationRun"');
+    expect(workerSource).toContain('case "runOrchestration"');
+    expect(workerSource).toContain('case "cancelOrchestrationRun"');
+    expect(workerSource).toContain('case "retryOrchestrationRun"');
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS orchestration_runs");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS orchestration_events");
+    expect(workerSource).toContain("idx_orchestration_runs_status");
+    expect(workerSource).toContain("idx_orchestration_runs_target");
+    expect(workerSource).toContain("idx_orchestration_events_run");
+    expect(workerSource).toContain("function recoverStaleOrchestrationRuns");
+    expect(workerSource).toContain("recoverStaleOrchestrationRuns(db)");
+
+    const retrieveSection = sourceSection("private async retrieveSources", "private async search");
+    expect(retrieveSection).not.toContain("orchestration_runs");
+    expect(retrieveSection).not.toContain("orchestration_events");
+    const kbSection = sourceSection("private async searchKnowledgeBase", "private async search(");
+    expect(kbSection).not.toContain("orchestration_runs");
+    expect(kbSection).not.toContain("orchestration_events");
   });
 
   it("rebuilds FTS from source chunks without changing embedding rows", () => {

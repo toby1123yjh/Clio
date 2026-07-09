@@ -278,6 +278,10 @@ describe("content local RAG flow", () => {
       contentSource.indexOf("const loadChunkMetaTier2Audit = React.useCallback"),
       contentSource.indexOf("const loadLibrary = React.useCallback"),
     );
+    const contentOrchestrationLoadSection = contentSource.slice(
+      contentSource.indexOf("const loadOrchestrationEvents = React.useCallback"),
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+    );
     const loadLibrarySection = contentSource.slice(
       contentSource.indexOf("const loadLibrary = React.useCallback"),
       contentSource.indexOf("const pinWorkingSetSource = React.useCallback"),
@@ -294,6 +298,10 @@ describe("content local RAG flow", () => {
       railShellSource.indexOf("function ChunkMetaTier2AuditPanel"),
       railShellSource.indexOf("function SourceContextMapArtifactPanel"),
     );
+    const orchestrationPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function OrchestrationDiagnosticsPanel"),
+      railShellSource.indexOf("function ChunkMetaTier2AuditPanel"),
+    );
     const memoryListSection = railShellSource.slice(
       railShellSource.indexOf("function MemoryList"),
       railShellSource.indexOf("function MemoryDetailPanel"),
@@ -304,12 +312,26 @@ describe("content local RAG flow", () => {
     expect(contentAuditLoadSection).toContain("filter: { limit: 30 }");
     expect(loadLibrarySection).toContain('kind: "listChunkMetaTier2Audit"');
     expect(contentRunSection).toContain('kind: "enqueueChunkMetaTier2Job"');
-    expect(contentRunSection).toContain('kind: "runJob"');
+    expect(contentRunSection).toContain('kind: "createOrchestrationRun"');
+    expect(contentRunSection).toContain('kind: "runOrchestration"');
+    expect(contentRunSection).toContain('kind: "cancelOrchestrationRun"');
+    expect(contentRunSection).toContain('kind: "retryOrchestrationRun"');
+    expect(contentOrchestrationLoadSection).toContain('kind: "listOrchestrationRuns"');
+    expect(contentOrchestrationLoadSection).toContain('kind: "listOrchestrationEvents"');
     expect(contentRunSection).toContain("payload: { sourceId, maxChunks }");
     expect(contentRunSection).toContain("await loadChunkMetaTier2Audit()");
+    expect(contentRunSection).toContain("await loadOrchestrationRuns()");
     expect(railPropsSection).toContain("chunkMetaTier2Audit={chunkMetaTier2Audit}");
+    expect(railPropsSection).toContain("orchestrationRuns={orchestrationRuns}");
+    expect(railPropsSection).toContain("orchestrationEvents={orchestrationEvents}");
     expect(railPropsSection).toContain("onRunChunkMetaTier2Job=");
+    expect(railPropsSection).toContain("onCancelOrchestrationRun=");
+    expect(railPropsSection).toContain("onRetryOrchestrationRun=");
+    expect(railPropsSection).toContain("onRefreshOrchestrationRuns=");
     expect(railPropsSection).toContain("onRefreshChunkMetaTier2Audit=");
+    expect(orchestrationPanelSection).toContain('data-clio-orchestration-diagnostics="true"');
+    expect(orchestrationPanelSection).toContain("Durable background job state");
+    expect(orchestrationPanelSection).not.toContain("requestEngine");
     expect(auditPanelSection).toContain('data-clio-chunk-meta-tier2-audit="true"');
     expect(auditPanelSection).toContain("Explicit chat-provider summaries");
     expect(auditPanelSection).toContain("chunkMetaTier2AuditLengthLabel(row)");

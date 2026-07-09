@@ -122,6 +122,8 @@ import type {
   KnowledgeBaseSemanticClusterBackend,
   KnowledgeBaseSourceClusterTrace,
   MemoryDetail,
+  OrchestrationEvent,
+  OrchestrationRunSummary,
   RetrieveSourceLifecycleFilter,
   RetrieveSourcesFilter,
   SearchMemoryItem,
@@ -214,6 +216,8 @@ export interface RailShellProps {
   knowledgeBaseClusters: KnowledgeBaseClusterGroup[];
   workingSetStatus: WorkingSetStatusResult | null;
   chunkMetaTier2Audit: ChunkMetaTier2AuditRecord[];
+  orchestrationRuns: OrchestrationRunSummary[];
+  orchestrationEvents: OrchestrationEvent[];
   sourceContextCompressionLogs: SourceContextCompressionLogRecord[];
   sourceContextMapArtifacts: SourceContextMapArtifactRecord[];
   sourceContextPlanner: SourceContextPlannerState;
@@ -297,6 +301,9 @@ export interface RailShellProps {
   onSetWorkingSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
   onReloadWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
+  onCancelOrchestrationRun: (runId: string) => void;
+  onRetryOrchestrationRun: (runId: string) => void;
+  onRefreshOrchestrationRuns: () => void;
   onRefreshChunkMetaTier2Audit: () => void;
   onRefreshSourceContextCompressionLogs: () => void;
   onRefreshSourceContextMapArtifacts: () => void;
@@ -5045,6 +5052,14 @@ function KnowledgeBasePanel(props: RailShellProps) {
               sessionId={props.state.activeSessionId}
               onRefresh={props.onRefreshSourceContextCompressionLogs}
             />
+            <OrchestrationDiagnosticsPanel
+              disabled={props.state.loading}
+              events={props.orchestrationEvents}
+              runs={props.orchestrationRuns}
+              onCancel={props.onCancelOrchestrationRun}
+              onRefresh={props.onRefreshOrchestrationRuns}
+              onRetry={props.onRetryOrchestrationRun}
+            />
             <ChunkMetaTier2AuditPanel
               audit={props.chunkMetaTier2Audit}
               disabled={props.state.loading}
@@ -5782,6 +5797,133 @@ function SourceContextCompressionLogPanel({
   );
 }
 
+function OrchestrationDiagnosticsPanel({
+  disabled,
+  events,
+  runs,
+  onCancel,
+  onRefresh,
+  onRetry,
+}: {
+  disabled: boolean;
+  events: OrchestrationEvent[];
+  runs: OrchestrationRunSummary[];
+  onCancel: (runId: string) => void;
+  onRefresh: () => void;
+  onRetry: (runId: string) => void;
+}) {
+  const activeRun = runs[0];
+  return (
+    <section
+      className="rounded-lg border border-border bg-surface px-4 py-3"
+      data-clio-orchestration-diagnostics="true"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">Orchestration</h3>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Durable background job state and bounded events
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Badge className="border-border bg-surface-subtle text-muted-foreground">
+            {runs.length}
+          </Badge>
+          <Button
+            aria-label="Refresh orchestration runs"
+            disabled={disabled}
+            onClick={onRefresh}
+            size="icon"
+            title="Refresh"
+            variant="ghost"
+          >
+            <RefreshCw size={14} />
+          </Button>
+        </div>
+      </div>
+      {activeRun === undefined ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">No orchestration runs yet.</p>
+      ) : (
+        <div className="mt-3 grid gap-3">
+          <div className="rounded-md border border-border bg-surface-subtle p-3">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <h4 className="line-clamp-1 text-[12.5px] font-semibold leading-5">
+                  {orchestrationRunStatusLabel(activeRun)}
+                </h4>
+                <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                  Job {activeRun.targetJobId}
+                </p>
+              </div>
+              <Badge className="shrink-0 border-border bg-surface text-muted-foreground">
+                {formatDate(activeRun.updatedAt)}
+              </Badge>
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+              <span className="truncate">Kind {activeRun.kind}</span>
+              <span className="truncate">
+                Progress {activeRun.progressCurrent}/{activeRun.progressTotal}
+              </span>
+              <span className="truncate">
+                Cancel {activeRun.cancelRequested ? "requested" : "no"}
+              </span>
+              <span className="truncate">
+                Retry {activeRun.retryOfRunId === undefined ? "original" : activeRun.retryOfRunId}
+              </span>
+            </div>
+            {activeRun.lastError === undefined ? null : (
+              <p className="mt-2 line-clamp-2 text-[11px] text-danger">{activeRun.lastError}</p>
+            )}
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              <Button
+                disabled={disabled || orchestrationRunIsTerminal(activeRun)}
+                onClick={() => onCancel(activeRun.id)}
+                size="sm"
+                title="Cancel orchestration"
+                variant="subtle"
+              >
+                <X size={13} />
+                Cancel
+              </Button>
+              <Button
+                disabled={
+                  disabled || (activeRun.status !== "failed" && activeRun.status !== "cancelled")
+                }
+                onClick={() => onRetry(activeRun.id)}
+                size="sm"
+                title="Retry orchestration"
+                variant="subtle"
+              >
+                <Sparkles size={13} />
+                Retry
+              </Button>
+            </div>
+          </div>
+          {events.length === 0 ? (
+            <p className="text-[12px] text-muted-foreground">No events recorded.</p>
+          ) : (
+            <ul className="divide-y divide-border">
+              {events.slice(0, 5).map((event) => (
+                <li className="grid gap-1.5 py-2 first:pt-0 last:pb-0" key={event.id}>
+                  <div className="flex min-w-0 items-center justify-between gap-2">
+                    <span className="truncate text-[12px] font-medium">
+                      {orchestrationEventLabel(event)}
+                    </span>
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      {formatDate(event.createdAt)}
+                    </span>
+                  </div>
+                  <p className="line-clamp-2 text-[11px] text-muted-foreground">{event.message}</p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ChunkMetaTier2AuditPanel({
   audit,
   disabled,
@@ -6034,6 +6176,30 @@ function chunkMetaTier2AuditLengthLabel(row: ChunkMetaTier2AuditRecord) {
 
 function compactId(value: string) {
   return value.length <= 14 ? value : `${value.slice(0, 6)}...${value.slice(-5)}`;
+}
+
+function orchestrationRunStatusLabel(run: OrchestrationRunSummary) {
+  if (run.status === "done") return "Done";
+  if (run.status === "failed") return "Failed";
+  if (run.status === "cancelled") return "Cancelled";
+  if (run.status === "running") return "Running";
+  return "Queued";
+}
+
+function orchestrationRunIsTerminal(run: OrchestrationRunSummary) {
+  return run.status === "done" || run.status === "failed" || run.status === "cancelled";
+}
+
+function orchestrationEventLabel(event: OrchestrationEvent) {
+  if (event.kind === "job_started") return "Job started";
+  if (event.kind === "job_completed") return "Job completed";
+  if (event.kind === "cancel_requested") return "Cancel requested";
+  if (event.kind === "retry_created") return "Retry created";
+  if (event.kind === "claimed") return "Claimed";
+  if (event.kind === "progress") return "Progress";
+  if (event.kind === "cancelled") return "Cancelled";
+  if (event.kind === "failed") return "Failed";
+  return "Queued";
 }
 
 function sourceContextCompressionReasonLabel(reason: SourceContextCompressionLogRecord["reason"]) {

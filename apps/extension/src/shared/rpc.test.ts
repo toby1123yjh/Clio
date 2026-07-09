@@ -1759,6 +1759,75 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts independent orchestration requests and rejects invalid filters", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "createOrchestrationRun",
+          payload: { kind: "post_capture_job", targetJobId: "job-1" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "createOrchestrationRun",
+          payload: { kind: "chat_run", targetJobId: "job-1" },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listOrchestrationRuns",
+          filter: { kind: "post_capture_job", status: "cancelled", limit: 8 },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listOrchestrationRuns",
+          filter: { status: "interrupted" },
+        },
+      }),
+    ).toBe(false);
+
+    for (const kind of [
+      "runOrchestration",
+      "cancelOrchestrationRun",
+      "retryOrchestrationRun",
+    ] as const) {
+      expect(
+        isEngineRequestMessage({
+          type: CLIO_ENGINE_REQUEST,
+          request: { kind, id: "orch-1" },
+        }),
+      ).toBe(true);
+    }
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listOrchestrationEvents", runId: "orch-1", limit: 20 },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listOrchestrationEvents", runId: 42 },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts typed agent thinking and tool trace stream events", () => {
     expect(
       isAgentStreamEventMessage({

@@ -177,6 +177,8 @@ import {
   type KnowledgeBaseSourceCluster,
   type MemoryDetail,
   type MemoryEvidenceWindow,
+  type OrchestrationEvent,
+  type OrchestrationRunSummary,
   type RetrieveSourceItem,
   type RetrieveSourcesFilter,
   type RetrieveSourcesResult,
@@ -1134,6 +1136,8 @@ function ClioContentApp() {
   const [chunkMetaTier2Audit, setChunkMetaTier2Audit] = React.useState<ChunkMetaTier2AuditRecord[]>(
     [],
   );
+  const [orchestrationRuns, setOrchestrationRuns] = React.useState<OrchestrationRunSummary[]>([]);
+  const [orchestrationEvents, setOrchestrationEvents] = React.useState<OrchestrationEvent[]>([]);
   const [sourceContextPlanner, setSourceContextPlanner] = React.useState<SourceContextPlannerState>(
     {
       selectedSourceIds: [],
@@ -1444,6 +1448,37 @@ function ClioContentApp() {
     }
   }, []);
 
+  const loadOrchestrationEvents = React.useCallback(async (runId?: string) => {
+    if (runId === undefined) {
+      setOrchestrationEvents([]);
+      return;
+    }
+    try {
+      const result = await requestEngine({
+        kind: "listOrchestrationEvents",
+        runId,
+        limit: 40,
+      });
+      setOrchestrationEvents(result.events);
+    } catch {
+      setOrchestrationEvents([]);
+    }
+  }, []);
+
+  const loadOrchestrationRuns = React.useCallback(async () => {
+    try {
+      const result = await requestEngine({
+        kind: "listOrchestrationRuns",
+        filter: { kind: "post_capture_job", limit: 8 },
+      });
+      setOrchestrationRuns(result.runs);
+      await loadOrchestrationEvents(result.runs[0]?.id);
+    } catch {
+      setOrchestrationRuns([]);
+      setOrchestrationEvents([]);
+    }
+  }, [loadOrchestrationEvents]);
+
   const loadLibrary = React.useCallback(
     async (nextQuery = railState.query) => {
       dispatch({ type: "SET_LOADING", loading: true });
@@ -1476,10 +1511,16 @@ function ClioContentApp() {
           kind: "listChunkMetaTier2Audit",
           filter: { limit: 30 },
         });
+        const orchestration = await requestEngine({
+          kind: "listOrchestrationRuns",
+          filter: { kind: "post_capture_job", limit: 8 },
+        });
         setTopicPages(topicResult.items);
         setWikiCompileJobs(wikiJobsResult.jobs);
         setWorkingSetStatus(workingSet);
         setChunkMetaTier2Audit(tier2Audit.items);
+        setOrchestrationRuns(orchestration.runs);
+        await loadOrchestrationEvents(orchestration.runs[0]?.id);
         if (wikiJobsResult.jobs[0] !== undefined) {
           await loadWikiCompileJobEvents(wikiJobsResult.jobs[0].id);
         } else {
@@ -1497,6 +1538,7 @@ function ClioContentApp() {
     [
       knowledgeBaseClusteringPayload,
       knowledgeBaseRetrieveFilter,
+      loadOrchestrationEvents,
       loadWikiCompileJobEvents,
       railState.query,
       showToast,
@@ -1571,9 +1613,16 @@ function ClioContentApp() {
           kind: "enqueueChunkMetaTier2Job",
           payload: { sourceId, maxChunks },
         });
-        const completed = await requestEngine({ kind: "runJob", id: queued.id });
+        const orchestration = await requestEngine({
+          kind: "createOrchestrationRun",
+          payload: { kind: "post_capture_job", targetJobId: queued.id },
+        });
+        setOrchestrationRuns((runs) => [orchestration, ...runs].slice(0, 8));
+        await loadOrchestrationEvents(orchestration.id);
+        const completed = await requestEngine({ kind: "runOrchestration", id: orchestration.id });
         await loadLibrary(railState.query);
         await loadChunkMetaTier2Audit();
+        await loadOrchestrationRuns();
         showToast({
           tone: completed.status === "done" ? "success" : "warning",
           message:
@@ -1583,12 +1632,65 @@ function ClioContentApp() {
         });
       } catch (error) {
         await loadChunkMetaTier2Audit();
+        await loadOrchestrationRuns();
         showToast(errorToast(error));
       } finally {
         dispatch({ type: "SET_LOADING", loading: false });
       }
     },
-    [loadChunkMetaTier2Audit, loadLibrary, railState.query, showToast],
+    [
+      loadChunkMetaTier2Audit,
+      loadLibrary,
+      loadOrchestrationEvents,
+      loadOrchestrationRuns,
+      railState.query,
+      showToast,
+    ],
+  );
+
+  const cancelOrchestrationRun = React.useCallback(
+    async (runId: string) => {
+      try {
+        await requestEngine({ kind: "cancelOrchestrationRun", id: runId });
+        await loadOrchestrationRuns();
+        showToast({ tone: "warning", message: "Orchestration cancellation requested." });
+      } catch (error) {
+        showToast(errorToast(error));
+      }
+    },
+    [loadOrchestrationRuns, showToast],
+  );
+
+  const retryOrchestrationRun = React.useCallback(
+    async (runId: string) => {
+      try {
+        const retry = await requestEngine({ kind: "retryOrchestrationRun", id: runId });
+        setOrchestrationRuns((runs) => [retry, ...runs].slice(0, 8));
+        await loadOrchestrationEvents(retry.id);
+        const completed = await requestEngine({ kind: "runOrchestration", id: retry.id });
+        await loadLibrary(railState.query);
+        await loadChunkMetaTier2Audit();
+        await loadOrchestrationRuns();
+        showToast({
+          tone: completed.status === "done" ? "success" : "warning",
+          message:
+            completed.status === "done"
+              ? "Orchestration retry finished."
+              : "Orchestration retry did not finish.",
+        });
+      } catch (error) {
+        await loadOrchestrationRuns();
+        showToast(errorToast(error));
+      }
+    },
+    [
+      loadChunkMetaTier2Audit,
+      loadLibrary,
+      loadOrchestrationEvents,
+      loadOrchestrationRuns,
+      railState.query,
+      showToast,
+    ],
   );
 
   const selectSourceContextPlannerSource = React.useCallback((sourceId: string) => {
@@ -4295,6 +4397,8 @@ function ClioContentApp() {
         knowledgeBaseRetrieveFilter={knowledgeBaseRetrieveFilter}
         workingSetStatus={workingSetStatus}
         chunkMetaTier2Audit={chunkMetaTier2Audit}
+        orchestrationRuns={orchestrationRuns}
+        orchestrationEvents={orchestrationEvents}
         sourceContextCompressionLogs={sourceContextCompressionLogs}
         sourceContextMapArtifacts={sourceContextMapArtifacts}
         sourceContextPlanner={sourceContextPlanner}
@@ -4374,6 +4478,9 @@ function ClioContentApp() {
         onRunChunkMetaTier2Job={(sourceId, maxChunks) =>
           void runChunkMetaTier2Job(sourceId, maxChunks)
         }
+        onCancelOrchestrationRun={(runId) => void cancelOrchestrationRun(runId)}
+        onRetryOrchestrationRun={(runId) => void retryOrchestrationRun(runId)}
+        onRefreshOrchestrationRuns={() => void loadOrchestrationRuns()}
         onRefreshChunkMetaTier2Audit={() => void loadChunkMetaTier2Audit()}
         onRefreshSourceContextCompressionLogs={() =>
           void loadSourceContextCompressionLogs(railState.activeSessionId)

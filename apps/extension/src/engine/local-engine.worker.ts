@@ -39,6 +39,7 @@ import {
   type CompactionRecord,
   type CreateChatSessionPayload,
   type CreateCompactionPayload,
+  type CreateOrchestrationRunPayload,
   type CreateTopicPagePayload,
   type CreateWikiCompileJobEventPayload,
   type CreateWikiCompileJobPayload,
@@ -79,6 +80,13 @@ import {
   type MemoryDetail,
   type MemoryEvidenceWindow,
   type MemorySummary,
+  type OrchestrationEvent,
+  type OrchestrationEventKind,
+  type OrchestrationEventLevel,
+  type OrchestrationKind,
+  type OrchestrationRunFilter,
+  type OrchestrationRunStatus,
+  type OrchestrationRunSummary,
   type PdfRawFileResult,
   type ReindexResult,
   type RepairAction,
@@ -335,7 +343,7 @@ export interface LocalEngineOptions {
 
 const databasePath = "/clio-browser-phase1.sqlite3";
 const pdfRawFileDirectoryName = "clio-pdf-raw-files";
-const schemaVersion = 20;
+const schemaVersion = 21;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -863,6 +871,18 @@ export class LocalEngine {
         return await this.getJobStatus(request.status, request.limit);
       case "runJob":
         return await this.runQueuedJob(request.id);
+      case "createOrchestrationRun":
+        return await this.createOrchestrationRun(request.payload);
+      case "listOrchestrationRuns":
+        return await this.listOrchestrationRuns(request.filter);
+      case "runOrchestration":
+        return await this.runOrchestration(request.id);
+      case "cancelOrchestrationRun":
+        return await this.cancelOrchestrationRun(request.id);
+      case "retryOrchestrationRun":
+        return await this.retryOrchestrationRun(request.id);
+      case "listOrchestrationEvents":
+        return await this.listOrchestrationEvents(request.runId, request.limit);
       case "enqueueChunkMetaTier2Job":
         return await this.enqueueChunkMetaTier2Job(request.payload);
       case "listChunkMetaTier2Audit":
@@ -2627,6 +2647,69 @@ export class LocalEngine {
     );
   }
 
+  private async createOrchestrationRun(
+    payload: CreateOrchestrationRunPayload,
+  ): Promise<OrchestrationRunSummary> {
+    const db = await this.ensureReady();
+    return createOrchestrationRun(db, payload);
+  }
+
+  private async listOrchestrationRuns(
+    filter: OrchestrationRunFilter = {},
+  ): Promise<{ runs: OrchestrationRunSummary[] }> {
+    const db = await this.ensureReady();
+    const where = orchestrationRunWhereClause(filter);
+    const rows = db.selectObjects(
+      `SELECT *
+       FROM orchestration_runs
+       ${where.sql}
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+      [...where.bind, clampOptionalLimit(filter.limit, 30, 100)],
+    );
+    return { runs: rows.map(orchestrationRunFromRow) };
+  }
+
+  private async listOrchestrationEvents(
+    runId: string,
+    limit = 40,
+  ): Promise<{ events: OrchestrationEvent[] }> {
+    const db = await this.ensureReady();
+    const rows = db.selectObjects(
+      `SELECT *
+       FROM orchestration_events
+       WHERE run_id = ?
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+      [normalizeText(runId), clampLimit(limit, 100)],
+    );
+    return { events: rows.map(orchestrationEventFromRow) };
+  }
+
+  private async cancelOrchestrationRun(id: string): Promise<OrchestrationRunSummary> {
+    const db = await this.ensureReady();
+    return cancelOrchestrationRun(db, id);
+  }
+
+  private async retryOrchestrationRun(id: string): Promise<OrchestrationRunSummary> {
+    const db = await this.ensureReady();
+    return retryOrchestrationRun(db, id);
+  }
+
+  private async runOrchestration(id: string): Promise<OrchestrationRunSummary> {
+    const db = await this.ensureReady();
+    return await runOrchestration(
+      db,
+      id,
+      this.embeddingProviderOverride,
+      this.embeddingProviderFactory,
+      this.chunkMetaSummarizerFactory,
+      this.figureVisionAnalyzerFactory,
+      this.pdfRawFileStore,
+      this.pdfFigureVisionImageExtractor,
+    );
+  }
+
   private async reindex(
     request: Extract<EngineRequest, { kind: "reindex" }>,
   ): Promise<ReindexResult> {
@@ -3406,6 +3489,8 @@ export class LocalEngine {
   private async resetLibrary() {
     const db = await this.ensureReady();
     transaction(db, () => {
+      db.exec("DELETE FROM orchestration_events");
+      db.exec("DELETE FROM orchestration_runs");
       db.exec("DELETE FROM jobs");
       db.exec("DELETE FROM source_audit_log");
       db.exec("DELETE FROM source_lifecycle_events");
@@ -3450,6 +3535,7 @@ export class LocalEngine {
       this.db = db;
       migrate(db);
       recoverStaleJobs(db);
+      recoverStaleOrchestrationRuns(db);
       const integrity = db.selectValue("PRAGMA integrity_check");
       if (integrity !== "ok") {
         this.healthState = {
@@ -3941,6 +4027,46 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS orchestration_runs (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('post_capture_job')),
+      status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'done', 'failed', 'cancelled')),
+      target_job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      progress_current INTEGER NOT NULL DEFAULT 0,
+      progress_total INTEGER NOT NULL DEFAULT 1,
+      cancel_requested INTEGER NOT NULL DEFAULT 0,
+      retry_of_run_id TEXT REFERENCES orchestration_runs(id) ON DELETE SET NULL,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS orchestration_events (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES orchestration_runs(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (
+        kind IN (
+          'queued',
+          'claimed',
+          'progress',
+          'job_started',
+          'job_completed',
+          'cancel_requested',
+          'cancelled',
+          'failed',
+          'retry_created'
+        )
+      ),
+      level TEXT NOT NULL CHECK (level IN ('info', 'warning', 'error')),
+      message TEXT NOT NULL,
+      detail_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -4242,6 +4368,18 @@ function migrate(db: SqliteDb) {
   );
   db.exec("CREATE INDEX IF NOT EXISTS idx_anchors_memory ON anchors(memory_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, run_after)");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_orchestration_runs_status ON orchestration_runs(status, created_at DESC)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_orchestration_runs_target ON orchestration_runs(target_job_id, created_at DESC)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_orchestration_runs_retry ON orchestration_runs(retry_of_run_id)",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_orchestration_events_run ON orchestration_events(run_id, created_at DESC)",
+  );
   db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC)");
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id, owner_heartbeat_at)",
@@ -6997,6 +7135,32 @@ function recoverStaleJobs(db: SqliteDb) {
   });
 }
 
+function recoverStaleOrchestrationRuns(db: SqliteDb) {
+  const now = new Date().toISOString();
+  transaction(db, () => {
+    db.exec({
+      sql: `UPDATE orchestration_runs
+            SET status = 'cancelled',
+                updated_at = ?,
+                finished_at = ?,
+                last_error = NULL
+            WHERE status = 'running'
+              AND cancel_requested <> 0`,
+      bind: [now, now],
+    });
+    db.exec({
+      sql: `UPDATE orchestration_runs
+            SET status = 'queued',
+                started_at = NULL,
+                updated_at = ?,
+                last_error = COALESCE(last_error, 'Orchestration was running when the engine stopped.')
+            WHERE status = 'running'
+              AND cancel_requested = 0`,
+      bind: [now],
+    });
+  });
+}
+
 function ensureDefaultEmbeddingModel(db: SqliteDb) {
   const now = new Date().toISOString();
   db.exec({
@@ -7124,6 +7288,301 @@ function enqueueJob(db: SqliteDb, type: JobType, payload: Record<string, unknown
     bind: [jobId, type, defaultJobMaxAttempts, now, JSON.stringify(payload), now],
   });
   return jobId;
+}
+
+function createOrchestrationRun(
+  db: SqliteDb,
+  payload: CreateOrchestrationRunPayload,
+  retryOfRunId?: string,
+): OrchestrationRunSummary {
+  if (payload.kind !== "post_capture_job") {
+    throw new EngineRpcError("INVALID_ORCHESTRATION_KIND", "Unsupported orchestration kind.");
+  }
+  const targetJobId = normalizeText(payload.targetJobId);
+  const job = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [targetJobId]);
+  if (job === undefined) {
+    throw new EngineRpcError("JOB_NOT_FOUND", `Job not found: ${targetJobId}`);
+  }
+  const jobType = jobTypeField(job, "type");
+  if (jobType !== "post_capture_hardening") {
+    throw new EngineRpcError(
+      "INVALID_ORCHESTRATION_TARGET",
+      `Orchestration target must be a post-capture job: ${targetJobId}`,
+    );
+  }
+
+  const id = normalizeText(payload.id ?? "") || createId("orch");
+  const now = new Date().toISOString();
+  transaction(db, () => {
+    db.exec({
+      sql: `INSERT INTO orchestration_runs (
+        id,
+        kind,
+        status,
+        target_job_id,
+        progress_current,
+        progress_total,
+        cancel_requested,
+        retry_of_run_id,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, 'queued', ?, 0, 1, 0, ?, ?, ?)`,
+      bind: [id, payload.kind, targetJobId, retryOfRunId ?? null, now, now],
+    });
+    insertOrchestrationEvent(db, {
+      runId: id,
+      kind: "queued",
+      level: "info",
+      message: "Orchestration run queued.",
+      detail: { targetJobId, retryOfRunId },
+      createdAt: now,
+    });
+  });
+  return loadOrchestrationRunOrThrow(db, id);
+}
+
+async function runOrchestration(
+  db: SqliteDb,
+  runIdInput: string,
+  embeddingProviderOverride?: EmbeddingProvider,
+  embeddingProviderFactory?: EmbeddingProviderFactory,
+  chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory,
+  figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory,
+  pdfRawFileStore?: PdfRawFileStore,
+  pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor = extractPdfFigureVisionImageInput,
+): Promise<OrchestrationRunSummary> {
+  const runId = normalizeText(runIdInput);
+  const existing = loadOrchestrationRunOrThrow(db, runId);
+  if (isTerminalOrchestrationStatus(existing.status)) return existing;
+  if (existing.cancelRequested) {
+    return finishCancelledOrchestrationRun(db, runId, "Cancelled before orchestration start.");
+  }
+  if (existing.status !== "queued") return existing;
+
+  const claimedAt = new Date().toISOString();
+  db.exec({
+    sql: `UPDATE orchestration_runs
+          SET status = 'running',
+              progress_current = 0,
+              progress_total = 1,
+              started_at = COALESCE(started_at, ?),
+              updated_at = ?
+          WHERE id = ?
+            AND status = 'queued'
+            AND cancel_requested = 0`,
+    bind: [claimedAt, claimedAt, runId],
+  });
+  if (Number(db.selectValue("SELECT changes()") ?? 0) === 0) {
+    return loadOrchestrationRunOrThrow(db, runId);
+  }
+  insertOrchestrationEvent(db, {
+    runId,
+    kind: "claimed",
+    level: "info",
+    message: "Orchestration run claimed.",
+    detail: { targetJobId: existing.targetJobId },
+    createdAt: claimedAt,
+  });
+  insertOrchestrationEvent(db, {
+    runId,
+    kind: "job_started",
+    level: "info",
+    message: "Wrapped job execution started.",
+    detail: { targetJobId: existing.targetJobId },
+  });
+
+  try {
+    const job = await runJob(
+      db,
+      existing.targetJobId,
+      embeddingProviderOverride,
+      embeddingProviderFactory,
+      chunkMetaSummarizerFactory,
+      figureVisionAnalyzerFactory,
+      pdfRawFileStore,
+      pdfFigureVisionImageExtractor,
+    );
+    const afterJob = loadOrchestrationRunOrThrow(db, runId);
+    if (afterJob.cancelRequested) {
+      return finishCancelledOrchestrationRun(
+        db,
+        runId,
+        "Cancelled after the current orchestration boundary.",
+      );
+    }
+    if (job.status === "done") {
+      const finishedAt = new Date().toISOString();
+      db.exec({
+        sql: `UPDATE orchestration_runs
+              SET status = 'done',
+                  progress_current = 1,
+                  progress_total = 1,
+                  updated_at = ?,
+                  finished_at = ?,
+                  last_error = NULL
+              WHERE id = ?`,
+        bind: [finishedAt, finishedAt, runId],
+      });
+      insertOrchestrationEvent(db, {
+        runId,
+        kind: "job_completed",
+        level: "info",
+        message: "Wrapped job completed.",
+        detail: { targetJobId: job.id, jobStatus: job.status },
+        createdAt: finishedAt,
+      });
+      insertOrchestrationEvent(db, {
+        runId,
+        kind: "progress",
+        level: "info",
+        message: "Progress 1/1.",
+        detail: { progressCurrent: 1, progressTotal: 1 },
+        createdAt: finishedAt,
+      });
+      return loadOrchestrationRunOrThrow(db, runId);
+    }
+
+    return failOrchestrationRun(
+      db,
+      runId,
+      job.lastError ?? `Wrapped job ended with status: ${job.status}`,
+      { targetJobId: job.id, jobStatus: job.status },
+    );
+  } catch (error) {
+    const engineError = engineErrorFromUnknown(error);
+    return failOrchestrationRun(db, runId, engineError.message, {
+      code: engineError.code,
+      targetJobId: existing.targetJobId,
+    });
+  }
+}
+
+function cancelOrchestrationRun(db: SqliteDb, runIdInput: string): OrchestrationRunSummary {
+  const runId = normalizeText(runIdInput);
+  const run = loadOrchestrationRunOrThrow(db, runId);
+  if (isTerminalOrchestrationStatus(run.status)) return run;
+  const now = new Date().toISOString();
+  insertOrchestrationEvent(db, {
+    runId,
+    kind: "cancel_requested",
+    level: "warning",
+    message:
+      run.status === "running"
+        ? "Cancellation requested; it will resolve at the next orchestration boundary."
+        : "Cancellation requested before execution.",
+    detail: { status: run.status, targetJobId: run.targetJobId },
+    createdAt: now,
+  });
+  if (run.status === "running") {
+    db.exec({
+      sql: `UPDATE orchestration_runs
+            SET cancel_requested = 1,
+                updated_at = ?
+            WHERE id = ?`,
+      bind: [now, runId],
+    });
+    return loadOrchestrationRunOrThrow(db, runId);
+  }
+  return finishCancelledOrchestrationRun(db, runId, "Cancelled before orchestration start.", now);
+}
+
+function retryOrchestrationRun(db: SqliteDb, runIdInput: string): OrchestrationRunSummary {
+  const runId = normalizeText(runIdInput);
+  const run = loadOrchestrationRunOrThrow(db, runId);
+  if (run.status !== "failed" && run.status !== "cancelled") {
+    throw new EngineRpcError(
+      "ORCHESTRATION_RETRY_NOT_ALLOWED",
+      `Only failed or cancelled orchestration runs can be retried: ${runId}`,
+    );
+  }
+  const targetJobId = retryTargetJobId(db, run.targetJobId);
+  const replacement = createOrchestrationRun(
+    db,
+    {
+      kind: run.kind,
+      targetJobId,
+    },
+    run.id,
+  );
+  insertOrchestrationEvent(db, {
+    runId,
+    kind: "retry_created",
+    level: "info",
+    message: "Retry orchestration run created.",
+    detail: { retryRunId: replacement.id, targetJobId },
+  });
+  return replacement;
+}
+
+function retryTargetJobId(db: SqliteDb, jobId: string) {
+  const job = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [jobId]);
+  if (job === undefined) {
+    throw new EngineRpcError("JOB_NOT_FOUND", `Job not found: ${jobId}`);
+  }
+  if (jobStatusField(job, "status") === "queued") return jobId;
+  const jobType = jobTypeField(job, "type");
+  if (jobType !== "post_capture_hardening") {
+    throw new EngineRpcError(
+      "INVALID_ORCHESTRATION_TARGET",
+      `Retry target must be a post-capture job: ${jobId}`,
+    );
+  }
+  return enqueueJob(db, jobType, parseMetadata(stringField(job, "payload_json")));
+}
+
+function failOrchestrationRun(
+  db: SqliteDb,
+  runId: string,
+  message: string,
+  detail: Record<string, unknown> = {},
+): OrchestrationRunSummary {
+  const now = new Date().toISOString();
+  const lastError = boundedNormalizedText(message, 1_000);
+  db.exec({
+    sql: `UPDATE orchestration_runs
+          SET status = 'failed',
+              updated_at = ?,
+              finished_at = ?,
+              last_error = ?
+          WHERE id = ?`,
+    bind: [now, now, lastError, runId],
+  });
+  insertOrchestrationEvent(db, {
+    runId,
+    kind: "failed",
+    level: "error",
+    message: lastError,
+    detail,
+    createdAt: now,
+  });
+  return loadOrchestrationRunOrThrow(db, runId);
+}
+
+function finishCancelledOrchestrationRun(
+  db: SqliteDb,
+  runId: string,
+  message: string,
+  now = new Date().toISOString(),
+): OrchestrationRunSummary {
+  db.exec({
+    sql: `UPDATE orchestration_runs
+          SET status = 'cancelled',
+              cancel_requested = 1,
+              updated_at = ?,
+              finished_at = ?,
+              last_error = NULL
+          WHERE id = ?`,
+    bind: [now, now, runId],
+  });
+  insertOrchestrationEvent(db, {
+    runId,
+    kind: "cancelled",
+    level: "warning",
+    message,
+    detail: {},
+    createdAt: now,
+  });
+  return loadOrchestrationRunOrThrow(db, runId);
 }
 
 async function runJob(
@@ -13593,6 +14052,117 @@ function jobSummaryFromRow(row: SqlRow): JobSummary {
   };
 }
 
+function orchestrationRunFromRow(row: SqlRow): OrchestrationRunSummary {
+  const retryOfRunId = optionalString(row, "retry_of_run_id");
+  const lastError = optionalString(row, "last_error");
+  const startedAt = optionalString(row, "started_at");
+  const finishedAt = optionalString(row, "finished_at");
+  return {
+    id: stringField(row, "id"),
+    kind: orchestrationKindField(row, "kind"),
+    status: orchestrationRunStatusField(row, "status"),
+    targetJobId: stringField(row, "target_job_id"),
+    progressCurrent: Math.max(0, numberField(row, "progress_current")),
+    progressTotal: Math.max(1, numberField(row, "progress_total")),
+    cancelRequested: numberField(row, "cancel_requested") !== 0,
+    createdAt: stringField(row, "created_at"),
+    updatedAt: stringField(row, "updated_at"),
+    ...(retryOfRunId === undefined ? {} : { retryOfRunId }),
+    ...(lastError === undefined ? {} : { lastError }),
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(finishedAt === undefined ? {} : { finishedAt }),
+  };
+}
+
+function orchestrationEventFromRow(row: SqlRow): OrchestrationEvent {
+  return {
+    id: stringField(row, "id"),
+    runId: stringField(row, "run_id"),
+    kind: orchestrationEventKindField(row, "kind"),
+    level: orchestrationEventLevelField(row, "level"),
+    message: stringField(row, "message"),
+    detail: parseMetadata(stringField(row, "detail_json")),
+    createdAt: stringField(row, "created_at"),
+  };
+}
+
+function loadOrchestrationRunOrThrow(db: SqliteDb, id: string): OrchestrationRunSummary {
+  const row = db.selectObject("SELECT * FROM orchestration_runs WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) {
+    throw new EngineRpcError("ORCHESTRATION_NOT_FOUND", `Orchestration run not found: ${id}`);
+  }
+  return orchestrationRunFromRow(row);
+}
+
+function orchestrationRunWhereClause(filter: OrchestrationRunFilter) {
+  const clauses: string[] = [];
+  const bind: unknown[] = [];
+  if (filter.kind !== undefined) {
+    clauses.push("kind = ?");
+    bind.push(filter.kind);
+  }
+  if (filter.status !== undefined) {
+    clauses.push("status = ?");
+    bind.push(filter.status);
+  }
+  if (filter.targetJobId !== undefined && normalizeText(filter.targetJobId).length > 0) {
+    clauses.push("target_job_id = ?");
+    bind.push(normalizeText(filter.targetJobId));
+  }
+  return {
+    sql: clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`,
+    bind,
+  };
+}
+
+function insertOrchestrationEvent(
+  db: SqliteDb,
+  input: {
+    runId: string;
+    kind: OrchestrationEventKind;
+    level?: OrchestrationEventLevel;
+    message: string;
+    detail?: Record<string, unknown>;
+    createdAt?: string;
+  },
+): OrchestrationEvent {
+  const id = createId("orch_evt");
+  const createdAt = input.createdAt ?? new Date().toISOString();
+  const message = boundedNormalizedText(input.message, 1_000);
+  db.exec({
+    sql: `INSERT INTO orchestration_events (
+      id,
+      run_id,
+      kind,
+      level,
+      message,
+      detail_json,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    bind: [
+      id,
+      input.runId,
+      input.kind,
+      input.level ?? "info",
+      message,
+      JSON.stringify(boundAuditPayload(input.detail ?? {})),
+      createdAt,
+    ],
+  });
+  const row = db.selectObject("SELECT * FROM orchestration_events WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) {
+    throw new EngineRpcError(
+      "ORCHESTRATION_EVENT_CREATE_FAILED",
+      "Orchestration event was not saved.",
+    );
+  }
+  return orchestrationEventFromRow(row);
+}
+
+function isTerminalOrchestrationStatus(status: OrchestrationRunStatus) {
+  return status === "done" || status === "failed" || status === "cancelled";
+}
+
 function chatSessionSummaryFromRow(row: SqlRow): ChatSessionSummary {
   const sourcePageUrl = optionalString(row, "source_page_url");
   const sourcePageTitle = optionalString(row, "source_page_title");
@@ -14113,6 +14683,43 @@ function jobStatusField(row: SqlRow, key: string): JobStatus {
   const value = stringField(row, key);
   if (value === "running" || value === "done" || value === "failed") return value;
   return "queued";
+}
+
+function orchestrationKindField(row: SqlRow, key: string): OrchestrationKind {
+  const value = stringField(row, key);
+  if (value === "post_capture_job") return value;
+  return "post_capture_job";
+}
+
+function orchestrationRunStatusField(row: SqlRow, key: string): OrchestrationRunStatus {
+  const value = stringField(row, key);
+  if (value === "running" || value === "done" || value === "failed" || value === "cancelled") {
+    return value;
+  }
+  return "queued";
+}
+
+function orchestrationEventKindField(row: SqlRow, key: string): OrchestrationEventKind {
+  const value = stringField(row, key);
+  if (
+    value === "claimed" ||
+    value === "progress" ||
+    value === "job_started" ||
+    value === "job_completed" ||
+    value === "cancel_requested" ||
+    value === "cancelled" ||
+    value === "failed" ||
+    value === "retry_created"
+  ) {
+    return value;
+  }
+  return "queued";
+}
+
+function orchestrationEventLevelField(row: SqlRow, key: string): OrchestrationEventLevel {
+  const value = stringField(row, key);
+  if (value === "warning" || value === "error") return value;
+  return "info";
 }
 
 function wikiCompileJobStatusField(row: SqlRow, key: string): WikiCompileJobStatus {

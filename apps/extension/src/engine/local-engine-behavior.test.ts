@@ -217,6 +217,109 @@ describe("local engine behavior harness", () => {
     expect(harness.count("graph_nodes", "kind = 'source' AND ref_id = ?", [sourceId])).toBe(0);
   });
 
+  it("wraps post-capture jobs in durable orchestration runs with cancel and retry", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/orchestration",
+        sourceTitle: "Orchestration Evidence",
+        normalizedText: ragText("orchestration post capture job evidence", 80),
+        metadata: {
+          title: "Orchestration Evidence",
+          source_type: "research-note",
+        },
+      }),
+    });
+    const queuedJobs = await harness.request({ kind: "getJobStatus", status: "queued", limit: 10 });
+    const queuedJobId = queuedJobs.jobs[0]?.id ?? "";
+    expect(queuedJobId).toMatch(/^job_/);
+
+    const run = await harness.request({
+      kind: "createOrchestrationRun",
+      payload: { kind: "post_capture_job", targetJobId: queuedJobId },
+    });
+    expect(run.status).toBe("queued");
+    expect(run.targetJobId).toBe(queuedJobId);
+    expect(harness.count("orchestration_runs")).toBe(1);
+    expect(harness.count("orchestration_events", "run_id = ?", [run.id])).toBe(1);
+
+    const completed = await harness.request({ kind: "runOrchestration", id: run.id });
+    expect(completed.status).toBe("done");
+    expect(completed.progressCurrent).toBe(1);
+    expect(completed.progressTotal).toBe(1);
+    expect(harness.count("jobs", "id = ? AND status = 'done'", [queuedJobId])).toBe(1);
+
+    const runs = await harness.request({
+      kind: "listOrchestrationRuns",
+      filter: { kind: "post_capture_job", limit: 10 },
+    });
+    expect(runs.runs[0]?.id).toBe(run.id);
+    const events = await harness.request({
+      kind: "listOrchestrationEvents",
+      runId: run.id,
+      limit: 20,
+    });
+    expect(events.events.some((event) => event.kind === "job_completed")).toBe(true);
+
+    const cancelJob = await harness.request({
+      kind: "enqueueChunkMetaTier2Job",
+      payload: { sourceId: capture.memory.id, maxChunks: 1 },
+    });
+    const cancellable = await harness.request({
+      kind: "createOrchestrationRun",
+      payload: { kind: "post_capture_job", targetJobId: cancelJob.id },
+    });
+    const cancelled = await harness.request({ kind: "cancelOrchestrationRun", id: cancellable.id });
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.cancelRequested).toBe(true);
+    expect(harness.count("jobs", "id = ? AND status = 'queued'", [cancelJob.id])).toBe(1);
+
+    const retryCancelled = await harness.request({
+      kind: "retryOrchestrationRun",
+      id: cancellable.id,
+    });
+    expect(retryCancelled.retryOfRunId).toBe(cancellable.id);
+    expect(retryCancelled.targetJobId).toBe(cancelJob.id);
+
+    const badJobId = "job_orchestration_bad_payload";
+    harness.exec(
+      `INSERT INTO jobs (
+        id,
+        type,
+        status,
+        attempts,
+        max_attempts,
+        run_after,
+        payload_json,
+        created_at
+      ) VALUES (?, 'post_capture_hardening', 'queued', 0, 1, ?, ?, ?)`,
+      [
+        badJobId,
+        "2026-07-09T00:00:00.000Z",
+        JSON.stringify({ sourceId: "missing-source", stages: ["embedding"] }),
+        "2026-07-09T00:00:00.000Z",
+      ],
+    );
+    const failing = await harness.request({
+      kind: "createOrchestrationRun",
+      payload: { kind: "post_capture_job", targetJobId: badJobId },
+    });
+    const failed = await harness.request({ kind: "runOrchestration", id: failing.id });
+    expect(failed.status).toBe("failed");
+    expect(failed.lastError).toContain("Source not found");
+
+    const retryFailed = await harness.request({
+      kind: "retryOrchestrationRun",
+      id: failed.id,
+    });
+    expect(retryFailed.retryOfRunId).toBe(failed.id);
+    expect(retryFailed.targetJobId).not.toBe(badJobId);
+    expect(harness.count("jobs", "id = ? AND status = 'queued'", [retryFailed.targetJobId])).toBe(
+      1,
+    );
+  });
+
   it("runs capture, post-capture embedding, retrieval, and evidence windows", async () => {
     const harness = createHarness();
     const sourceText = ragText("alpha metadata retrieval evidence", 700);
