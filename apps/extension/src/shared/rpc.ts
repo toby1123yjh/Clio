@@ -533,6 +533,7 @@ export interface ChunkMetaTier2AuditRecord {
   reason?: string;
   sectionSummaryChars?: number;
   chunkSummaryChars?: number;
+  semanticRelationCount?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -3729,7 +3730,37 @@ function isChunkMetaSummaryResponse(
     (result.providerKind === undefined || result.providerKind === "chat") &&
     (result.sectionSummary === undefined || typeof result.sectionSummary === "string") &&
     (result.chunkSummary === undefined || typeof result.chunkSummary === "string") &&
+    (result.semanticRelations === undefined ||
+      (Array.isArray(result.semanticRelations) &&
+        result.semanticRelations.every(isChunkMetaSemanticRelationCandidate))) &&
     (result.reason === undefined || typeof result.reason === "string")
+  );
+}
+
+function isChunkMetaSemanticRelationCandidate(value: unknown) {
+  return (
+    isRecord(value) &&
+    isChunkMetaSemanticRelationKind(value.kind) &&
+    typeof value.target === "string" &&
+    value.target.length > 0 &&
+    (value.label === undefined || typeof value.label === "string") &&
+    typeof value.confidence === "number" &&
+    Number.isFinite(value.confidence) &&
+    value.confidence >= 0 &&
+    value.confidence <= 1 &&
+    (value.reason === undefined || typeof value.reason === "string") &&
+    value.source === "remote_llm"
+  );
+}
+
+function isChunkMetaSemanticRelationKind(value: unknown) {
+  return (
+    value === "parent" ||
+    value === "previous" ||
+    value === "next" ||
+    value === "section" ||
+    value === "role" ||
+    value === "citation_hint"
   );
 }
 

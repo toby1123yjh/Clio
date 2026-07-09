@@ -18,7 +18,7 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 19");
+    expect(workerSource).toContain("const schemaVersion = 20");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
@@ -620,9 +620,12 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("insertChunkMetaTier2AuditRow");
     expect(workerSource).toContain("chunkMetaTier2AuditRecordFromRow");
     expect(workerSource).toContain("chunkMetaTier2AuditWhereClause");
+    expect(workerSource).toContain("semantic_relation_count");
+    expect(workerSource).toContain("semanticRelationCount");
     expect(workerSource).toContain("chunk_meta_summarizer_unavailable");
     expect(workerSource).toContain("chunk_meta_tier2_max_chunks_exceeded");
     expect(workerSource).toContain("applyChunkMetaTier2Result");
+    expect(workerSource).toContain("chunkMetaSemanticRelationsFromSummary");
     expect(workerSource).toContain('selectedTier: "tier2"');
     expect(workerSource).toContain('summarySource: "remote_llm"');
     expect(workerSource).toContain("function sectionHeadingRanges");

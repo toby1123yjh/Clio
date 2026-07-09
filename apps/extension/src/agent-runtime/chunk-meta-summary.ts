@@ -20,11 +20,29 @@ export interface ChunkMetaSummaryInput {
   chunkTextExcerpt: string;
 }
 
+export type ChunkMetaSemanticRelationKind =
+  | "parent"
+  | "previous"
+  | "next"
+  | "section"
+  | "role"
+  | "citation_hint";
+
+export interface ChunkMetaSemanticRelationCandidate {
+  kind: ChunkMetaSemanticRelationKind;
+  target: string;
+  label?: string;
+  confidence: number;
+  reason?: string;
+  source: "remote_llm";
+}
+
 export interface ChunkMetaSummaryResult {
   status: "summarized" | "unavailable" | "error";
   providerKind?: "chat";
   sectionSummary?: string;
   chunkSummary?: string;
+  semanticRelations?: ChunkMetaSemanticRelationCandidate[];
   reason?: string;
 }
 
@@ -50,7 +68,7 @@ const chunkMetaSummarySystemPrompt =
   "Use only the supplied metadata, section path, and chunk excerpt. " +
   "Do not use full PDF text, full webpage text, web search, or outside knowledge. " +
   "Return only strict JSON with this shape: " +
-  '{"sectionSummary":"short section summary","chunkSummary":"short chunk summary"}.';
+  '{"sectionSummary":"short section summary","chunkSummary":"short chunk summary","semanticRelations":[{"kind":"role","target":"bounded target","label":"optional label","confidence":0.7,"reason":"short reason"}]}.';
 
 const maxSourceIdChars = 160;
 const maxChunkIdChars = 160;
@@ -62,6 +80,10 @@ const maxSectionPathChars = 360;
 const maxChunkExcerptChars = 1_800;
 const maxSectionSummaryChars = 500;
 const maxChunkSummaryChars = 360;
+const maxSemanticRelations = 8;
+const maxRelationTargetChars = 360;
+const maxRelationLabelChars = 160;
+const maxRelationReasonChars = 240;
 
 export class ProviderBackedChunkMetaSummarizer implements ChunkMetaSummarizer {
   private readonly loadConfig: ProviderBackedChunkMetaSummarizerOptions["loadConfig"];
@@ -147,6 +169,9 @@ export function buildChunkMetaSummaryPrompt(input: ChunkMetaSummaryInput) {
     "Summarize this single bounded chunk for chunk metadata.",
     "Do not use outside knowledge, web search, full PDF text, full webpage text, or unstated source text.",
     "Keep both summaries concise and citation-neutral.",
+    "Optionally extract semanticRelations using only these kinds: parent, previous, next, section, role, citation_hint.",
+    "Each relation target must be a chunk id, section path, bounded role/citation target, or short phrase present in the supplied context.",
+    "Return at most 8 relation candidates. Include confidence from 0 to 1 and a short reason.",
     "Return JSON only.",
     "",
     JSON.stringify({
@@ -205,9 +230,11 @@ function parseChunkMetaSummaryOutput(output: string): ChunkMetaSummaryResult {
     typeof parsed.chunkSummary === "string"
       ? truncateText(parsed.chunkSummary, maxChunkSummaryChars)
       : undefined;
+  const semanticRelations = parseChunkMetaSemanticRelations(parsed.semanticRelations);
   if (
     (sectionSummary === undefined || sectionSummary.length === 0) &&
-    (chunkSummary === undefined || chunkSummary.length === 0)
+    (chunkSummary === undefined || chunkSummary.length === 0) &&
+    semanticRelations.length === 0
   ) {
     return errorResult("chunk_meta_summary_missing_summary");
   }
@@ -217,7 +244,53 @@ function parseChunkMetaSummaryOutput(output: string): ChunkMetaSummaryResult {
     providerKind: "chat",
     ...(sectionSummary === undefined || sectionSummary.length === 0 ? {} : { sectionSummary }),
     ...(chunkSummary === undefined || chunkSummary.length === 0 ? {} : { chunkSummary }),
+    ...(semanticRelations.length === 0 ? {} : { semanticRelations }),
   };
+}
+
+function parseChunkMetaSemanticRelations(value: unknown): ChunkMetaSemanticRelationCandidate[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const relations: ChunkMetaSemanticRelationCandidate[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) continue;
+    if (!isChunkMetaSemanticRelationKind(item.kind)) continue;
+    if (typeof item.target !== "string") continue;
+    const target = truncateText(item.target, maxRelationTargetChars);
+    if (target.length === 0) continue;
+    const key = `${item.kind}:${target}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const label =
+      typeof item.label === "string" ? truncateText(item.label, maxRelationLabelChars) : "";
+    const reason =
+      typeof item.reason === "string" ? truncateText(item.reason, maxRelationReasonChars) : "";
+    const confidence =
+      typeof item.confidence === "number" && Number.isFinite(item.confidence)
+        ? Math.max(0, Math.min(1, item.confidence))
+        : 0.5;
+    relations.push({
+      kind: item.kind,
+      target,
+      ...(label.length === 0 ? {} : { label }),
+      confidence,
+      ...(reason.length === 0 ? {} : { reason }),
+      source: "remote_llm",
+    });
+    if (relations.length >= maxSemanticRelations) break;
+  }
+  return relations;
+}
+
+function isChunkMetaSemanticRelationKind(value: unknown): value is ChunkMetaSemanticRelationKind {
+  return (
+    value === "parent" ||
+    value === "previous" ||
+    value === "next" ||
+    value === "section" ||
+    value === "role" ||
+    value === "citation_hint"
+  );
 }
 
 function unavailableResult(reason: string): ChunkMetaSummaryResult {

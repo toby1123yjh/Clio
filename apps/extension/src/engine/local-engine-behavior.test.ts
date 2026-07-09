@@ -442,6 +442,16 @@ describe("local engine behavior harness", () => {
           providerKind: "chat",
           sectionSummary: "Remote section summary for bounded retrieval.",
           chunkSummary: "Remote chunk summary improves the embedding prefix.",
+          semanticRelations: [
+            {
+              kind: "role",
+              target: "retrieval_method",
+              label: "Methods",
+              confidence: 0.82,
+              reason: "Bounded chunk describes retrieval method details.",
+              source: "remote_llm",
+            },
+          ],
         };
       },
     };
@@ -497,6 +507,24 @@ describe("local engine behavior harness", () => {
     expect(metaHead.tiers?.tier2?.chunkSummary).toBe(
       "Remote chunk summary improves the embedding prefix.",
     );
+    expect(metaHead.tiers?.tier2?.semanticRelations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "role",
+          target: "retrieval_method",
+          source: "remote_llm",
+        }),
+      ]),
+    );
+    expect(metaHead.semanticRelations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "role",
+          target: "retrieval_method",
+          source: "remote_llm",
+        }),
+      ]),
+    );
 
     const audit = await harness.request({
       kind: "listChunkMetaTier2Audit",
@@ -516,8 +544,10 @@ describe("local engine behavior harness", () => {
     expect(audit.items[0]?.chunkSummaryChars).toBe(
       "Remote chunk summary improves the embedding prefix.".length,
     );
+    expect(audit.items[0]?.semanticRelationCount).toBe(1);
     const auditJson = JSON.stringify(audit);
     expect(auditJson).not.toContain("Remote chunk summary improves the embedding prefix.");
+    expect(auditJson).not.toContain("Bounded chunk describes retrieval method details.");
     expect(auditJson).not.toContain("Tier2 success local chunk evidence");
     expect(auditJson).not.toContain("apiKey");
 
@@ -3826,6 +3856,7 @@ function ragText(seed: string, repeat: number) {
 type ChunkMetaSemanticRelationForTest = {
   kind?: unknown;
   target?: unknown;
+  source?: unknown;
 };
 
 type ChunkMetaTierStateForTest = {

@@ -95,6 +95,15 @@ describe("ProviderBackedChunkMetaSummarizer", () => {
         JSON.stringify({
           sectionSummary: "Methods describe bounded retrieval.",
           chunkSummary: "The chunk explains local memory retrieval with evidence bounds.",
+          semanticRelations: [
+            {
+              kind: "role",
+              target: "method",
+              label: "Methods",
+              confidence: 0.72,
+              reason: "The chunk describes retrieval method details.",
+            },
+          ],
         }),
         (_model, context, options) => {
           observedPrompt = String(context.messages[0]?.content ?? "");
@@ -111,6 +120,16 @@ describe("ProviderBackedChunkMetaSummarizer", () => {
       providerKind: "chat",
       sectionSummary: "Methods describe bounded retrieval.",
       chunkSummary: "The chunk explains local memory retrieval with evidence bounds.",
+      semanticRelations: [
+        {
+          kind: "role",
+          target: "method",
+          label: "Methods",
+          confidence: 0.72,
+          reason: "The chunk describes retrieval method details.",
+          source: "remote_llm",
+        },
+      ],
     });
   });
 
@@ -138,11 +157,45 @@ describe("ProviderBackedChunkMetaSummarizer", () => {
     const prompt = buildChunkMetaSummaryPrompt(bounded);
 
     expect(prompt).toContain("chunkTextExcerpt");
+    expect(prompt).toContain("semanticRelations");
     expect(prompt).not.toContain("apiKey");
     expect(prompt).not.toContain("normalizedText");
     expect(prompt).not.toContain("fullText");
     expect(prompt).not.toContain(longTail);
     expect(bounded.chunkTextExcerpt.length).toBeLessThanOrEqual(1_800);
+  });
+
+  it("bounds semantic relation candidates from provider JSON", async () => {
+    const longTail = "RELATION_TAIL_SHOULD_NOT_APPEAR";
+    const result = await summarizer(
+      streamJson(
+        JSON.stringify({
+          semanticRelations: [
+            {
+              kind: "citation_hint",
+              target: `10.5555/clio.${"x".repeat(500)}${longTail}`,
+              label: `reference ${"label ".repeat(80)}${longTail}`,
+              confidence: 2,
+              reason: `short evidence ${"reason ".repeat(80)}${longTail}`,
+            },
+            {
+              kind: "unsupported",
+              target: "ignored",
+              confidence: 0.5,
+            },
+          ],
+        }),
+      ),
+    ).summarize(input());
+
+    expect(result.status).toBe("summarized");
+    expect(result.semanticRelations).toHaveLength(1);
+    expect(result.semanticRelations?.[0]).toMatchObject({
+      kind: "citation_hint",
+      confidence: 1,
+      source: "remote_llm",
+    });
+    expect(JSON.stringify(result)).not.toContain(longTail);
   });
 
   it("reports malformed JSON as a summary error", async () => {

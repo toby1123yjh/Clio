@@ -333,7 +333,7 @@ export interface LocalEngineOptions {
 
 const databasePath = "/clio-browser-phase1.sqlite3";
 const pdfRawFileDirectoryName = "clio-pdf-raw-files";
-const schemaVersion = 19;
+const schemaVersion = 20;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -702,7 +702,7 @@ interface ChunkMetaSemanticRelationV1 {
   target: string;
   label: string | null;
   confidence: number;
-  source: "deterministic" | "local_extractive";
+  source: "deterministic" | "local_extractive" | "remote_llm";
 }
 
 interface SourceAdapterInput {
@@ -4071,10 +4071,12 @@ function migrate(db: SqliteDb) {
       reason TEXT,
       section_summary_chars INTEGER,
       chunk_summary_chars INTEGER,
+      semantic_relation_count INTEGER,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )
   `);
+  ensureColumn(db, "chunk_meta_tier2_audit", "semantic_relation_count", "INTEGER");
   db.exec(`
     CREATE TABLE IF NOT EXISTS web_search_history (
       id TEXT PRIMARY KEY,
@@ -5381,7 +5383,7 @@ function normalizeChunkMetaSemanticRelations(
       target,
       label: label !== null && label.length > 0 ? label : null,
       confidence,
-      source: relation.source === "deterministic" ? "deterministic" : "local_extractive",
+      source: normalizeChunkMetaSemanticRelationSource(relation.source),
     });
     if (relations.length >= chunkMetaMaxRelations) break;
   }
@@ -5390,6 +5392,13 @@ function normalizeChunkMetaSemanticRelations(
 
 function isChunkMetaSemanticRelationKind(value: unknown): value is ChunkMetaSemanticRelationKindV1 {
   return isChunkMetaRelationKind(value) || value === "role" || value === "citation_hint";
+}
+
+function normalizeChunkMetaSemanticRelationSource(
+  value: unknown,
+): ChunkMetaSemanticRelationV1["source"] {
+  if (value === "deterministic" || value === "remote_llm") return value;
+  return "local_extractive";
 }
 
 function buildChunkEmbeddingInput(chunk: SqlRow) {
@@ -8281,6 +8290,7 @@ async function runChunkMetaStageForSource(
       reason: result.reason,
       sectionSummaryChars: chunkMetaSummaryCharCount(result.sectionSummary),
       chunkSummaryChars: chunkMetaSummaryCharCount(result.chunkSummary),
+      semanticRelationCount: chunkMetaSummarySemanticRelationCount(result.semanticRelations),
     });
     if (result.status === "summarized") summarizedCount += 1;
     else if (result.status === "unavailable") unavailableCount += 1;
@@ -8367,6 +8377,7 @@ interface InsertChunkMetaTier2AuditInput {
   reason?: string;
   sectionSummaryChars?: number;
   chunkSummaryChars?: number;
+  semanticRelationCount?: number;
 }
 
 function insertChunkMetaTier2AuditRowsForChunks(
@@ -8399,9 +8410,10 @@ function insertChunkMetaTier2AuditRow(db: SqliteDb, input: InsertChunkMetaTier2A
       reason,
       section_summary_chars,
       chunk_summary_chars,
+      semantic_relation_count,
       created_at,
       updated_at
-    ) VALUES (?, ?, ?, ?, 'tier2', ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, 'tier2', ?, ?, ?, ?, ?, ?, ?, ?)`,
     bind: [
       createId("cmeta_t2_audit"),
       input.sourceId,
@@ -8412,6 +8424,7 @@ function insertChunkMetaTier2AuditRow(db: SqliteDb, input: InsertChunkMetaTier2A
       normalizeOptionalArtifactText(input.reason, 240) ?? null,
       finiteNumberOrNull(input.sectionSummaryChars),
       finiteNumberOrNull(input.chunkSummaryChars),
+      finiteNumberOrNull(input.semanticRelationCount),
       now,
       now,
     ],
@@ -8428,6 +8441,10 @@ function chunkMetaTier2AuditStatusFromSummary(
 function chunkMetaSummaryCharCount(value: string | undefined) {
   const normalized = normalizeText(value ?? "");
   return normalized.length === 0 ? undefined : normalized.length;
+}
+
+function chunkMetaSummarySemanticRelationCount(value: ChunkMetaSummaryResult["semanticRelations"]) {
+  return chunkMetaSemanticRelationsFromSummary(value).length;
 }
 
 function updateChunkMetaTier2StateForRows(
@@ -8470,7 +8487,11 @@ function applyChunkMetaTier2Result(metaHeadJson: string, result: ChunkMetaSummar
     stringMetadataField(fallbackState, "chunkSummary") ??
     stringMetadataField(metaHead, "chunkSummary");
   const relations = parseChunkMetaRelations(metaHeadJson);
-  const semanticRelations = chunkMetaSemanticRelationsFromState(fallbackState);
+  const fallbackSemanticRelations = chunkMetaSemanticRelationsFromState(fallbackState);
+  const semanticRelations = normalizeChunkMetaSemanticRelations([
+    ...chunkMetaSemanticRelationsFromSummary(result.semanticRelations),
+    ...fallbackSemanticRelations,
+  ]);
   const updated: ChunkMetaHeadV1 = {
     ...(metaHead as unknown as ChunkMetaHeadV1),
     version: chunkMetaHeadVersion,
@@ -8566,10 +8587,32 @@ function chunkMetaSemanticRelationsFromState(
             typeof relation.confidence === "number" && Number.isFinite(relation.confidence)
               ? relation.confidence
               : 0.5,
-          source:
-            relation.source === "local_extractive" || relation.source === "deterministic"
-              ? relation.source
-              : "local_extractive",
+          source: normalizeChunkMetaSemanticRelationSource(relation.source),
+        },
+      ];
+    }),
+  );
+}
+
+function chunkMetaSemanticRelationsFromSummary(
+  value: ChunkMetaSummaryResult["semanticRelations"],
+): ChunkMetaSemanticRelationV1[] {
+  if (!Array.isArray(value)) return [];
+  return normalizeChunkMetaSemanticRelations(
+    value.flatMap((relation): ChunkMetaSemanticRelationV1[] => {
+      if (!isRecord(relation)) return [];
+      if (!isChunkMetaSemanticRelationKind(relation.kind)) return [];
+      if (typeof relation.target !== "string" || relation.target.length === 0) return [];
+      return [
+        {
+          kind: relation.kind,
+          target: relation.target,
+          label: typeof relation.label === "string" ? relation.label : null,
+          confidence:
+            typeof relation.confidence === "number" && Number.isFinite(relation.confidence)
+              ? relation.confidence
+              : 0.5,
+          source: "remote_llm",
         },
       ];
     }),
@@ -13161,6 +13204,7 @@ function chunkMetaTier2AuditRecordFromRow(row: SqlRow): ChunkMetaTier2AuditRecor
   const reason = optionalString(row, "reason");
   const sectionSummaryChars = optionalNumber(row, "section_summary_chars");
   const chunkSummaryChars = optionalNumber(row, "chunk_summary_chars");
+  const semanticRelationCount = optionalNumber(row, "semantic_relation_count");
   return {
     id: stringField(row, "id"),
     sourceId: stringField(row, "source_id"),
@@ -13172,6 +13216,7 @@ function chunkMetaTier2AuditRecordFromRow(row: SqlRow): ChunkMetaTier2AuditRecor
     ...(reason === undefined ? {} : { reason }),
     ...(sectionSummaryChars === undefined ? {} : { sectionSummaryChars }),
     ...(chunkSummaryChars === undefined ? {} : { chunkSummaryChars }),
+    ...(semanticRelationCount === undefined ? {} : { semanticRelationCount }),
     createdAt: stringField(row, "created_at"),
     updatedAt: stringField(row, "updated_at"),
   };

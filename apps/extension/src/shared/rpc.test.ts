@@ -2273,10 +2273,42 @@ describe("session engine RPC guards", () => {
             providerKind: "chat",
             sectionSummary: "Methods describe bounded retrieval.",
             chunkSummary: "The chunk explains local retrieval context.",
+            semanticRelations: [
+              {
+                kind: "role",
+                target: "method",
+                label: "Methods",
+                confidence: 0.72,
+                reason: "Bounded chunk describes method details.",
+                source: "remote_llm",
+              },
+            ],
           },
         },
       }),
     ).toBe(true);
+
+    expect(
+      isWorkerChunkMetaSummaryResponseMessage({
+        type: CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
+        requestId: "chunk-meta-summary-request-1",
+        response: {
+          ok: true,
+          value: {
+            status: "summarized",
+            providerKind: "chat",
+            semanticRelations: [
+              {
+                kind: "unsupported",
+                target: "method",
+                confidence: 0.72,
+                source: "remote_llm",
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
 
     expect(
       isWorkerChunkMetaSummaryResponseMessage({

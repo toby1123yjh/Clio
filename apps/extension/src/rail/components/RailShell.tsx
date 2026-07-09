@@ -5798,6 +5798,7 @@ function ChunkMetaTier2AuditPanel({
                 <span className="min-w-0 truncate">
                   Summary {chunkMetaTier2AuditLengthLabel(row)}
                 </span>
+                <span className="min-w-0 truncate">Relations {row.semanticRelationCount ?? 0}</span>
                 {row.jobId === undefined ? null : (
                   <span className="min-w-0 truncate">Job {compactId(row.jobId)}</span>
                 )}
