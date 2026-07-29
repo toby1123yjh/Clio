@@ -1,9 +1,5 @@
 import { readClioCitationValidation } from "@/src/agent-runtime/citation-validator";
 import type {
-  EmbeddingProviderSettings,
-  SaveEmbeddingProviderSettingsInput,
-} from "@/src/agent-runtime/embedding-provider-settings";
-import type {
   ImageGenerationSettings,
   SaveImageGenerationSettingsInput,
 } from "@/src/agent-runtime/image-generation-settings";
@@ -50,6 +46,11 @@ import {
   type WebSearchStreamController,
   openWebSearchStream,
 } from "@/src/agent-runtime/web-search-stream-client";
+import type {
+  LocalEmbeddingModelRequest,
+  LocalEmbeddingModelStatus,
+} from "@/src/local-embedding/contracts";
+import { recommendedLocalEmbeddingModelManifest } from "@/src/local-embedding/trusted-models";
 import {
   type ComposerContextAttachmentKind,
   type StartSessionTurnResult,
@@ -123,10 +124,9 @@ import { type ToolboxSkill, toolboxSkills } from "@/src/rail/app/toolbox-registr
 import {
   type ImageGenerationDisplayState,
   type ImageGenerationSubmitInput,
-  type KnowledgeBaseClusterGroup,
-  type KnowledgeBaseClusteringState,
   type KnowledgeBaseFilterState,
   type PdfReaderPreviewState,
+  type ProviderMessageTone,
   RailShell,
   type SourceContextPlannerBudget,
   type SourceContextPlannerState,
@@ -156,11 +156,7 @@ import {
   storePendingHighlight,
   storePendingHighlightFromAnchor,
 } from "@/src/rail/page/source-highlight";
-import {
-  requestEngine,
-  requestKnowledgeBaseClusterLabelRefinement,
-  requestProvider,
-} from "@/src/shared/chrome-client";
+import { requestEngine, requestProvider } from "@/src/shared/chrome-client";
 import { sourceUrlsMatch } from "@/src/shared/reliability";
 import {
   type ActiveEmbeddingModelSummary,
@@ -177,10 +173,7 @@ import {
   type EngineHealth,
   type GetMemoryEvidenceWindowAnchor,
   type ImageGenerationHistoryRecord,
-  type KnowledgeBaseClusterLabelRefinementRequest,
-  type KnowledgeBaseClusteringOptions,
-  type KnowledgeBaseSourceCluster,
-  type KnowledgeBaseSourceClusterTrace,
+  type KnowledgeBaseSearchMode,
   type MemoryDetail,
   type MemoryEvidenceWindow,
   type OrchestrationEvent,
@@ -210,11 +203,21 @@ import {
   type SuggestionCooldownState,
   suggestReplyActions,
 } from "@/src/suggestions/suggestion-engine";
+import { testWorkspaceBuildConfig } from "@/src/test-workspace/build-config";
+import {
+  type TestWorkspaceCleanupResult,
+  type TestWorkspaceInitializationResult,
+  type TestWorkspaceProgress,
+  type TestWorkspaceRunnerDependencies,
+  initializeTestWorkspace,
+  removeTestWorkspaceSources,
+} from "@/src/test-workspace/runner";
 import {
   type ExplicitToolRouteKind,
   type ExplicitToolTrace,
   explicitToolRouteLabel,
 } from "@/src/tool-routing/tool-route-types";
+import { normalizeShadowCssRemUnits } from "@/src/ui/shadow-css";
 import styles from "@/src/ui/tailwind.css?inline";
 import katexStyles from "katex/dist/katex.min.css?inline";
 import * as React from "react";
@@ -335,13 +338,6 @@ const defaultKnowledgeBaseFilter: KnowledgeBaseFilterState = {
   arxivIdsText: "",
 };
 
-const defaultKnowledgeBaseClustering: KnowledgeBaseClusteringState = {
-  clusterBy: "none",
-  granularity: "medium",
-  semanticBackend: "auto",
-  providerBackedLabels: false,
-};
-
 type KnowledgeUploadKind = "markdown" | "pdf";
 
 function uniqueKnowledgeBaseFilterValues(values: string[]): string[] {
@@ -424,176 +420,6 @@ function retrieveFilterForKnowledgeBase(
     ...(doi === undefined ? {} : { doi }),
     ...(arxivIds === undefined ? {} : { arxivIds }),
   };
-}
-
-function clusteringPayloadForKnowledgeBase(
-  clustering: KnowledgeBaseClusteringState,
-): KnowledgeBaseClusteringOptions | undefined {
-  if (clustering.clusterBy === "none") return undefined;
-  return {
-    clusterBy: clustering.clusterBy,
-    granularity: clustering.granularity,
-    ...(clustering.clusterBy === "semantic" ? { semanticBackend: clustering.semanticBackend } : {}),
-    ...(clustering.clusterBy === "topic" && clustering.providerBackedLabels
-      ? { refinement: { providerBackedLabels: true } }
-      : {}),
-  };
-}
-
-function knowledgeBaseClusterGroups(
-  clusters: KnowledgeBaseSourceCluster[] | undefined,
-  items: SearchMemoryItem[],
-): KnowledgeBaseClusterGroup[] {
-  if (clusters === undefined || clusters.length === 0) return [];
-  const itemById = new Map(items.map((item) => [item.id, item]));
-  return clusters.flatMap((cluster) => {
-    const clusterItems = cluster.sourceIds.flatMap((sourceId) => {
-      const item = itemById.get(sourceId);
-      return item === undefined ? [] : [item];
-    });
-    if (clusterItems.length === 0) return [];
-    return [
-      {
-        id: cluster.id,
-        label: cluster.label,
-        clusterBy: cluster.clusterBy,
-        sourceCount: cluster.sourceCount,
-        score: cluster.score,
-        ...(cluster.summary === undefined ? {} : { summary: cluster.summary }),
-        ...(cluster.deterministicLabel === undefined
-          ? {}
-          : { deterministicLabel: cluster.deterministicLabel }),
-        ...(cluster.deterministicSummary === undefined
-          ? {}
-          : { deterministicSummary: cluster.deterministicSummary }),
-        ...(cluster.trace === undefined ? {} : { trace: cluster.trace }),
-        items: clusterItems,
-      },
-    ];
-  });
-}
-
-function shouldRefineKnowledgeBaseClusterLabels(clustering: KnowledgeBaseClusteringState) {
-  return clustering.clusterBy === "topic" && clustering.providerBackedLabels;
-}
-
-function knowledgeBaseClusterLabelRefinementTrace(
-  cluster: KnowledgeBaseSourceCluster,
-  status: "unavailable" | "error",
-  reason?: string,
-): KnowledgeBaseSourceClusterTrace {
-  return {
-    backend: cluster.trace?.backend ?? "metadata",
-    method: cluster.trace?.method ?? "metadata_topic_label",
-    ...(cluster.trace?.vectorCount === undefined ? {} : { vectorCount: cluster.trace.vectorCount }),
-    ...(cluster.trace?.fallbackReason === undefined
-      ? {}
-      : { fallbackReason: cluster.trace.fallbackReason }),
-    labelRefinement: {
-      status,
-      method: "provider_llm",
-      ...(reason === undefined ? {} : { reason: excerpt(reason, 180) }),
-    },
-  };
-}
-
-function knowledgeBaseClustersWithLabelRefinementTrace(
-  clusters: KnowledgeBaseSourceCluster[] | undefined,
-  status: "unavailable" | "error",
-  reason?: string,
-): KnowledgeBaseSourceCluster[] | undefined {
-  return clusters?.map((cluster) => ({
-    ...cluster,
-    trace: knowledgeBaseClusterLabelRefinementTrace(cluster, status, reason),
-  }));
-}
-
-async function refineKnowledgeBaseClusterLabels(
-  clusters: KnowledgeBaseSourceCluster[] | undefined,
-  items: SearchMemoryItem[],
-): Promise<KnowledgeBaseSourceCluster[] | undefined> {
-  if (clusters === undefined || clusters.length === 0) return clusters;
-  const request = knowledgeBaseClusterLabelRefinementRequest(clusters, items);
-  if (request === undefined) return clusters;
-  const result = await requestKnowledgeBaseClusterLabelRefinement(request);
-  const refinementByClusterId = new Map(
-    result.clusters.map((cluster) => [cluster.clusterId, cluster]),
-  );
-  return clusters.map((cluster): KnowledgeBaseSourceCluster => {
-    const refinement = refinementByClusterId.get(cluster.id);
-    if (refinement?.status !== "refined" || refinement.label === undefined) {
-      const status =
-        refinement?.status === "error" || refinement?.status === "unavailable"
-          ? refinement.status
-          : result.status === "error"
-            ? "error"
-            : "unavailable";
-      return {
-        ...cluster,
-        trace: knowledgeBaseClusterLabelRefinementTrace(
-          cluster,
-          status,
-          refinement?.reason ?? result.reason,
-        ),
-      };
-    }
-    return {
-      ...cluster,
-      deterministicLabel: cluster.deterministicLabel ?? cluster.label,
-      ...(cluster.summary === undefined
-        ? {}
-        : { deterministicSummary: cluster.deterministicSummary ?? cluster.summary }),
-      label: refinement.label,
-      ...(refinement.summary === undefined ? {} : { summary: refinement.summary }),
-      ...(cluster.trace === undefined
-        ? {}
-        : {
-            trace: {
-              ...knowledgeBaseClusterLabelRefinementTrace(cluster, "unavailable"),
-              labelRefinement: {
-                status: "refined",
-                method: "provider_llm",
-              },
-            },
-          }),
-    };
-  });
-}
-
-function knowledgeBaseClusterLabelRefinementRequest(
-  clusters: KnowledgeBaseSourceCluster[],
-  items: SearchMemoryItem[],
-): KnowledgeBaseClusterLabelRefinementRequest | undefined {
-  const itemById = new Map(items.map((item) => [item.id, item]));
-  const requestClusters = clusters.flatMap((cluster) => {
-    if (cluster.clusterBy !== "topic") return [];
-    const examples = cluster.sourceIds
-      .flatMap((sourceId) => {
-        const item = itemById.get(sourceId);
-        if (item === undefined) return [];
-        return [
-          {
-            sourceId: item.id,
-            title: item.sourceTitle,
-            sourceType: item.sourceKind,
-            abstractSnippet: excerpt(item.excerpt, 360),
-          },
-        ];
-      })
-      .slice(0, 4);
-    if (examples.length === 0) return [];
-    return [
-      {
-        id: cluster.id,
-        label: cluster.label,
-        ...(cluster.summary === undefined ? {} : { summary: cluster.summary }),
-        clusterBy: "topic" as const,
-        sourceCount: cluster.sourceCount,
-        examples,
-      },
-    ];
-  });
-  return requestClusters.length === 0 ? undefined : { clusters: requestClusters };
 }
 
 function knowledgeUploadKindForFile(file: File): KnowledgeUploadKind | null {
@@ -1206,6 +1032,24 @@ function providerLabel(provider: ProviderId) {
   return "Gemini";
 }
 
+function localEmbeddingActionMessage(
+  kind: Exclude<LocalEmbeddingModelRequest, { kind: "getLocalEmbeddingModelStatus" }>["kind"],
+  status: LocalEmbeddingModelStatus,
+) {
+  if (status.error !== undefined) return status.error.message;
+  if (kind === "installLocalEmbeddingModel") return "Local model download started.";
+  if (kind === "cancelLocalEmbeddingModelInstall")
+    return "Local model download cancellation requested.";
+  if (kind === "retryLocalEmbeddingModelInstall") return "Local model download restarted.";
+  if (kind === "deleteLocalEmbeddingModel") return "Local embedding model deleted.";
+  if (kind === "cancelLocalEmbeddingReindex") return "Local embedding rebuild is stopping.";
+  if (kind === "testLocalEmbeddingModel")
+    return `Local embedding runtime ready (${status.backend ?? "WASM"}).`;
+  return status.active
+    ? "Local embeddings rebuilt and activated."
+    : "Local embedding rebuild finished.";
+}
+
 function exhaustiveRoute(value: never): never {
   throw new Error(`Unhandled explicit tool route: ${String(value)}`);
 }
@@ -1220,7 +1064,7 @@ export default defineContentScript({
 
     const shadow = host.attachShadow({ mode: "open" });
     const style = document.createElement("style");
-    style.textContent = `${styles}\n${katexStyles}`;
+    style.textContent = normalizeShadowCssRemUnits(`${styles}\n${katexStyles}`);
     const mount = document.createElement("div");
     mount.className = "clio-shadow-root";
     shadow.append(style, mount);
@@ -1249,6 +1093,10 @@ function ClioContentApp() {
   );
   const [selection, setSelection] = React.useState<SelectionState | null>(null);
   const [items, setItems] = React.useState<SearchMemoryItem[]>([]);
+  const [knowledgeBaseSearchLoading, setKnowledgeBaseSearchLoading] = React.useState(false);
+  const [knowledgeBaseRefreshLoading, setKnowledgeBaseRefreshLoading] = React.useState(false);
+  const [knowledgeBaseSearchMode, setKnowledgeBaseSearchMode] =
+    React.useState<KnowledgeBaseSearchMode>("exact");
   const [knowledgeBaseFilter, setKnowledgeBaseFilter] = React.useState<KnowledgeBaseFilterState>(
     defaultKnowledgeBaseFilter,
   );
@@ -1256,15 +1104,6 @@ function ClioContentApp() {
     () => retrieveFilterForKnowledgeBase(knowledgeBaseFilter),
     [knowledgeBaseFilter],
   );
-  const [knowledgeBaseClustering, setKnowledgeBaseClustering] =
-    React.useState<KnowledgeBaseClusteringState>(defaultKnowledgeBaseClustering);
-  const knowledgeBaseClusteringPayload = React.useMemo(
-    () => clusteringPayloadForKnowledgeBase(knowledgeBaseClustering),
-    [knowledgeBaseClustering],
-  );
-  const [knowledgeBaseClusters, setKnowledgeBaseClusters] = React.useState<
-    KnowledgeBaseClusterGroup[]
-  >([]);
   const [workingSetStatus, setWorkingSetStatus] = React.useState<WorkingSetStatusResult | null>(
     null,
   );
@@ -1312,10 +1151,10 @@ function ClioContentApp() {
   const [providerSettings, setProviderSettings] = React.useState<ProviderSettings | null>(null);
   const [searchProviderSettings, setSearchProviderSettings] =
     React.useState<SearchProviderSettings | null>(null);
-  const [embeddingProviderSettings, setEmbeddingProviderSettings] =
-    React.useState<EmbeddingProviderSettings | null>(null);
   const [activeEmbeddingModel, setActiveEmbeddingModel] =
     React.useState<ActiveEmbeddingModelSummary | null>(null);
+  const [localEmbeddingStatus, setLocalEmbeddingStatus] =
+    React.useState<LocalEmbeddingModelStatus | null>(null);
   const [imageGenerationSettings, setImageGenerationSettings] =
     React.useState<ImageGenerationSettings | null>(null);
   const [visionProviderSettings, setVisionProviderSettings] =
@@ -1330,6 +1169,18 @@ function ClioContentApp() {
     React.useState<WebSearchViewState>(emptyWebSearchState);
   const [providerLoading, setProviderLoading] = React.useState(false);
   const [providerMessage, setProviderMessage] = React.useState<string | null>(null);
+  const [providerMessageTone, setProviderMessageTone] =
+    React.useState<ProviderMessageTone>("neutral");
+  const [testWorkspaceProgress, setTestWorkspaceProgress] =
+    React.useState<TestWorkspaceProgress | null>(null);
+  const [testWorkspaceBusy, setTestWorkspaceBusy] = React.useState(false);
+  const [testWorkspaceMessage, setTestWorkspaceMessage] = React.useState<string | null>(null);
+  const [testWorkspaceMessageTone, setTestWorkspaceMessageTone] =
+    React.useState<ProviderMessageTone>("neutral");
+  const [testWorkspaceInitializationResult, setTestWorkspaceInitializationResult] =
+    React.useState<TestWorkspaceInitializationResult | null>(null);
+  const [testWorkspaceCleanupResult, setTestWorkspaceCleanupResult] =
+    React.useState<TestWorkspaceCleanupResult | null>(null);
   const [toast, setToast] = React.useState<ToastState | null>(null);
   const [railWidth, setRailWidth] = React.useState(defaultRailWidth);
   const [railTheme, setRailTheme] = React.useState<RailTheme>(defaultRailTheme);
@@ -1351,6 +1202,7 @@ function ClioContentApp() {
   const activeImageGenerationStreamRef = React.useRef<ImageGenerationStreamController | null>(null);
   const ownerIdRef = React.useRef<string | null>(null);
   const suggestionCooldownRef = React.useRef<Record<string, SessionSuggestionCooldown>>({});
+  const knowledgeBaseSearchSequenceRef = React.useRef(0);
 
   const clearPdfPreview = React.useCallback(() => {
     if (pdfPreviewObjectUrlRef.current !== null) {
@@ -1388,6 +1240,10 @@ function ClioContentApp() {
     }, 6000);
     return () => window.clearTimeout(timer);
   }, [railState.runtimeStatus]);
+
+  React.useEffect(() => {
+    if (providerLoading) setProviderMessageTone("neutral");
+  }, [providerLoading]);
 
   const showToast = React.useCallback((next: ToastState) => {
     setToast(next);
@@ -1466,29 +1322,26 @@ function ClioContentApp() {
     }
   }, []);
 
-  const loadEmbeddingProviderSettings = React.useCallback(async () => {
-    setProviderLoading(true);
-    setProviderMessage(null);
-    try {
-      const settings = await requestProvider({ kind: "getEmbeddingProviderSettings" });
-      setEmbeddingProviderSettings(settings);
-      return true;
-    } catch (error) {
-      setProviderMessage(
-        error instanceof Error ? error.message : "Unable to read embedding provider setup.",
-      );
-      return false;
-    } finally {
-      setProviderLoading(false);
-    }
-  }, []);
-
   const loadActiveEmbeddingModel = React.useCallback(async () => {
     try {
       const model = await requestEngine({ kind: "getActiveEmbeddingModel" });
       setActiveEmbeddingModel(model);
       return true;
     } catch {
+      return false;
+    }
+  }, []);
+
+  const loadLocalEmbeddingStatus = React.useCallback(async () => {
+    try {
+      const result = await requestProvider({ kind: "getLocalEmbeddingModelStatus" });
+      setLocalEmbeddingStatus(result.status);
+      return true;
+    } catch (error) {
+      setProviderMessageTone("error");
+      setProviderMessage(
+        error instanceof Error ? error.message : "Unable to read local embedding status.",
+      );
       return false;
     }
   }, []);
@@ -1665,42 +1518,78 @@ function ClioContentApp() {
     }
   }, [loadOrchestrationEvents]);
 
-  const loadLibrary = React.useCallback(
-    async (nextQuery = railState.query) => {
-      dispatch({ type: "SET_LOADING", loading: true });
-      try {
-        const topicResult = await requestEngine({
-          kind: "listTopicPages",
-          query: nextQuery.trim().length > 0 ? nextQuery : undefined,
+  const requestKnowledgeBaseResults = React.useCallback(
+    async (nextQuery: string) => {
+      const result = await requestEngine({
+        kind: "searchKnowledgeBase",
+        payload: {
+          query: nextQuery,
+          mode: knowledgeBaseSearchMode,
           limit: 40,
-        });
-        const wikiJobsResult = await requestEngine({
-          kind: "listWikiCompileJobs",
-          limit: 8,
-        });
-        const result = await requestEngine({
-          kind: "searchKnowledgeBase",
-          payload: {
-            query: nextQuery,
-            limit: 40,
-            includeChunks: 2,
-            ...(knowledgeBaseRetrieveFilter === undefined
-              ? {}
-              : { filter: knowledgeBaseRetrieveFilter }),
-            ...(knowledgeBaseClusteringPayload === undefined
-              ? {}
-              : { clustering: knowledgeBaseClusteringPayload }),
-          },
-        });
-        const workingSet = await requestEngine({ kind: "getWorkingSetStatus" });
-        const tier2Audit = await requestEngine({
-          kind: "listChunkMetaTier2Audit",
-          filter: { limit: 30 },
-        });
-        const orchestration = await requestEngine({
-          kind: "listOrchestrationRuns",
-          filter: { kind: "post_capture_job", limit: 8 },
-        });
+          includeChunks: 2,
+          ...(knowledgeBaseRetrieveFilter === undefined
+            ? {}
+            : { filter: knowledgeBaseRetrieveFilter }),
+        },
+      });
+      return result.items.map(toKnowledgeBaseSearchItem);
+    },
+    [knowledgeBaseRetrieveFilter, knowledgeBaseSearchMode],
+  );
+
+  const loadKnowledgeBaseResults = React.useCallback(
+    async (nextQuery = railState.query) => {
+      const sequence = ++knowledgeBaseSearchSequenceRef.current;
+      setKnowledgeBaseSearchLoading(true);
+      try {
+        const nextItems = await requestKnowledgeBaseResults(nextQuery);
+        if (sequence !== knowledgeBaseSearchSequenceRef.current) return;
+        setItems(nextItems);
+      } catch (error) {
+        if (sequence === knowledgeBaseSearchSequenceRef.current) showToast(errorToast(error));
+      } finally {
+        if (sequence === knowledgeBaseSearchSequenceRef.current) {
+          setKnowledgeBaseSearchLoading(false);
+        }
+      }
+    },
+    [railState.query, requestKnowledgeBaseResults, showToast],
+  );
+
+  const loadLibrary = React.useCallback(
+    async (nextQuery = railState.query, options?: { background?: boolean }) => {
+      const background = options?.background === true;
+      const searchSequence = ++knowledgeBaseSearchSequenceRef.current;
+      if (background) {
+        setKnowledgeBaseSearchLoading(false);
+        setKnowledgeBaseRefreshLoading(true);
+      } else {
+        setKnowledgeBaseSearchLoading(true);
+        dispatch({ type: "SET_LOADING", loading: true });
+      }
+      try {
+        const [topicResult, wikiJobsResult, nextItems, workingSet, tier2Audit, orchestration] =
+          await Promise.all([
+            requestEngine({
+              kind: "listTopicPages",
+              query: nextQuery.trim().length > 0 ? nextQuery : undefined,
+              limit: 40,
+            }),
+            requestEngine({
+              kind: "listWikiCompileJobs",
+              limit: 8,
+            }),
+            requestKnowledgeBaseResults(nextQuery),
+            requestEngine({ kind: "getWorkingSetStatus" }),
+            requestEngine({
+              kind: "listChunkMetaTier2Audit",
+              filter: { limit: 30 },
+            }),
+            requestEngine({
+              kind: "listOrchestrationRuns",
+              filter: { kind: "post_capture_job", limit: 8 },
+            }),
+          ]);
         setTopicPages(topicResult.items);
         setWikiCompileJobs(wikiJobsResult.jobs);
         setWorkingSetStatus(workingSet);
@@ -1712,31 +1601,27 @@ function ClioContentApp() {
         } else {
           setWikiCompileJobEvents([]);
         }
-        const nextItems = result.items.map(toKnowledgeBaseSearchItem);
-        const nextClusters = shouldRefineKnowledgeBaseClusterLabels(knowledgeBaseClustering)
-          ? await refineKnowledgeBaseClusterLabels(result.clusters, nextItems).catch(() =>
-              knowledgeBaseClustersWithLabelRefinementTrace(
-                result.clusters,
-                "error",
-                "kb_cluster_label_refinement_rpc_error",
-              ),
-            )
-          : result.clusters;
-        setItems(nextItems);
-        setKnowledgeBaseClusters(knowledgeBaseClusterGroups(nextClusters, nextItems));
+        if (searchSequence === knowledgeBaseSearchSequenceRef.current) {
+          setItems(nextItems);
+        }
       } catch (error) {
         showToast(errorToast(error));
       } finally {
-        dispatch({ type: "SET_LOADING", loading: false });
+        if (!background && searchSequence === knowledgeBaseSearchSequenceRef.current) {
+          setKnowledgeBaseSearchLoading(false);
+        }
+        if (background) {
+          setKnowledgeBaseRefreshLoading(false);
+        } else {
+          dispatch({ type: "SET_LOADING", loading: false });
+        }
       }
     },
     [
-      knowledgeBaseClusteringPayload,
-      knowledgeBaseClustering,
-      knowledgeBaseRetrieveFilter,
       loadOrchestrationEvents,
       loadWikiCompileJobEvents,
       railState.query,
+      requestKnowledgeBaseResults,
       showToast,
     ],
   );
@@ -1842,6 +1727,40 @@ function ClioContentApp() {
       railState.query,
       showToast,
     ],
+  );
+
+  const runSourceGraphJob = React.useCallback(
+    async (sourceId: string) => {
+      dispatch({ type: "SET_LOADING", loading: true });
+      try {
+        const queued = await requestEngine({
+          kind: "enqueueSourceGraphJob",
+          payload: { sourceId, mode: "llm" },
+        });
+        const orchestration = await requestEngine({
+          kind: "createOrchestrationRun",
+          payload: { kind: "post_capture_job", targetJobId: queued.id },
+        });
+        setOrchestrationRuns((runs) => [orchestration, ...runs].slice(0, 8));
+        await loadOrchestrationEvents(orchestration.id);
+        const completed = await requestEngine({ kind: "runOrchestration", id: orchestration.id });
+        await loadLibrary(railState.query);
+        await loadOrchestrationRuns();
+        showToast({
+          tone: completed.status === "done" ? "success" : "warning",
+          message:
+            completed.status === "done"
+              ? "Research graph generation finished."
+              : "Research graph job did not finish. Check orchestration status.",
+        });
+      } catch (error) {
+        await loadOrchestrationRuns();
+        showToast(errorToast(error));
+      } finally {
+        dispatch({ type: "SET_LOADING", loading: false });
+      }
+    },
+    [loadLibrary, loadOrchestrationEvents, loadOrchestrationRuns, railState.query, showToast],
   );
 
   const cancelOrchestrationRun = React.useCallback(
@@ -2272,12 +2191,12 @@ function ClioContentApp() {
     void loadSearchProviderSettings();
     void loadImageGenerationSettings();
     void loadVisionProviderSettings();
-    void loadEmbeddingProviderSettings();
     void loadActiveEmbeddingModel();
+    void loadLocalEmbeddingStatus();
   }, [
     loadActiveEmbeddingModel,
-    loadEmbeddingProviderSettings,
     loadImageGenerationSettings,
+    loadLocalEmbeddingStatus,
     loadProviderSettings,
     loadSearchProviderSettings,
     loadVisionProviderSettings,
@@ -2288,13 +2207,13 @@ function ClioContentApp() {
     const searchOk = await loadSearchProviderSettings();
     const imageOk = await loadImageGenerationSettings();
     const visionOk = await loadVisionProviderSettings();
-    const embeddingOk = await loadEmbeddingProviderSettings();
     const activeEmbeddingOk = await loadActiveEmbeddingModel();
-    return providerOk && searchOk && imageOk && visionOk && embeddingOk && activeEmbeddingOk;
+    const localEmbeddingOk = await loadLocalEmbeddingStatus();
+    return providerOk && searchOk && imageOk && visionOk && activeEmbeddingOk && localEmbeddingOk;
   }, [
     loadActiveEmbeddingModel,
-    loadEmbeddingProviderSettings,
     loadImageGenerationSettings,
+    loadLocalEmbeddingStatus,
     loadProviderSettings,
     loadSearchProviderSettings,
     loadVisionProviderSettings,
@@ -2352,9 +2271,11 @@ function ClioContentApp() {
           model: input.model,
         });
         await loadProviderSettings();
+        setProviderMessageTone("success");
         setProviderMessage("Gemini connection works.");
         return true;
       } catch (error) {
+        setProviderMessageTone("error");
         setProviderMessage(
           error instanceof Error ? error.message : "Gemini connection test failed.",
         );
@@ -2399,9 +2320,11 @@ function ClioContentApp() {
           baseUrl: input.baseUrl,
         });
         await loadProviderSettings();
+        setProviderMessageTone("success");
         setProviderMessage("OpenAI connection works.");
         return true;
       } catch (error) {
+        setProviderMessageTone("error");
         setProviderMessage(
           error instanceof Error ? error.message : "OpenAI connection test failed.",
         );
@@ -2489,15 +2412,18 @@ function ClioContentApp() {
     async (input: SaveVisionProviderSettingsInput) => {
       setProviderLoading(true);
       setProviderMessage(null);
+      setProviderMessageTone("neutral");
       try {
         const settings = await requestProvider({
           kind: "saveVisionProviderSettings",
           settings: input,
         });
         setVisionProviderSettings(settings);
+        setProviderMessageTone("success");
         setProviderMessage("Vision provider saved.");
         return true;
       } catch (error) {
+        setProviderMessageTone("error");
         setProviderMessage(
           error instanceof Error ? error.message : "Unable to save Vision provider.",
         );
@@ -2509,74 +2435,176 @@ function ClioContentApp() {
     [],
   );
 
-  const saveEmbeddingProviderSettings = React.useCallback(
-    async (input: SaveEmbeddingProviderSettingsInput) => {
+  const runLocalEmbeddingAction = React.useCallback(
+    async (
+      request: Exclude<LocalEmbeddingModelRequest, { kind: "getLocalEmbeddingModelStatus" }>,
+    ) => {
       setProviderLoading(true);
       setProviderMessage(null);
+      setProviderMessageTone("neutral");
       try {
-        const settings = await requestProvider({
-          kind: "saveEmbeddingProviderSettings",
-          settings: input,
-        });
-        setEmbeddingProviderSettings(settings);
-        setProviderMessage("Embedding provider saved.");
+        const result = await requestProvider(request);
+        setLocalEmbeddingStatus(result.status);
+        if (request.kind === "authorizeLocalEmbeddingReindex") {
+          await loadActiveEmbeddingModel();
+        }
+        setProviderMessageTone(
+          result.status.error !== undefined
+            ? "error"
+            : result.status.state === "downloading" ||
+                result.status.state === "verifying" ||
+                result.status.state === "loading"
+              ? "neutral"
+              : "success",
+        );
+        setProviderMessage(localEmbeddingActionMessage(request.kind, result.status));
         return true;
       } catch (error) {
+        setProviderMessageTone("error");
         setProviderMessage(
-          error instanceof Error ? error.message : "Unable to save embedding provider.",
+          error instanceof Error ? error.message : "Local embedding action failed.",
         );
+        await loadLocalEmbeddingStatus();
         return false;
       } finally {
         setProviderLoading(false);
       }
     },
+    [loadActiveEmbeddingModel, loadLocalEmbeddingStatus],
+  );
+
+  const createTestWorkspaceDependencies = React.useCallback(
+    (): TestWorkspaceRunnerDependencies => ({
+      getEmbeddingStatus: async () => {
+        const result = await requestProvider({ kind: "getLocalEmbeddingModelStatus" });
+        setLocalEmbeddingStatus(result.status);
+        return result.status;
+      },
+      installEmbeddingModel: async () => {
+        const result = await requestProvider({
+          kind: "installLocalEmbeddingModel",
+          modelId: recommendedLocalEmbeddingModelManifest.modelId,
+        });
+        setLocalEmbeddingStatus(result.status);
+        return result.status;
+      },
+      authorizeEmbeddingReindex: async () => {
+        const result = await requestProvider({
+          kind: "authorizeLocalEmbeddingReindex",
+          modelId: recommendedLocalEmbeddingModelManifest.modelId,
+        });
+        setLocalEmbeddingStatus(result.status);
+        return result.status;
+      },
+      capturePage: (payload) => requestEngine({ kind: "capturePage", payload }),
+      captureSelection: (payload) => requestEngine({ kind: "captureSelection", payload }),
+      captureMarkdown: (payload) => requestEngine({ kind: "captureMarkdown", payload }),
+      capturePdf: (payload) => requestEngine({ kind: "capturePdf", payload }),
+      listMemories: (limit) => requestEngine({ kind: "listMemories", limit }),
+      deleteMemory: (id) => requestEngine({ kind: "deleteMemory", id }),
+      fetchAsset: async (assetPath) => {
+        const response = await fetch(chrome.runtime.getURL(assetPath));
+        if (!response.ok) {
+          throw new Error(`Unable to load staged test asset (${response.status}).`);
+        }
+        return await response.arrayBuffer();
+      },
+      onProgress: setTestWorkspaceProgress,
+    }),
     [],
   );
 
-  const testEmbeddingProvider = React.useCallback(
-    async (input: SaveEmbeddingProviderSettingsInput) => {
-      setProviderLoading(true);
-      setProviderMessage(null);
-      try {
-        const result = await requestProvider({
-          kind: "testEmbeddingProvider",
-          settings: input,
-        });
-        await loadEmbeddingProviderSettings();
-        setProviderMessage(`Embedding connection works: ${result.dimension}d (${result.modelId}).`);
-        return true;
-      } catch (error) {
-        setProviderMessage(
-          error instanceof Error ? error.message : "Embedding connection test failed.",
-        );
-        return false;
-      } finally {
-        setProviderLoading(false);
-      }
-    },
-    [loadEmbeddingProviderSettings],
-  );
-
-  const authorizeEmbeddingReindex = React.useCallback(async () => {
-    setProviderLoading(true);
-    setProviderMessage(null);
+  const initializeLocalTestWorkspace = React.useCallback(async () => {
+    if (testWorkspaceBuildConfig === null || testWorkspaceBusy) return;
+    setTestWorkspaceBusy(true);
+    setTestWorkspaceMessage(null);
+    setTestWorkspaceMessageTone("neutral");
+    setTestWorkspaceInitializationResult(null);
+    setTestWorkspaceCleanupResult(null);
     try {
-      const result = await requestProvider({ kind: "authorizeEmbeddingReindex" });
-      await loadActiveEmbeddingModel();
-      await loadEmbeddingProviderSettings();
-      setProviderMessage(
-        `Embedding rebuild queued: ${result.status} job ${result.jobId.slice(0, 8)}.`,
+      const result = await initializeTestWorkspace(
+        testWorkspaceBuildConfig,
+        createTestWorkspaceDependencies(),
       );
-      return true;
+      setTestWorkspaceInitializationResult(result);
+      setTestWorkspaceMessageTone(result.status === "completed" ? "success" : "error");
+      setTestWorkspaceMessage(
+        result.status === "completed"
+          ? `Test workspace ready: ${result.saved} saved, ${result.duplicates} already present.`
+          : `Test workspace partially ready: ${result.failed} of ${result.total} imports failed.`,
+      );
     } catch (error) {
-      setProviderMessage(
-        error instanceof Error ? error.message : "Unable to start embedding rebuild.",
-      );
-      return false;
+      const message =
+        error instanceof Error ? error.message : "Unable to initialize the test workspace.";
+      setTestWorkspaceProgress((current) => ({
+        phase: "failed",
+        completed: current?.completed ?? 0,
+        total: Math.max(1, current?.total ?? 1),
+        message,
+      }));
+      setTestWorkspaceMessageTone("error");
+      setTestWorkspaceMessage(message);
     } finally {
-      setProviderLoading(false);
+      await Promise.all([loadLibrary(""), loadLocalEmbeddingStatus(), loadActiveEmbeddingModel()]);
+      setTestWorkspaceBusy(false);
     }
-  }, [loadActiveEmbeddingModel, loadEmbeddingProviderSettings]);
+  }, [
+    createTestWorkspaceDependencies,
+    loadActiveEmbeddingModel,
+    loadLibrary,
+    loadLocalEmbeddingStatus,
+    testWorkspaceBusy,
+  ]);
+
+  const removeLocalTestWorkspace = React.useCallback(async () => {
+    if (testWorkspaceBuildConfig === null || testWorkspaceBusy) return;
+    setTestWorkspaceBusy(true);
+    setTestWorkspaceMessage(null);
+    setTestWorkspaceMessageTone("neutral");
+    setTestWorkspaceInitializationResult(null);
+    setTestWorkspaceCleanupResult(null);
+    setTestWorkspaceProgress({
+      phase: "removing_sources",
+      completed: 0,
+      total: 1,
+      message: "Finding test workspace sources.",
+    });
+    try {
+      const result = await removeTestWorkspaceSources(
+        testWorkspaceBuildConfig,
+        createTestWorkspaceDependencies(),
+      );
+      setTestWorkspaceCleanupResult(result);
+      setTestWorkspaceProgress({
+        phase: "removing_sources",
+        completed: Math.max(1, result.matched),
+        total: Math.max(1, result.matched),
+        message:
+          result.failed === 0
+            ? `Removed ${result.deleted} test sources.`
+            : `Removed ${result.deleted} test sources; ${result.failed} deletions failed.`,
+      });
+      setTestWorkspaceMessageTone(result.failed === 0 ? "success" : "error");
+      setTestWorkspaceMessage(
+        result.failed === 0
+          ? `Removed ${result.deleted} test sources. Other Knowledge Base data was preserved.`
+          : `Removed ${result.deleted} test sources; ${result.failed} deletions failed.`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to remove test data.";
+      setTestWorkspaceProgress({
+        phase: "failed",
+        completed: 0,
+        total: 1,
+        message,
+      });
+      setTestWorkspaceMessageTone("error");
+      setTestWorkspaceMessage(message);
+    } finally {
+      await loadLibrary("");
+      setTestWorkspaceBusy(false);
+    }
+  }, [createTestWorkspaceDependencies, loadLibrary, testWorkspaceBusy]);
 
   const testOpenAICompatibleProvider = React.useCallback(
     async (input: { apiKey?: string; model?: string; baseUrl?: string; providerName?: string }) => {
@@ -2591,9 +2619,11 @@ function ClioContentApp() {
           providerName: input.providerName,
         });
         await loadProviderSettings();
+        setProviderMessageTone("success");
         setProviderMessage("OpenAI-compatible connection works.");
         return true;
       } catch (error) {
+        setProviderMessageTone("error");
         setProviderMessage(
           error instanceof Error ? error.message : "OpenAI-compatible connection test failed.",
         );
@@ -3627,16 +3657,33 @@ function ClioContentApp() {
     void loadSearchProviderSettings();
     void loadImageGenerationSettings();
     void loadVisionProviderSettings();
-    void loadEmbeddingProviderSettings();
     void loadActiveEmbeddingModel();
+    void loadLocalEmbeddingStatus();
   }, [
     loadActiveEmbeddingModel,
-    loadEmbeddingProviderSettings,
     loadImageGenerationSettings,
+    loadLocalEmbeddingStatus,
     loadProviderSettings,
     loadSearchProviderSettings,
     loadVisionProviderSettings,
   ]);
+
+  React.useEffect(() => {
+    if (
+      localEmbeddingStatus?.state !== "downloading" &&
+      localEmbeddingStatus?.state !== "verifying" &&
+      localEmbeddingStatus?.state !== "loading" &&
+      localEmbeddingStatus?.reindex?.state !== "queued" &&
+      localEmbeddingStatus?.reindex?.state !== "running" &&
+      localEmbeddingStatus?.reindex?.state !== "cancel_requested"
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void loadLocalEmbeddingStatus();
+    }, 750);
+    return () => window.clearInterval(timer);
+  }, [loadLocalEmbeddingStatus, localEmbeddingStatus?.reindex?.state, localEmbeddingStatus?.state]);
 
   React.useEffect(() => {
     void getRailOwnerId()
@@ -3789,10 +3836,15 @@ function ClioContentApp() {
   React.useEffect(() => {
     if (railState.mode !== "knowledge-base" && railState.mode !== "research-planner") return;
     const timer = window.setTimeout(() => {
-      void loadLibrary(railState.query);
+      void loadKnowledgeBaseResults(railState.query);
     }, 220);
     return () => window.clearTimeout(timer);
-  }, [loadLibrary, railState.mode, railState.query]);
+  }, [loadKnowledgeBaseResults, railState.mode, railState.query]);
+
+  React.useEffect(() => {
+    if (activeEmbeddingModel !== null || knowledgeBaseSearchMode !== "semantic") return;
+    setKnowledgeBaseSearchMode("exact");
+  }, [activeEmbeddingModel, knowledgeBaseSearchMode]);
 
   React.useEffect(() => {
     if (railState.mode !== "agent-home") {
@@ -4657,16 +4709,24 @@ function ClioContentApp() {
         detail={detail}
         pdfPreview={pdfPreview}
         activeEmbeddingModel={activeEmbeddingModel}
-        embeddingProviderSettings={embeddingProviderSettings}
+        localEmbeddingStatus={localEmbeddingStatus}
+        testWorkspaceBusy={testWorkspaceBusy}
+        testWorkspaceCleanupResult={testWorkspaceCleanupResult}
+        testWorkspaceConfig={testWorkspaceBuildConfig}
+        testWorkspaceInitializationResult={testWorkspaceInitializationResult}
+        testWorkspaceMessage={testWorkspaceMessage}
+        testWorkspaceMessageTone={testWorkspaceMessageTone}
+        testWorkspaceProgress={testWorkspaceProgress}
         health={health}
         imageGenerationHistory={imageGenerationHistory}
         imageGenerationSettings={imageGenerationSettings}
         imageGenerationState={imageGenerationState}
         items={items}
-        knowledgeBaseClusters={knowledgeBaseClusters}
-        knowledgeBaseClustering={knowledgeBaseClustering}
         knowledgeBaseFilter={knowledgeBaseFilter}
+        knowledgeBaseRefreshLoading={knowledgeBaseRefreshLoading}
         knowledgeBaseRetrieveFilter={knowledgeBaseRetrieveFilter}
+        knowledgeBaseSearchMode={knowledgeBaseSearchMode}
+        knowledgeBaseSearchLoading={knowledgeBaseSearchLoading}
         workingSetStatus={workingSetStatus}
         chunkMetaTier2Audit={chunkMetaTier2Audit}
         orchestrationRuns={orchestrationRuns}
@@ -4700,7 +4760,24 @@ function ClioContentApp() {
         }}
         onCollapsedKeyDown={handleCollapsedKeyDown}
         onCollapsedPointerDown={handleCollapsedPointerDown}
-        onAuthorizeEmbeddingReindex={authorizeEmbeddingReindex}
+        onAuthorizeLocalEmbeddingReindex={() =>
+          runLocalEmbeddingAction({
+            kind: "authorizeLocalEmbeddingReindex",
+            modelId: recommendedLocalEmbeddingModelManifest.modelId,
+          })
+        }
+        onCancelLocalEmbeddingInstall={() =>
+          runLocalEmbeddingAction({
+            kind: "cancelLocalEmbeddingModelInstall",
+            modelId: recommendedLocalEmbeddingModelManifest.modelId,
+          })
+        }
+        onCancelLocalEmbeddingReindex={() =>
+          runLocalEmbeddingAction({
+            kind: "cancelLocalEmbeddingReindex",
+            modelId: recommendedLocalEmbeddingModelManifest.modelId,
+          })
+        }
         onCancelImageGeneration={handleCancelImageGeneration}
         onCancelDialogue={handleCancelDialogue}
         onClearDialogue={handleClearDialogue}
@@ -4712,6 +4789,12 @@ function ClioContentApp() {
         onComposerPrefillConsumed={handleComposerPrefillConsumed}
         onClearComposerSkillMode={() => dispatch({ type: "CLEAR_COMPOSER_SKILL_MODE" })}
         onDelete={(id) => void deleteMemory(id)}
+        onDeleteLocalEmbeddingModel={() =>
+          runLocalEmbeddingAction({
+            kind: "deleteLocalEmbeddingModel",
+            modelId: recommendedLocalEmbeddingModelManifest.modelId,
+          })
+        }
         onDeleteTopicPage={(id) => void deleteTopicPage(id)}
         onDeleteImageGenerationHistory={(id) => void handleDeleteImageGenerationHistory(id)}
         onCloseCommandPalette={() => dispatch({ type: "CLOSE_COMMAND_PALETTE" })}
@@ -4738,7 +4821,6 @@ function ClioContentApp() {
         onOpenSettings={openSettings}
         onImagePromptPrefillConsumed={() => dispatch({ type: "CLEAR_IMAGE_PROMPT_PREFILL" })}
         onOpenSource={(memory) => void openSource(memory)}
-        onKnowledgeBaseClusteringChange={setKnowledgeBaseClustering}
         onKnowledgeBaseFilterChange={setKnowledgeBaseFilter}
         onPinWorkingSetSource={(sourceId, loadDepth) =>
           void pinWorkingSetSource(sourceId, loadDepth)
@@ -4753,6 +4835,7 @@ function ClioContentApp() {
         onRunChunkMetaTier2Job={(sourceId, maxChunks) =>
           void runChunkMetaTier2Job(sourceId, maxChunks)
         }
+        onRunSourceGraphJob={(sourceId) => void runSourceGraphJob(sourceId)}
         onCancelOrchestrationRun={(runId) => void cancelOrchestrationRun(runId)}
         onRetryOrchestrationRun={(runId) => void retryOrchestrationRun(runId)}
         onRefreshOrchestrationRuns={() => void loadOrchestrationRuns()}
@@ -4785,7 +4868,8 @@ function ClioContentApp() {
         onCompileTopicWithAI={(form, topicId) => void compileTopicWithAI(form, topicId)}
         onOpenTopicSource={(memoryId) => void openTopicSource(memoryId)}
         onQueryChange={(query) => dispatch({ type: "SET_QUERY", query })}
-        onRefresh={() => void loadLibrary(railState.query)}
+        onKnowledgeBaseSearchModeChange={setKnowledgeBaseSearchMode}
+        onRefresh={() => void loadLibrary(railState.query, { background: true })}
         onRefreshProvider={refreshSettingsProviders}
         onRuntimeStatus={(message) => dispatch({ type: "SET_RUNTIME_STATUS", message })}
         onRetryDialogue={handleRetryDialogue}
@@ -4803,13 +4887,20 @@ function ClioContentApp() {
         onToggleCommandPalette={toggleCommandPalette}
         onToolboxSkill={handleToolboxSkill}
         onSaveGeminiProvider={saveGeminiProvider}
-        onSaveEmbeddingProviderSettings={saveEmbeddingProviderSettings}
         onSaveOpenAICompatibleProvider={saveOpenAICompatibleProvider}
         onSaveOpenAIProvider={saveOpenAIProvider}
         onSaveImageGenerationSettings={saveImageGenerationSettings}
         onSaveSearchProvider={saveSearchProvider}
         onSaveVisionProviderSettings={saveVisionProviderSettings}
+        onInstallLocalEmbeddingModel={() =>
+          runLocalEmbeddingAction({
+            kind: "installLocalEmbeddingModel",
+            modelId: recommendedLocalEmbeddingModelManifest.modelId,
+          })
+        }
+        onInitializeTestWorkspace={initializeLocalTestWorkspace}
         onSelectProvider={selectProvider}
+        onRemoveTestWorkspace={removeLocalTestWorkspace}
         onClearWebSearchHistory={handleClearWebSearchHistory}
         onDeleteWebSearchHistory={(id) => void handleDeleteWebSearchHistory(id)}
         onOpenWebSearchHistory={handleOpenWebSearchHistory}
@@ -4817,11 +4908,23 @@ function ClioContentApp() {
         onSubmitImageGeneration={handleSubmitImageGeneration}
         onSubmitWebSearch={handleSubmitWebSearch}
         onTestGeminiProvider={testGeminiProvider}
-        onTestEmbeddingProvider={testEmbeddingProvider}
+        onTestLocalEmbeddingModel={() =>
+          runLocalEmbeddingAction({
+            kind: "testLocalEmbeddingModel",
+            modelId: recommendedLocalEmbeddingModelManifest.modelId,
+          })
+        }
+        onRetryLocalEmbeddingInstall={() =>
+          runLocalEmbeddingAction({
+            kind: "retryLocalEmbeddingModelInstall",
+            modelId: recommendedLocalEmbeddingModelManifest.modelId,
+          })
+        }
         onTestOpenAICompatibleProvider={testOpenAICompatibleProvider}
         onTestOpenAIProvider={testOpenAIProvider}
         providerLoading={providerLoading}
         providerMessage={providerMessage}
+        providerMessageTone={providerMessageTone}
         providerSettings={providerSettings}
         railCommands={railCommands}
         railTheme={railTheme}

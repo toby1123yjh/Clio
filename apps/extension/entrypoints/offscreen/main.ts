@@ -1,8 +1,8 @@
 import { AgentRunHost } from "@/src/agent-runtime/agent-run-host";
 import { ProviderBackedChunkMetaSummarizer } from "@/src/agent-runtime/chunk-meta-summary";
 import { PiAgentCompactionRuntime } from "@/src/agent-runtime/compaction-context";
-import { ClioEmbeddingProviderRuntime } from "@/src/agent-runtime/embedding-provider-runtime";
 import { ProviderBackedFigureVisionAnalyzer } from "@/src/agent-runtime/figure-vision-analyzer";
+import { ProviderBackedGraphExtractor } from "@/src/agent-runtime/graph-extractor";
 import { ClioImageGenerationRuntime } from "@/src/agent-runtime/image-generation-runtime";
 import { ProviderBackedKnowledgeBaseClusterLabelRefiner } from "@/src/agent-runtime/knowledge-base-cluster-label-refiner";
 import { PiAgentCoreRunAdapter } from "@/src/agent-runtime/pi-agent-core-run-adapter";
@@ -10,6 +10,7 @@ import { type ProviderId, defaultActiveProvider } from "@/src/agent-runtime/prov
 import { ProviderBackedSemanticCitationJudge } from "@/src/agent-runtime/semantic-citation-judge";
 import { ClioWebToolRuntime } from "@/src/agent-runtime/web-search-runtime";
 import engineWorkerUrl from "@/src/engine/local-engine.worker.ts?worker&url";
+import { LocalEmbeddingManager } from "@/src/local-embedding/local-embedding-manager";
 import { installPhase0PocHost } from "@/src/phase0/poc-host";
 import { requestProvider, requestProviderConfig } from "@/src/shared/chrome-client";
 import {
@@ -20,23 +21,29 @@ import {
   CLIO_WEB_SEARCH_RUN_EVENT,
   CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
   CLIO_WORKER_EMBEDDING_RESPONSE,
+  CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE,
   CLIO_WORKER_REQUEST,
   CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
   type ClioImageGenerationEvent,
   type ClioWebSearchEvent,
   type EngineRequest,
   type EngineResponse,
+  type GetJobStatusResult,
   type ImageGenerationRunRequest,
   type WebSearchRunRequest,
   createRequestId,
+  decodeEngineRequestFromChrome,
+  encodeEngineResponseForChrome,
   engineErrorFromUnknown,
   isAgentRunRequestMessage,
   isImageGenerationRunRequestMessage,
   isKnowledgeBaseClusterLabelRefinementRequestMessage,
+  isLocalEmbeddingModelRequestMessage,
   isOffscreenRequestMessage,
   isWebSearchRunRequestMessage,
   isWorkerChunkMetaSummaryRequestMessage,
   isWorkerEmbeddingRequestMessage,
+  isWorkerGraphExtractionRequestMessage,
   isWorkerResponseMessage,
   isWorkerVisionAnalysisRequestMessage,
   unwrapEngineResponse,
@@ -98,24 +105,20 @@ const imageGenerationRuntime = new ClioImageGenerationRuntime({
       .then(() => true)
       .catch(() => false),
 });
-const embeddingProviderRuntime = new ClioEmbeddingProviderRuntime({
-  loadEmbeddingProviderSettings: () => requestProvider({ kind: "getEmbeddingProviderSettings" }),
-  ensureOpenAIHostPermission: (baseUrl) =>
-    requestProvider({
-      kind: "ensureEmbeddingProviderHostPermission",
-      provider: "openai",
-      baseUrl,
-    })
-      .then(() => true)
-      .catch(() => false),
-  ensureOpenAICompatibleHostPermission: (baseUrl) =>
-    requestProvider({
-      kind: "ensureEmbeddingProviderHostPermission",
-      provider: "openai-compatible",
-      baseUrl,
-    })
-      .then(() => true)
-      .catch(() => false),
+const localEmbeddingManager = new LocalEmbeddingManager({
+  getActiveEmbeddingModel: () => requestEngineValue({ kind: "getActiveEmbeddingModel" }),
+  reindex: (model) => requestEngineValue({ kind: "enqueueEmbeddingReindex", model }),
+  getReindexJob: async (jobId) =>
+    (await requestEngineValue<GetJobStatusResult>({ kind: "getJobStatus", limit: 100 })).jobs.find(
+      (job) => job.id === jobId,
+    ),
+  cancelReindexJob: (jobId) => requestEngineValue({ kind: "cancelJob", id: jobId }),
+});
+void localEmbeddingManager.recover().catch((error) => {
+  console.debug(
+    "clio:offscreen local embedding recovery failed",
+    engineErrorFromUnknown(error).message,
+  );
 });
 const chunkMetaSummarizer = new ProviderBackedChunkMetaSummarizer({
   loadConfig: () => requestProviderConfig(),
@@ -126,6 +129,11 @@ const figureVisionAnalyzer = new ProviderBackedFigureVisionAnalyzer({
   loadVisionProviderSettings: () => requestProvider({ kind: "getVisionProviderSettings" }),
   loadActiveProviderConfig: () => requestProviderConfig(),
   ensureProviderPermission: (provider, config) => hasVisionProviderHostPermission(provider, config),
+});
+const graphExtractor = new ProviderBackedGraphExtractor({
+  loadConfig: () => requestProviderConfig(),
+  loadProviderId: async () => (await requestProviderConfig())?.provider ?? defaultActiveProvider,
+  ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
 });
 const knowledgeBaseClusterLabelRefiner = new ProviderBackedKnowledgeBaseClusterLabelRefiner({
   loadConfig: () => requestProviderConfig(),
@@ -188,6 +196,19 @@ const pending = new Map<
 >();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (isLocalEmbeddingModelRequestMessage(message)) {
+    localEmbeddingManager
+      .request(message.request)
+      .then((value) => sendResponse({ ok: true, value }))
+      .catch((error) =>
+        sendResponse({
+          ok: false,
+          error: localEmbeddingErrorFromUnknown(error),
+        }),
+      );
+    return true;
+  }
+
   if (isAgentRunRequestMessage(message)) {
     handleAgentRunRequest(message.request)
       .then(() => sendResponse({ ok: true, value: { accepted: true } }))
@@ -249,8 +270,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (!isOffscreenRequestMessage(message)) return false;
 
-  requestEngine(message.request)
-    .then((response) => sendResponse(response))
+  let request: EngineRequest;
+  try {
+    request = decodeEngineRequestFromChrome(message.request);
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      error: engineErrorFromUnknown(error, "OFFSCREEN_ENGINE_TRANSPORT_ERROR"),
+    });
+    return true;
+  }
+  requestEngine(request)
+    .then((response) => sendResponse(encodeEngineResponseForChrome(request, response)))
     .catch((error) =>
       sendResponse({
         ok: false,
@@ -417,6 +448,10 @@ function ensureWorker() {
       void handleWorkerVisionAnalysisRequest(worker as Worker, event.data);
       return;
     }
+    if (isWorkerGraphExtractionRequestMessage(event.data)) {
+      void handleWorkerGraphExtractionRequest(worker as Worker, event.data);
+      return;
+    }
     if (!isWorkerResponseMessage(event.data)) return;
     const entry = pending.get(event.data.requestId);
     if (entry === undefined) return;
@@ -439,8 +474,9 @@ async function handleWorkerEmbeddingRequest(
   message: import("@/src/shared/rpc").WorkerEmbeddingRequestMessage,
 ) {
   try {
-    const vectors = await embeddingProviderRuntime.embedTexts(
+    const vectors = await localEmbeddingManager.embed(
       message.request.modelId,
+      message.request.purpose,
       message.request.inputs,
     );
     engineWorker.postMessage({
@@ -506,6 +542,44 @@ async function handleWorkerVisionAnalysisRequest(
   }
 }
 
+async function handleWorkerGraphExtractionRequest(
+  engineWorker: Worker,
+  message: import("@/src/shared/rpc").WorkerGraphExtractionRequestMessage,
+) {
+  try {
+    const result = await graphExtractor.extract(message.request);
+    engineWorker.postMessage({
+      type: CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE,
+      requestId: message.requestId,
+      response: { ok: true, value: result },
+    });
+  } catch (error) {
+    engineWorker.postMessage({
+      type: CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE,
+      requestId: message.requestId,
+      response: {
+        ok: false,
+        error: engineErrorFromUnknown(error, "GRAPH_EXTRACTION_PROVIDER_ERROR"),
+      },
+    });
+  }
+}
+
 function assertNever(value: never): never {
   throw new Error(`Unhandled agent run request: ${JSON.stringify(value)}`);
+}
+
+function localEmbeddingErrorFromUnknown(error: unknown) {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string"
+  ) {
+    return {
+      code: error.code,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return engineErrorFromUnknown(error, "LOCAL_EMBEDDING_MANAGER_ERROR");
 }

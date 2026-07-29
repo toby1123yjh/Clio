@@ -3,18 +3,20 @@ import type {
   ChunkMetaSummaryInput,
 } from "@/src/agent-runtime/chunk-meta-summary";
 import type { FigureVisionAnalysisInput } from "@/src/agent-runtime/figure-vision-analyzer";
+import type { GraphExtractionInput } from "@/src/agent-runtime/graph-extractor";
 import type {
   CaptureBasePayload,
   CaptureSelectionPayload,
   EmbeddingReindexModelDescriptor,
   EngineRequest,
   EngineResultFor,
+  JobSummary,
   RetrieveSourcesResult,
   SourceContextMapRunDetail,
 } from "@/src/shared/rpc";
 import { hashText } from "@/src/shared/text";
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   type ActiveEmbeddingModel,
   type EmbeddingProvider,
@@ -43,6 +45,103 @@ afterEach(() => {
 });
 
 describe("local engine behavior harness", () => {
+  it("keeps capture and keyword retrieval available without an embedding model", async () => {
+    const harness = createHarness();
+    expect(await harness.request({ kind: "getActiveEmbeddingModel" })).toBeNull();
+
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceTitle: "Keyword Only Capture",
+        normalizedText: ragText("keyword-only retrieval remains available", 30),
+      }),
+    });
+    const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
+    const job = await harness.request({ kind: "runJob", id: queued.jobs[0]?.id ?? "" });
+    expect(job.status).toBe("done");
+    expect(harness.count("source_embeddings", "source_id = ?", [capture.memory.id])).toBe(0);
+
+    const storedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
+      queued.jobs[0]?.id ?? "",
+    ]);
+    expect(JSON.parse(String(storedJob?.result_json ?? "{}"))).toMatchObject({
+      embedding: {
+        skipped: true,
+        reason: "embedding_model_unavailable",
+      },
+    });
+
+    const retrieved = await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "keyword-only retrieval", limit: 5, includeChunks: 1 },
+    });
+    expect(retrieved.items[0]?.id).toBe(capture.memory.id);
+    expect(trackStatus(retrieved, "fts_chunks")).toBe("used");
+    expect(trackStatus(retrieved, "vector_meta")).toBe("unavailable");
+    expect(trackReason(retrieved, "vector_meta")).toBe("embedding_model_unavailable");
+  });
+
+  it("removes legacy deterministic embedding rows during migration", async () => {
+    const harness = createHarness({
+      prepareDatabase(db) {
+        db.exec(`
+          CREATE TABLE embedding_models (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            label TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            metric TEXT NOT NULL CHECK (metric IN ('cosine')),
+            status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          )
+        `);
+        db.exec(`
+          CREATE TABLE source_embeddings (
+            model_id TEXT NOT NULL,
+            target_kind TEXT NOT NULL CHECK (target_kind IN ('chunk', 'meta')),
+            target_id TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            vector_json TEXT NOT NULL,
+            text_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (model_id, target_kind, target_id)
+          )
+        `);
+        db.exec(
+          `INSERT INTO embedding_models VALUES (
+            'legacy-hash-model',
+            'local-deterministic',
+            'Legacy hash model',
+            64,
+            'cosine',
+            'active',
+            '2026-07-01T00:00:00.000Z',
+            '2026-07-01T00:00:00.000Z'
+          )`,
+        );
+        db.exec(
+          `INSERT INTO source_embeddings VALUES (
+            'legacy-hash-model',
+            'meta',
+            'legacy-source',
+            'legacy-source',
+            '[1,0]',
+            'legacy-hash',
+            '2026-07-01T00:00:00.000Z',
+            '2026-07-01T00:00:00.000Z'
+          )`,
+        );
+        db.exec("PRAGMA user_version = 21");
+      },
+    });
+
+    expect(await harness.request({ kind: "getActiveEmbeddingModel" })).toBeNull();
+    expect(harness.count("embedding_models", "provider = 'local-deterministic'")).toBe(0);
+    expect(harness.count("source_embeddings", "model_id = 'legacy-hash-model'")).toBe(0);
+  });
+
   it("builds and queries explicit source graph with evidence anchors", async () => {
     const harness = createHarness();
     const capture = await harness.request({
@@ -218,6 +317,198 @@ describe("local engine behavior harness", () => {
     expect(harness.count("graph_nodes", "kind = 'source' AND ref_id = ?", [sourceId])).toBe(0);
   });
 
+  it("builds citation edges from reference metadata with chunk evidence anchors", async () => {
+    const harness = createHarness();
+    const text = [
+      "# Citation Graph Study",
+      "The bounded retrieval result follows prior evidence [1] in the evaluation.",
+      "## References",
+      "[1] Ada Lovelace. Bounded Evidence Retrieval. 2024. doi:10.5555/bounded.1",
+    ].join("\n");
+    const markerStart = text.indexOf("[1]");
+    const referenceStart = text.lastIndexOf("[1]");
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceTitle: "Citation Graph Study",
+        normalizedText: text,
+        metadata: {
+          source_type: "pdf",
+          paper_metadata: {
+            version: 1,
+            authors: [],
+            referenceList: [
+              {
+                index: 0,
+                raw: "Ada Lovelace. Bounded Evidence Retrieval. 2024. doi:10.5555/bounded.1",
+                title: "Bounded Evidence Retrieval",
+                doi: "10.5555/bounded.1",
+              },
+            ],
+          },
+          pdf_references: [
+            {
+              index: 0,
+              label: "[1]",
+              text: "Ada Lovelace. Bounded Evidence Retrieval. 2024. doi:10.5555/bounded.1",
+              charStart: referenceStart,
+              charEnd: text.length,
+              pageStart: 2,
+              pageEnd: 2,
+              doi: "10.5555/bounded.1",
+            },
+          ],
+          pdf_citation_links: [
+            {
+              id: "citation-link:1",
+              marker: "[1]",
+              citationStyle: "numeric_bracket",
+              normalizedTargetLabel: "[1]",
+              targetReferenceIndex: 0,
+              targetReferenceLabel: "[1]",
+              charStart: markerStart,
+              charEnd: markerStart + 3,
+              pageNumber: 1,
+              context: "prior evidence [1] in the evaluation",
+              confidence: "high",
+            },
+          ],
+        },
+      }),
+    });
+
+    const build = await harness.request({
+      kind: "buildSourceGraph",
+      payload: { sourceId: capture.memory.id, mode: "deterministic" },
+    });
+    expect(build).toMatchObject({
+      requestedMode: "deterministic",
+      appliedMode: "deterministic",
+      citationEdgeCount: 1,
+    });
+
+    const neighbors = await harness.request({
+      kind: "queryGraphNeighbors",
+      payload: { sourceId: capture.memory.id, dimension: "citation", limit: 20 },
+    });
+    const citationEdge = neighbors.edges.find((edge) => edge.edgeType === "cites");
+    expect(citationEdge).toMatchObject({
+      dimension: "citation",
+      evidenceSourceId: capture.memory.id,
+      weight: 0.95,
+    });
+    expect(citationEdge?.evidenceChunkIds.length ?? 0).toBeGreaterThan(0);
+    expect(neighbors.nodes).toContainEqual(
+      expect.objectContaining({ kind: "source", canonicalId: "source:doi:10.5555/bounded.1" }),
+    );
+    expect(neighbors.evidence.some((anchor) => anchor.excerpt.includes("prior evidence"))).toBe(
+      true,
+    );
+  });
+
+  it("runs explicit LLM graph jobs and falls back to deterministic graph on provider failure", async () => {
+    const observedInputs: GraphExtractionInput[] = [];
+    const harness = createHarness({
+      graphExtractor: {
+        extract: async (input) => {
+          observedInputs.push(input);
+          return {
+            status: "extracted",
+            providerKind: "chat",
+            entities: [
+              {
+                id: "method:rrf",
+                kind: "method",
+                label: "Reciprocal rank fusion",
+                confidence: 0.94,
+              },
+            ],
+            relations: [
+              {
+                sourceEntityId: "source",
+                targetEntityId: "method:rrf",
+                dimension: "technical",
+                edgeType: "uses",
+                confidence: 0.94,
+                evidenceChunkIds: [input.chunks[0]?.chunkId ?? ""],
+              },
+            ],
+          };
+        },
+      },
+    });
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceTitle: "LLM Graph Job Study",
+        normalizedText: ragText("bounded reciprocal rank fusion method evidence", 30),
+        metadata: { source_type: "paper", categories: ["retrieval"] },
+      }),
+    });
+    const queued = await harness.request({
+      kind: "enqueueSourceGraphJob",
+      payload: { sourceId: capture.memory.id, mode: "llm" },
+    });
+    const orchestration = await harness.request({
+      kind: "createOrchestrationRun",
+      payload: { kind: "post_capture_job", targetJobId: queued.id },
+    });
+    const completed = await harness.request({ kind: "runOrchestration", id: orchestration.id });
+    expect(completed.status).toBe("done");
+    expect(observedInputs).toHaveLength(1);
+    expect(observedInputs[0]?.chunks.length ?? 0).toBeLessThanOrEqual(10);
+    expect(JSON.stringify(observedInputs[0])).not.toContain("apiKey");
+    expect(JSON.stringify(observedInputs[0])).not.toContain("normalizedText");
+
+    const jobRow = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
+      queued.id,
+    ]);
+    const result = JSON.parse(String(jobRow?.result_json ?? "{}")) as {
+      graph?: {
+        requestedMode?: string;
+        appliedMode?: string;
+        llmEdgeCount?: number;
+        fallbackReason?: string;
+      };
+    };
+    expect(result.graph).toMatchObject({
+      requestedMode: "llm",
+      appliedMode: "llm",
+      llmEdgeCount: 1,
+    });
+
+    const fallbackHarness = createHarness({
+      graphExtractor: {
+        extract: async () => ({
+          status: "unavailable",
+          providerKind: "chat",
+          entities: [],
+          relations: [],
+          reason: "provider_not_configured",
+        }),
+      },
+    });
+    const fallbackCapture = await fallbackHarness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceTitle: "Fallback Graph Study",
+        normalizedText: ragText("deterministic fallback graph method evidence", 20),
+        metadata: { source_type: "paper", categories: ["graph retrieval"] },
+      }),
+    });
+    const fallback = await fallbackHarness.request({
+      kind: "buildSourceGraph",
+      payload: { sourceId: fallbackCapture.memory.id, mode: "llm" },
+    });
+    expect(fallback).toMatchObject({
+      requestedMode: "llm",
+      appliedMode: "deterministic",
+      llmEdgeCount: 0,
+      fallbackReason: "provider_not_configured",
+    });
+    expect(fallback.edgeCount).toBeGreaterThan(0);
+  });
+
   it("wraps post-capture jobs in durable orchestration runs with cancel and retry", async () => {
     const harness = createHarness();
     const capture = await harness.request({
@@ -323,6 +614,7 @@ describe("local engine behavior harness", () => {
 
   it("runs capture, post-capture embedding, retrieval, and evidence windows", async () => {
     const harness = createHarness();
+    await activateTestEmbeddingModel(harness);
     const sourceText = ragText("alpha metadata retrieval evidence", 700);
     const capture = await harness.request({
       kind: "capturePage",
@@ -560,6 +852,7 @@ describe("local engine behavior harness", () => {
       },
     };
     const harness = createHarness({ chunkMetaSummarizer: summarizer });
+    await activateTestEmbeddingModel(harness);
     const capture = await harness.request({
       kind: "capturePage",
       payload: pagePayload({
@@ -785,6 +1078,7 @@ describe("local engine behavior harness", () => {
 
   it("materializes section-aware chunk meta and repairs it before embedding", async () => {
     const harness = createHarness();
+    await activateTestEmbeddingModel(harness);
     const expectedSectionPath = "Markdown Adapter Notes > Registry Design";
     const registryBody = ragText("registry design adapter chunk routing metadata", 260);
     const capture = await harness.request({
@@ -936,6 +1230,7 @@ describe("local engine behavior harness", () => {
 
   it("stores section parent chunks but keeps prompt and embedding paths child-only", async () => {
     const harness = createHarness();
+    await activateTestEmbeddingModel(harness);
     const sectionBody = ragText("parent child boundary retrieval evidence", 950);
     const capture = await harness.request({
       kind: "captureMarkdown",
@@ -1058,10 +1353,10 @@ describe("local engine behavior harness", () => {
     expect(parentAnchorWithOrdFallback.items).toHaveLength(0);
   });
 
-  it("uses a remote active embedding factory for jobs and vector retrieval", async () => {
+  it("uses an injected local embedding factory for jobs and vector retrieval", async () => {
     const remoteModel: ActiveEmbeddingModel = {
-      modelId: "openai:remote-test:semantic-bridge:d3",
-      provider: "openai",
+      modelId: "local-transformers:test:semantic-bridge:d3",
+      provider: "local-transformers",
       dimension: 3,
     };
     const requestedModels: ActiveEmbeddingModel[] = [];
@@ -1126,11 +1421,7 @@ describe("local engine behavior harness", () => {
         remoteModel.modelId,
       ]),
     ).toBeGreaterThan(1);
-    expect(
-      harness.count("source_embeddings", "source_id = ? AND model_id = 'clio-local-hash-v1'", [
-        sourceId,
-      ]),
-    ).toBe(0);
+    expect(harness.count("embedding_models", "provider = 'local-deterministic'")).toBe(0);
 
     const retrieved = await harness.request({
       kind: "retrieveSources",
@@ -1188,15 +1479,7 @@ describe("local engine behavior harness", () => {
     }
     await harness.request({ kind: "deleteMemory", id: deleted.memory.id });
 
-    const initialModel = await harness.request({ kind: "getActiveEmbeddingModel" });
-    expect(initialModel).toMatchObject({
-      id: "clio-local-hash-v1",
-      provider: "local-deterministic",
-      dimension: 64,
-      metric: "cosine",
-      status: "active",
-    });
-    expect(initialModel).not.toHaveProperty("apiKey");
+    expect(await harness.request({ kind: "getActiveEmbeddingModel" })).toBeNull();
 
     const reindex = await harness.request({
       kind: "reindex",
@@ -1220,9 +1503,7 @@ describe("local engine behavior harness", () => {
     expect(
       harness.count("embedding_models", "id = ? AND status = 'active'", [remoteModel.id]),
     ).toBe(1);
-    expect(
-      harness.count("embedding_models", "id = 'clio-local-hash-v1' AND status = 'disabled'"),
-    ).toBe(1);
+    expect(harness.count("embedding_models", "provider = 'local-deterministic'")).toBe(0);
     expect(
       harness.count("source_embeddings", "source_id = ? AND model_id = ?", [
         active.memory.id,
@@ -1235,11 +1516,9 @@ describe("local engine behavior harness", () => {
         remoteModel.id,
       ]),
     ).toBe(0);
-    expect(
-      harness.count("source_embeddings", "source_id = ? AND model_id = 'clio-local-hash-v1'", [
-        active.memory.id,
-      ]),
-    ).toBeGreaterThan(0);
+    expect(harness.count("source_embeddings", "source_id = ?", [active.memory.id])).toBeGreaterThan(
+      0,
+    );
     expect(embeddedInputs.every((input) => input.length < sourceText.length)).toBe(true);
     expect(embeddedInputs.some((input) => input.includes("Deleted Remote Reindex"))).toBe(false);
 
@@ -1250,6 +1529,204 @@ describe("local engine behavior harness", () => {
     expect(retrieved.items[0]?.id).toBe(active.memory.id);
     expect(trackStatus(retrieved, "vector_meta")).toBe("used");
     expect(trackStatus(retrieved, "vector_chunks")).toBe("used");
+  });
+
+  it("accepts a local-transformers model through the shared reindex path", async () => {
+    const localModel = embeddingModelDescriptor(
+      "local-transformers:xenova-multilingual-e5-small:test:int8:d3",
+      "local-transformers",
+    );
+    const purposes: Array<"query" | "document"> = [];
+    const harness = createHarness({
+      embeddingProviderFactory: (model) =>
+        model.modelId === localModel.id && model.provider === localModel.provider
+          ? {
+              modelId: model.modelId,
+              provider: model.provider,
+              dimension: model.dimension,
+              embedTexts: async (inputs, purpose = "document") => {
+                purposes.push(purpose);
+                return inputs.map(remoteEmbeddingVector);
+              },
+            }
+          : null,
+    });
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/local-transformers-reindex",
+        sourceTitle: "Local Transformers Reindex",
+        normalizedText: ragText("local browser semantic embedding evidence", 80),
+      }),
+    });
+
+    const reindex = await harness.request({
+      kind: "reindex",
+      scope: "embeddings",
+      model: localModel,
+    });
+
+    expect(reindex.status).toBe("done");
+    expect(await harness.request({ kind: "getActiveEmbeddingModel" })).toMatchObject({
+      id: localModel.id,
+      provider: "local-transformers",
+      dimension: 3,
+      status: "active",
+    });
+    expect(
+      harness.count("source_embeddings", "source_id = ? AND model_id = ?", [
+        capture.memory.id,
+        localModel.id,
+      ]),
+    ).toBeGreaterThan(1);
+    expect(purposes).toContain("document");
+
+    await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "local browser semantic", limit: 5, includeChunks: 1 },
+    });
+    expect(purposes).toContain("query");
+  });
+
+  it("reports per-source progress and cancels an async embedding rebuild without switching active vectors", async () => {
+    const localModel = embeddingModelDescriptor(
+      "local-transformers:xenova-multilingual-e5-small:cancel:int8:d3",
+      "local-transformers",
+    );
+    const harness = createHarness({
+      embeddingProviderFactory: (model) =>
+        model.modelId === localModel.id
+          ? {
+              modelId: model.modelId,
+              provider: model.provider,
+              dimension: model.dimension,
+              embedTexts: async (inputs) => {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                return inputs.map(remoteEmbeddingVector);
+              },
+            }
+          : null,
+    });
+    const sourceIds: string[] = [];
+    for (let index = 0; index < 3; index += 1) {
+      const capture = await harness.request({
+        kind: "capturePage",
+        payload: pagePayload({
+          sourceUrl: `https://example.test/local-reindex-cancel-${index}`,
+          sourceTitle: `Local Reindex Cancel ${index}`,
+          normalizedText: ragText(`local reindex cancellation source ${index}`, 30),
+        }),
+      });
+      sourceIds.push(capture.memory.id);
+    }
+    for (const job of (await harness.request({ kind: "getJobStatus", status: "queued" })).jobs) {
+      await harness.request({ kind: "runJob", id: job.id });
+    }
+    const initialVectorCount = harness.count("source_embeddings");
+
+    const reindex = await harness.request({ kind: "enqueueEmbeddingReindex", model: localModel });
+    expect(reindex.status).toBe("queued");
+    const running = await waitForJob(harness, reindex.jobId, (job) => job.progressCurrent >= 1);
+    expect(running.maxAttempts).toBe(1);
+    expect(running.progressTotal).toBe(3);
+    expect(running.progressCurrent).toBeGreaterThanOrEqual(1);
+
+    const cancelRequested = await harness.request({ kind: "cancelJob", id: reindex.jobId });
+    expect(cancelRequested.cancelRequested).toBe(true);
+    const cancelled = await waitForJob(harness, reindex.jobId, (job) => job.status === "failed");
+    expect(cancelled.lastError).toBe(
+      "EMBEDDING_REINDEX_CANCELLED: Embedding rebuild cancelled by user.",
+    );
+    expect(cancelled.progressCurrent).toBeLessThan(cancelled.progressTotal);
+    expect(await harness.request({ kind: "getActiveEmbeddingModel" })).toBeNull();
+    expect(harness.count("embedding_models", "id LIKE '%::staging::%'")).toBe(0);
+    expect(harness.count("source_embeddings", "model_id = ?", [localModel.id])).toBe(0);
+    expect(harness.count("source_embeddings")).toBe(initialVectorCount);
+  });
+
+  it("finishes an async local reindex failure instead of leaving an unclaimed retry queued", async () => {
+    const localModel = embeddingModelDescriptor(
+      "local-transformers:xenova-multilingual-e5-small:failure:int8:d3",
+      "local-transformers",
+    );
+    const harness = createHarness({
+      embeddingProviderFactory: (model) =>
+        model.modelId === localModel.id
+          ? {
+              modelId: model.modelId,
+              provider: model.provider,
+              dimension: model.dimension,
+              embedTexts: async () => {
+                throw new Error("local embedding runtime failed");
+              },
+            }
+          : null,
+    });
+    await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/local-reindex-failure",
+        sourceTitle: "Local Reindex Failure",
+        normalizedText: ragText("local async rebuild failure", 20),
+      }),
+    });
+
+    const reindex = await harness.request({ kind: "enqueueEmbeddingReindex", model: localModel });
+    const failed = await waitForJob(harness, reindex.jobId, (job) => job.status === "failed");
+
+    expect(failed.maxAttempts).toBe(1);
+    expect(failed.lastError).toBe("local embedding runtime failed");
+    expect(harness.count("embedding_models", "id LIKE '%::staging::%'")).toBe(0);
+    expect(await harness.request({ kind: "getActiveEmbeddingModel" })).toBeNull();
+  });
+
+  it("keeps FTS retrieval available when the active local embedding runtime fails", async () => {
+    const localModel = embeddingModelDescriptor(
+      "local-transformers:xenova-multilingual-e5-small:degrade:int8:d3",
+      "local-transformers",
+    );
+    let failQueries = false;
+    const harness = createHarness({
+      embeddingProviderFactory: (model) =>
+        model.modelId === localModel.id
+          ? {
+              modelId: model.modelId,
+              provider: model.provider,
+              dimension: model.dimension,
+              embedTexts: async (inputs, purpose = "document") => {
+                if (purpose === "query" && failQueries) throw new Error("local runtime offline");
+                return inputs.map(remoteEmbeddingVector);
+              },
+            }
+          : null,
+    });
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/local-runtime-degradation",
+        sourceTitle: "Local Runtime Degradation",
+        normalizedText: ragText("browser fallback keyword survives semantic outage", 40),
+      }),
+    });
+    const reindex = await harness.request({
+      kind: "reindex",
+      scope: "embeddings",
+      model: localModel,
+    });
+    expect(reindex.status).toBe("done");
+
+    failQueries = true;
+    const retrieved = await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "fallback keyword", limit: 5, includeChunks: 1 },
+    });
+
+    expect(retrieved.items[0]?.id).toBe(capture.memory.id);
+    expect(trackStatus(retrieved, "fts_chunks")).toBe("used");
+    expect(trackStatus(retrieved, "vector_meta")).toBe("unavailable");
+    expect(trackStatus(retrieved, "vector_chunks")).toBe("unavailable");
+    expect(trackReason(retrieved, "vector_meta")).toBe("embedding_provider_error");
+    expect(trackReason(retrieved, "vector_chunks")).toBe("embedding_provider_error");
   });
 
   it("keeps the previous active embedding model when remote reindex fails", async () => {
@@ -1282,17 +1759,76 @@ describe("local engine behavior harness", () => {
       model: remoteModel,
     });
     expect(reindex.status).toBe("queued");
-    expect(
-      harness.count("embedding_models", "id = 'clio-local-hash-v1' AND status = 'active'"),
-    ).toBe(1);
+    expect(harness.count("embedding_models", "provider = 'local-deterministic'")).toBe(0);
     expect(
       harness.count("embedding_models", "id = ? AND status = 'disabled'", [remoteModel.id]),
-    ).toBe(1);
+    ).toBe(0);
+    expect(harness.count("embedding_models", "id LIKE '%::staging::%'")).toBe(0);
+    expect(await harness.request({ kind: "getActiveEmbeddingModel" })).toBeNull();
+  });
+
+  it("keeps an active model and its vectors when rebuilding that same model fails", async () => {
+    const remoteModel = embeddingModelDescriptor("openai:active-reindex:semantic:d3");
+    let fail = false;
+    const harness = createHarness({
+      embeddingProviderFactory: (model) =>
+        model.modelId === remoteModel.id
+          ? {
+              modelId: model.modelId,
+              provider: model.provider,
+              dimension: model.dimension,
+              embedTexts: async (inputs) => {
+                if (fail) throw new Error("active embedding rebuild failed");
+                return inputs.map(remoteEmbeddingVector);
+              },
+            }
+          : null,
+    });
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/active-reindex-rollback",
+        sourceTitle: "Active Reindex Rollback",
+        normalizedText: ragText("active embedding rollback evidence", 80),
+      }),
+    });
+
+    expect(
+      (
+        await harness.request({
+          kind: "reindex",
+          scope: "embeddings",
+          model: remoteModel,
+        })
+      ).status,
+    ).toBe("done");
+    const vectorCount = harness.count("source_embeddings", "source_id = ? AND model_id = ?", [
+      capture.memory.id,
+      remoteModel.id,
+    ]);
+    expect(vectorCount).toBeGreaterThan(1);
+
+    fail = true;
+    expect(
+      (
+        await harness.request({
+          kind: "reindex",
+          scope: "embeddings",
+          model: remoteModel,
+        })
+      ).status,
+    ).toBe("queued");
     expect(await harness.request({ kind: "getActiveEmbeddingModel" })).toMatchObject({
-      id: "clio-local-hash-v1",
-      provider: "local-deterministic",
+      id: remoteModel.id,
       status: "active",
     });
+    expect(
+      harness.count("source_embeddings", "source_id = ? AND model_id = ?", [
+        capture.memory.id,
+        remoteModel.id,
+      ]),
+    ).toBe(vectorCount);
+    expect(harness.count("embedding_models", "id LIKE '%::staging::%'")).toBe(0);
   });
 
   it("builds keyword index and expands knowledge base page search locally", async () => {
@@ -1359,6 +1895,177 @@ describe("local engine behavior harness", () => {
     expect(harness.count("keyword_index", "term = ?", ["degradation"])).toBe(1);
   });
 
+  it("keeps direct knowledge-base matches precise and bounds semantic vector candidates", async () => {
+    const model = embeddingModelDescriptor(
+      "local-transformers:knowledge-base-search-precision:d3",
+      "local-transformers",
+    );
+    const harness = createHarness({
+      embeddingProviderFactory: (candidate) =>
+        candidate.modelId === model.id
+          ? {
+              modelId: candidate.modelId,
+              provider: candidate.provider,
+              dimension: candidate.dimension,
+              embedTexts: async (inputs) => inputs.map(knowledgeBasePrecisionVector),
+            }
+          : null,
+    });
+    const relevant = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceTitle: "MUARF precision fixture",
+        normalizedText: ragText(
+          "PurityChecker validates method purity before automated transformation",
+          24,
+        ),
+      }),
+    });
+    const sourceIds = [relevant.memory.id];
+    for (let index = 0; index < 9; index += 1) {
+      const noise = await harness.request({
+        kind: "capturePage",
+        payload: pagePayload({
+          sourceUrl: `https://example.test/vector-noise-${index}`,
+          sourceTitle: `Noise source ${index}`,
+          normalizedText: ragText(`Noise source ${index} unrelated browser fixture`, 24),
+        }),
+      });
+      sourceIds.push(noise.memory.id);
+    }
+
+    const reindex = await harness.request({ kind: "reindex", scope: "embeddings", model });
+    expect(reindex.status).toBe("done");
+
+    const exact = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: { query: "PurityChecker", mode: "exact", limit: 40, includeChunks: 2 },
+    });
+    expect(exact.items.map((item) => item.id)).toEqual([relevant.memory.id]);
+    expect(exact.expansion).toMatchObject({
+      status: "skipped",
+      reason: "exact_mode",
+      expandedItemCount: 0,
+    });
+    expect(trackReason(exact, "meta_sources")).toBe("no_matches");
+    expect(trackStatus(exact, "fts_chunks")).toBe("used");
+    expect(trackReason(exact, "vector_meta")).toBe("exact_mode");
+    expect(trackReason(exact, "vector_chunks")).toBe("exact_mode");
+
+    const semantic = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "classify hidden mutation risks",
+        mode: "semantic",
+        limit: 40,
+        includeChunks: 2,
+      },
+    });
+    expect(semantic.items[0]?.id).toBe(relevant.memory.id);
+    expect(semantic.items.length).toBeLessThan(sourceIds.length);
+    expect(semantic.expansion).toMatchObject({
+      status: "skipped",
+      reason: "semantic_mode",
+      expandedItemCount: 0,
+    });
+    expect(trackReason(semantic, "meta_sources")).toBe("semantic_mode");
+    expect(trackReason(semantic, "fts_chunks")).toBe("semantic_mode");
+    expect(semantic.items[0]?.tracks).toEqual(
+      expect.arrayContaining(["vector_meta", "vector_chunks"]),
+    );
+  });
+
+  it("prunes divergent meta and chunk vector candidates at the source boundary", async () => {
+    const model = embeddingModelDescriptor(
+      "local-transformers:cross-track-source-pruning:d3",
+      "local-transformers",
+    );
+    const harness = createHarness({
+      embeddingProviderFactory: (candidate) =>
+        candidate.modelId === model.id
+          ? {
+              modelId: candidate.modelId,
+              provider: candidate.provider,
+              dimension: candidate.dimension,
+              embedTexts: async (inputs) => inputs.map(crossTrackSemanticVector),
+            }
+          : null,
+    });
+
+    for (let index = 0; index < 12; index += 1) {
+      await harness.request({
+        kind: "capturePage",
+        payload: pagePayload({
+          sourceUrl: `https://example.test/cross-track-${index}`,
+          sourceTitle: `Cross track source ${index}`,
+          normalizedText: ragText(`chunk-signal-${index} bounded evidence`, 24),
+          metadata: {
+            title: `Cross track source ${index}`,
+            abstract: `meta-signal-${index} source summary`,
+            source_type: "paper",
+          },
+        }),
+      });
+    }
+
+    const reindex = await harness.request({ kind: "reindex", scope: "embeddings", model });
+    expect(reindex.status).toBe("done");
+
+    const semantic = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "cross-track query",
+        mode: "semantic",
+        limit: 40,
+        includeChunks: 2,
+      },
+    });
+
+    expect(semantic.items.length).toBeGreaterThan(0);
+    expect(semantic.items.length).toBeLessThanOrEqual(4);
+    expect(trackStatus(semantic, "vector_meta")).toBe("used");
+    expect(trackStatus(semantic, "vector_chunks")).toBe("used");
+  });
+
+  it("counts each source only once per RRF track while retaining multiple hit chunks", async () => {
+    const harness = createHarness();
+    const dense = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/dense-rrf-source",
+        sourceTitle: "Dense evidence source",
+        normalizedText: ragText("rare fusion token evidence", 1_200),
+      }),
+    });
+    const sparse = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/sparse-rrf-source",
+        sourceTitle: "Sparse evidence source",
+        normalizedText: `rare fusion token evidence. ${ragText("unrelated filler", 8)}`,
+      }),
+    });
+
+    const result = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "rare fusion token",
+        mode: "exact",
+        limit: 10,
+        includeChunks: 8,
+      },
+    });
+    const denseItem = result.items.find((item) => item.id === dense.memory.id);
+    const sparseItem = result.items.find((item) => item.id === sparse.memory.id);
+
+    expect(denseItem?.hitChunks.length).toBeGreaterThan(1);
+    expect(sparseItem).toBeDefined();
+    expect(denseItem?.tracks).toEqual(["fts_chunks"]);
+    expect(sparseItem?.tracks).toEqual(["fts_chunks"]);
+    expect(denseItem?.score ?? 1).toBeLessThan(0.017);
+    expect(sparseItem?.score ?? 1).toBeLessThan(0.017);
+  });
+
   it("uses source graph terms only as knowledge-base page expansion diagnostics", async () => {
     const harness = createHarness();
     const capture = await harness.request({
@@ -1418,6 +2125,91 @@ describe("local engine behavior harness", () => {
     ).toBe(false);
   });
 
+  it("groups recalled sources by research graph affinity without changing result ranking", async () => {
+    const harness = createHarness({
+      graphExtractor: {
+        extract: async (input) => {
+          const vision = input.sourceTitle?.includes("Gamma") === true;
+          const entityId = vision ? "method:vision" : "method:retrieval";
+          const label = vision ? "Vision models" : "Retrieval systems";
+          return {
+            status: "extracted",
+            providerKind: "chat",
+            entities: [{ id: entityId, kind: "method", label, confidence: 0.99 }],
+            relations: [
+              {
+                sourceEntityId: "source",
+                targetEntityId: entityId,
+                dimension: "technical",
+                edgeType: "uses",
+                confidence: 0.99,
+                evidenceChunkIds: [input.chunks[0]?.chunkId ?? ""],
+              },
+            ],
+          };
+        },
+      },
+    });
+    const sourceIds: string[] = [];
+    for (const title of ["Graph Alpha", "Graph Beta", "Graph Gamma"]) {
+      const capture = await harness.request({
+        kind: "capturePage",
+        payload: pagePayload({
+          sourceUrl: `https://example.test/${title.toLowerCase().replace(/\s+/g, "-")}`,
+          sourceTitle: title,
+          normalizedText: `${title}\n${ragText("shared graph clustering evidence token", 20)}`,
+          metadata: { source_type: "paper" },
+        }),
+      });
+      sourceIds.push(capture.memory.id);
+      const graph = await harness.request({
+        kind: "buildSourceGraph",
+        payload: { sourceId: capture.memory.id, mode: "llm" },
+      });
+      expect(graph.appliedMode).toBe("llm");
+    }
+
+    const flat = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: { query: "shared graph clustering evidence token", limit: 10, includeChunks: 1 },
+    });
+    const grouped = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "shared graph clustering evidence token",
+        limit: 10,
+        includeChunks: 1,
+        clustering: { clusterBy: "graph", granularity: "fine" },
+      },
+    });
+
+    expect(grouped.items.map((item) => item.id)).toEqual(flat.items.map((item) => item.id));
+    expect(grouped.clusters?.flatMap((cluster) => cluster.sourceIds).sort()).toEqual(
+      sourceIds.sort(),
+    );
+    expect(grouped.clusters).toHaveLength(2);
+    expect(grouped.clusters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: "Retrieval systems",
+          sourceCount: 2,
+          trace: expect.objectContaining({
+            backend: "graph",
+            method: "graph_entity_affinity",
+          }),
+        }),
+        expect.objectContaining({
+          label: "Vision models",
+          sourceCount: 1,
+          trace: expect.objectContaining({
+            backend: "graph",
+            method: "graph_entity_affinity",
+          }),
+        }),
+      ]),
+    );
+  });
+
   it("clusters knowledge base page search results without graph or full document dependencies", async () => {
     const harness = createHarness();
     const fixture = [
@@ -1475,7 +2267,7 @@ describe("local engine behavior harness", () => {
     expect(semantic.clusters?.[0]?.trace).toMatchObject({
       backend: "metadata",
       method: "metadata_fallback",
-      fallbackReason: "insufficient_embeddings",
+      fallbackReason: "embedding_model_unavailable",
     });
 
     const sourceType = await harness.request({
@@ -1535,6 +2327,7 @@ describe("local engine behavior harness", () => {
 
   it("clusters knowledge base semantic groups from existing source meta embeddings", async () => {
     const harness = createHarness();
+    await activateTestEmbeddingModel(harness);
     const fixture = [
       {
         title: "Vector Alpha",
@@ -1601,8 +2394,9 @@ describe("local engine behavior harness", () => {
           text_hash,
           created_at,
           updated_at
-        ) VALUES ('clio-local-hash-v1', 'meta', ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, 'meta', ?, ?, ?, ?, ?, ?)`,
         [
+          testEmbeddingModel.id,
           sourceId,
           sourceId,
           JSON.stringify(unitVector64(item.vectorIndex)),
@@ -1663,6 +2457,7 @@ describe("local engine behavior harness", () => {
 
   it("repairs malformed chunk meta heads before post-capture embedding", async () => {
     const harness = createHarness();
+    await activateTestEmbeddingModel(harness);
     const capture = await harness.request({
       kind: "capturePage",
       payload: pagePayload({
@@ -1807,6 +2602,7 @@ describe("local engine behavior harness", () => {
 
   it("cleans source-derived rows on delete and reset", async () => {
     const harness = createHarness();
+    await activateTestEmbeddingModel(harness);
     const capture = await harness.request({
       kind: "captureSelection",
       payload: selectionPayload({ normalizedText: ragText("cleanup derived rows", 10) }),
@@ -2810,6 +3606,7 @@ describe("local engine behavior harness", () => {
 
   it("uses metadata FTS and applies source filters across retrieval tracks", async () => {
     const harness = createHarness();
+    await activateTestEmbeddingModel(harness);
     const research = await harness.request({
       kind: "capturePage",
       payload: pagePayload({
@@ -3456,12 +4253,15 @@ describe("local engine behavior harness", () => {
         textHash: hashText(text),
       },
     };
-    const parserInputs: Array<Uint8Array | ArrayBuffer> = [];
+    const parserInputSnapshots: number[][] = [];
     const pdfRawFileStore = new MemoryPdfRawFileStore();
     const harness = createHarness({
       pdfRawFileStore,
       pdfParser: async (bytes) => {
-        parserInputs.push(bytes);
+        const input = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        parserInputSnapshots.push(Array.from(input));
+        structuredClone(input, { transfer: [input.buffer] });
+        expect(input.byteLength).toBe(0);
         return parsed;
       },
     });
@@ -3481,9 +4281,7 @@ describe("local engine behavior harness", () => {
     });
     const sourceId = capture.memory.id;
 
-    expect(parserInputs).toHaveLength(1);
-    expect(parserInputs[0]).toBeInstanceOf(Uint8Array);
-    expect(Array.from(parserInputs[0] as Uint8Array)).toEqual([1, 2, 3]);
+    expect(parserInputSnapshots).toEqual([[1, 2, 3]]);
     expect(pdfRawFileStore.writes).toHaveLength(1);
     expect(pdfRawFileStore.writes[0]).toMatchObject({
       sourceId,
@@ -3964,7 +4762,7 @@ describe("local engine behavior harness", () => {
     });
   });
 
-  it("keeps PDF capture saved when raw file persistence fails", async () => {
+  it("keeps PDF capture saved when raw persistence fails and repairs a duplicate re-upload", async () => {
     const text = "Uploaded PDF remains searchable when raw file persistence fails.";
     const parsed: ParsedPdfDocument = {
       text,
@@ -4052,6 +4850,105 @@ describe("local engine behavior harness", () => {
       code: "PDF_RAW_FILE_NOT_AVAILABLE",
     });
     expect(detail?.chunks[0]?.text).toContain("raw file persistence fails");
+
+    pdfRawFileStore.failWrite = false;
+    const retry = await harness.request({
+      kind: "capturePdf",
+      payload: {
+        sourceUrl: "clio://upload/raw-failure.pdf",
+        sourceTitle: "raw-failure.pdf",
+        capturedAt: "2026-07-01T00:00:00.000Z",
+        bytes: new Uint8Array([9, 8, 7, 6]),
+        metadata: {},
+      },
+    });
+    const repairedDetail = await harness.request({ kind: "getMemory", id: capture.memory.id });
+    const repairedRawFile = await harness.request({
+      kind: "getPdfRawFile",
+      id: capture.memory.id,
+    });
+
+    expect(retry.status).toBe("duplicate");
+    expect(retry.memory.id).toBe(capture.memory.id);
+    expect(pdfRawFileStore.writes).toHaveLength(2);
+    expect(repairedDetail?.metadata.pdf_raw_file).toMatchObject({
+      status: "persisted",
+      byteLength: 4,
+      contentType: "application/pdf",
+    });
+    expect(
+      Array.from(
+        repairedRawFile.bytes instanceof Uint8Array
+          ? repairedRawFile.bytes
+          : new Uint8Array(repairedRawFile.bytes),
+      ),
+    ).toEqual([9, 8, 7, 6]);
+  });
+
+  it("calls OPFS getDirectory with its StorageManager receiver", async () => {
+    const bytes = new Uint8Array([37, 80, 68, 70]);
+    let storedBytes = new Uint8Array();
+    const fileHandle = {
+      async createWritable() {
+        return {
+          async write(data: Uint8Array | ArrayBuffer | string) {
+            if (typeof data === "string") throw new Error("Expected binary PDF data.");
+            storedBytes = new Uint8Array(data instanceof Uint8Array ? data : new Uint8Array(data));
+          },
+          async close() {},
+        };
+      },
+      async getFile() {
+        return {
+          async arrayBuffer() {
+            return new Uint8Array(storedBytes).buffer;
+          },
+        };
+      },
+    };
+    const directory = {
+      async getDirectoryHandle() {
+        return directory;
+      },
+      async getFileHandle() {
+        return fileHandle;
+      },
+      async removeEntry() {},
+    };
+    const storage = {
+      async getDirectory() {
+        if (this !== storage) throw new TypeError("Illegal invocation");
+        return directory;
+      },
+    };
+    vi.stubGlobal("navigator", { storage });
+
+    try {
+      const harness = createHarness({
+        pdfParser: async () => minimalParsedPdf("Receiver-safe OPFS PDF"),
+      });
+      const capture = await harness.request({
+        kind: "capturePdf",
+        payload: {
+          sourceUrl: "clio://upload/opfs-receiver.pdf",
+          sourceTitle: "opfs-receiver.pdf",
+          capturedAt: "2026-07-13T00:00:00.000Z",
+          bytes,
+          metadata: {},
+        },
+      });
+      const rawFile = await harness.request({ kind: "getPdfRawFile", id: capture.memory.id });
+
+      expect(capture.status).toBe("saved");
+      expect(Array.from(storedBytes)).toEqual(Array.from(bytes));
+      expect(
+        Array.from(
+          rawFile.bytes instanceof Uint8Array ? rawFile.bytes : new Uint8Array(rawFile.bytes),
+        ),
+      ).toEqual(Array.from(bytes));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("adapts ordinary PDF sources without classifying them as papers", async () => {
@@ -4215,15 +5112,42 @@ describe("local engine behavior harness", () => {
   });
 });
 
-function createHarness(options: Omit<LocalEngineOptions, "openDatabase"> = {}) {
+type BehaviorHarnessOptions = Omit<LocalEngineOptions, "openDatabase"> & {
+  prepareDatabase?: (db: LocalEngineSqliteDb) => void;
+};
+
+const testEmbeddingModel = {
+  id: "local-transformers:test-fixture:d64",
+  provider: "local-transformers",
+  label: "Test local embedding",
+  dimension: 64,
+  metric: "cosine",
+} as const;
+
+function createHarness(options: BehaviorHarnessOptions = {}) {
+  const { prepareDatabase, ...engineOptions } = options;
   const dbPath = `/local-engine-behavior-${Date.now()}-${Math.random()
     .toString(36)
     .slice(2)}.sqlite3`;
   let db: LocalEngineSqliteDb | undefined;
   const engine = new LocalEngine({
-    ...options,
+    ...engineOptions,
+    embeddingProviderFactory:
+      engineOptions.embeddingProviderFactory ??
+      ((model) =>
+        model.modelId === testEmbeddingModel.id
+          ? {
+              modelId: model.modelId,
+              provider: model.provider,
+              dimension: model.dimension,
+              async embedTexts(inputs) {
+                return inputs.map(testEmbeddingVector);
+              },
+            }
+          : null),
     openDatabase: async () => {
       db = new sqliteApi.oo1.DB({ filename: dbPath, flags: "c" });
+      prepareDatabase?.(db);
       return {
         db,
         sqliteVersion: sqliteApi.version.libVersion,
@@ -4257,8 +5181,123 @@ function createHarness(options: Omit<LocalEngineOptions, "openDatabase"> = {}) {
   };
 }
 
+async function activateTestEmbeddingModel(harness: ReturnType<typeof createHarness>) {
+  await harness.request({ kind: "getActiveEmbeddingModel" });
+  const now = "2026-07-01T00:00:00.000Z";
+  harness.exec("UPDATE embedding_models SET status = 'disabled', updated_at = ?", [now]);
+  harness.exec(
+    `INSERT INTO embedding_models (
+      id,
+      provider,
+      label,
+      dimension,
+      metric,
+      status,
+      created_at,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+    ON CONFLICT(id) DO UPDATE SET status = 'active', updated_at = excluded.updated_at`,
+    [
+      testEmbeddingModel.id,
+      testEmbeddingModel.provider,
+      testEmbeddingModel.label,
+      testEmbeddingModel.dimension,
+      testEmbeddingModel.metric,
+      now,
+      now,
+    ],
+  );
+}
+
+function testEmbeddingVector(input: string) {
+  const vector = Array.from({ length: testEmbeddingModel.dimension }, () => 0);
+  const tokens = input.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [input.toLowerCase()];
+  for (const token of tokens) {
+    let hash = 2166136261;
+    for (let index = 0; index < token.length; index += 1) {
+      hash ^= token.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    const bucket = (hash >>> 0) % vector.length;
+    vector[bucket] = (vector[bucket] ?? 0) + 1;
+  }
+  return vector;
+}
+
+async function waitForJob(
+  harness: ReturnType<typeof createHarness>,
+  jobId: string,
+  predicate: (job: JobSummary) => boolean,
+) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const job = (await harness.request({ kind: "getJobStatus", limit: 100 })).jobs.find(
+      (candidate) => candidate.id === jobId,
+    );
+    if (job !== undefined && predicate(job)) return job;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for job ${jobId}.`);
+}
+
 function unitVector64(index: number) {
   return Array.from({ length: 64 }, (_, vectorIndex) => (vectorIndex === index ? 1 : 0));
+}
+
+function minimalParsedPdf(text: string): ParsedPdfDocument {
+  return {
+    text,
+    pages: [{ pageNumber: 1, text, charStart: 0, charEnd: text.length }],
+    sections: [],
+    references: [],
+    figures: [],
+    tables: [],
+    images: [],
+    tableStructures: [],
+    figureAnalyses: [],
+    citationLinks: [],
+    pageLabels: [{ pageNumber: 1, label: "Page 1", charStart: 0, charEnd: text.length }],
+    parseProfile: {
+      parser: "pdfjs",
+      parserVersion: "clio-pdf-structure-v2",
+      pageCount: 1,
+      textHash: hashText(text),
+      ocrStatus: "not_required",
+      warnings: [],
+    },
+    parseQuality: {
+      version: "clio-pdf-parse-quality-v1",
+      status: "needs_review",
+      score: 0.61,
+      metrics: {
+        pageCount: 1,
+        textPageCoverage: 1,
+        sectionCount: 0,
+        referenceCount: 0,
+        figureCaptionCount: 0,
+        imageArtifactCount: 0,
+        tableCaptionCount: 0,
+        tableStructureCount: 0,
+        tableSemanticCount: 0,
+        figureAnalysisQueueCount: 0,
+        figureVisionReadyCount: 0,
+        citationLinkCount: 0,
+        linkedReferenceRatio: null,
+      },
+      warnings: ["section_outline_unavailable"],
+    },
+    rawFile: {
+      status: "not_persisted",
+      reason: "raw_file_persistence_pending",
+      byteLength: text.length,
+    },
+    metadata: {
+      title: text,
+      pageCount: 1,
+      parser: "pdfjs",
+      textHash: hashText(text),
+    },
+  };
 }
 
 class MemoryPdfRawFileStore implements PdfRawFileStore {
@@ -4267,14 +5306,18 @@ class MemoryPdfRawFileStore implements PdfRawFileStore {
   readonly files = new Map<string, Uint8Array>();
   clearCount = 0;
 
-  constructor(private readonly options: { failWrite?: boolean } = {}) {}
+  failWrite: boolean;
+
+  constructor(options: { failWrite?: boolean } = {}) {
+    this.failWrite = options.failWrite === true;
+  }
 
   async write(input: PdfRawFileStoreWriteInput): Promise<PdfRawFileStoreWriteResult> {
     this.writes.push({
       ...input,
       bytes: new Uint8Array(input.bytes),
     });
-    if (this.options.failWrite === true) {
+    if (this.failWrite) {
       throw new Error("raw store offline");
     }
     this.files.set(input.sourceId, new Uint8Array(input.bytes));
@@ -4437,6 +5480,36 @@ function normalizeTextForTest(input: string) {
     .trim();
 }
 
+function knowledgeBasePrecisionVector(input: string) {
+  const normalized = input.toLowerCase();
+  if (
+    normalized.includes("puritychecker") ||
+    normalized.includes("muarf precision fixture") ||
+    normalized.includes("classify hidden mutation risks")
+  ) {
+    return [1, 0, 0];
+  }
+  const noiseIndex = Number(normalized.match(/noise source (\d+)/)?.[1] ?? 9);
+  const cosine = Math.max(0.1, 0.82 - noiseIndex * 0.01);
+  return [cosine, Math.sqrt(1 - cosine * cosine), 0];
+}
+
+function crossTrackSemanticVector(input: string) {
+  const normalized = input.toLowerCase();
+  if (normalized.includes("cross-track query")) return [1, 0, 0];
+  const chunkIndex = Number(normalized.match(/chunk-signal-(\d+)/)?.[1]);
+  if (Number.isFinite(chunkIndex)) {
+    const cosine = 0.79 + Math.min(11, chunkIndex) * 0.01;
+    return [cosine, Math.sqrt(1 - cosine * cosine), 0];
+  }
+  const metaIndex = Number(normalized.match(/meta-signal-(\d+)/)?.[1]);
+  if (Number.isFinite(metaIndex)) {
+    const cosine = 0.9 - Math.min(11, metaIndex) * 0.01;
+    return [cosine, Math.sqrt(1 - cosine * cosine), 0];
+  }
+  return [0, 1, 0];
+}
+
 function remoteEmbeddingVector(input: string) {
   const normalized = input.toLowerCase();
   return [
@@ -4446,10 +5519,13 @@ function remoteEmbeddingVector(input: string) {
   ];
 }
 
-function embeddingModelDescriptor(id: string): EmbeddingReindexModelDescriptor {
+function embeddingModelDescriptor(
+  id: string,
+  provider: EmbeddingReindexModelDescriptor["provider"] = "local-transformers",
+): EmbeddingReindexModelDescriptor {
   return {
     id,
-    provider: "openai",
+    provider,
     label: "Remote test embeddings",
     dimension: 3,
     metric: "cosine",

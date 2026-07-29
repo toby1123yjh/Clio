@@ -19,6 +19,8 @@ import {
   type UiResponse,
   type UiResultFor,
   createRequestId,
+  decodeEngineResponseFromChrome,
+  encodeEngineRequestForChrome,
   isKnowledgeBaseClusterLabelRefinementResponseMessage,
   unwrapEngineResponse,
 } from "./rpc";
@@ -28,9 +30,9 @@ export async function requestEngine<T extends EngineRequest>(
 ): Promise<EngineResultFor<T>> {
   const response = (await chrome.runtime.sendMessage({
     type: CLIO_ENGINE_REQUEST,
-    request,
+    request: encodeEngineRequestForChrome(request),
   })) as EngineResponse<EngineResultFor<T>>;
-  return unwrapEngineResponse(response);
+  return unwrapEngineResponse(decodeEngineResponseFromChrome(request, response));
 }
 
 export async function sendCurrentTabCommand(command: ContentCommand) {

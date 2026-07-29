@@ -1,3 +1,6 @@
+import type { LocalEmbeddingModelStatus } from "@/src/local-embedding/contracts";
+import { recommendedLocalEmbeddingModelManifest } from "@/src/local-embedding/trusted-models";
+import type { MemoryDetail } from "@/src/shared/rpc";
 import { describe, expect, it } from "vitest";
 import { isComposerSubmitKeyEvent } from "../app/composer-keyboard";
 import type { RailDialogueMessage } from "../app/rail-state";
@@ -8,7 +11,10 @@ import {
 import {
   buildCitationDetailMetrics,
   buildCitationGraphModel,
-  buildEmbeddingProviderSettingsInput,
+  buildLocalEmbeddingUiState,
+  isMarkdownMemoryDetail,
+  pdfPreviewExpandedForMemory,
+  pdfPreviewStatusMessage,
 } from "./RailShell";
 
 function keyEvent(input: {
@@ -65,36 +71,235 @@ describe("assistant thinking indicator", () => {
   });
 });
 
-describe("buildEmbeddingProviderSettingsInput", () => {
-  it("builds the dedicated embedding provider payload without reindex authorization fields", () => {
-    const input = buildEmbeddingProviderSettingsInput({
-      activeProvider: "openai-compatible",
-      openAIApiKey: "openai-key",
-      openAIModel: "text-embedding-3-small",
-      openAIBaseUrl: "https://api.openai.com/v1",
-      compatibleApiKey: "compatible-key",
-      compatibleModel: "embedding-model",
-      compatibleBaseUrl: "https://example.test/v1",
-      compatibleProviderName: "Example",
-    });
+describe("pdfPreviewStatusMessage", () => {
+  it("surfaces the persisted raw-file failure message", () => {
+    const detail = {
+      id: "pdf-1",
+      sourceKind: "page",
+      sourceUrl: "clio://upload/paper.pdf",
+      sourceTitle: "paper.pdf",
+      capturedAt: "2026-07-13T00:00:00.000Z",
+      excerpt: "Paper",
+      version: { groupKey: "pdf-1", versionNo: 1, isCurrent: true },
+      normalizedText: "Paper",
+      chunks: [],
+      metadata: {
+        pdf_raw_file: {
+          status: "persist_failed",
+          message: "Illegal invocation",
+        },
+      },
+    } satisfies MemoryDetail;
 
-    expect(input).toEqual({
-      activeProvider: "openai-compatible",
-      openai: {
-        apiKey: "openai-key",
-        model: "text-embedding-3-small",
-        baseUrl: "https://api.openai.com/v1",
-      },
-      openaiCompatible: {
-        apiKey: "compatible-key",
-        model: "embedding-model",
-        baseUrl: "https://example.test/v1",
-        providerName: "Example",
-      },
+    expect(pdfPreviewStatusMessage(detail, null)).toBe(
+      "Raw PDF persistence failed: Illegal invocation",
+    );
+  });
+});
+
+describe("pdfPreviewExpandedForMemory", () => {
+  it("keeps PDF evidence collapsed until the current document is explicitly expanded", () => {
+    expect(pdfPreviewExpandedForMemory(null, "pdf-1")).toBe(false);
+    expect(pdfPreviewExpandedForMemory({ memoryId: "pdf-1", expanded: true }, "pdf-1")).toBe(true);
+    expect(pdfPreviewExpandedForMemory({ memoryId: "pdf-1", expanded: true }, "pdf-2")).toBe(false);
+    expect(pdfPreviewExpandedForMemory({ memoryId: "pdf-1", expanded: false }, "pdf-1")).toBe(
+      false,
+    );
+  });
+});
+
+describe("isMarkdownMemoryDetail", () => {
+  const detail = {
+    id: "markdown-1",
+    sourceKind: "page",
+    sourceUrl: "clio://upload/notes",
+    sourceTitle: "notes",
+    capturedAt: "2026-07-18T00:00:00.000Z",
+    excerpt: "Notes",
+    version: { groupKey: "markdown-1", versionNo: 1, isCurrent: true },
+    normalizedText: "# Notes\n\n- Item",
+    chunks: [],
+    metadata: {},
+  } satisfies MemoryDetail;
+
+  it("recognizes the Markdown adapter metadata used by uploaded documents", () => {
+    expect(
+      isMarkdownMemoryDetail({
+        ...detail,
+        metadata: { adapter: "markdown", source_type: "markdown" },
+      }),
+    ).toBe(true);
+  });
+
+  it("falls back to Markdown upload file extensions without treating PDF text as Markdown", () => {
+    expect(
+      isMarkdownMemoryDetail({
+        ...detail,
+        sourceUrl: "clio://upload/notes.markdown?version=1",
+      }),
+    ).toBe(true);
+    expect(
+      isMarkdownMemoryDetail({
+        ...detail,
+        sourceUrl: "clio://upload/paper.pdf",
+        metadata: { adapter: "pdf", source_type: "pdf" },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("buildLocalEmbeddingUiState", () => {
+  it("keeps actions disabled while status is loading", () => {
+    expect(buildLocalEmbeddingUiState(null)).toMatchObject({
+      state: "checking",
+      statusLabel: "Checking",
+      primaryAction: null,
+      canInstall: false,
+      canTest: false,
+      canRebuild: false,
+      canDelete: false,
     });
-    expect(input).not.toHaveProperty("scope");
-    expect(input).not.toHaveProperty("authorizedAt");
-    expect(input).not.toHaveProperty("reindex");
+  });
+
+  it.each([
+    {
+      name: "not installed",
+      status: localEmbeddingStatus({ state: "not_installed" }),
+      expected: { primaryAction: "install", canInstall: true, canDelete: false },
+    },
+    {
+      name: "downloading",
+      status: localEmbeddingStatus({ state: "downloading", downloadedBytes: 64 }),
+      expected: {
+        primaryAction: "cancel",
+        canCancel: true,
+        progressVisible: true,
+        progressPercent: 50,
+      },
+    },
+    {
+      name: "verifying",
+      status: localEmbeddingStatus({ state: "verifying", downloadedBytes: 128 }),
+      expected: { primaryAction: null, progressVisible: true, progressPercent: 100 },
+    },
+    {
+      name: "installed",
+      status: localEmbeddingStatus({ state: "installed", installedRevision: revision }),
+      expected: {
+        installed: true,
+        primaryAction: "test",
+        canTest: true,
+        canDelete: true,
+      },
+    },
+    {
+      name: "loading",
+      status: localEmbeddingStatus({ state: "loading", installedRevision: revision }),
+      expected: { installed: true, primaryAction: null, canDelete: true },
+    },
+    {
+      name: "ready and awaiting activation",
+      status: localEmbeddingStatus({
+        state: "ready",
+        installedRevision: revision,
+        ready: true,
+        reindexRequired: true,
+      }),
+      expected: {
+        tone: "success",
+        primaryAction: "rebuild",
+        canTest: true,
+        canRebuild: true,
+        canDelete: true,
+      },
+    },
+    {
+      name: "active",
+      status: localEmbeddingStatus({
+        state: "ready",
+        installedRevision: revision,
+        ready: true,
+        active: true,
+      }),
+      expected: {
+        active: true,
+        primaryAction: null,
+        canTest: true,
+        canRebuild: true,
+      },
+    },
+    {
+      name: "reindex running",
+      status: localEmbeddingStatus({
+        state: "ready",
+        installedRevision: revision,
+        ready: true,
+        reindexRequired: true,
+        reindex: {
+          jobId: "job:embedding-reindex",
+          state: "running",
+          progressCurrent: 2,
+          progressTotal: 5,
+        },
+      }),
+      expected: {
+        statusLabel: "Rebuilding index",
+        primaryAction: "cancel_reindex",
+        canCancelReindex: true,
+        canTest: false,
+        canRebuild: false,
+        canDelete: false,
+        progressVisible: true,
+        progressPercent: 40,
+      },
+    },
+    {
+      name: "reindex failed",
+      status: localEmbeddingStatus({
+        state: "ready",
+        installedRevision: revision,
+        ready: true,
+        reindexRequired: true,
+        reindex: {
+          jobId: "job:embedding-reindex",
+          state: "failed",
+          progressCurrent: 2,
+          progressTotal: 5,
+          error: "Embedding provider failed.",
+        },
+      }),
+      expected: {
+        statusLabel: "Rebuild failed",
+        tone: "error",
+        primaryAction: "rebuild",
+        canRebuild: true,
+      },
+    },
+    {
+      name: "install error",
+      status: localEmbeddingStatus({
+        state: "error",
+        error: { code: "NETWORK", message: "Download failed" },
+      }),
+      expected: { tone: "error", primaryAction: "retry", canRetry: true, canDelete: false },
+    },
+    {
+      name: "runtime error",
+      status: localEmbeddingStatus({
+        state: "error",
+        installedRevision: revision,
+        error: { code: "RUNTIME", message: "Runtime failed" },
+      }),
+      expected: {
+        tone: "error",
+        installed: true,
+        primaryAction: "test",
+        canTest: true,
+        canDelete: true,
+      },
+    },
+  ])("projects the $name state", ({ status, expected }) => {
+    expect(buildLocalEmbeddingUiState(status)).toMatchObject(expected);
   });
 });
 
@@ -192,5 +397,22 @@ function citation(id: string, evidenceId: string, sourceTitle: string) {
     sourceUrl: "https://example.com/source",
     sourceTitle,
     excerpt: "Bounded evidence excerpt",
+  };
+}
+
+const revision = recommendedLocalEmbeddingModelManifest.revision;
+
+function localEmbeddingStatus(
+  overrides: Partial<LocalEmbeddingModelStatus>,
+): LocalEmbeddingModelStatus {
+  return {
+    modelId: recommendedLocalEmbeddingModelManifest.modelId,
+    state: "not_installed",
+    downloadedBytes: 0,
+    totalBytes: 128,
+    ready: false,
+    active: false,
+    reindexRequired: false,
+    ...overrides,
   };
 }

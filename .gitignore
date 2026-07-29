@@ -28,6 +28,7 @@ playwright-report/
 .env
 .env.*
 !.env.example
+test-workspace.local.json
 
 # POC artifacts (large)
 poc/**/output/

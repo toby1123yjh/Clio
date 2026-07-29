@@ -1,15 +1,5 @@
 import { formatCitationValidationWarning } from "@/src/agent-runtime/citation-validator";
 import {
-  type EmbeddingOpenAICompatibleSlotSettings,
-  type EmbeddingOpenAISlotSettings,
-  type EmbeddingProviderId,
-  type EmbeddingProviderSettings,
-  type SaveEmbeddingProviderSettingsInput,
-  defaultEmbeddingProvider as defaultActiveEmbeddingProvider,
-  defaultOpenAICompatibleEmbeddingModel,
-  defaultOpenAIEmbeddingModel,
-} from "@/src/agent-runtime/embedding-provider-settings";
-import {
   type ImageGenerationSettings,
   type SaveImageGenerationSettingsInput,
   defaultImageGenerationModel,
@@ -46,6 +36,14 @@ import type {
   VisionProviderId,
   VisionProviderSettings,
 } from "@/src/agent-runtime/vision-provider-settings";
+import type {
+  LocalEmbeddingModelState,
+  LocalEmbeddingModelStatus,
+} from "@/src/local-embedding/contracts";
+import {
+  recommendedLocalEmbeddingDownloadBytes,
+  recommendedLocalEmbeddingModelManifest,
+} from "@/src/local-embedding/trusted-models";
 import type { ComposerContextAttachmentKind } from "@/src/rail/api/chat-session";
 import { formatDate } from "@/src/rail/api/local-memory";
 import {
@@ -117,10 +115,7 @@ import type {
   ClioWebSearchResult,
   EngineHealth,
   ImageGenerationHistoryRecord,
-  KnowledgeBaseClusterBy,
-  KnowledgeBaseClusterGranularity,
-  KnowledgeBaseSemanticClusterBackend,
-  KnowledgeBaseSourceClusterTrace,
+  KnowledgeBaseSearchMode,
   MemoryDetail,
   OrchestrationEvent,
   OrchestrationRunSummary,
@@ -143,6 +138,12 @@ import type {
   WorkingSetStatusResult,
 } from "@/src/shared/rpc";
 import type { ReplyActionSuggestion } from "@/src/suggestions/suggestion-types";
+import type { TestWorkspaceBuildConfig } from "@/src/test-workspace/contracts";
+import type {
+  TestWorkspaceCleanupResult,
+  TestWorkspaceInitializationResult,
+  TestWorkspaceProgress,
+} from "@/src/test-workspace/runner";
 import {
   type ExplicitToolTrace,
   explicitToolRouteLabel,
@@ -159,6 +160,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Clock,
   Command,
   Copy,
@@ -167,6 +169,7 @@ import {
   Eye,
   EyeOff,
   FileText,
+  FlaskConical,
   History,
   Home,
   Image as ImageIcon,
@@ -177,6 +180,8 @@ import {
   MessageSquare,
   Mic,
   Moon,
+  MoreHorizontal,
+  Network,
   PanelRightClose,
   Paperclip,
   Pencil,
@@ -188,6 +193,7 @@ import {
   Settings,
   ShieldAlert,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Square,
   Sun,
@@ -208,14 +214,17 @@ export interface PdfReaderPreviewState {
   message?: string;
 }
 
+export type ProviderMessageTone = "neutral" | "success" | "error";
+
 export interface RailShellProps {
   state: RailState;
   health: EngineHealth | null;
   items: SearchMemoryItem[];
   knowledgeBaseFilter: KnowledgeBaseFilterState;
+  knowledgeBaseRefreshLoading: boolean;
   knowledgeBaseRetrieveFilter?: RetrieveSourcesFilter;
-  knowledgeBaseClustering: KnowledgeBaseClusteringState;
-  knowledgeBaseClusters: KnowledgeBaseClusterGroup[];
+  knowledgeBaseSearchMode: KnowledgeBaseSearchMode;
+  knowledgeBaseSearchLoading: boolean;
   workingSetStatus: WorkingSetStatusResult | null;
   chunkMetaTier2Audit: ChunkMetaTier2AuditRecord[];
   orchestrationRuns: OrchestrationRunSummary[];
@@ -245,7 +254,14 @@ export interface RailShellProps {
   activeEmbeddingModel: ActiveEmbeddingModelSummary | null;
   providerSettings: ProviderSettings | null;
   searchProviderSettings: SearchProviderSettings | null;
-  embeddingProviderSettings: EmbeddingProviderSettings | null;
+  localEmbeddingStatus: LocalEmbeddingModelStatus | null;
+  testWorkspaceConfig: TestWorkspaceBuildConfig | null;
+  testWorkspaceProgress: TestWorkspaceProgress | null;
+  testWorkspaceBusy: boolean;
+  testWorkspaceInitializationResult: TestWorkspaceInitializationResult | null;
+  testWorkspaceCleanupResult: TestWorkspaceCleanupResult | null;
+  testWorkspaceMessage: string | null;
+  testWorkspaceMessageTone: ProviderMessageTone;
   imageGenerationSettings: ImageGenerationSettings | null;
   visionProviderSettings: VisionProviderSettings | null;
   imageGenerationHistory: ImageGenerationHistoryRecord[];
@@ -257,6 +273,7 @@ export interface RailShellProps {
   wikiCompileRunning: boolean;
   providerLoading: boolean;
   providerMessage: string | null;
+  providerMessageTone: ProviderMessageTone;
   railTheme: RailTheme;
   onAcceptPageChange: () => void;
   onBackToHome: () => void;
@@ -264,7 +281,9 @@ export interface RailShellProps {
   onCollapsedKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => void;
   onCollapsedPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => void;
   onCollapse: () => void;
-  onAuthorizeEmbeddingReindex: () => Promise<boolean>;
+  onAuthorizeLocalEmbeddingReindex: () => Promise<boolean>;
+  onCancelLocalEmbeddingInstall: () => Promise<boolean>;
+  onCancelLocalEmbeddingReindex: () => Promise<boolean>;
   onCloseCommandPalette: () => void;
   onCommandPaletteQueryChange: (query: string) => void;
   onComposerInputChange: () => void;
@@ -272,6 +291,7 @@ export interface RailShellProps {
   onCancelDialogue: () => void;
   onClearDialogue: () => void;
   onDelete: (id: string) => void;
+  onDeleteLocalEmbeddingModel: () => Promise<boolean>;
   onDeleteTopicPage: (id: string) => void;
   onExecuteCommand: (command: RailCommand) => void;
   onKeepPreviousPage: () => void;
@@ -300,12 +320,13 @@ export interface RailShellProps {
   onOpenSettings: () => void;
   onOpenSource: (memory: MemoryDetail) => void;
   onKnowledgeBaseFilterChange: (filter: KnowledgeBaseFilterState) => void;
-  onKnowledgeBaseClusteringChange: (state: KnowledgeBaseClusteringState) => void;
+  onKnowledgeBaseSearchModeChange: (mode: KnowledgeBaseSearchMode) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onEvictWorkingSetSource: (sourceId: string) => void;
   onSetWorkingSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
   onReloadWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
+  onRunSourceGraphJob: (sourceId: string) => void;
   onCancelOrchestrationRun: (runId: string) => void;
   onRetryOrchestrationRun: (runId: string) => void;
   onRefreshOrchestrationRuns: () => void;
@@ -362,8 +383,11 @@ export interface RailShellProps {
   onSaveSearchProvider: (input: SaveSearchProviderInput) => Promise<boolean>;
   onSaveImageGenerationSettings: (input: SaveImageGenerationSettingsInput) => Promise<boolean>;
   onSaveVisionProviderSettings: (input: SaveVisionProviderSettingsInput) => Promise<boolean>;
-  onSaveEmbeddingProviderSettings: (input: SaveEmbeddingProviderSettingsInput) => Promise<boolean>;
-  onTestEmbeddingProvider: (input: SaveEmbeddingProviderSettingsInput) => Promise<boolean>;
+  onInstallLocalEmbeddingModel: () => Promise<boolean>;
+  onInitializeTestWorkspace: () => Promise<void>;
+  onRemoveTestWorkspace: () => Promise<void>;
+  onRetryLocalEmbeddingInstall: () => Promise<boolean>;
+  onTestLocalEmbeddingModel: () => Promise<boolean>;
   onSubmitWebSearch: (query: string) => void;
   onSubmitImageGeneration: (input: ImageGenerationSubmitInput) => void;
   onCancelImageGeneration: () => void;
@@ -423,26 +447,6 @@ export interface KnowledgeBaseFilterState {
   arxivIdsText: string;
 }
 
-export interface KnowledgeBaseClusteringState {
-  clusterBy: KnowledgeBaseClusterBy;
-  granularity: KnowledgeBaseClusterGranularity;
-  semanticBackend: KnowledgeBaseSemanticClusterBackend;
-  providerBackedLabels: boolean;
-}
-
-export interface KnowledgeBaseClusterGroup {
-  id: string;
-  label: string;
-  clusterBy: Exclude<KnowledgeBaseClusterBy, "none">;
-  sourceCount: number;
-  score: number;
-  summary?: string;
-  deterministicLabel?: string;
-  deterministicSummary?: string;
-  trace?: KnowledgeBaseSourceClusterTrace;
-  items: SearchMemoryItem[];
-}
-
 type KnowledgeBaseAdvancedFilterField =
   | "yearsText"
   | "authorsText"
@@ -473,38 +477,17 @@ const emptyKnowledgeBaseAdvancedFilterPatch: Record<KnowledgeBaseAdvancedFilterF
   arxivIdsText: "",
 };
 
-const knowledgeBaseClusterByOptions: Array<{
-  value: KnowledgeBaseClusterBy;
-  label: string;
-}> = [
-  { value: "none", label: "No grouping" },
-  { value: "semantic", label: "Semantic" },
-  { value: "topic", label: "Topic" },
-  { value: "year", label: "Year" },
-  { value: "venue", label: "Venue" },
-  { value: "source_type", label: "Source type" },
-];
-
-const knowledgeBaseClusterGranularityOptions: Array<{
-  value: KnowledgeBaseClusterGranularity;
-  label: string;
-}> = [
-  { value: "coarse", label: "Coarse" },
-  { value: "medium", label: "Medium" },
-  { value: "fine", label: "Fine" },
-];
-
-const knowledgeBaseSemanticClusterBackendOptions: Array<{
-  value: KnowledgeBaseSemanticClusterBackend;
-  label: string;
-}> = [
-  { value: "auto", label: "Auto" },
-  { value: "embedding", label: "Embeddings" },
-  { value: "metadata", label: "Metadata" },
-];
-
 function hasKnowledgeBaseAdvancedFilterText(filter: KnowledgeBaseFilterState) {
   return knowledgeBaseAdvancedFilterFields.some((field) => filter[field].trim().length > 0);
+}
+
+function hasKnowledgeBaseListCriteria(query: string, filter: KnowledgeBaseFilterState) {
+  return (
+    query.trim().length > 0 ||
+    filter.sourceType !== "all" ||
+    filter.lifecycleStatus !== "all" ||
+    hasKnowledgeBaseAdvancedFilterText(filter)
+  );
 }
 
 function knowledgeBaseAdvancedFilterChips(
@@ -596,34 +579,164 @@ export interface SourceContextPlannerState {
 
 const workingSetLoadDepthOptions: WorkingSetLoadDepth[] = ["meta", "outline", "chunks", "full"];
 
-export interface EmbeddingProviderFormValues {
-  activeProvider: EmbeddingProviderId;
-  openAIApiKey: string;
-  openAIModel: string;
-  openAIBaseUrl: string;
-  compatibleApiKey: string;
-  compatibleModel: string;
-  compatibleBaseUrl: string;
-  compatibleProviderName: string;
+export type LocalEmbeddingUiAction =
+  | "install"
+  | "cancel"
+  | "retry"
+  | "test"
+  | "rebuild"
+  | "cancel_reindex";
+
+export interface LocalEmbeddingUiState {
+  state: LocalEmbeddingModelState | "checking";
+  statusLabel: string;
+  tone: "neutral" | "success" | "error";
+  installed: boolean;
+  ready: boolean;
+  active: boolean;
+  reindexRequired: boolean;
+  progressVisible: boolean;
+  progressPercent: number;
+  primaryAction: LocalEmbeddingUiAction | null;
+  canInstall: boolean;
+  canCancel: boolean;
+  canRetry: boolean;
+  canTest: boolean;
+  canRebuild: boolean;
+  canCancelReindex: boolean;
+  canDelete: boolean;
 }
 
-export function buildEmbeddingProviderSettingsInput(
-  values: EmbeddingProviderFormValues,
-): SaveEmbeddingProviderSettingsInput {
+export function buildLocalEmbeddingUiState(
+  status: LocalEmbeddingModelStatus | null,
+): LocalEmbeddingUiState {
+  if (status === null) {
+    return {
+      state: "checking",
+      statusLabel: "Checking",
+      tone: "neutral",
+      installed: false,
+      ready: false,
+      active: false,
+      reindexRequired: false,
+      progressVisible: false,
+      progressPercent: 0,
+      primaryAction: null,
+      canInstall: false,
+      canCancel: false,
+      canRetry: false,
+      canTest: false,
+      canRebuild: false,
+      canCancelReindex: false,
+      canDelete: false,
+    };
+  }
+
+  const installed =
+    status.installedRevision !== undefined ||
+    status.state === "installed" ||
+    status.state === "loading" ||
+    status.state === "ready";
+  const reindexRunning =
+    status.reindex?.state === "queued" ||
+    status.reindex?.state === "running" ||
+    status.reindex?.state === "cancel_requested";
+  const progressVisible =
+    status.state === "downloading" || status.state === "verifying" || reindexRunning;
+  const progressCurrent = reindexRunning
+    ? (status.reindex?.progressCurrent ?? 0)
+    : status.downloadedBytes;
+  const progressTotal = reindexRunning ? (status.reindex?.progressTotal ?? 1) : status.totalBytes;
+  const progressPercent =
+    progressTotal === 0
+      ? 0
+      : Math.min(100, Math.max(0, Math.round((progressCurrent / progressTotal) * 100)));
+  const runtimeError = status.state === "error" && installed;
+  const canInstall = status.state === "not_installed";
+  const canCancel = status.state === "downloading";
+  const canRetry = status.state === "error" && !installed;
+  const canTest =
+    !reindexRunning && (status.state === "installed" || status.state === "ready" || runtimeError);
+  const canRebuild = status.ready && !reindexRunning;
+  const canCancelReindex =
+    status.reindex?.state === "queued" || status.reindex?.state === "running";
+  const canDelete = installed && !reindexRunning;
+  const primaryAction = canCancelReindex
+    ? "cancel_reindex"
+    : canInstall
+      ? "install"
+      : canCancel
+        ? "cancel"
+        : canRetry
+          ? "retry"
+          : status.state === "installed" || runtimeError
+            ? "test"
+            : status.ready && status.reindexRequired
+              ? "rebuild"
+              : null;
+
   return {
-    activeProvider: values.activeProvider,
-    openai: {
-      apiKey: values.openAIApiKey,
-      model: values.openAIModel,
-      baseUrl: values.openAIBaseUrl,
-    },
-    openaiCompatible: {
-      apiKey: values.compatibleApiKey,
-      model: values.compatibleModel,
-      baseUrl: values.compatibleBaseUrl,
-      providerName: values.compatibleProviderName,
-    },
+    state: status.state,
+    statusLabel: localEmbeddingStatusLabel(status),
+    tone:
+      status.state === "error" || status.reindex?.state === "failed"
+        ? "error"
+        : status.ready
+          ? "success"
+          : "neutral",
+    installed,
+    ready: status.ready,
+    active: status.active,
+    reindexRequired: status.reindexRequired,
+    progressVisible,
+    progressPercent,
+    primaryAction,
+    canInstall,
+    canCancel,
+    canRetry,
+    canTest,
+    canRebuild,
+    canCancelReindex,
+    canDelete,
   };
+}
+
+function localEmbeddingStatusLabel(status: LocalEmbeddingModelStatus) {
+  switch (status.reindex?.state) {
+    case "queued":
+      return "Rebuild queued";
+    case "running":
+      return "Rebuilding index";
+    case "cancel_requested":
+      return "Stopping rebuild";
+    case "done":
+      return "Index rebuilt";
+    case "failed":
+      return "Rebuild failed";
+    case "cancelled":
+      return "Rebuild cancelled";
+    default:
+      return localEmbeddingStateLabel(status.state);
+  }
+}
+
+function localEmbeddingStateLabel(state: LocalEmbeddingModelState) {
+  switch (state) {
+    case "not_installed":
+      return "Not installed";
+    case "downloading":
+      return "Downloading";
+    case "verifying":
+      return "Verifying";
+    case "installed":
+      return "Installed";
+    case "loading":
+      return "Loading runtime";
+    case "ready":
+      return "Runtime ready";
+    case "error":
+      return "Needs attention";
+  }
 }
 
 export interface CitationDetailMetric {
@@ -746,7 +859,11 @@ export function RailShell(props: RailShellProps) {
       data-clio-rail-state="expanded"
       data-clio-theme={props.railTheme}
       data-clio-view={props.state.mode}
-      style={{ width: `${props.railWidth}px` }}
+      style={{
+        containerName: "clio-rail",
+        containerType: "inline-size",
+        width: `${props.railWidth}px`,
+      }}
     >
       <div
         aria-label="Resize Clio Rail"
@@ -3272,7 +3389,19 @@ function isSearchConfigurationError(code: string) {
   );
 }
 
+type SettingsSectionId =
+  | "appearance"
+  | "test-workspace"
+  | "search"
+  | "embeddings"
+  | "vision"
+  | "image-generation"
+  | "model";
+
 function SettingsPanel(props: RailShellProps) {
+  const settingsScrollRef = React.useRef<HTMLDivElement | null>(null);
+  const [activeSettingsSection, setActiveSettingsSection] =
+    React.useState<SettingsSectionId>("appearance");
   const [geminiApiKey, setGeminiApiKey] = React.useState("");
   const [geminiModel, setGeminiModel] = React.useState(defaultGeminiModel);
   const [openAIApiKey, setOpenAIApiKey] = React.useState("");
@@ -3305,23 +3434,6 @@ function SettingsPanel(props: RailShellProps) {
   const [visionOpenAICompatibleModel, setVisionOpenAICompatibleModel] = React.useState("");
   const [visionOpenAICompatibleBaseUrl, setVisionOpenAICompatibleBaseUrl] = React.useState("");
   const [visionOpenAICompatibleProviderName, setVisionOpenAICompatibleProviderName] =
-    React.useState(defaultOpenAICompatibleProviderName);
-  const [embeddingProvider, setEmbeddingProvider] = React.useState<EmbeddingProviderId>(
-    defaultActiveEmbeddingProvider,
-  );
-  const [embeddingOpenAIApiKey, setEmbeddingOpenAIApiKey] = React.useState("");
-  const [embeddingOpenAIModel, setEmbeddingOpenAIModel] = React.useState(
-    defaultOpenAIEmbeddingModel,
-  );
-  const [embeddingOpenAIBaseUrl, setEmbeddingOpenAIBaseUrl] = React.useState(defaultOpenAIBaseUrl);
-  const [embeddingOpenAICompatibleApiKey, setEmbeddingOpenAICompatibleApiKey] = React.useState("");
-  const [embeddingOpenAICompatibleModel, setEmbeddingOpenAICompatibleModel] = React.useState(
-    defaultOpenAICompatibleEmbeddingModel,
-  );
-  const [embeddingOpenAICompatibleBaseUrl, setEmbeddingOpenAICompatibleBaseUrl] = React.useState(
-    defaultOpenAICompatibleBaseUrl,
-  );
-  const [embeddingOpenAICompatibleProviderName, setEmbeddingOpenAICompatibleProviderName] =
     React.useState(defaultOpenAICompatibleProviderName);
   const [imageGenerationApiKey, setImageGenerationApiKey] = React.useState("");
   const [imageGenerationModel, setImageGenerationModel] = React.useState("");
@@ -3372,22 +3484,6 @@ function SettingsPanel(props: RailShellProps) {
   }, [props.visionProviderSettings]);
 
   React.useEffect(() => {
-    if (props.embeddingProviderSettings === null) return;
-    setEmbeddingProvider(props.embeddingProviderSettings.activeProvider);
-    setEmbeddingOpenAIApiKey(props.embeddingProviderSettings.openai.apiKey ?? "");
-    setEmbeddingOpenAIModel(props.embeddingProviderSettings.openai.model);
-    setEmbeddingOpenAIBaseUrl(props.embeddingProviderSettings.openai.baseUrl);
-    setEmbeddingOpenAICompatibleApiKey(
-      props.embeddingProviderSettings.openaiCompatible.apiKey ?? "",
-    );
-    setEmbeddingOpenAICompatibleModel(props.embeddingProviderSettings.openaiCompatible.model);
-    setEmbeddingOpenAICompatibleBaseUrl(props.embeddingProviderSettings.openaiCompatible.baseUrl);
-    setEmbeddingOpenAICompatibleProviderName(
-      props.embeddingProviderSettings.openaiCompatible.providerName,
-    );
-  }, [props.embeddingProviderSettings]);
-
-  React.useEffect(() => {
     if (props.imageGenerationSettings === null) return;
     setImageGenerationApiKey(props.imageGenerationSettings.apiKey ?? "");
     setImageGenerationModel(props.imageGenerationSettings.model ?? "");
@@ -3397,6 +3493,26 @@ function SettingsPanel(props: RailShellProps) {
 
   const activeProvider = props.providerSettings?.activeProvider ?? defaultActiveProvider;
   const providerSelectDisabled = props.providerLoading || props.providerSettings === null;
+  const providerMessageClass =
+    props.providerMessageTone === "success"
+      ? "border-success-border bg-success-background text-success-foreground"
+      : props.providerMessageTone === "error"
+        ? "border-danger bg-danger/10 text-danger"
+        : "border-border bg-surface text-muted-foreground";
+  const scrollToSettingsSection = React.useCallback((section: SettingsSectionId) => {
+    const container = settingsScrollRef.current;
+    const target = container?.querySelector<HTMLElement>(
+      `[data-clio-settings-section="${section}"]`,
+    );
+    if (container === null || target === undefined || target === null) return;
+    const containerTop = container.getBoundingClientRect().top;
+    const targetTop = target.getBoundingClientRect().top;
+    container.scrollTo({
+      behavior: "smooth",
+      top: container.scrollTop + targetTop - containerTop - 8,
+    });
+    setActiveSettingsSection(section);
+  }, []);
 
   return (
     <div className="relative z-10 flex min-h-0 flex-1 flex-col" data-clio-panel="settings">
@@ -3416,10 +3532,31 @@ function SettingsPanel(props: RailShellProps) {
           <RefreshCw className={props.providerLoading ? "animate-spin" : ""} size={16} />
         </IconButton>
       </div>
-      <div className="clio-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overflow-x-hidden px-6 py-4">
-        <SettingsSectionMenu />
+      <div
+        className="clio-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overflow-x-hidden px-6 py-4"
+        ref={settingsScrollRef}
+      >
+        <SettingsSectionMenu
+          activeSection={activeSettingsSection}
+          onSelectSection={scrollToSettingsSection}
+          testWorkspaceEnabled={props.testWorkspaceConfig !== null}
+        />
 
         <AppearanceSettingsCard theme={props.railTheme} onThemeChange={props.onThemeChange} />
+
+        {props.testWorkspaceConfig === null ? null : (
+          <TestWorkspaceSettingsCard
+            busy={props.testWorkspaceBusy}
+            cleanupResult={props.testWorkspaceCleanupResult}
+            config={props.testWorkspaceConfig}
+            initializationResult={props.testWorkspaceInitializationResult}
+            message={props.testWorkspaceMessage}
+            messageTone={props.testWorkspaceMessageTone}
+            onInitialize={props.onInitializeTestWorkspace}
+            onRemove={props.onRemoveTestWorkspace}
+            progress={props.testWorkspaceProgress}
+          />
+        )}
 
         <VisionProviderSettingsCard
           compatibleApiKey={visionOpenAICompatibleApiKey}
@@ -3429,6 +3566,8 @@ function SettingsPanel(props: RailShellProps) {
           geminiApiKey={visionGeminiApiKey}
           geminiModel={visionGeminiModel}
           loading={props.providerLoading}
+          message={props.providerMessage}
+          messageTone={props.providerMessageTone}
           openAIApiKey={visionOpenAIApiKey}
           openAIBaseUrl={visionOpenAIBaseUrl}
           openAIModel={visionOpenAIModel}
@@ -3523,53 +3662,15 @@ function SettingsPanel(props: RailShellProps) {
 
         <EmbeddingProviderSettingsCard
           activeModel={props.activeEmbeddingModel}
-          compatibleApiKey={embeddingOpenAICompatibleApiKey}
-          compatibleBaseUrl={embeddingOpenAICompatibleBaseUrl}
-          compatibleModel={embeddingOpenAICompatibleModel}
-          compatibleProviderName={embeddingOpenAICompatibleProviderName}
+          localStatus={props.localEmbeddingStatus}
           loading={props.providerLoading}
-          openAIApiKey={embeddingOpenAIApiKey}
-          openAIBaseUrl={embeddingOpenAIBaseUrl}
-          openAIModel={embeddingOpenAIModel}
-          onAuthorizeReindex={props.onAuthorizeEmbeddingReindex}
-          onCompatibleApiKeyChange={setEmbeddingOpenAICompatibleApiKey}
-          onCompatibleBaseUrlChange={setEmbeddingOpenAICompatibleBaseUrl}
-          onCompatibleModelChange={setEmbeddingOpenAICompatibleModel}
-          onCompatibleProviderNameChange={setEmbeddingOpenAICompatibleProviderName}
-          onOpenAIApiKeyChange={setEmbeddingOpenAIApiKey}
-          onOpenAIBaseUrlChange={setEmbeddingOpenAIBaseUrl}
-          onOpenAIModelChange={setEmbeddingOpenAIModel}
-          onProviderChange={setEmbeddingProvider}
-          onSave={() =>
-            props.onSaveEmbeddingProviderSettings(
-              buildEmbeddingProviderSettingsInput({
-                activeProvider: embeddingProvider,
-                openAIApiKey: embeddingOpenAIApiKey,
-                openAIModel: embeddingOpenAIModel,
-                openAIBaseUrl: embeddingOpenAIBaseUrl,
-                compatibleApiKey: embeddingOpenAICompatibleApiKey,
-                compatibleModel: embeddingOpenAICompatibleModel,
-                compatibleBaseUrl: embeddingOpenAICompatibleBaseUrl,
-                compatibleProviderName: embeddingOpenAICompatibleProviderName,
-              }),
-            )
-          }
-          onTest={() =>
-            props.onTestEmbeddingProvider(
-              buildEmbeddingProviderSettingsInput({
-                activeProvider: embeddingProvider,
-                openAIApiKey: embeddingOpenAIApiKey,
-                openAIModel: embeddingOpenAIModel,
-                openAIBaseUrl: embeddingOpenAIBaseUrl,
-                compatibleApiKey: embeddingOpenAICompatibleApiKey,
-                compatibleModel: embeddingOpenAICompatibleModel,
-                compatibleBaseUrl: embeddingOpenAICompatibleBaseUrl,
-                compatibleProviderName: embeddingOpenAICompatibleProviderName,
-              }),
-            )
-          }
-          provider={embeddingProvider}
-          settings={props.embeddingProviderSettings}
+          onAuthorizeLocalReindex={props.onAuthorizeLocalEmbeddingReindex}
+          onCancelLocalInstall={props.onCancelLocalEmbeddingInstall}
+          onCancelLocalReindex={props.onCancelLocalEmbeddingReindex}
+          onDeleteLocalModel={props.onDeleteLocalEmbeddingModel}
+          onInstallLocalModel={props.onInstallLocalEmbeddingModel}
+          onRetryLocalInstall={props.onRetryLocalEmbeddingInstall}
+          onTestLocalModel={props.onTestLocalEmbeddingModel}
         />
 
         <section
@@ -3582,7 +3683,7 @@ function SettingsPanel(props: RailShellProps) {
                 <KeyRound size={16} />
               </span>
               <div className="min-w-0 leading-tight">
-                <h4 className="truncate text-sm font-semibold">Large model</h4>
+                <h4 className="truncate text-sm font-semibold">Main model</h4>
                 <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
                   {props.providerSettings === null
                     ? "Checking provider setup"
@@ -3699,8 +3800,9 @@ function SettingsPanel(props: RailShellProps) {
         {props.providerMessage === null ? null : (
           <div
             aria-live="polite"
-            className="rounded-lg border border-border bg-surface px-3 py-2 text-xs leading-5 text-muted-foreground"
+            className={`rounded-lg border px-3 py-2 text-xs leading-5 ${providerMessageClass}`}
             data-clio-provider-message="true"
+            data-clio-provider-message-tone={props.providerMessageTone}
           >
             {props.providerMessage}
           </div>
@@ -3710,13 +3812,24 @@ function SettingsPanel(props: RailShellProps) {
   );
 }
 
-function SettingsSectionMenu() {
+function SettingsSectionMenu(props: {
+  activeSection: SettingsSectionId;
+  onSelectSection: (section: SettingsSectionId) => void;
+  testWorkspaceEnabled: boolean;
+}) {
+  const buttonClass = (section: SettingsSectionId) =>
+    [
+      "flex min-h-12 w-full items-center gap-3 rounded-lg px-3 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary",
+      props.activeSection === section ? "bg-surface-hover" : "hover:bg-surface-hover",
+    ].join(" ");
+
   return (
-    <nav aria-label="Settings sections" className="grid gap-2">
+    <nav aria-label="Settings sections" className="grid gap-2" data-clio-settings-directory="true">
       <button
-        aria-current="page"
+        aria-current={props.activeSection === "appearance" ? "location" : undefined}
         aria-label="Appearance settings"
-        className="flex min-h-12 w-full items-center gap-3 rounded-lg bg-surface-hover px-3 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary"
+        className={buttonClass("appearance")}
+        onClick={() => props.onSelectSection("appearance")}
         type="button"
       >
         <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
@@ -3729,9 +3842,32 @@ function SettingsSectionMenu() {
           </span>
         </span>
       </button>
+      {props.testWorkspaceEnabled ? (
+        <button
+          aria-current={props.activeSection === "test-workspace" ? "location" : undefined}
+          aria-label="Test workspace settings"
+          className={buttonClass("test-workspace")}
+          onClick={() => props.onSelectSection("test-workspace")}
+          type="button"
+        >
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
+            <FlaskConical size={16} />
+          </span>
+          <span className="min-w-0 leading-tight">
+            <span className="block truncate text-sm font-semibold text-foreground">
+              Test workspace
+            </span>
+            <span className="block truncate text-[11px] text-muted-foreground">
+              Local validation corpus
+            </span>
+          </span>
+        </button>
+      ) : null}
       <button
+        aria-current={props.activeSection === "search" ? "location" : undefined}
         aria-label="Search provider settings"
-        className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 text-left outline-none transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-primary"
+        className={buttonClass("search")}
+        onClick={() => props.onSelectSection("search")}
         type="button"
       >
         <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
@@ -3745,8 +3881,10 @@ function SettingsSectionMenu() {
         </span>
       </button>
       <button
+        aria-current={props.activeSection === "embeddings" ? "location" : undefined}
         aria-label="Embedding provider settings"
-        className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 text-left outline-none transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-primary"
+        className={buttonClass("embeddings")}
+        onClick={() => props.onSelectSection("embeddings")}
         type="button"
       >
         <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
@@ -3760,8 +3898,10 @@ function SettingsSectionMenu() {
         </span>
       </button>
       <button
+        aria-current={props.activeSection === "vision" ? "location" : undefined}
         aria-label="Vision analysis settings"
-        className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 text-left outline-none transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-primary"
+        className={buttonClass("vision")}
+        onClick={() => props.onSelectSection("vision")}
         type="button"
       >
         <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
@@ -3775,8 +3915,10 @@ function SettingsSectionMenu() {
         </span>
       </button>
       <button
+        aria-current={props.activeSection === "image-generation" ? "location" : undefined}
         aria-label="Image generation settings"
-        className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 text-left outline-none transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-primary"
+        className={buttonClass("image-generation")}
+        onClick={() => props.onSelectSection("image-generation")}
         type="button"
       >
         <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
@@ -3790,20 +3932,201 @@ function SettingsSectionMenu() {
         </span>
       </button>
       <button
-        aria-label="Model settings"
-        className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 text-left outline-none transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-primary"
+        aria-current={props.activeSection === "model" ? "location" : undefined}
+        aria-label="Main model settings"
+        className={buttonClass("model")}
+        onClick={() => props.onSelectSection("model")}
         type="button"
       >
         <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
           <Bot size={16} />
         </span>
         <span className="min-w-0 leading-tight">
-          <span className="block truncate text-sm font-semibold text-foreground">Model</span>
+          <span className="block truncate text-sm font-semibold text-foreground">Main model</span>
           <span className="block truncate text-[11px] text-muted-foreground">Provider and API</span>
         </span>
       </button>
     </nav>
   );
+}
+
+interface TestWorkspaceSettingsCardProps {
+  config: TestWorkspaceBuildConfig;
+  progress: TestWorkspaceProgress | null;
+  busy: boolean;
+  initializationResult: TestWorkspaceInitializationResult | null;
+  cleanupResult: TestWorkspaceCleanupResult | null;
+  message: string | null;
+  messageTone: ProviderMessageTone;
+  onInitialize: () => Promise<void>;
+  onRemove: () => Promise<void>;
+}
+
+function TestWorkspaceSettingsCard(props: TestWorkspaceSettingsCardProps) {
+  const fixtureCount = props.config.pdfs.length + 4;
+  const progressPercent = testWorkspaceProgressPercent(props.progress);
+  const removing = props.busy && props.progress?.phase === "removing_sources";
+  const messageClass =
+    props.messageTone === "success"
+      ? "border-success-border bg-success-background text-success-foreground"
+      : props.messageTone === "error"
+        ? "border-danger bg-danger/10 text-danger"
+        : "border-border bg-background text-muted-foreground";
+  const removeTestData = () => {
+    const confirmed = window.confirm(
+      "Remove only the local test workspace sources? Other Knowledge Base data will be preserved.",
+    );
+    if (confirmed) void props.onRemove();
+  };
+
+  return (
+    <section
+      className="rounded-xl border border-border bg-surface p-4"
+      data-clio-settings-section="test-workspace"
+      data-clio-test-workspace="true"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted text-primary">
+            <FlaskConical size={16} />
+          </span>
+          <div className="min-w-0 leading-tight">
+            <h4 className="text-sm font-semibold">Test workspace</h4>
+            <p className="mt-1 break-all text-[11px] leading-4 text-muted-foreground">
+              {props.config.corpusId}
+            </p>
+          </div>
+        </div>
+        <Badge className="shrink-0 border-warning-border bg-warning-background text-warning-foreground">
+          Local build
+        </Badge>
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-[11px] leading-4">
+        <span className="text-muted-foreground">Capture fixtures</span>
+        <span className="text-right font-medium text-foreground">{fixtureCount}</span>
+        <span className="text-muted-foreground">PDF papers</span>
+        <span className="text-right font-medium text-foreground">{props.config.pdfs.length}</span>
+        <span className="text-muted-foreground">Synthetic sources</span>
+        <span className="text-right font-medium text-foreground">4</span>
+      </div>
+
+      <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
+        Multilingual E5 Small is installed when needed. All sources are imported before one
+        embedding rebuild.
+      </p>
+
+      {props.progress === null ? null : (
+        <div className="mt-4" aria-live="polite" data-clio-test-workspace-progress="true">
+          <div className="flex min-w-0 items-center justify-between gap-3 text-[11px] leading-4">
+            <span className="min-w-0 truncate font-medium text-foreground">
+              {testWorkspacePhaseLabel(props.progress.phase)}
+            </span>
+            <span className="shrink-0 text-muted-foreground">{progressPercent}%</span>
+          </div>
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-primary transition-[width] duration-200"
+              style={{ width: `${progressPercent}%` }}
+            />
+          </div>
+          <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
+            {props.progress.message}
+          </p>
+          {props.progress.currentItem === undefined ? null : (
+            <p
+              className="mt-1 truncate text-[11px] leading-4 text-foreground-soft"
+              title={props.progress.currentItem}
+            >
+              {props.progress.currentItem}
+            </p>
+          )}
+        </div>
+      )}
+
+      {props.initializationResult === null ? null : (
+        <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
+          Saved {props.initializationResult.saved}, already present{" "}
+          {props.initializationResult.duplicates}, failed {props.initializationResult.failed}.
+        </p>
+      )}
+      {props.cleanupResult === null ? null : (
+        <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
+          Matched {props.cleanupResult.matched}, deleted {props.cleanupResult.deleted}, failed{" "}
+          {props.cleanupResult.failed}.
+        </p>
+      )}
+
+      <div className="mt-4 grid gap-2">
+        <Button
+          className="w-full min-w-0"
+          disabled={props.busy}
+          onClick={() => void props.onInitialize()}
+          type="button"
+        >
+          {props.busy && !removing ? (
+            <Loader2 className="shrink-0 animate-spin" size={15} />
+          ) : (
+            <FlaskConical className="shrink-0" size={15} />
+          )}
+          <span className="truncate">
+            {props.busy && !removing ? "Initializing" : "Initialize"}
+          </span>
+        </Button>
+        <Button
+          className="w-full min-w-0"
+          disabled={props.busy}
+          onClick={removeTestData}
+          type="button"
+          variant="danger"
+        >
+          {removing ? (
+            <Loader2 className="shrink-0 animate-spin" size={15} />
+          ) : (
+            <Trash2 className="shrink-0" size={15} />
+          )}
+          <span className="truncate">{removing ? "Removing" : "Remove test data"}</span>
+        </Button>
+      </div>
+
+      {props.message === null ? null : (
+        <div
+          aria-live="polite"
+          className={`mt-3 rounded-lg border px-3 py-2 text-[11px] leading-4 ${messageClass}`}
+          data-clio-test-workspace-message="true"
+          data-clio-test-workspace-message-tone={props.messageTone}
+        >
+          {props.message}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function testWorkspaceProgressPercent(progress: TestWorkspaceProgress | null) {
+  if (progress === null || progress.total <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((progress.completed / progress.total) * 100)));
+}
+
+function testWorkspacePhaseLabel(phase: TestWorkspaceProgress["phase"]) {
+  switch (phase) {
+    case "checking_model":
+      return "Checking embedding model";
+    case "installing_model":
+      return "Installing embedding model";
+    case "importing_sources":
+      return "Importing sources";
+    case "rebuilding_embeddings":
+      return "Rebuilding embeddings";
+    case "completed":
+      return "Workspace ready";
+    case "partial":
+      return "Workspace partially ready";
+    case "failed":
+      return "Workspace failed";
+    case "removing_sources":
+      return "Removing test data";
+  }
 }
 
 interface VisionProviderSettingsCardProps {
@@ -3819,6 +4142,8 @@ interface VisionProviderSettingsCardProps {
   compatibleBaseUrl: string;
   compatibleProviderName: string;
   loading: boolean;
+  message: string | null;
+  messageTone: ProviderMessageTone;
   onProviderChange: (provider: VisionProviderId) => void;
   onGeminiApiKeyChange: (value: string) => void;
   onGeminiModelChange: (value: string) => void;
@@ -3834,7 +4159,9 @@ interface VisionProviderSettingsCardProps {
 
 function VisionProviderSettingsCard(props: VisionProviderSettingsCardProps) {
   const [apiKeyMasked, setApiKeyMasked] = React.useState(true);
+  const [saveAttempted, setSaveAttempted] = React.useState(false);
   const disabled = props.loading || props.settings === null;
+  const usesMainModel = props.provider === "auto";
   const provider = props.provider === "auto" ? "openai" : props.provider;
   const showingGemini = provider === "gemini";
   const showingCompatible = provider === "openai-compatible";
@@ -3871,6 +4198,11 @@ function VisionProviderSettingsCard(props: VisionProviderSettingsCardProps) {
   const fieldPrefix = showingGemini ? "gemini" : showingCompatible ? "openai-compatible" : "openai";
   const label = visionProviderLabel(props.provider);
   const apiKeyToggleLabel = apiKeyMasked ? `Show ${label} Vision key` : `Mask ${label} Vision key`;
+  const saveVisionSettings = React.useCallback(async () => {
+    setSaveAttempted(false);
+    await props.onSave();
+    setSaveAttempted(true);
+  }, [props.onSave]);
 
   return (
     <section
@@ -3905,7 +4237,7 @@ function VisionProviderSettingsCard(props: VisionProviderSettingsCardProps) {
           onChange={(event) => props.onProviderChange(event.target.value as VisionProviderId)}
           value={props.provider}
         >
-          <option value="auto">Auto</option>
+          <option value="auto">Main model</option>
           <option value="gemini">Gemini</option>
           <option value="openai">OpenAI</option>
           <option value="openai-compatible">OpenAI Compatible</option>
@@ -3919,98 +4251,98 @@ function VisionProviderSettingsCard(props: VisionProviderSettingsCardProps) {
           </span>
           <div className="min-w-0 leading-tight">
             <h5 className="truncate text-sm font-semibold">
-              {props.provider === "auto" ? "Auto Vision fallback" : `${label} Vision override`}
+              {usesMainModel ? "Main model for Vision" : `${label} Vision override`}
             </h5>
             <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
-              {props.provider === "auto"
-                ? "Blank fields inherit the active vision-capable main model."
+              {usesMainModel
+                ? "Reuses the Main model configuration for vision analysis."
                 : "Used for PDF figures and other image-understanding tasks."}
             </p>
           </div>
         </div>
 
-        <div className="grid gap-3">
-          <div className="grid gap-1.5 text-[12px]">
-            <label
-              className="font-medium text-foreground"
-              htmlFor={`clio-rail-vision-${fieldPrefix}-key`}
-            >
-              API Key
-            </label>
-            <div className="flex gap-2">
-              <Input
-                autoComplete="off"
-                className="h-10 min-w-0 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-                disabled={disabled}
-                id={`clio-rail-vision-${fieldPrefix}-key`}
-                onChange={(event) => onApiKeyChange(event.target.value)}
-                placeholder={`Use main ${label} key`}
-                type={apiKeyMasked ? "password" : "text"}
-                value={apiKey}
-              />
-              <Button
-                aria-label={apiKeyToggleLabel}
-                className="h-10 w-10 shrink-0 border border-border bg-surface px-0 text-muted-foreground hover:bg-muted hover:text-foreground"
-                disabled={disabled}
-                onClick={() => setApiKeyMasked((value) => !value)}
-                size="icon"
-                title={apiKeyToggleLabel}
-                type="button"
-                variant="subtle"
+        {usesMainModel ? null : (
+          <div className="grid gap-3">
+            <div className="grid gap-1.5 text-[12px]">
+              <label
+                className="font-medium text-foreground"
+                htmlFor={`clio-rail-vision-${fieldPrefix}-key`}
               >
-                {apiKeyMasked ? <Eye size={15} /> : <EyeOff size={15} />}
-              </Button>
+                API Key
+              </label>
+              <div className="flex gap-2">
+                <Input
+                  autoComplete="off"
+                  className="h-10 min-w-0 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                  disabled={disabled}
+                  id={`clio-rail-vision-${fieldPrefix}-key`}
+                  onChange={(event) => onApiKeyChange(event.target.value)}
+                  placeholder={`${label} Vision API key`}
+                  type={apiKeyMasked ? "password" : "text"}
+                  value={apiKey}
+                />
+                <Button
+                  aria-label={apiKeyToggleLabel}
+                  className="h-10 w-10 shrink-0 border border-border bg-surface px-0 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  disabled={disabled}
+                  onClick={() => setApiKeyMasked((value) => !value)}
+                  size="icon"
+                  title={apiKeyToggleLabel}
+                  type="button"
+                  variant="subtle"
+                >
+                  {apiKeyMasked ? <Eye size={15} /> : <EyeOff size={15} />}
+                </Button>
+              </div>
             </div>
+            <label
+              className="grid gap-1.5 text-[12px]"
+              htmlFor={`clio-rail-vision-${fieldPrefix}-model`}
+            >
+              <span className="font-medium text-foreground">Model</span>
+              <Input
+                className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                disabled={disabled}
+                id={`clio-rail-vision-${fieldPrefix}-model`}
+                onChange={(event) => onModelChange(event.target.value)}
+                placeholder={defaultModel}
+                value={model}
+              />
+            </label>
+            {showingGemini ? null : (
+              <label
+                className="grid gap-1.5 text-[12px]"
+                htmlFor={`clio-rail-vision-${fieldPrefix}-base-url`}
+              >
+                <span className="font-medium text-foreground">Base URL</span>
+                <Input
+                  className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                  disabled={disabled}
+                  id={`clio-rail-vision-${fieldPrefix}-base-url`}
+                  onChange={(event) => onBaseUrlChange(event.target.value)}
+                  placeholder={defaultBaseUrl}
+                  value={baseUrl}
+                />
+              </label>
+            )}
+            {showingCompatible ? (
+              <label
+                className="grid gap-1.5 text-[12px]"
+                htmlFor="clio-rail-vision-openai-compatible-provider-name"
+              >
+                <span className="font-medium text-foreground">Provider name</span>
+                <Input
+                  className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                  disabled={disabled}
+                  id="clio-rail-vision-openai-compatible-provider-name"
+                  onChange={(event) => props.onCompatibleProviderNameChange(event.target.value)}
+                  placeholder={defaultOpenAICompatibleProviderName}
+                  value={props.compatibleProviderName}
+                />
+              </label>
+            ) : null}
           </div>
-          <label
-            className="grid gap-1.5 text-[12px]"
-            htmlFor={`clio-rail-vision-${fieldPrefix}-model`}
-          >
-            <span className="font-medium text-foreground">Model</span>
-            <Input
-              className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-              disabled={disabled}
-              id={`clio-rail-vision-${fieldPrefix}-model`}
-              onChange={(event) => onModelChange(event.target.value)}
-              placeholder={props.provider === "auto" ? `Use main ${label} model` : defaultModel}
-              value={model}
-            />
-          </label>
-          {showingGemini ? null : (
-            <label
-              className="grid gap-1.5 text-[12px]"
-              htmlFor={`clio-rail-vision-${fieldPrefix}-base-url`}
-            >
-              <span className="font-medium text-foreground">Base URL</span>
-              <Input
-                className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-                disabled={disabled}
-                id={`clio-rail-vision-${fieldPrefix}-base-url`}
-                onChange={(event) => onBaseUrlChange(event.target.value)}
-                placeholder={
-                  props.provider === "auto" ? `Use main ${label} Base URL` : defaultBaseUrl
-                }
-                value={baseUrl}
-              />
-            </label>
-          )}
-          {showingCompatible ? (
-            <label
-              className="grid gap-1.5 text-[12px]"
-              htmlFor="clio-rail-vision-openai-compatible-provider-name"
-            >
-              <span className="font-medium text-foreground">Provider name</span>
-              <Input
-                className="h-10 rounded-lg border-border bg-surface text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-                disabled={disabled}
-                id="clio-rail-vision-openai-compatible-provider-name"
-                onChange={(event) => props.onCompatibleProviderNameChange(event.target.value)}
-                placeholder={defaultOpenAICompatibleProviderName}
-                value={props.compatibleProviderName}
-              />
-            </label>
-          ) : null}
-        </div>
+        )}
 
         <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
           PDF parsing does not require this model. Without a configured vision-capable model, image
@@ -4021,13 +4353,28 @@ function VisionProviderSettingsCard(props: VisionProviderSettingsCardProps) {
           <Button
             className="w-full border border-border bg-surface text-foreground hover:bg-muted"
             disabled={disabled}
-            onClick={() => void props.onSave()}
+            onClick={() => void saveVisionSettings()}
             variant="subtle"
           >
             <ShieldCheck size={15} />
             Save Vision
           </Button>
         </div>
+        {!saveAttempted || props.message === null ? null : (
+          <div
+            aria-live="polite"
+            className={[
+              "mt-3 rounded-lg border px-3 py-2 text-xs leading-5",
+              props.messageTone === "success"
+                ? "border-success-border bg-success-background text-success-foreground"
+                : "border-danger bg-danger/10 text-danger",
+            ].join(" ")}
+            data-clio-vision-save-feedback="true"
+            data-clio-vision-save-feedback-tone={props.messageTone}
+          >
+            {props.message}
+          </div>
+        )}
       </section>
     </section>
   );
@@ -4354,74 +4701,123 @@ function SearchProviderSettingsCard(props: SearchProviderSettingsCardProps) {
 }
 
 interface EmbeddingProviderSettingsCardProps {
-  provider: EmbeddingProviderId;
-  settings: EmbeddingProviderSettings | null;
   activeModel: ActiveEmbeddingModelSummary | null;
-  openAIApiKey: string;
-  openAIModel: string;
-  openAIBaseUrl: string;
-  compatibleApiKey: string;
-  compatibleModel: string;
-  compatibleBaseUrl: string;
-  compatibleProviderName: string;
+  localStatus: LocalEmbeddingModelStatus | null;
   loading: boolean;
-  onProviderChange: (provider: EmbeddingProviderId) => void;
-  onOpenAIApiKeyChange: (value: string) => void;
-  onOpenAIModelChange: (value: string) => void;
-  onOpenAIBaseUrlChange: (value: string) => void;
-  onCompatibleApiKeyChange: (value: string) => void;
-  onCompatibleModelChange: (value: string) => void;
-  onCompatibleBaseUrlChange: (value: string) => void;
-  onCompatibleProviderNameChange: (value: string) => void;
-  onSave: () => Promise<boolean>;
-  onTest: () => Promise<boolean>;
-  onAuthorizeReindex: () => Promise<boolean>;
+  onAuthorizeLocalReindex: () => Promise<boolean>;
+  onCancelLocalInstall: () => Promise<boolean>;
+  onCancelLocalReindex: () => Promise<boolean>;
+  onDeleteLocalModel: () => Promise<boolean>;
+  onInstallLocalModel: () => Promise<boolean>;
+  onRetryLocalInstall: () => Promise<boolean>;
+  onTestLocalModel: () => Promise<boolean>;
 }
 
 function EmbeddingProviderSettingsCard(props: EmbeddingProviderSettingsCardProps) {
-  const [apiKeyMasked, setApiKeyMasked] = React.useState(true);
-  const disabled = props.loading || props.settings === null;
-  const showingCompatible = props.provider === "openai-compatible";
-  const currentSettings:
-    | EmbeddingOpenAISlotSettings
-    | EmbeddingOpenAICompatibleSlotSettings
-    | undefined = showingCompatible ? props.settings?.openaiCompatible : props.settings?.openai;
-  const fieldIds = showingCompatible
-    ? {
-        key: "clio-rail-embedding-openai-compatible-key",
-        model: "clio-rail-embedding-openai-compatible-model",
-        baseUrl: "clio-rail-embedding-openai-compatible-base-url",
-        providerName: "clio-rail-embedding-openai-compatible-provider-name",
-      }
-    : {
-        key: "clio-rail-embedding-openai-key",
-        model: "clio-rail-embedding-openai-model",
-        baseUrl: "clio-rail-embedding-openai-base-url",
-        providerName: undefined,
-      };
-  const apiKey = showingCompatible ? props.compatibleApiKey : props.openAIApiKey;
-  const model = showingCompatible ? props.compatibleModel : props.openAIModel;
-  const baseUrl = showingCompatible ? props.compatibleBaseUrl : props.openAIBaseUrl;
-  const onApiKeyChange = showingCompatible
-    ? props.onCompatibleApiKeyChange
-    : props.onOpenAIApiKeyChange;
-  const onModelChange = showingCompatible
-    ? props.onCompatibleModelChange
-    : props.onOpenAIModelChange;
-  const onBaseUrlChange = showingCompatible
-    ? props.onCompatibleBaseUrlChange
-    : props.onOpenAIBaseUrlChange;
-  const defaultModel = showingCompatible
-    ? defaultOpenAICompatibleEmbeddingModel
-    : defaultOpenAIEmbeddingModel;
-  const defaultBaseUrl = showingCompatible ? defaultOpenAICompatibleBaseUrl : defaultOpenAIBaseUrl;
-  const configured = currentSettings?.apiKeyConfigured === true;
-  const hostReady = currentSettings?.hostPermissionGranted === true;
-  const canRebuild =
-    currentSettings?.dimension !== undefined && currentSettings.modelId !== undefined;
-  const apiKeyToggleLabel = apiKeyMasked
-    ? `Show ${embeddingProviderLabel(props.provider)} embedding API key`
-    : `Mask ${embeddingProviderLabel(props.provider)} embedding API key`;
+  const localUi = buildLocalEmbeddingUiState(props.localStatus);
+  const localStatusClass =
+    localUi.tone === "success"
+      ? "border-success-border bg-success-background text-success-foreground"
+      : localUi.tone === "error"
+        ? "border-danger bg-danger/10 text-danger"
+        : "border-border bg-muted text-foreground-soft";
+  const localTotalBytes = props.localStatus?.totalBytes ?? recommendedLocalEmbeddingDownloadBytes;
+  const localDownloadedBytes = props.localStatus?.downloadedBytes ?? 0;
+  const localBusy =
+    props.localStatus?.state === "downloading" ||
+    props.localStatus?.state === "verifying" ||
+    props.localStatus?.state === "loading" ||
+    props.localStatus?.reindex?.state === "queued" ||
+    props.localStatus?.reindex?.state === "running" ||
+    props.localStatus?.reindex?.state === "cancel_requested";
+  const localError = props.localStatus?.error?.message ?? props.localStatus?.reindex?.error;
+  const localActionDisabled = props.loading || localBusy;
+  const confirmAndDeleteLocalModel = () => {
+    const warning = localUi.active
+      ? "This model is active. Deleting its local files disables semantic retrieval until another embedding model is activated. Continue?"
+      : "Delete the downloaded local embedding model files? Knowledge Base sources and indexes are not deleted.";
+    if (window.confirm(warning)) void props.onDeleteLocalModel();
+  };
+
+  let localPrimaryAction: React.ReactNode = null;
+  switch (localUi.primaryAction) {
+    case "install":
+      localPrimaryAction = (
+        <Button
+          className="w-full border border-primary bg-primary text-primary-foreground hover:bg-primary/90"
+          disabled={props.loading}
+          onClick={() => void props.onInstallLocalModel()}
+        >
+          <Download size={15} />
+          Install local model
+        </Button>
+      );
+      break;
+    case "cancel":
+      localPrimaryAction = (
+        <Button
+          className="w-full border border-danger bg-surface text-danger hover:bg-danger/10"
+          disabled={props.loading}
+          onClick={() => void props.onCancelLocalInstall()}
+          variant="subtle"
+        >
+          <Square size={14} />
+          Cancel download
+        </Button>
+      );
+      break;
+    case "retry":
+      localPrimaryAction = (
+        <Button
+          className="w-full border border-border bg-surface text-foreground hover:bg-muted"
+          disabled={props.loading}
+          onClick={() => void props.onRetryLocalInstall()}
+          variant="subtle"
+        >
+          <RefreshCw size={15} />
+          Retry install
+        </Button>
+      );
+      break;
+    case "test":
+      localPrimaryAction = (
+        <Button
+          className="w-full border border-border bg-surface text-foreground hover:bg-muted"
+          disabled={props.loading}
+          onClick={() => void props.onTestLocalModel()}
+          variant="subtle"
+        >
+          <Wifi size={15} />
+          Load and test runtime
+        </Button>
+      );
+      break;
+    case "rebuild":
+      localPrimaryAction = (
+        <Button
+          className="w-full border border-primary bg-primary text-primary-foreground hover:bg-primary/90"
+          disabled={props.loading}
+          onClick={() => void props.onAuthorizeLocalReindex()}
+        >
+          <RefreshCw size={15} />
+          Enable and rebuild
+        </Button>
+      );
+      break;
+    case "cancel_reindex":
+      localPrimaryAction = (
+        <Button
+          className="w-full border border-danger bg-surface text-danger hover:bg-danger/10"
+          disabled={props.loading}
+          onClick={() => void props.onCancelLocalReindex()}
+          variant="subtle"
+        >
+          <Square size={14} />
+          Stop rebuild
+        </Button>
+      );
+      break;
+  }
 
   return (
     <section
@@ -4440,166 +4836,169 @@ function EmbeddingProviderSettingsCard(props: EmbeddingProviderSettingsCardProps
             </p>
           </div>
         </div>
-        <Badge className="shrink-0 border-border bg-muted text-foreground-soft">
-          {props.settings === null ? "checking" : embeddingProviderLabel(props.provider)}
-        </Badge>
+        <Badge className={`shrink-0 ${localStatusClass}`}>{localUi.statusLabel}</Badge>
+      </div>
+
+      <div className="mb-4 border-y border-border bg-background px-3 py-3 text-[11px] leading-4">
+        <span className="text-muted-foreground">Active embedding model</span>
+        <div className="mt-1 min-w-0">
+          <p className="break-words text-[12px] font-semibold text-foreground">
+            {props.activeModel?.label ?? "No active semantic model"}
+          </p>
+          <p className="mt-0.5 break-all font-mono text-[10px] text-muted-foreground">
+            {props.activeModel === null
+              ? "Keyword and metadata retrieval remain available."
+              : `${props.activeModel.provider} · ${props.activeModel.dimension}d · ${props.activeModel.id}`}
+          </p>
+        </div>
       </div>
 
       <div className="grid gap-3">
-        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-rail-embedding-provider">
-          <span className="font-medium text-foreground">Provider</span>
-          <select
-            className="h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
-            disabled={disabled}
-            id="clio-rail-embedding-provider"
-            onChange={(event) => props.onProviderChange(event.target.value as EmbeddingProviderId)}
-            value={props.provider}
-          >
-            <option value="openai">OpenAI</option>
-            <option value="openai-compatible">OpenAI Compatible</option>
-          </select>
-        </label>
-
-        <div className="grid gap-1.5 text-[12px]">
-          <label className="font-medium text-foreground" htmlFor={fieldIds.key}>
-            API Key
-          </label>
-          <div className="flex gap-2">
-            <Input
-              autoComplete="off"
-              className="h-10 min-w-0 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-              disabled={disabled}
-              id={fieldIds.key}
-              onChange={(event) => onApiKeyChange(event.target.value)}
-              placeholder={`Paste ${embeddingProviderLabel(props.provider)} embedding key`}
-              type={apiKeyMasked ? "password" : "text"}
-              value={apiKey}
-            />
-            <Button
-              aria-label={apiKeyToggleLabel}
-              className="h-10 w-10 shrink-0 border border-border bg-surface px-0 text-muted-foreground hover:bg-muted hover:text-foreground"
-              disabled={disabled}
-              onClick={() => setApiKeyMasked((value) => !value)}
-              size="icon"
-              title={apiKeyToggleLabel}
-              type="button"
-              variant="subtle"
-            >
-              {apiKeyMasked ? <Eye size={15} /> : <EyeOff size={15} />}
-            </Button>
+        <div className="flex min-w-0 items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h5 className="break-words text-[13px] font-semibold text-foreground">
+                {recommendedLocalEmbeddingModelManifest.label}
+              </h5>
+              <Badge className="border-primary/30 bg-primary/10 text-primary">Recommended</Badge>
+            </div>
+            <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+              Browser-local multilingual semantic retrieval. No API key or document upload.
+            </p>
           </div>
-        </div>
-
-        <label className="grid gap-1.5 text-[12px]" htmlFor={fieldIds.model}>
-          <span className="font-medium text-foreground">Model</span>
-          <Input
-            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-            disabled={disabled}
-            id={fieldIds.model}
-            onChange={(event) => onModelChange(event.target.value)}
-            placeholder={defaultModel}
-            value={model}
-          />
-        </label>
-
-        <label className="grid gap-1.5 text-[12px]" htmlFor={fieldIds.baseUrl}>
-          <span className="font-medium text-foreground">Base URL</span>
-          <Input
-            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-            disabled={disabled}
-            id={fieldIds.baseUrl}
-            onChange={(event) => onBaseUrlChange(event.target.value)}
-            placeholder={defaultBaseUrl}
-            value={baseUrl}
-          />
-        </label>
-
-        {showingCompatible ? (
-          <label className="grid gap-1.5 text-[12px]" htmlFor={fieldIds.providerName}>
-            <span className="font-medium text-foreground">Provider Name</span>
-            <Input
-              className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-              disabled={disabled}
-              id={fieldIds.providerName}
-              onChange={(event) => props.onCompatibleProviderNameChange(event.target.value)}
-              placeholder={defaultOpenAICompatibleProviderName}
-              value={props.compatibleProviderName}
-            />
-          </label>
-        ) : null}
-      </div>
-
-      <div className="mt-3 grid gap-2 rounded-lg border border-border bg-background p-3 text-[11px] leading-4">
-        <div className="grid min-w-0 gap-1">
-          <span className="text-muted-foreground">Active Model</span>
-          <span className="break-all font-mono text-[10.5px] text-foreground">
-            {props.activeModel === null
-              ? "unknown"
-              : `${props.activeModel.id} (${props.activeModel.dimension}d)`}
+          <span className="shrink-0 text-right text-[10px] leading-4 text-muted-foreground">
+            {formatByteLength(recommendedLocalEmbeddingDownloadBytes)}
+            <br />
+            {recommendedLocalEmbeddingModelManifest.dimension}d int8
           </span>
         </div>
-        <div className="flex min-w-0 items-center justify-between gap-3">
-          <span className="text-muted-foreground">Config</span>
-          <span className="shrink-0 font-medium text-foreground">
-            {configured ? "configured" : "not set"}
-          </span>
-        </div>
-        <div className="flex min-w-0 items-center justify-between gap-3">
-          <span className="text-muted-foreground">Host</span>
-          <span className="shrink-0 font-medium text-foreground">
-            {hostReady ? "ready" : "not ready"}
-          </span>
-        </div>
-        <div className="flex min-w-0 items-center justify-between gap-3">
-          <span className="text-muted-foreground">Dimension</span>
-          <span className="shrink-0 font-medium text-foreground">
-            {currentSettings?.dimension === undefined
-              ? "test required"
-              : `${currentSettings.dimension}d`}
-          </span>
-        </div>
-        <div className="grid min-w-0 gap-1">
-          <span className="text-muted-foreground">Model ID</span>
-          <span className="break-all font-mono text-[10.5px] text-foreground">
-            {currentSettings?.modelId ?? "pending test"}
-          </span>
-        </div>
-      </div>
 
-      <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
-        Save and Test only update provider setup. Rebuild embeddings is the authorization step.
-      </p>
-
-      <div className="mt-3 grid gap-2">
-        <div className="grid grid-cols-2 gap-2">
-          <Button
-            className="border border-border bg-surface text-foreground hover:bg-muted"
-            disabled={disabled}
-            onClick={() => void props.onSave()}
-            variant="subtle"
+        <div className="flex flex-wrap gap-1.5" data-clio-local-embedding-badges="true">
+          <Badge className="border-border bg-muted text-foreground-soft">
+            Files: {localUi.installed ? "installed" : "not installed"}
+          </Badge>
+          <Badge
+            className={
+              localUi.ready
+                ? "border-success-border bg-success-background text-success-foreground"
+                : "border-border bg-muted text-foreground-soft"
+            }
           >
-            <ShieldCheck size={15} />
-            Save
-          </Button>
-          <Button
-            className="border border-border bg-surface text-foreground hover:bg-muted"
-            disabled={disabled}
-            onClick={() => void props.onTest()}
-            variant="subtle"
+            Runtime: {localUi.ready ? "ready" : "not loaded"}
+          </Badge>
+          <Badge
+            className={
+              localUi.active
+                ? "border-success-border bg-success-background text-success-foreground"
+                : localUi.reindexRequired
+                  ? "border-primary/30 bg-primary/10 text-primary"
+                  : "border-border bg-muted text-foreground-soft"
+            }
           >
-            <Wifi size={15} />
-            Test
-          </Button>
+            Index:{" "}
+            {localUi.active ? "active" : localUi.reindexRequired ? "reindex required" : "inactive"}
+          </Badge>
         </div>
-        <Button
-          className="w-full border border-border bg-surface text-foreground hover:bg-muted"
-          disabled={disabled || !canRebuild}
-          onClick={() => void props.onAuthorizeReindex()}
-          variant="subtle"
+
+        <div
+          aria-live="polite"
+          className="grid min-h-[64px] content-center gap-2 border-y border-border py-2 text-[11px] leading-4"
+          data-clio-local-embedding-progress="true"
         >
-          <RefreshCw size={15} />
-          Rebuild embeddings
-        </Button>
+          <div className="flex min-w-0 items-center justify-between gap-3">
+            <span className="min-w-0 truncate text-muted-foreground">
+              {localUi.progressVisible
+                ? props.localStatus?.reindex?.state === "queued" ||
+                  props.localStatus?.reindex?.state === "running" ||
+                  props.localStatus?.reindex?.state === "cancel_requested"
+                  ? `Sources ${props.localStatus.reindex.progressCurrent}/${props.localStatus.reindex.progressTotal}`
+                  : (props.localStatus?.currentFile ?? localUi.statusLabel)
+                : localUi.state === "checking"
+                  ? "Reading local model status"
+                  : props.localStatus?.backend !== undefined
+                    ? `${localUi.statusLabel} · ${props.localStatus.backend.toUpperCase()}`
+                    : localUi.statusLabel}
+            </span>
+            <span className="shrink-0 font-medium text-foreground">
+              {localUi.progressVisible ? `${localUi.progressPercent}%` : localUi.statusLabel}
+            </span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+            <div
+              className={`h-full rounded-full transition-[width] ${
+                localUi.tone === "error" ? "bg-danger" : "bg-primary"
+              }`}
+              style={{
+                width: `${localUi.progressVisible ? localUi.progressPercent : localUi.installed ? 100 : 0}%`,
+              }}
+            />
+          </div>
+          <span className="text-[10px] text-muted-foreground">
+            {localUi.progressVisible
+              ? props.localStatus?.reindex?.state === "queued" ||
+                props.localStatus?.reindex?.state === "running" ||
+                props.localStatus?.reindex?.state === "cancel_requested"
+                ? "The active model switches only after every source succeeds."
+                : `${formatByteLength(localDownloadedBytes)} of ${formatByteLength(localTotalBytes)}`
+              : `${formatByteLength(localTotalBytes)} download · cached in browser storage`}
+          </span>
+        </div>
+
+        {localError === undefined ? null : (
+          <div
+            className="flex items-start gap-2 border-l-2 border-danger bg-danger/10 px-3 py-2 text-[11px] leading-4 text-danger"
+            data-clio-local-embedding-error="true"
+          >
+            <ShieldAlert className="mt-0.5 shrink-0" size={14} />
+            <span className="min-w-0 break-words">
+              {localError}
+              {props.localStatus?.error === undefined ? null : ` (${props.localStatus.error.code})`}
+            </span>
+          </div>
+        )}
+
+        {localPrimaryAction}
+
+        {localUi.canTest || localUi.canRebuild || localUi.canDelete ? (
+          <div className="flex gap-2">
+            {localUi.canTest && localUi.primaryAction !== "test" ? (
+              <Button
+                className="min-w-0 flex-1 border border-border bg-surface text-foreground hover:bg-muted"
+                disabled={localActionDisabled}
+                onClick={() => void props.onTestLocalModel()}
+                variant="subtle"
+              >
+                <Wifi size={15} />
+                Test
+              </Button>
+            ) : null}
+            {localUi.canRebuild && localUi.primaryAction !== "rebuild" ? (
+              <Button
+                className="min-w-0 flex-1 border border-border bg-surface text-foreground hover:bg-muted"
+                disabled={localActionDisabled}
+                onClick={() => void props.onAuthorizeLocalReindex()}
+                variant="subtle"
+              >
+                <RefreshCw size={15} />
+                {localUi.active ? "Rebuild" : "Enable"}
+              </Button>
+            ) : null}
+            {localUi.canDelete ? (
+              <Button
+                aria-label="Delete local embedding model"
+                className="h-10 w-10 shrink-0 border border-border bg-surface px-0 text-muted-foreground hover:border-danger hover:bg-danger/10 hover:text-danger"
+                disabled={props.loading}
+                onClick={confirmAndDeleteLocalModel}
+                size="icon"
+                title="Delete local embedding model"
+                type="button"
+                variant="subtle"
+              >
+                <Trash2 size={15} />
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     </section>
   );
@@ -4833,11 +5232,6 @@ function visionProviderLabel(provider: VisionProviderId) {
   return "Auto";
 }
 
-function embeddingProviderLabel(provider: EmbeddingProviderId) {
-  if (provider === "openai-compatible") return "OpenAI Compatible";
-  return "OpenAI";
-}
-
 function KnowledgeBasePanel(props: RailShellProps) {
   const [section, setSection] = React.useState<"memories" | "topics">("memories");
   const uploadInputRef = React.useRef<HTMLInputElement | null>(null);
@@ -4849,6 +5243,10 @@ function KnowledgeBasePanel(props: RailShellProps) {
     () => new Set(props.sourceContextPlanner.selectedSourceIds),
     [props.sourceContextPlanner.selectedSourceIds],
   );
+  const hasActiveListCriteria = hasKnowledgeBaseListCriteria(
+    props.state.query,
+    props.knowledgeBaseFilter,
+  );
   const patchKnowledgeBaseFilter = React.useCallback(
     (patch: Partial<KnowledgeBaseFilterState>) => {
       props.onKnowledgeBaseFilterChange({
@@ -4858,23 +5256,14 @@ function KnowledgeBasePanel(props: RailShellProps) {
     },
     [props.knowledgeBaseFilter, props.onKnowledgeBaseFilterChange],
   );
-  const patchKnowledgeBaseClustering = React.useCallback(
-    (patch: Partial<KnowledgeBaseClusteringState>) => {
-      props.onKnowledgeBaseClusteringChange({
-        ...props.knowledgeBaseClustering,
-        ...patch,
-      });
-    },
-    [props.knowledgeBaseClustering, props.onKnowledgeBaseClusteringChange],
-  );
   const topicCountLabel =
     props.topicPages.length === 0 ? "No topic pages" : `${props.topicPages.length} topic pages`;
   const memoryCountLabel =
     props.items.length === 0
-      ? "Local memory"
-      : props.knowledgeBaseClusters.length > 0
-        ? `${props.items.length} local items / ${props.knowledgeBaseClusters.length} clusters`
-        : `${props.items.length} local items`;
+      ? hasActiveListCriteria
+        ? "No matching sources"
+        : "No saved sources"
+      : `${props.items.length} sources`;
   const handleUploadFiles = React.useCallback(
     (event: React.ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(event.target.files ?? []);
@@ -4885,59 +5274,99 @@ function KnowledgeBasePanel(props: RailShellProps) {
   );
   return (
     <div className="relative z-10 flex min-h-0 flex-1 flex-col" data-clio-panel="knowledge-base">
-      <div className="flex h-[62px] shrink-0 items-center justify-between border-b border-border px-5">
+      <div
+        className="flex h-[62px] shrink-0 items-center justify-between border-b border-border px-5"
+        data-clio-knowledge-header="true"
+      >
         <div className="flex min-w-0 items-center gap-3">
           <IconButton label="Back to Agent Home" onClick={props.onBackToHome}>
             <ArrowLeft size={17} />
           </IconButton>
           <div className="min-w-0 leading-tight">
-            <h3 className="truncate text-[20px] font-semibold leading-7">Knowledge Base</h3>
-            <p className="truncate text-[11px] text-muted-foreground">
+            <h3
+              className="break-words text-[20px] font-semibold leading-7"
+              data-clio-knowledge-title="true"
+            >
+              Knowledge Base
+            </h3>
+            <p className="line-clamp-2 text-[11px] leading-4 text-muted-foreground">
               {section === "topics" ? topicCountLabel : memoryCountLabel}
             </p>
           </div>
         </div>
-        <Button
-          className="border border-border bg-surface text-muted-foreground hover:bg-muted hover:text-foreground"
-          disabled={props.state.loading}
-          onClick={props.onRefresh}
-          size="icon"
-          variant="ghost"
-        >
-          {props.state.loading ? (
-            <Loader2 className="animate-spin" size={15} />
-          ) : (
-            <RefreshCw size={15} />
-          )}
-        </Button>
+        <div className="flex shrink-0 items-center gap-1">
+          <Button
+            aria-label="Open Research planner"
+            className="border border-border bg-surface text-muted-foreground hover:bg-muted hover:text-foreground"
+            disabled={props.state.loading}
+            onClick={props.onOpenResearchPlanner}
+            size="icon"
+            title="Open Research planner"
+            variant="ghost"
+          >
+            <Maximize2 size={15} />
+          </Button>
+          <Button
+            aria-label="Refresh Knowledge Base"
+            aria-busy={props.knowledgeBaseRefreshLoading}
+            className="border border-border bg-surface text-muted-foreground hover:bg-muted hover:text-foreground"
+            disabled={props.state.loading || props.knowledgeBaseRefreshLoading}
+            onClick={props.onRefresh}
+            size="icon"
+            title="Refresh Knowledge Base"
+            variant="ghost"
+          >
+            {props.state.loading || props.knowledgeBaseRefreshLoading ? (
+              <Loader2 className="animate-spin" size={15} />
+            ) : (
+              <RefreshCw size={15} />
+            )}
+          </Button>
+        </div>
       </div>
-      <div className="clio-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden px-6 py-4">
+      <div
+        className="clio-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden px-6 py-4"
+        data-clio-knowledge-scroll="true"
+      >
         {renderRoutePrompt(props)}
         <InlineHealthBanner health={props.health} onOpenSettings={props.onOpenSettings} />
-        <div className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-surface p-1">
+        <div
+          aria-label="Knowledge Base sections"
+          className="flex gap-5 border-b border-border"
+          data-clio-knowledge-tabs="true"
+          role="tablist"
+        >
           <button
-            aria-pressed={section === "memories"}
+            aria-controls="clio-knowledge-sources-panel"
+            aria-selected={section === "memories"}
             className={[
-              "flex h-9 items-center justify-center gap-1.5 rounded-md text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary",
+              "relative flex min-h-9 items-center gap-1.5 border-b-2 px-1 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary",
               section === "memories"
-                ? "bg-background text-foreground shadow-[0_1px_2px_rgba(15,15,15,0.08)]"
+                ? "border-primary text-foreground"
                 : "text-muted-foreground hover:bg-muted hover:text-foreground",
             ].join(" ")}
+            id="clio-knowledge-sources-tab"
             onClick={() => setSection("memories")}
+            role="tab"
+            tabIndex={0}
             type="button"
           >
             <FileText size={14} />
-            Memories
+            Sources
           </button>
           <button
-            aria-pressed={section === "topics"}
+            aria-controls="clio-knowledge-topics-panel"
+            aria-selected={section === "topics"}
             className={[
-              "flex h-9 items-center justify-center gap-1.5 rounded-md text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary",
+              "relative flex min-h-9 items-center gap-1.5 border-b-2 px-1 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary",
               section === "topics"
-                ? "bg-background text-foreground shadow-[0_1px_2px_rgba(15,15,15,0.08)]"
+                ? "border-primary text-foreground"
                 : "text-muted-foreground hover:bg-muted hover:text-foreground",
             ].join(" ")}
+            id="clio-knowledge-topics-tab"
             onClick={() => setSection("topics")}
+            role="tab"
+            tabIndex={0}
             type="button"
           >
             <BookOpen size={14} />
@@ -4952,9 +5381,14 @@ function KnowledgeBasePanel(props: RailShellProps) {
           onChange={handleUploadFiles}
           type="file"
         />
-        <div className="grid grid-cols-3 gap-2">
+        <div
+          className="grid grid-cols-3 gap-2"
+          data-clio-knowledge-actions="true"
+          data-clio-knowledge-command-bar="true"
+        >
           <Button
             className="border border-border bg-surface text-foreground hover:bg-muted"
+            data-clio-knowledge-upload-action="true"
             disabled={props.state.loading}
             onClick={props.onSavePage}
             variant="subtle"
@@ -4992,135 +5426,96 @@ function KnowledgeBasePanel(props: RailShellProps) {
             New topic
           </Button>
         ) : null}
-        <div className="relative">
-          <Search
-            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
-            size={15}
-          />
-          <Input
-            aria-label="Search Clio memories"
-            className="h-11 rounded-lg border-border bg-background pl-9 text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-            onChange={(event) => props.onQueryChange(event.target.value)}
-            placeholder="Search memories"
-            value={props.state.query}
-          />
-        </div>
-        {section === "memories" ? (
-          <KnowledgeBaseFilterControls
-            disabled={props.state.loading}
-            filter={props.knowledgeBaseFilter}
-            normalizedFilter={props.knowledgeBaseRetrieveFilter}
-            onFilterChange={patchKnowledgeBaseFilter}
-          />
-        ) : null}
-        {section === "memories" ? (
-          <KnowledgeBaseClusteringControls
-            clustering={props.knowledgeBaseClustering}
-            disabled={props.state.loading}
-            onClusteringChange={patchKnowledgeBaseClustering}
-          />
-        ) : null}
-        {section === "topics" ? (
-          <TopicKnowledgePanel
-            detail={props.topicDetail}
-            form={props.topicForm}
-            formOpen={props.topicFormOpen}
-            graphEdges={props.topicGraphEdges}
-            items={props.topicPages}
-            loading={props.state.loading}
-            wikiCompileForm={props.wikiCompileForm}
-            wikiCompileJobEvents={props.wikiCompileJobEvents}
-            wikiCompileJobs={props.wikiCompileJobs}
-            wikiCompileRunning={props.wikiCompileRunning}
-            onCancelForm={props.onCancelTopicForm}
-            onChangeForm={props.onTopicFormChange}
-            onChangeWikiCompileForm={props.onWikiCompileFormChange}
-            onCompileWithAI={props.onCompileTopicWithAI}
-            onCreate={props.onCreateTopicPage}
-            onDelete={props.onDeleteTopicPage}
-            onEdit={props.onEditTopicPage}
-            onOpen={props.onOpenTopicPage}
-            onOpenSource={props.onOpenTopicSource}
-            onSave={props.onSaveTopicPage}
-          />
-        ) : (
-          <div className="grid gap-3">
-            <KnowledgeBaseWorkingSetPanel
-              disabled={props.state.loading}
-              status={props.workingSetStatus}
-              onEvict={props.onEvictWorkingSetSource}
-              onReload={props.onReloadWorkingSetSource}
-              onSetDepth={props.onSetWorkingSetSourceDepth}
+        <div className="grid gap-2" data-clio-knowledge-toolbar="true">
+          <div className="relative">
+            <Search
+              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+              size={15}
             />
-            <div className="flex justify-end">
-              <Button
-                className="border border-border bg-surface text-foreground hover:bg-muted"
+            <Input
+              aria-label="Search knowledge sources"
+              aria-busy={props.knowledgeBaseSearchLoading}
+              className="h-10 rounded-md border-border bg-background pl-9 pr-9 text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+              onChange={(event) => props.onQueryChange(event.target.value)}
+              placeholder="Search sources"
+              value={props.state.query}
+            />
+            {props.knowledgeBaseSearchLoading ? (
+              <Loader2
+                className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-muted-foreground"
+                data-clio-knowledge-search-loading="true"
+                size={14}
+              />
+            ) : null}
+          </div>
+          {section === "memories" ? (
+            <KnowledgeBaseSearchModeControl
+              disabled={props.state.loading}
+              mode={props.knowledgeBaseSearchMode}
+              semanticAvailable={props.activeEmbeddingModel !== null}
+              onModeChange={props.onKnowledgeBaseSearchModeChange}
+            />
+          ) : null}
+          <div className="grid gap-2" data-clio-knowledge-toolbar-controls="true">
+            {section === "memories" ? (
+              <KnowledgeBaseFilterControls
                 disabled={props.state.loading}
-                onClick={props.onOpenResearchPlanner}
-                size="sm"
-                variant="subtle"
-              >
-                <Maximize2 size={14} />
-                Research planner
-              </Button>
-            </div>
-            <SourceContextPlannerPanel
-              disabled={props.state.loading}
-              items={props.items}
-              query={props.state.query}
-              state={props.sourceContextPlanner}
-              workingSetStatus={props.workingSetStatus}
-              onBudgetChange={props.onSourceContextPlannerBudgetChange}
-              onPreview={props.onPreviewSourceContextPlanner}
-              onRemoveSource={props.onRemoveSourceContextPlannerSource}
-              onSetSourceDepth={props.onSetSourceContextPlannerSourceDepth}
-              onStartResearch={props.onStartSourceContextPlannerResearch}
+                filter={props.knowledgeBaseFilter}
+                normalizedFilter={props.knowledgeBaseRetrieveFilter}
+                onFilterChange={patchKnowledgeBaseFilter}
+              />
+            ) : null}
+          </div>
+        </div>
+        {section === "topics" ? (
+          <div
+            aria-labelledby="clio-knowledge-topics-tab"
+            className="grid gap-3"
+            id="clio-knowledge-topics-panel"
+            role="tabpanel"
+          >
+            <TopicKnowledgePanel
+              detail={props.topicDetail}
+              form={props.topicForm}
+              formOpen={props.topicFormOpen}
+              graphEdges={props.topicGraphEdges}
+              items={props.topicPages}
+              loading={props.state.loading}
+              wikiCompileForm={props.wikiCompileForm}
+              wikiCompileJobEvents={props.wikiCompileJobEvents}
+              wikiCompileJobs={props.wikiCompileJobs}
+              wikiCompileRunning={props.wikiCompileRunning}
+              onCancelForm={props.onCancelTopicForm}
+              onChangeForm={props.onTopicFormChange}
+              onChangeWikiCompileForm={props.onWikiCompileFormChange}
+              onCompileWithAI={props.onCompileTopicWithAI}
+              onCreate={props.onCreateTopicPage}
+              onDelete={props.onDeleteTopicPage}
+              onEdit={props.onEditTopicPage}
+              onOpen={props.onOpenTopicPage}
+              onOpenSource={props.onOpenTopicSource}
+              onSave={props.onSaveTopicPage}
             />
-            <SourceContextCompressionLogPanel
-              disabled={props.state.loading}
-              logs={props.sourceContextCompressionLogs}
-              sessionId={props.state.activeSessionId}
-              onRefresh={props.onRefreshSourceContextCompressionLogs}
-            />
-            <OrchestrationDiagnosticsPanel
-              disabled={props.state.loading}
-              events={props.orchestrationEvents}
-              runs={props.orchestrationRuns}
-              onCancel={props.onCancelOrchestrationRun}
-              onRefresh={props.onRefreshOrchestrationRuns}
-              onRetry={props.onRetryOrchestrationRun}
-            />
-            <ChunkMetaTier2AuditPanel
-              audit={props.chunkMetaTier2Audit}
-              disabled={props.state.loading}
-              onRefresh={props.onRefreshChunkMetaTier2Audit}
-            />
-            <SourceContextMapSchedulerPanel
-              disabled={props.state.loading}
-              events={props.sourceContextMapEvents}
-              runs={props.sourceContextMapRuns}
-              sessionId={props.state.activeSessionId}
-              onCancel={props.onCancelSourceContextMapRun}
-              onRefresh={props.onRefreshSourceContextMapRuns}
-              onResume={props.onResumeSourceContextMapRun}
-              onRetry={props.onRetrySourceContextMapRun}
-            />
-            <SourceContextMapArtifactPanel
-              artifacts={props.sourceContextMapArtifacts}
-              disabled={props.state.loading}
-              sessionId={props.state.activeSessionId}
-              onRefresh={props.onRefreshSourceContextMapArtifacts}
-            />
+          </div>
+        ) : (
+          <div
+            aria-labelledby="clio-knowledge-sources-tab"
+            className="grid gap-3"
+            data-clio-knowledge-sources-panel="true"
+            id="clio-knowledge-sources-panel"
+            role="tabpanel"
+          >
             <MemoryList
-              clusters={props.knowledgeBaseClusters}
+              hasActiveCriteria={hasActiveListCriteria}
               highlightedId={props.state.highlightedMemoryId}
               items={props.items}
-              loading={props.state.loading}
+              loading={props.state.loading || props.knowledgeBaseSearchLoading}
               selectedPlannerSourceIds={selectedPlannerSourceIds}
               workingSetSourceIds={workingSetSourceIds}
               onOpenDetail={props.onOpenDetail}
               onPinWorkingSetSource={props.onPinWorkingSetSource}
               onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
+              onRunSourceGraphJob={props.onRunSourceGraphJob}
               onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
             />
           </div>
@@ -5156,13 +5551,14 @@ function ResearchPlannerPanel(props: RailShellProps) {
           </div>
         </div>
         <Button
+          aria-busy={props.knowledgeBaseRefreshLoading}
           className="border border-border bg-surface text-muted-foreground hover:bg-muted hover:text-foreground"
-          disabled={props.state.loading}
+          disabled={props.state.loading || props.knowledgeBaseRefreshLoading}
           onClick={props.onRefresh}
           size="icon"
           variant="ghost"
         >
-          {props.state.loading ? (
+          {props.state.loading || props.knowledgeBaseRefreshLoading ? (
             <Loader2 className="animate-spin" size={15} />
           ) : (
             <RefreshCw size={15} />
@@ -5174,6 +5570,13 @@ function ResearchPlannerPanel(props: RailShellProps) {
         <InlineHealthBanner health={props.health} onOpenSettings={props.onOpenSettings} />
         <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(280px,0.85fr)] xl:items-start">
           <div className="grid min-w-0 gap-3">
+            <KnowledgeBaseWorkingSetPanel
+              disabled={props.state.loading}
+              status={props.workingSetStatus}
+              onEvict={props.onEvictWorkingSetSource}
+              onReload={props.onReloadWorkingSetSource}
+              onSetDepth={props.onSetWorkingSetSourceDepth}
+            />
             <SourceContextPlannerPanel
               disabled={props.state.loading}
               items={props.items}
@@ -5216,6 +5619,11 @@ function ResearchPlannerPanel(props: RailShellProps) {
               onRefresh={props.onRefreshOrchestrationRuns}
               onRetry={props.onRetryOrchestrationRun}
             />
+            <ChunkMetaTier2AuditPanel
+              audit={props.chunkMetaTier2Audit}
+              disabled={props.state.loading}
+              onRefresh={props.onRefreshChunkMetaTier2Audit}
+            />
           </div>
           <section className="grid min-w-0 gap-3" data-clio-research-planner-source-list="true">
             <div className="flex items-start justify-between gap-3">
@@ -5236,27 +5644,97 @@ function ResearchPlannerPanel(props: RailShellProps) {
               />
               <Input
                 aria-label="Search research planner sources"
-                className="h-11 rounded-lg border-border bg-background pl-9 text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                aria-busy={props.knowledgeBaseSearchLoading}
+                className="h-11 rounded-lg border-border bg-background pl-9 pr-9 text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
                 onChange={(event) => props.onQueryChange(event.target.value)}
                 placeholder="Search sources"
                 value={props.state.query}
               />
+              {props.knowledgeBaseSearchLoading ? (
+                <Loader2
+                  className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-muted-foreground"
+                  data-clio-research-planner-search-loading="true"
+                  size={14}
+                />
+              ) : null}
             </div>
+            <KnowledgeBaseSearchModeControl
+              disabled={props.state.loading}
+              mode={props.knowledgeBaseSearchMode}
+              semanticAvailable={props.activeEmbeddingModel !== null}
+              onModeChange={props.onKnowledgeBaseSearchModeChange}
+            />
             <MemoryList
-              clusters={props.knowledgeBaseClusters}
+              hasActiveCriteria={hasKnowledgeBaseListCriteria(
+                props.state.query,
+                props.knowledgeBaseFilter,
+              )}
               highlightedId={props.state.highlightedMemoryId}
               items={props.items}
-              loading={props.state.loading}
+              loading={props.state.loading || props.knowledgeBaseSearchLoading}
               selectedPlannerSourceIds={selectedPlannerSourceIds}
               workingSetSourceIds={workingSetSourceIds}
               onOpenDetail={props.onOpenDetail}
               onPinWorkingSetSource={props.onPinWorkingSetSource}
               onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
+              onRunSourceGraphJob={props.onRunSourceGraphJob}
               onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
             />
           </section>
         </div>
       </div>
+    </div>
+  );
+}
+
+function KnowledgeBaseSearchModeControl(props: {
+  disabled: boolean;
+  mode: KnowledgeBaseSearchMode;
+  semanticAvailable: boolean;
+  onModeChange: (mode: KnowledgeBaseSearchMode) => void;
+}) {
+  return (
+    <div
+      aria-label="Knowledge Base search mode"
+      className="grid min-h-9 grid-cols-2 rounded-md border border-border bg-muted/45 p-0.5"
+      data-clio-knowledge-search-mode="true"
+      role="radiogroup"
+    >
+      {(["exact", "semantic"] as const).map((mode) => {
+        const selected = props.mode === mode;
+        const disabled = props.disabled || (mode === "semantic" && !props.semanticAvailable);
+        return (
+          <label
+            className={[
+              "flex min-h-8 items-center justify-center rounded-[4px] px-3 text-[12px] font-medium outline-none transition-colors focus-within:ring-2 focus-within:ring-primary",
+              disabled ? "cursor-not-allowed opacity-45" : "cursor-pointer",
+              selected
+                ? "bg-surface text-foreground shadow-sm ring-1 ring-border"
+                : "text-muted-foreground hover:bg-surface/70 hover:text-foreground",
+            ].join(" ")}
+            key={mode}
+            title={
+              mode === "exact"
+                ? "Match titles, metadata, and document text without vector expansion"
+                : props.semanticAvailable
+                  ? "Find conceptually similar sources using the active embedding model"
+                  : "Install and activate an embedding model to enable semantic search"
+            }
+          >
+            <input
+              aria-label={mode === "exact" ? "Use exact keyword search" : "Use semantic search"}
+              checked={selected}
+              className="sr-only"
+              disabled={disabled}
+              name="clio-knowledge-search-mode"
+              onChange={() => props.onModeChange(mode)}
+              type="radio"
+              value={mode}
+            />
+            {mode === "exact" ? "Exact" : "Semantic"}
+          </label>
+        );
+      })}
     </div>
   );
 }
@@ -5277,6 +5755,10 @@ function KnowledgeBaseFilterControls({
     [normalizedFilter],
   );
   const hasAdvancedText = React.useMemo(() => hasKnowledgeBaseAdvancedFilterText(filter), [filter]);
+  const [advancedOpen, setAdvancedOpen] = React.useState(() => hasAdvancedText);
+  React.useEffect(() => {
+    if (hasAdvancedText) setAdvancedOpen(true);
+  }, [hasAdvancedText]);
   const removeAdvancedChip = React.useCallback(
     (chip: KnowledgeBaseAdvancedFilterChip) => {
       onFilterChange({
@@ -5286,12 +5768,15 @@ function KnowledgeBaseFilterControls({
     [normalizedFilter, onFilterChange],
   );
   return (
-    <div className="grid gap-3" data-clio-knowledge-filters="true">
-      <div className="grid grid-cols-2 gap-2">
-        <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-source-type-filter">
+    <div className="grid gap-2" data-clio-knowledge-filters="true">
+      <div className="flex flex-wrap items-center gap-2" data-clio-knowledge-filter-bar="true">
+        <label
+          className="grid min-w-[112px] flex-1 gap-1 text-[11px]"
+          htmlFor="clio-kb-source-type-filter"
+        >
           <span className="font-medium text-muted-foreground">Type</span>
           <select
-            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+            className="h-8 w-full rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
             disabled={disabled}
             id="clio-kb-source-type-filter"
             onChange={(event) =>
@@ -5308,10 +5793,13 @@ function KnowledgeBaseFilterControls({
             <option value="paper">Papers</option>
           </select>
         </label>
-        <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-lifecycle-filter">
+        <label
+          className="grid min-w-[112px] flex-1 gap-1 text-[11px]"
+          htmlFor="clio-kb-lifecycle-filter"
+        >
           <span className="font-medium text-muted-foreground">Status</span>
           <select
-            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+            className="h-8 w-full rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
             disabled={disabled}
             id="clio-kb-lifecycle-filter"
             onChange={(event) =>
@@ -5327,251 +5815,129 @@ function KnowledgeBaseFilterControls({
             <option value="archived">Archived</option>
           </select>
         </label>
+        <Button
+          aria-controls="clio-kb-metadata-filters"
+          aria-expanded={advancedOpen}
+          className="h-8 shrink-0 border border-border bg-surface text-foreground hover:bg-muted"
+          disabled={disabled}
+          onClick={() => setAdvancedOpen((open) => !open)}
+          size="sm"
+          type="button"
+          variant="subtle"
+        >
+          <SlidersHorizontal size={14} />
+          More filters
+          {activeAdvancedChips.length > 0 ? (
+            <Badge className="border-border bg-background text-muted-foreground">
+              {activeAdvancedChips.length}
+            </Badge>
+          ) : null}
+          <ChevronDown
+            className={advancedOpen ? "rotate-180 transition-transform" : "transition-transform"}
+            size={13}
+          />
+        </Button>
       </div>
-      <section
-        className="grid gap-2 rounded-lg border border-border bg-surface px-3 py-3"
-        data-clio-knowledge-advanced-filters="true"
-      >
-        <div className="flex items-center justify-between gap-2">
-          <div>
-            <h4 className="text-[12px] font-semibold leading-5">Metadata</h4>
-            <p className="text-[11px] text-muted-foreground">Year, author, venue, DOI, ArXiv</p>
+      {advancedOpen ? (
+        <section
+          className="grid gap-2 rounded-md border border-border bg-surface-subtle p-3"
+          data-clio-knowledge-advanced-filters="true"
+          id="clio-kb-metadata-filters"
+        >
+          <div className="flex items-center justify-between gap-2" data-clio-responsive-row="wrap">
+            <h4 className="text-[12px] font-semibold leading-5">Metadata filters</h4>
+            <Button
+              disabled={disabled || !hasAdvancedText}
+              onClick={() => onFilterChange(emptyKnowledgeBaseAdvancedFilterPatch)}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
+              Clear
+            </Button>
           </div>
-          <Button
-            disabled={disabled || !hasAdvancedText}
-            onClick={() => onFilterChange(emptyKnowledgeBaseAdvancedFilterPatch)}
-            size="sm"
-            type="button"
-            variant="ghost"
-          >
-            Clear
-          </Button>
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-years-filter">
-            <span className="font-medium text-muted-foreground">Year(s)</span>
-            <Input
-              className="h-8 px-2.5 text-[12px]"
-              disabled={disabled}
-              id="clio-kb-years-filter"
-              onChange={(event) => onFilterChange({ yearsText: event.target.value })}
-              placeholder="2024, 2025"
-              value={filter.yearsText}
-            />
-          </label>
-          <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-doi-filter">
-            <span className="font-medium text-muted-foreground">DOI</span>
-            <Input
-              className="h-8 px-2.5 text-[12px]"
-              disabled={disabled}
-              id="clio-kb-doi-filter"
-              onChange={(event) => onFilterChange({ doiText: event.target.value })}
-              placeholder="10.5555/clio.2026"
-              value={filter.doiText}
-            />
-          </label>
-          <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-authors-filter">
-            <span className="font-medium text-muted-foreground">Author(s)</span>
-            <Input
-              className="h-8 px-2.5 text-[12px]"
-              disabled={disabled}
-              id="clio-kb-authors-filter"
-              onChange={(event) => onFilterChange({ authorsText: event.target.value })}
-              placeholder="Ada Lovelace, Alan Turing"
-              value={filter.authorsText}
-            />
-          </label>
-          <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-arxiv-filter">
-            <span className="font-medium text-muted-foreground">ArXiv ID(s)</span>
-            <Input
-              className="h-8 px-2.5 text-[12px]"
-              disabled={disabled}
-              id="clio-kb-arxiv-filter"
-              onChange={(event) => onFilterChange({ arxivIdsText: event.target.value })}
-              placeholder="2501.01234, cs.CL/9901001"
-              value={filter.arxivIdsText}
-            />
-          </label>
-          <label className="col-span-2 grid gap-1.5 text-[11px]" htmlFor="clio-kb-venues-filter">
-            <span className="font-medium text-muted-foreground">Venue(s)</span>
-            <Input
-              className="h-8 px-2.5 text-[12px]"
-              disabled={disabled}
-              id="clio-kb-venues-filter"
-              onChange={(event) => onFilterChange({ venuesText: event.target.value })}
-              placeholder="NeurIPS, Nature"
-              value={filter.venuesText}
-            />
-          </label>
-        </div>
-        {activeAdvancedChips.length > 0 ? (
-          <div
-            className="flex flex-wrap gap-1.5"
-            data-clio-knowledge-advanced-filter-summary="true"
-          >
-            {activeAdvancedChips.map((chip) => (
-              <button
-                aria-label={`Remove ${chip.label} filter ${chip.value}`}
-                className="inline-flex max-w-full items-center gap-1 rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
-                key={chip.key}
-                onClick={() => removeAdvancedChip(chip)}
-                type="button"
-              >
-                <span className="text-muted-foreground">{chip.label}</span>
-                <span className="truncate">{chip.value}</span>
-                <X size={12} />
-              </button>
-            ))}
+          <div className="grid grid-cols-2 gap-2" data-clio-responsive-grid="stack">
+            <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-years-filter">
+              <span className="font-medium text-muted-foreground">Year(s)</span>
+              <Input
+                className="h-8 px-2.5 text-[12px]"
+                disabled={disabled}
+                id="clio-kb-years-filter"
+                onChange={(event) => onFilterChange({ yearsText: event.target.value })}
+                placeholder="2024, 2025"
+                value={filter.yearsText}
+              />
+            </label>
+            <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-doi-filter">
+              <span className="font-medium text-muted-foreground">DOI</span>
+              <Input
+                className="h-8 px-2.5 text-[12px]"
+                disabled={disabled}
+                id="clio-kb-doi-filter"
+                onChange={(event) => onFilterChange({ doiText: event.target.value })}
+                placeholder="10.5555/clio.2026"
+                value={filter.doiText}
+              />
+            </label>
+            <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-authors-filter">
+              <span className="font-medium text-muted-foreground">Author(s)</span>
+              <Input
+                className="h-8 px-2.5 text-[12px]"
+                disabled={disabled}
+                id="clio-kb-authors-filter"
+                onChange={(event) => onFilterChange({ authorsText: event.target.value })}
+                placeholder="Ada Lovelace, Alan Turing"
+                value={filter.authorsText}
+              />
+            </label>
+            <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-arxiv-filter">
+              <span className="font-medium text-muted-foreground">ArXiv ID(s)</span>
+              <Input
+                className="h-8 px-2.5 text-[12px]"
+                disabled={disabled}
+                id="clio-kb-arxiv-filter"
+                onChange={(event) => onFilterChange({ arxivIdsText: event.target.value })}
+                placeholder="2501.01234, cs.CL/9901001"
+                value={filter.arxivIdsText}
+              />
+            </label>
+            <label
+              className="col-span-2 grid gap-1.5 text-[11px]"
+              data-clio-responsive-col-span="full"
+              htmlFor="clio-kb-venues-filter"
+            >
+              <span className="font-medium text-muted-foreground">Venue(s)</span>
+              <Input
+                className="h-8 px-2.5 text-[12px]"
+                disabled={disabled}
+                id="clio-kb-venues-filter"
+                onChange={(event) => onFilterChange({ venuesText: event.target.value })}
+                placeholder="NeurIPS, Nature"
+                value={filter.venuesText}
+              />
+            </label>
           </div>
-        ) : null}
-      </section>
+        </section>
+      ) : null}
+      {activeAdvancedChips.length > 0 ? (
+        <div className="flex flex-wrap gap-1.5" data-clio-knowledge-advanced-filter-summary="true">
+          {activeAdvancedChips.map((chip) => (
+            <button
+              aria-label={`Remove ${chip.label} filter ${chip.value}`}
+              className="inline-flex max-w-full items-center gap-1 rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
+              key={chip.key}
+              onClick={() => removeAdvancedChip(chip)}
+              type="button"
+            >
+              <span className="text-muted-foreground">{chip.label}</span>
+              <span className="truncate">{chip.value}</span>
+              <X size={12} />
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
-}
-
-function KnowledgeBaseClusteringControls({
-  clustering,
-  disabled,
-  onClusteringChange,
-}: {
-  clustering: KnowledgeBaseClusteringState;
-  disabled: boolean;
-  onClusteringChange: (patch: Partial<KnowledgeBaseClusteringState>) => void;
-}) {
-  const groupingEnabled = clustering.clusterBy !== "none";
-  const semanticEnabled = clustering.clusterBy === "semantic";
-  const topicEnabled = clustering.clusterBy === "topic";
-  return (
-    <section
-      className="grid gap-2 rounded-lg border border-border bg-surface px-3 py-3"
-      data-clio-knowledge-clustering="true"
-    >
-      <div className="flex items-center justify-between gap-2">
-        <div className="min-w-0">
-          <h4 className="text-[12px] font-semibold leading-5">Result grouping</h4>
-          <p className="text-[11px] text-muted-foreground">Source-level clusters</p>
-        </div>
-        <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
-          {groupingEnabled ? knowledgeBaseClusterByLabel(clustering.clusterBy) : "Flat"}
-        </Badge>
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-cluster-by">
-          <span className="font-medium text-muted-foreground">Group by</span>
-          <select
-            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
-            disabled={disabled}
-            id="clio-kb-cluster-by"
-            onChange={(event) => {
-              const clusterBy = event.target.value as KnowledgeBaseClusterBy;
-              onClusteringChange({
-                clusterBy,
-                ...(clusterBy === "topic" ? {} : { providerBackedLabels: false }),
-              });
-            }}
-            value={clustering.clusterBy}
-          >
-            {knowledgeBaseClusterByOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="grid gap-1.5 text-[11px]" htmlFor="clio-kb-cluster-granularity">
-          <span className="font-medium text-muted-foreground">Granularity</span>
-          <select
-            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
-            disabled={disabled || !groupingEnabled}
-            id="clio-kb-cluster-granularity"
-            onChange={(event) =>
-              onClusteringChange({
-                granularity: event.target.value as KnowledgeBaseClusterGranularity,
-              })
-            }
-            value={clustering.granularity}
-          >
-            {knowledgeBaseClusterGranularityOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label
-          className="col-span-2 grid gap-1.5 text-[11px]"
-          htmlFor="clio-kb-cluster-semantic-backend"
-        >
-          <span className="font-medium text-muted-foreground">Semantic backend</span>
-          <select
-            className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
-            disabled={disabled || !semanticEnabled}
-            id="clio-kb-cluster-semantic-backend"
-            onChange={(event) =>
-              onClusteringChange({
-                semanticBackend: event.target.value as KnowledgeBaseSemanticClusterBackend,
-              })
-            }
-            value={clustering.semanticBackend}
-          >
-            {knowledgeBaseSemanticClusterBackendOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label
-          className="col-span-2 flex items-center gap-2 rounded-lg border border-border bg-background px-2.5 py-2 text-[11px] text-muted-foreground"
-          htmlFor="clio-kb-cluster-llm-labels"
-        >
-          <input
-            checked={clustering.providerBackedLabels}
-            className="size-3.5 accent-primary"
-            disabled={disabled || !topicEnabled}
-            id="clio-kb-cluster-llm-labels"
-            onChange={(event) =>
-              onClusteringChange({
-                providerBackedLabels: event.target.checked,
-              })
-            }
-            type="checkbox"
-          />
-          <span className="min-w-0">
-            <span className="font-medium text-foreground">Refine topic labels with LLM</span>
-            <span className="block text-[10px]">
-              Display-only, bounded metadata, no retrieval changes
-            </span>
-          </span>
-        </label>
-      </div>
-    </section>
-  );
-}
-
-function knowledgeBaseClusterByLabel(clusterBy: KnowledgeBaseClusterBy) {
-  return (
-    knowledgeBaseClusterByOptions.find((option) => option.value === clusterBy)?.label ?? "Unknown"
-  );
-}
-
-function knowledgeBaseClusterTraceLabel(trace: KnowledgeBaseSourceClusterTrace) {
-  if (trace.labelRefinement !== undefined) {
-    const suffix =
-      trace.labelRefinement.status === "refined"
-        ? "LLM refined"
-        : `LLM ${trace.labelRefinement.status}`;
-    return trace.labelRefinement.reason === undefined
-      ? suffix
-      : `${suffix} / ${trace.labelRefinement.reason}`;
-  }
-  if (trace.method === "metadata_topic_label") return "Topic labels / bounded metadata";
-  const backend = trace.backend === "embedding" ? "Embedding KMeans" : "Metadata fallback";
-  if (trace.backend === "embedding") {
-    return trace.vectorCount === undefined ? backend : `${backend} / ${trace.vectorCount} vectors`;
-  }
-  if (trace.fallbackReason === undefined) return backend;
-  return `${backend} / ${trace.fallbackReason.replace(/_/g, " ")}`;
 }
 
 function KnowledgeBaseWorkingSetPanel({
@@ -5787,7 +6153,7 @@ function SourceContextPlannerPanel({
         </ul>
       )}
 
-      <div className="mt-3 grid grid-cols-2 gap-2">
+      <div className="mt-3 grid grid-cols-2 gap-2" data-clio-responsive-grid="stack">
         <SourceContextPlannerBudgetInput
           disabled={disabled}
           label="Total tokens"
@@ -5823,7 +6189,7 @@ function SourceContextPlannerPanel({
           value={state.budget.maxWindowsPerSource}
           onChange={(value) => onBudgetChange({ ...state.budget, maxWindowsPerSource: value })}
         />
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-2 gap-2" data-clio-responsive-grid="stack">
           <SourceContextPlannerBudgetInput
             disabled={disabled}
             label="Before"
@@ -5913,7 +6279,10 @@ function SourceContextPlannerPreviewSummary({ pack }: { pack: SourceContextPackR
   const windowCount = sourceContextPlannerPreviewWindowCount(pack);
   return (
     <div className="mt-3 rounded-md border border-border bg-background px-3 py-2">
-      <div className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+      <div
+        className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground"
+        data-clio-responsive-grid="stack"
+      >
         <span>Sources {pack.sources.length}</span>
         <span>Groups {pack.groups.length}</span>
         <span>Windows {windowCount}</span>
@@ -5984,7 +6353,10 @@ function SourceContextCompressionLogPanel({
                   {formatDate(log.createdAt)}
                 </Badge>
               </div>
-              <div className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+              <div
+                className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground"
+                data-clio-responsive-grid="stack"
+              >
                 <span className="min-w-0 truncate">
                   Source {sourceContextCompressionSourceLabel(log)}
                 </span>
@@ -6068,7 +6440,10 @@ function OrchestrationDiagnosticsPanel({
                 {formatDate(activeRun.updatedAt)}
               </Badge>
             </div>
-            <div className="mt-2 grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+            <div
+              className="mt-2 grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground"
+              data-clio-responsive-grid="stack"
+            >
               <span className="truncate">Kind {activeRun.kind}</span>
               <span className="truncate">
                 Progress {activeRun.progressCurrent}/{activeRun.progressTotal}
@@ -6189,7 +6564,10 @@ function ChunkMetaTier2AuditPanel({
                   {formatDate(row.createdAt)}
                 </Badge>
               </div>
-              <div className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+              <div
+                className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground"
+                data-clio-responsive-grid="stack"
+              >
                 <span className="min-w-0 truncate">Source {compactId(row.sourceId)}</span>
                 <span className="min-w-0 truncate">Chunk {compactId(row.chunkId)}</span>
                 <span className="min-w-0 truncate">Provider {row.providerKind ?? "not used"}</span>
@@ -6277,7 +6655,10 @@ function SourceContextMapSchedulerPanel({
                 {formatDate(activeRun.updatedAt)}
               </Badge>
             </div>
-            <div className="mt-2 grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+            <div
+              className="mt-2 grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground"
+              data-clio-responsive-grid="stack"
+            >
               <span className="truncate">
                 Progress {activeRun.progressCurrent}/{activeRun.progressTotal}
               </span>
@@ -6412,7 +6793,10 @@ function SourceContextMapArtifactPanel({
                   {formatDate(artifact.createdAt)}
                 </Badge>
               </div>
-              <div className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground">
+              <div
+                className="grid grid-cols-2 gap-1.5 text-[11px] text-muted-foreground"
+                data-clio-responsive-grid="stack"
+              >
                 <span className="min-w-0 truncate">
                   Sources {artifact.sourceIds?.length || "n/a"}
                 </span>
@@ -7236,7 +7620,7 @@ function TopicPageForm({
 }
 
 function MemoryList({
-  clusters,
+  hasActiveCriteria,
   highlightedId,
   items,
   loading,
@@ -7245,9 +7629,10 @@ function MemoryList({
   onOpenDetail,
   onPinWorkingSetSource,
   onRunChunkMetaTier2Job,
+  onRunSourceGraphJob,
   onSelectSourceContextPlannerSource,
 }: {
-  clusters?: KnowledgeBaseClusterGroup[];
+  hasActiveCriteria: boolean;
   highlightedId?: string;
   items: SearchMemoryItem[];
   loading: boolean;
@@ -7256,11 +7641,12 @@ function MemoryList({
   onOpenDetail: (id: string) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
+  onRunSourceGraphJob: (sourceId: string) => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
 }) {
-  if (loading) {
+  if (loading && items.length === 0) {
     return (
-      <div className="flex h-32 items-center justify-center rounded-lg border border-border bg-surface text-sm text-muted-foreground">
+      <div className="flex h-28 items-center justify-center rounded-md border border-border bg-surface text-sm text-muted-foreground">
         <Loader2 className="mr-2 animate-spin" size={16} />
         Loading
       </div>
@@ -7268,69 +7654,11 @@ function MemoryList({
   }
   if (items.length === 0) {
     return (
-      <div className="rounded-lg border border-border bg-surface px-4 py-10 text-center text-sm text-muted-foreground">
-        No saved memories yet.
-      </div>
-    );
-  }
-  if (clusters !== undefined && clusters.length > 0) {
-    return (
-      <div className="grid gap-2" data-clio-knowledge-cluster-list="true">
-        {clusters.map((cluster) => (
-          <details
-            className="overflow-hidden rounded-lg border border-border bg-surface"
-            data-clio-knowledge-cluster="true"
-            key={cluster.id}
-            open
-          >
-            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3.5 py-3 text-left outline-none transition-colors hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary">
-              <div className="min-w-0">
-                <h3 className="truncate text-[13px] font-semibold leading-5">{cluster.label}</h3>
-                <p className="text-[11px] text-muted-foreground">
-                  {knowledgeBaseClusterByLabel(cluster.clusterBy)}
-                  {cluster.deterministicLabel === undefined
-                    ? ""
-                    : ` / from ${cluster.deterministicLabel}`}
-                </p>
-                {cluster.summary === undefined ? null : (
-                  <p
-                    className="mt-1 line-clamp-2 text-[11px] leading-4 text-muted-foreground"
-                    data-clio-knowledge-cluster-summary="true"
-                  >
-                    {cluster.summary}
-                  </p>
-                )}
-                {cluster.trace === undefined ? null : (
-                  <p
-                    className="mt-1 text-[10px] uppercase text-muted-foreground"
-                    data-clio-knowledge-cluster-trace="true"
-                  >
-                    {knowledgeBaseClusterTraceLabel(cluster.trace)}
-                  </p>
-                )}
-              </div>
-              <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
-                {cluster.sourceCount}
-              </Badge>
-            </summary>
-            <ul className="flex flex-col gap-2 border-t border-border p-2.5">
-              {cluster.items.map((item) => (
-                <MemoryListItem
-                  highlightedId={highlightedId}
-                  item={item}
-                  key={item.id}
-                  loading={loading}
-                  selectedPlannerSourceIds={selectedPlannerSourceIds}
-                  workingSetSourceIds={workingSetSourceIds}
-                  onOpenDetail={onOpenDetail}
-                  onPinWorkingSetSource={onPinWorkingSetSource}
-                  onRunChunkMetaTier2Job={onRunChunkMetaTier2Job}
-                  onSelectSourceContextPlannerSource={onSelectSourceContextPlannerSource}
-                />
-              ))}
-            </ul>
-          </details>
-        ))}
+      <div
+        className="rounded-md border border-border bg-surface px-4 py-8 text-center text-sm text-muted-foreground"
+        data-clio-knowledge-empty-state={hasActiveCriteria ? "no-match" : "no-sources"}
+      >
+        {hasActiveCriteria ? "No matching sources" : "No saved sources yet"}
       </div>
     );
   }
@@ -7347,6 +7675,7 @@ function MemoryList({
           onOpenDetail={onOpenDetail}
           onPinWorkingSetSource={onPinWorkingSetSource}
           onRunChunkMetaTier2Job={onRunChunkMetaTier2Job}
+          onRunSourceGraphJob={onRunSourceGraphJob}
           onSelectSourceContextPlannerSource={onSelectSourceContextPlannerSource}
         />
       ))}
@@ -7363,6 +7692,7 @@ function MemoryListItem({
   onOpenDetail,
   onPinWorkingSetSource,
   onRunChunkMetaTier2Job,
+  onRunSourceGraphJob,
   onSelectSourceContextPlannerSource,
 }: {
   highlightedId?: string;
@@ -7373,72 +7703,196 @@ function MemoryListItem({
   onOpenDetail: (id: string) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
+  onRunSourceGraphJob: (sourceId: string) => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
 }) {
   const isInWorkingSet = workingSetSourceIds.has(item.id);
   const isSelectedForPlanner = selectedPlannerSourceIds.has(item.id);
+  const [menuOpen, setMenuOpen] = React.useState(false);
+  const menuId = `clio-memory-menu-${React.useId().replace(/:/g, "")}`;
+  const menuTriggerRef = React.useRef<HTMLButtonElement | null>(null);
+  const menuRef = React.useRef<HTMLDivElement | null>(null);
+
+  React.useEffect(() => {
+    const handleSiblingMenuOpen = (event: Event) => {
+      if ((event as CustomEvent<string>).detail !== menuId) setMenuOpen(false);
+    };
+    document.addEventListener("clio-memory-menu-open", handleSiblingMenuOpen);
+    return () => document.removeEventListener("clio-memory-menu-open", handleSiblingMenuOpen);
+  }, [menuId]);
+
+  React.useEffect(() => {
+    if (!menuOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const eventPath = event.composedPath();
+      if (
+        (menuRef.current && eventPath.includes(menuRef.current)) ||
+        (menuTriggerRef.current && eventPath.includes(menuTriggerRef.current))
+      ) {
+        return;
+      }
+      setMenuOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setMenuOpen(false);
+      menuTriggerRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [menuOpen]);
+
+  const closeMenuAndFocusTrigger = React.useCallback(() => {
+    setMenuOpen(false);
+    menuTriggerRef.current?.focus();
+  }, []);
+
   return (
-    <li className="relative" key={item.id}>
+    <li
+      className={[
+        "rounded-md border bg-surface transition-colors hover:border-border-strong",
+        highlightedId === item.id ? "border-primary/70 bg-primary/5" : "border-border",
+      ].join(" ")}
+      data-clio-memory-card="true"
+      data-clio-memory-row="true"
+      key={item.id}
+    >
       <button
-        className={[
-          "relative flex w-full flex-col gap-2 overflow-hidden rounded-lg border bg-surface p-3.5 pr-36 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
-          highlightedId === item.id ? "border-primary/70" : "border-border",
-        ].join(" ")}
+        className="relative grid w-full min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-2.5 p-3 text-left outline-none transition-colors hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary"
         onClick={() => onOpenDetail(item.id)}
         type="button"
       >
         {highlightedId === item.id ? (
           <span className="absolute bottom-3 left-0 top-3 w-[2px] rounded-r bg-primary" />
         ) : null}
-        <div className="flex items-start gap-2.5">
-          <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-surface-subtle text-primary">
-            <FileText size={15} />
-          </span>
-          <div className="min-w-0 flex-1">
-            <h3 className="line-clamp-2 text-sm font-semibold leading-5">{item.sourceTitle}</h3>
-            <p className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-              <span className="truncate">{item.sourceUrl}</span>
-              <span>{formatDate(item.capturedAt)}</span>
-            </p>
+        <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-surface-subtle text-primary">
+          <FileText size={15} />
+        </span>
+        <div className="min-w-0" data-clio-memory-summary="true">
+          <h3
+            className="line-clamp-2 text-[13px] font-semibold leading-5 text-foreground"
+            data-clio-memory-title="true"
+            title={item.sourceTitle}
+          >
+            {item.sourceTitle}
+          </h3>
+          <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] leading-4 text-muted-foreground">
+            <Badge className="border-border bg-surface-subtle px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              {item.sourceKind}
+            </Badge>
+            <span>{formatDate(item.capturedAt)}</span>
           </div>
-          <Badge className="border-border bg-surface-subtle text-muted-foreground">
-            {item.sourceKind}
-          </Badge>
+          <p
+            className="mt-1 break-all text-[11px] leading-4 text-muted-foreground/90"
+            title={item.sourceUrl}
+          >
+            {item.sourceUrl}
+          </p>
+          <p
+            className="mt-1 line-clamp-2 break-words text-[12px] leading-5 text-muted-foreground"
+            data-clio-memory-snippet="true"
+          >
+            {item.snippet || item.excerpt}
+          </p>
         </div>
-        <p className="line-clamp-3 pl-9 text-[12.5px] leading-5 text-muted-foreground">
-          {item.snippet || item.excerpt}
-        </p>
       </button>
-      <button
-        aria-label={`Run Tier2 summaries for ${item.sourceTitle}`}
-        className="absolute right-[84px] top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
-        disabled={loading}
-        onClick={() => onRunChunkMetaTier2Job(item.id, 8)}
-        title="Run Tier2 summaries with current chat provider"
-        type="button"
+      <div
+        className="flex flex-wrap items-center justify-end gap-1.5 px-3 pb-2.5 pt-0"
+        data-clio-memory-actions="true"
       >
-        <Sparkles size={14} />
-      </button>
-      <button
-        aria-label={`${isSelectedForPlanner ? "Already selected" : "Select"} ${item.sourceTitle} for source planner`}
-        className="absolute right-12 top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
-        disabled={loading || isSelectedForPlanner}
-        onClick={() => onSelectSourceContextPlannerSource(item.id)}
-        title={isSelectedForPlanner ? "Selected for source planner" : "Select for source planner"}
-        type="button"
-      >
-        {isSelectedForPlanner ? <CheckCircle2 size={14} /> : <Plus size={14} />}
-      </button>
-      <button
-        aria-label={`${isInWorkingSet ? "Already pinned" : "Pin"} ${item.sourceTitle} to working set`}
-        className="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-45"
-        disabled={loading || isInWorkingSet}
-        onClick={() => onPinWorkingSetSource(item.id, "meta")}
-        title={isInWorkingSet ? "In working set" : "Pin to working set"}
-        type="button"
-      >
-        <Pin size={14} />
-      </button>
+        <button
+          aria-label={`${isSelectedForPlanner ? "Already selected" : "Select"} ${item.sourceTitle} for source planner`}
+          aria-pressed={isSelectedForPlanner}
+          className={[
+            "flex h-8 w-8 items-center justify-center rounded-md border outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-60",
+            isSelectedForPlanner
+              ? "border-primary/50 bg-primary/10 text-primary"
+              : "border-border bg-background text-muted-foreground hover:bg-muted hover:text-foreground",
+          ].join(" ")}
+          disabled={loading || isSelectedForPlanner}
+          onClick={() => onSelectSourceContextPlannerSource(item.id)}
+          title={isSelectedForPlanner ? "Selected for source planner" : "Select for source planner"}
+          type="button"
+        >
+          {isSelectedForPlanner ? <CheckCircle2 size={14} /> : <Plus size={14} />}
+        </button>
+        <button
+          aria-label={`${isInWorkingSet ? "Already pinned" : "Pin"} ${item.sourceTitle} to working set`}
+          aria-pressed={isInWorkingSet}
+          className={[
+            "flex h-8 w-8 items-center justify-center rounded-md border outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-60",
+            isInWorkingSet
+              ? "border-success-border bg-success-background text-success-foreground"
+              : "border-border bg-background text-muted-foreground hover:bg-muted hover:text-foreground",
+          ].join(" ")}
+          disabled={loading || isInWorkingSet}
+          onClick={() => onPinWorkingSetSource(item.id, "meta")}
+          title={isInWorkingSet ? "In working set" : "Pin to working set"}
+          type="button"
+        >
+          {isInWorkingSet ? <CheckCircle2 size={14} /> : <Pin size={14} />}
+        </button>
+        <button
+          aria-controls={menuId}
+          aria-expanded={menuOpen}
+          aria-haspopup="menu"
+          aria-label={`More actions for ${item.sourceTitle}`}
+          className="flex h-8 w-8 items-center justify-center rounded-md border border-border bg-background text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary"
+          onClick={() => {
+            if (!menuOpen) {
+              document.dispatchEvent(new CustomEvent("clio-memory-menu-open", { detail: menuId }));
+            }
+            setMenuOpen((open) => !open);
+          }}
+          ref={menuTriggerRef}
+          title="More source actions"
+          type="button"
+        >
+          <MoreHorizontal size={15} />
+        </button>
+      </div>
+      {menuOpen ? (
+        <div
+          aria-label={`Actions for ${item.sourceTitle}`}
+          className="grid gap-1 border-t border-border bg-surface-subtle p-2"
+          data-clio-memory-menu="true"
+          id={menuId}
+          ref={menuRef}
+          role="menu"
+        >
+          <button
+            className="flex min-h-8 items-center gap-2 rounded-md px-2 text-left text-[12px] text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-50"
+            disabled={loading}
+            onClick={() => {
+              closeMenuAndFocusTrigger();
+              onRunSourceGraphJob(item.id);
+            }}
+            role="menuitem"
+            type="button"
+          >
+            <Network size={14} />
+            Generate research graph
+          </button>
+          <button
+            className="flex min-h-8 items-center gap-2 rounded-md px-2 text-left text-[12px] text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-50"
+            disabled={loading}
+            onClick={() => {
+              closeMenuAndFocusTrigger();
+              onRunChunkMetaTier2Job(item.id, 8);
+            }}
+            role="menuitem"
+            type="button"
+          >
+            <Sparkles size={14} />
+            Run Tier2 summaries
+          </button>
+        </div>
+      ) : null}
     </li>
   );
 }
@@ -7509,13 +7963,31 @@ function MemoryDetailPanel({
           {detail.version.versionNo > 1 ? <Badge>v{detail.version.versionNo}</Badge> : null}
           {!detail.version.isCurrent ? <Badge>superseded</Badge> : null}
         </div>
-        <PdfReaderPreview detail={detail} preview={pdfPreview} />
-        <p className="whitespace-pre-wrap text-sm leading-6 text-foreground">
-          {detail.normalizedText}
-        </p>
+        <PdfDocumentIndex detail={detail} preview={pdfPreview} />
+        {isMarkdownMemoryDetail(detail) ? (
+          <MarkdownRenderer
+            markdown={detail.normalizedText}
+            onSourceActivate={() => undefined}
+            sources={[]}
+            variant="preview"
+          />
+        ) : (
+          <p className="whitespace-pre-wrap text-sm leading-6 text-foreground">
+            {detail.normalizedText}
+          </p>
+        )}
       </article>
     </div>
   );
+}
+
+export function isMarkdownMemoryDetail(detail: MemoryDetail) {
+  const sourceType = metadataString(detail.metadata.source_type);
+  const adapter = metadataString(detail.metadata.adapter);
+  if (sourceType === "markdown" || adapter === "markdown") return true;
+
+  const sourcePath = detail.sourceUrl.toLowerCase().split(/[?#]/, 1)[0] ?? "";
+  return sourcePath.endsWith(".md") || sourcePath.endsWith(".markdown");
 }
 
 interface PdfPreviewArtifact {
@@ -7535,204 +8007,286 @@ interface PdfPreviewBoundingBox {
   unit: "pdf_user_space";
 }
 
-function PdfReaderPreview({
+interface PdfPreviewExpansionState {
+  memoryId: string;
+  expanded: boolean;
+}
+
+type PdfEvidenceGroupId = "citations" | "tables" | "figures";
+
+interface PdfEvidenceGroup {
+  id: PdfEvidenceGroupId;
+  icon: React.ReactNode;
+  items: PdfPreviewArtifact[];
+  title: string;
+}
+
+export function pdfPreviewExpandedForMemory(
+  state: PdfPreviewExpansionState | null,
+  memoryId: string,
+) {
+  return state?.memoryId === memoryId && state.expanded;
+}
+
+function PdfDocumentIndex({
   detail,
   preview,
 }: {
   detail: MemoryDetail;
   preview: PdfReaderPreviewState | null;
 }) {
-  const [selectedPageState, setSelectedPageState] = React.useState<{
-    memoryId: string;
-    objectUrl?: string;
-    pageNumber: number;
-  } | null>(null);
   const [selectedArtifactState, setSelectedArtifactState] = React.useState<{
     memoryId: string;
     objectUrl?: string;
     artifact: PdfPreviewArtifact;
   } | null>(null);
+  const [activeArtifactGroupState, setActiveArtifactGroupState] = React.useState<{
+    memoryId: string;
+    groupId: PdfEvidenceGroupId;
+  } | null>(null);
+  const [expansionState, setExpansionState] = React.useState<PdfPreviewExpansionState | null>(null);
 
   if (!isPdfMemoryDetail(detail)) return null;
 
-  const pageItems = pdfPageArtifacts(detail);
-  const firstPage = pageItems[0]?.pageNumber ?? 1;
+  const previewPanelId = `clio-pdf-preview-body-${detail.id}`;
+  const pageCount = Math.max(pdfPageCount(detail) ?? 1, 1);
   const objectUrl =
     preview?.status === "ready" && preview.objectUrl !== undefined ? preview.objectUrl : undefined;
-  const selectedPage =
-    selectedPageState?.memoryId === detail.id && selectedPageState.objectUrl === objectUrl
-      ? selectedPageState.pageNumber
-      : null;
-  const activePage = selectedPage ?? firstPage;
-  const iframeSrc = objectUrl === undefined ? undefined : pdfPreviewUrl(objectUrl, activePage);
   const statusMessage = pdfPreviewStatusMessage(detail, preview);
   const citationItems = pdfCitationArtifacts(detail);
   const tableItems = pdfTableArtifacts(detail);
   const imageItems = pdfImageArtifacts(detail);
+  const allEvidenceGroups: PdfEvidenceGroup[] = [
+    { id: "citations", icon: <FileText size={13} />, items: citationItems, title: "Citations" },
+    { id: "tables", icon: <Library size={13} />, items: tableItems, title: "Tables" },
+    { id: "figures", icon: <ImageIcon size={13} />, items: imageItems, title: "Figures" },
+  ];
+  const evidenceGroups = allEvidenceGroups.filter((group) => group.items.length > 0);
+  const expanded =
+    evidenceGroups.length > 0 && pdfPreviewExpandedForMemory(expansionState, detail.id);
+  const activeEvidenceGroup =
+    evidenceGroups.find(
+      (group) =>
+        activeArtifactGroupState?.memoryId === detail.id &&
+        activeArtifactGroupState.groupId === group.id,
+    ) ?? evidenceGroups[0];
   const selectedArtifact =
     selectedArtifactState?.memoryId === detail.id && selectedArtifactState.objectUrl === objectUrl
       ? selectedArtifactState.artifact
       : undefined;
+  const activePage = Math.min(Math.max(selectedArtifact?.pageNumber ?? 1, 1), pageCount);
   const activeOverlay =
-    selectedArtifact?.bbox !== undefined && selectedArtifact.pageNumber === activePage
+    selectedArtifact?.bbox !== undefined && selectedArtifact.pageNumber !== undefined
       ? selectedArtifact
       : undefined;
   const selectArtifact = (item: PdfPreviewArtifact) => {
-    if (item.pageNumber !== undefined) {
-      setSelectedPageState({ memoryId: detail.id, objectUrl, pageNumber: item.pageNumber });
-    }
     setSelectedArtifactState({ memoryId: detail.id, objectUrl, artifact: item });
   };
 
   return (
     <section
-      className="mb-5 overflow-hidden rounded-lg border border-border bg-surface"
-      data-clio-pdf-preview="true"
+      className="mb-5 overflow-hidden rounded-lg border border-border bg-surface shadow-[0_1px_2px_rgba(15,15,15,0.04)]"
+      data-clio-pdf-document-index="true"
     >
-      <div className="flex min-h-12 items-center justify-between gap-3 border-b border-border px-4 py-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <FileText className="shrink-0 text-primary" size={16} />
-            <h4 className="truncate text-sm font-semibold">PDF preview</h4>
-          </div>
-          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
-            {preview?.byteLength === undefined
-              ? statusMessage
-              : `${formatByteLength(preview.byteLength)} · ${statusMessage}`}
-          </p>
-        </div>
-        {objectUrl === undefined ? null : (
-          <a
-            className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-[11px] font-medium text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
-            href={pdfPreviewUrl(objectUrl, activePage)}
-            rel="noreferrer"
-            target="_blank"
-          >
-            <ExternalLink size={13} />
-            Open page
-          </a>
-        )}
-      </div>
-      <div className="grid gap-0 lg:grid-cols-[minmax(0,1fr)_180px]">
-        <div className="min-h-[360px] border-b border-border bg-background lg:border-b-0 lg:border-r">
-          {iframeSrc === undefined ? (
-            <div className="flex h-[360px] flex-col items-center justify-center px-6 text-center text-sm text-muted-foreground">
+      <div
+        className={`flex min-h-14 items-center justify-between gap-3 px-3.5 py-3 ${
+          expanded ? "border-b border-border" : ""
+        }`}
+        data-clio-pdf-header="true"
+      >
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border bg-background text-primary">
+            <FileText size={17} />
+          </span>
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-2">
+              <h4 className="truncate text-[13px] font-semibold text-foreground">PDF document</h4>
               {preview?.status === "loading" ? (
-                <Loader2 className="mb-3 animate-spin" size={20} />
-              ) : (
-                <FileText className="mb-3" size={22} />
-              )}
-              <p className="max-w-[260px]">{statusMessage}</p>
+                <Loader2 className="shrink-0 animate-spin text-muted-foreground" size={12} />
+              ) : preview?.status === "ready" ? (
+                <CheckCircle2 className="shrink-0 text-success-foreground" size={12} />
+              ) : null}
             </div>
-          ) : (
-            <>
-              <iframe
-                className="h-[360px] w-full bg-background"
-                data-clio-pdf-preview-frame="true"
-                src={iframeSrc}
-                title={`PDF preview for ${detail.sourceTitle}`}
-              />
-              <PdfBBoxOverlay artifact={activeOverlay} detail={detail} pageNumber={activePage} />
-            </>
+            <p className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
+              <span className="shrink-0 tabular-nums">
+                {pageCount} {pageCount === 1 ? "page" : "pages"}
+              </span>
+              {preview?.byteLength === undefined ? null : (
+                <>
+                  <span aria-hidden="true">/</span>
+                  <span className="shrink-0">{formatByteLength(preview.byteLength)}</span>
+                </>
+              )}
+              <span aria-hidden="true">/</span>
+              <span className="truncate">{statusMessage}</span>
+            </p>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          {objectUrl === undefined ? null : (
+            <a
+              aria-label={`Open PDF page ${activePage} in a new tab`}
+              className="flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary"
+              href={pdfPreviewUrl(objectUrl, activePage)}
+              rel="noreferrer"
+              target="_blank"
+              title="Open PDF in a new tab"
+            >
+              <ExternalLink size={14} />
+            </a>
+          )}
+          {evidenceGroups.length === 0 ? null : (
+            <button
+              aria-controls={previewPanelId}
+              aria-expanded={expanded}
+              aria-label={expanded ? "Collapse PDF details" : "Open PDF details"}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary"
+              onClick={() =>
+                setExpansionState({
+                  memoryId: detail.id,
+                  expanded: !expanded,
+                })
+              }
+              title={expanded ? "Collapse PDF details" : "Open PDF details"}
+              type="button"
+            >
+              {expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </button>
           )}
         </div>
-        <div className="flex min-h-[360px] flex-col gap-3 p-3">
-          <PdfArtifactGroup
-            icon={<BookOpen size={14} />}
-            items={pageItems}
+      </div>
+      {expanded ? (
+        <div id={previewPanelId}>
+          <PdfBBoxOverlay artifact={activeOverlay} detail={detail} pageNumber={activePage} />
+          <PdfEvidenceBrowser
+            activeGroup={activeEvidenceGroup}
+            groups={evidenceGroups}
             objectUrl={objectUrl}
             onSelectArtifact={selectArtifact}
-            title="Pages"
-          />
-          <PdfArtifactGroup
-            icon={<FileText size={14} />}
-            items={citationItems}
-            objectUrl={objectUrl}
-            onSelectArtifact={selectArtifact}
-            title="Citations"
-          />
-          <PdfArtifactGroup
-            icon={<Library size={14} />}
-            items={tableItems}
-            objectUrl={objectUrl}
-            onSelectArtifact={selectArtifact}
-            title="Tables"
-          />
-          <PdfArtifactGroup
-            icon={<ImageIcon size={14} />}
-            items={imageItems}
-            objectUrl={objectUrl}
-            onSelectArtifact={selectArtifact}
-            title="Figures"
+            onSelectGroup={(groupId) =>
+              setActiveArtifactGroupState({ memoryId: detail.id, groupId })
+            }
+            selectedArtifactId={selectedArtifact?.id}
           />
         </div>
-      </div>
+      ) : null}
     </section>
   );
 }
 
-function PdfArtifactGroup({
-  icon,
-  items,
+function PdfEvidenceBrowser({
+  activeGroup,
+  groups,
   objectUrl,
   onSelectArtifact,
-  title,
+  onSelectGroup,
+  selectedArtifactId,
 }: {
-  icon: React.ReactNode;
-  items: PdfPreviewArtifact[];
-  objectUrl?: string;
+  activeGroup: PdfEvidenceGroup | undefined;
+  groups: PdfEvidenceGroup[];
+  objectUrl: string | undefined;
   onSelectArtifact: (item: PdfPreviewArtifact) => void;
-  title: string;
+  onSelectGroup: (groupId: PdfEvidenceGroupId) => void;
+  selectedArtifactId: string | undefined;
 }) {
-  if (items.length === 0) return null;
+  if (activeGroup === undefined) return null;
+  const totalArtifacts = groups.reduce((total, group) => total + group.items.length, 0);
   return (
-    <div className="min-w-0">
-      <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase text-muted-foreground">
-        {icon}
-        {title}
+    <section className="border-t border-border bg-surface" data-clio-pdf-evidence="true">
+      <div className="px-3.5 pb-2 pt-3">
+        <h5 className="text-xs font-semibold text-foreground">Document evidence</h5>
+        <p className="mt-0.5 text-[11px] text-muted-foreground">
+          {totalArtifacts} extracted {totalArtifacts === 1 ? "item" : "items"}
+        </p>
       </div>
-      <ul className="flex flex-col gap-1">
-        {items.slice(0, 8).map((item) => {
-          const hasPage = item.pageNumber !== undefined;
+      <div
+        aria-label="PDF evidence types"
+        className="clio-scroll flex max-w-full overflow-x-auto border-b border-border px-3"
+        role="tablist"
+      >
+        {groups.map((group) => {
+          const active = group.id === activeGroup.id;
           return (
-            <li key={item.id}>
-              <button
-                className="flex min-h-8 w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-60"
-                disabled={!hasPage}
-                onClick={() => {
-                  if (item.pageNumber !== undefined) onSelectArtifact(item);
-                }}
-                type="button"
-              >
-                <span className="min-w-0">
-                  <span className="block truncate font-medium text-foreground">{item.label}</span>
-                  {item.detail === undefined ? null : (
-                    <span className="block truncate text-[11px] text-muted-foreground">
-                      {item.detail}
-                    </span>
-                  )}
+            <button
+              aria-selected={active}
+              className={`flex h-9 shrink-0 items-center gap-1.5 border-b-2 px-2 text-[11px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary ${
+                active
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground"
+              }`}
+              key={group.id}
+              onClick={() => onSelectGroup(group.id)}
+              role="tab"
+              type="button"
+            >
+              {group.icon}
+              {group.title}
+              <span className="tabular-nums text-[10px] text-muted-foreground">
+                {group.items.length}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      <ul aria-label={`${activeGroup.title} evidence`} role="tabpanel">
+        {activeGroup.items.slice(0, 8).map((item) => {
+          const hasPage = item.pageNumber !== undefined;
+          const selected = item.id === selectedArtifactId;
+          const pageUrl =
+            objectUrl !== undefined && item.pageNumber !== undefined
+              ? pdfPreviewUrl(objectUrl, item.pageNumber)
+              : undefined;
+          const itemContent = (
+            <>
+              <span className="min-w-0">
+                <span className="block break-words font-medium leading-5 text-foreground">
+                  {item.label}
                 </span>
-                {hasPage ? (
-                  <span className="shrink-0 text-[11px] text-muted-foreground">
-                    p.{item.pageNumber}
+                {item.detail === undefined ? null : (
+                  <span className="mt-0.5 line-clamp-2 block break-words text-[11px] leading-4 text-muted-foreground">
+                    {item.detail}
                   </span>
-                ) : null}
-              </button>
-              {objectUrl !== undefined && item.pageNumber !== undefined ? (
+                )}
+              </span>
+              {hasPage ? (
+                <span className="mt-0.5 shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">
+                  p.{item.pageNumber}
+                </span>
+              ) : null}
+            </>
+          );
+          const itemClassName = `flex min-h-12 w-full min-w-0 items-start justify-between gap-3 px-3.5 py-2.5 text-left text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary disabled:cursor-default disabled:opacity-60 ${
+            selected ? "bg-surface-subtle" : "hover:bg-muted"
+          }`;
+          return (
+            <li className="border-b border-border last:border-b-0" key={item.id}>
+              {pageUrl === undefined ? (
+                <button
+                  aria-pressed={selected}
+                  className={itemClassName}
+                  disabled={!hasPage}
+                  onClick={() => onSelectArtifact(item)}
+                  type="button"
+                >
+                  {itemContent}
+                </button>
+              ) : (
                 <a
-                  className="sr-only"
-                  href={pdfPreviewUrl(objectUrl, item.pageNumber)}
+                  aria-label={`Open ${item.label} on page ${item.pageNumber}`}
+                  className={itemClassName}
+                  href={pageUrl}
+                  onClick={() => onSelectArtifact(item)}
                   rel="noreferrer"
                   target="_blank"
                 >
-                  Open {item.label}
+                  {itemContent}
                 </a>
-              ) : null}
+              )}
             </li>
           );
         })}
       </ul>
-    </div>
+    </section>
   );
 }
 
@@ -7795,7 +8349,7 @@ function isPdfMemoryDetail(detail: MemoryDetail) {
   );
 }
 
-function pdfPreviewStatusMessage(
+export function pdfPreviewStatusMessage(
   detail: MemoryDetail,
   preview: PdfReaderPreviewState | null,
 ): string {
@@ -7803,36 +8357,21 @@ function pdfPreviewStatusMessage(
   if (preview?.status === "ready") return "Raw PDF ready";
   if (preview?.message !== undefined) return preview.message;
   const rawFile = metadataRecord(detail.metadata.pdf_raw_file);
-  if (rawFile?.status === "persist_failed") return "Raw PDF persistence failed";
+  if (rawFile?.status === "persist_failed") {
+    const message = metadataString(rawFile.message);
+    return message === undefined
+      ? "Raw PDF persistence failed"
+      : `Raw PDF persistence failed: ${message.slice(0, 160)}`;
+  }
   if (rawFile?.status === "not_persisted") return "Raw PDF was not persisted";
   return "Raw PDF preview unavailable";
 }
 
-function pdfPageArtifacts(detail: MemoryDetail): PdfPreviewArtifact[] {
-  const labels = metadataRecordArray(detail.metadata.pdf_page_labels)
-    .map((record, index): PdfPreviewArtifact | undefined => {
-      const pageNumber = metadataNumber(record.pageNumber);
-      if (pageNumber === undefined) return undefined;
-      return {
-        id: `page-${pageNumber}-${index}`,
-        label: metadataString(record.label) ?? `Page ${pageNumber}`,
-        pageNumber,
-        source: "page" as const,
-      };
-    })
-    .filter(isPdfPreviewArtifact);
-  if (labels.length > 0) return labels.slice(0, 12);
-
-  const pageCount =
+function pdfPageCount(detail: MemoryDetail) {
+  return (
     metadataNumber(detail.metadata.pdf_page_count) ??
-    metadataNumber(metadataRecord(detail.metadata.pdf_parse_profile)?.pageCount);
-  if (pageCount === undefined) return [];
-  return Array.from({ length: Math.min(pageCount, 12) }, (_, index) => ({
-    id: `page-${index + 1}`,
-    label: `Page ${index + 1}`,
-    pageNumber: index + 1,
-    source: "page" as const,
-  }));
+    metadataNumber(metadataRecord(detail.metadata.pdf_parse_profile)?.pageCount)
+  );
 }
 
 function pdfCitationArtifacts(detail: MemoryDetail): PdfPreviewArtifact[] {

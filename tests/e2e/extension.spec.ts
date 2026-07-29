@@ -129,16 +129,14 @@ test("drives Clio extension in a real browser", async () => {
       const providerTest = await page.waitForFunction(
         () => {
           const root = document.querySelector("#clio-toolbox-root")?.shadowRoot;
-          const message = root
-            ?.querySelector("[data-clio-provider-message='true']")
-            ?.textContent?.replace(/\s+/g, " ")
-            .trim();
+          const providerMessage = root?.querySelector("[data-clio-provider-message='true']");
+          const message = providerMessage?.textContent?.replace(/\s+/g, " ").trim();
           if (message === undefined || message === "") return null;
-          if (message === "OpenAI provider saved." || message === "OpenAI selected.") {
-            return null;
-          }
+          if (message === "OpenAI provider saved." || message === "OpenAI selected.") return null;
           return {
-            ok: message === "OpenAI connection works.",
+            ok:
+              providerMessage?.getAttribute("data-clio-provider-message-tone") === "success" &&
+              message === "OpenAI connection works.",
             message,
           };
         },

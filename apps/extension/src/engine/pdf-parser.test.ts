@@ -7,6 +7,18 @@ import {
 } from "./pdf-parser";
 
 describe("pdf parser", () => {
+  it("configures the bundled PDF.js worker before loading a document", async () => {
+    const workerOptions = { workerSrc: "" };
+    const pdfjs = {
+      ...fakePdfJs({ pages: [["Worker-backed PDF"]] }),
+      GlobalWorkerOptions: workerOptions,
+    };
+
+    await parsePdfDocument(new Uint8Array([1, 2, 3]), pdfjs);
+
+    expect(workerOptions.workerSrc).toContain("pdf.worker");
+  });
+
   it("extracts normalized text and page ranges from a PDF.js document", async () => {
     const destroy = vi.fn(async () => undefined);
     const pdfjs = fakePdfJs({
@@ -551,7 +563,8 @@ describe("pdf parser", () => {
     const drawImage = vi.fn();
     const destroy = vi.fn(async () => undefined);
     const pdfjs = {
-      getDocument() {
+      getDocument(input: { data: Uint8Array }) {
+        structuredClone(input.data, { transfer: [input.data.buffer] });
         return {
           promise: Promise.resolve({
             numPages: 2,
@@ -590,8 +603,9 @@ describe("pdf parser", () => {
       },
     };
 
+    const bytes = new Uint8Array([1, 2, 3]);
     const result = await extractPdfFigureVisionImageInput({
-      bytes: new Uint8Array([1, 2, 3]),
+      bytes,
       pageNumber: 2,
       maxWidth: 500,
       maxHeight: 500,
@@ -648,6 +662,7 @@ describe("pdf parser", () => {
     expect(drawImage).toHaveBeenCalledOnce();
     expect(drawImage.mock.calls[0]?.slice(1)).toEqual([0, 189, 34, 61, 0, 0, 34, 61]);
     expect(destroy).toHaveBeenCalledOnce();
+    expect(Array.from(bytes)).toEqual([1, 2, 3]);
   });
 
   it("falls back to bounded page render when bbox crop is unavailable", async () => {

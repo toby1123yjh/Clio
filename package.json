@@ -29,7 +29,8 @@
     "poc:05-worker-cpu": "node poc/run-poc.mjs 05",
     "poc:06-csp": "node poc/run-poc.mjs 06",
     "poc:10-idb-fallback": "node poc/run-poc.mjs 10",
-    "poc:11-pdfjs": "node poc/run-poc.mjs 11"
+    "poc:11-pdfjs": "node poc/run-poc.mjs 11",
+    "poc:local-embedding": "node poc/local-embedding-runtime.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.0",

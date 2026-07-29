@@ -19,6 +19,9 @@
   --clio-warning-background: 47 100% 93%;
   --clio-warning-border: 45 65% 78%;
   --clio-warning-foreground: 39 100% 27%;
+  --clio-success-background: 145 52% 94%;
+  --clio-success-border: 145 43% 70%;
+  --clio-success-foreground: 147 62% 27%;
   --clio-danger: 354 68% 48%;
   color-scheme: light;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -44,6 +47,9 @@
   --clio-warning-background: 47 100% 93%;
   --clio-warning-border: 45 65% 78%;
   --clio-warning-foreground: 39 100% 27%;
+  --clio-success-background: 145 52% 94%;
+  --clio-success-border: 145 43% 70%;
+  --clio-success-foreground: 147 62% 27%;
   --clio-danger: 354 68% 48%;
   color-scheme: light;
 }
@@ -65,6 +71,9 @@
   --clio-warning-background: 38 35% 18%;
   --clio-warning-border: 39 54% 38%;
   --clio-warning-foreground: 42 88% 78%;
+  --clio-success-background: 148 31% 16%;
+  --clio-success-border: 147 38% 35%;
+  --clio-success-foreground: 145 55% 72%;
   --clio-danger: 354 70% 62%;
   color-scheme: dark;
 }
@@ -72,6 +81,10 @@
 .clio-shadow-root,
 .clio-shadow-root * {
   box-sizing: border-box;
+}
+
+.clio-shadow-root {
+  font-size: 16px;
 }
 
 .clio-shadow-root button,
@@ -92,6 +105,132 @@
 .clio-scroll::-webkit-scrollbar-thumb {
   background: hsl(var(--clio-border));
   border-radius: 999px;
+}
+
+[data-clio-knowledge-toolbar="true"] {
+  min-width: 0;
+}
+
+[data-clio-memory-row="true"] {
+  min-width: 0;
+}
+
+[data-clio-memory-menu="true"] {
+  min-width: 0;
+}
+
+@container clio-rail (min-width: 481px) {
+  [data-clio-knowledge-filter-bar="true"] {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+    align-items: end;
+  }
+
+  [data-clio-knowledge-grouping-bar="true"] {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: end;
+  }
+}
+
+@container clio-rail (max-width: 480px) {
+  [data-clio-knowledge-header="true"] {
+    padding-inline: 12px;
+  }
+
+  [data-clio-knowledge-scroll="true"] {
+    padding-inline: 16px;
+  }
+
+  [data-clio-knowledge-actions="true"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  [data-clio-knowledge-upload-action="true"] {
+    grid-column: 1 / -1;
+  }
+
+  [data-clio-responsive-grid="stack"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  [data-clio-responsive-grid="stack"] > * {
+    min-width: 0;
+    overflow: visible;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
+  [data-clio-responsive-col-span="full"] {
+    grid-column: auto;
+  }
+
+  [data-clio-responsive-row="wrap"] {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  [data-clio-responsive-row="wrap"] > :first-child {
+    flex: 1 1 160px;
+  }
+
+  [data-clio-memory-title="true"],
+  [data-clio-memory-snippet="true"] {
+    display: block;
+    overflow: visible;
+    -webkit-box-orient: initial;
+    -webkit-line-clamp: initial;
+  }
+
+  [data-clio-knowledge-filter-bar="true"] > label,
+  [data-clio-knowledge-filter-bar="true"] > button {
+    min-width: min(140px, 100%);
+  }
+
+  [data-clio-knowledge-grouping-bar="true"] > label {
+    min-width: min(140px, 100%);
+  }
+
+  [data-clio-memory-row="true"] [data-clio-memory-title="true"],
+  [data-clio-memory-row="true"] [data-clio-memory-snippet="true"] {
+    overflow-wrap: anywhere;
+  }
+}
+
+@container clio-rail (max-width: 380px) {
+  [data-clio-knowledge-title="true"] {
+    font-size: 16px;
+    line-height: 22px;
+  }
+
+  [data-clio-knowledge-scroll="true"] {
+    padding-inline: 12px;
+  }
+
+  [data-clio-knowledge-actions="true"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  [data-clio-knowledge-upload-action="true"] {
+    grid-column: auto;
+  }
+
+  [data-clio-knowledge-toolbar-controls="true"] {
+    gap: 6px;
+  }
+
+  [data-clio-memory-actions="true"] {
+    justify-content: flex-start;
+  }
+
+  [data-clio-memory-row="true"] {
+    border-radius: 6px;
+  }
+
+  [data-clio-pdf-header="true"] {
+    padding-inline: 10px;
+  }
 }
 
 .clio-thinking-indicator {

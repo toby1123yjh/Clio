@@ -3,6 +3,11 @@ declare module "*.wasm?url" {
   export default url;
 }
 
+declare module "*.mjs?url" {
+  const url: string;
+  export default url;
+}
+
 declare module "*?worker&url" {
   const url: string;
   export default url;

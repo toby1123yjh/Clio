@@ -7,16 +7,18 @@ import {
   isCitationValidationResult,
 } from "@/src/agent-runtime/citation-validator";
 import {
-  type EmbeddingProviderId,
-  type EmbeddingProviderSettings,
-  type EmbeddingProviderTestResult,
-  type SaveEmbeddingProviderSettingsInput,
-  isEmbeddingProviderId,
-} from "@/src/agent-runtime/embedding-provider-settings";
+  type EmbeddingReindexProviderId,
+  type EmbeddingRuntimeProviderId,
+  isEmbeddingReindexProviderId,
+} from "@/src/agent-runtime/embedding-provider-ids";
 import type {
   FigureVisionAnalysisInput,
   FigureVisionAnalysisResult,
 } from "@/src/agent-runtime/figure-vision-analyzer";
+import type {
+  GraphExtractionInput,
+  GraphExtractionResult,
+} from "@/src/agent-runtime/graph-extractor";
 import type {
   ImageGenerationSettings,
   SaveImageGenerationSettingsInput,
@@ -48,9 +50,16 @@ import {
   type VisionProviderSettings,
   isVisionProviderId,
 } from "@/src/agent-runtime/vision-provider-settings";
+import {
+  type LocalEmbeddingModelRequest,
+  type LocalEmbeddingModelResult,
+  type LocalEmbeddingPurpose,
+  isLocalEmbeddingModelRequest,
+} from "@/src/local-embedding/contracts";
 
 export const CLIO_ENGINE_REQUEST = "clio:engine:request";
 export const CLIO_OFFSCREEN_REQUEST = "clio:offscreen:request";
+export const CLIO_LOCAL_EMBEDDING_REQUEST = "clio:local-embedding:request";
 export const CLIO_WORKER_REQUEST = "clio:worker:request";
 export const CLIO_WORKER_RESPONSE = "clio:worker:response";
 export const CLIO_WORKER_EMBEDDING_REQUEST = "clio:worker:embedding:request";
@@ -59,6 +68,8 @@ export const CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST = "clio:worker:chunk-meta-su
 export const CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE = "clio:worker:chunk-meta-summary:response";
 export const CLIO_WORKER_VISION_ANALYSIS_REQUEST = "clio:worker:vision-analysis:request";
 export const CLIO_WORKER_VISION_ANALYSIS_RESPONSE = "clio:worker:vision-analysis:response";
+export const CLIO_WORKER_GRAPH_EXTRACTION_REQUEST = "clio:worker:graph-extraction:request";
+export const CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE = "clio:worker:graph-extraction:response";
 export const CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST = "clio:kb-cluster-label-refinement:request";
 export const CLIO_CONTENT_COMMAND = "clio:content:command";
 export const CLIO_PROVIDER_REQUEST = "clio:provider:request";
@@ -305,22 +316,27 @@ export type KnowledgeBaseClusterBy =
   | "none"
   | "semantic"
   | "topic"
+  | "graph"
   | "year"
   | "venue"
   | "source_type";
 export type KnowledgeBaseClusterGranularity = "coarse" | "medium" | "fine";
 export type KnowledgeBaseEngineClusterBy = Exclude<KnowledgeBaseClusterBy, "none">;
 export type KnowledgeBaseSemanticClusterBackend = "auto" | "embedding" | "metadata";
-export type KnowledgeBaseClusterTraceBackend = "embedding" | "metadata";
+export type KnowledgeBaseClusterTraceBackend = "embedding" | "metadata" | "graph";
 export type KnowledgeBaseClusterTraceMethod =
   | "kmeans_meta_embedding"
   | "metadata_fallback"
-  | "metadata_topic_label";
+  | "metadata_topic_label"
+  | "graph_entity_affinity";
 export type KnowledgeBaseSemanticClusterFallbackReason =
   | "metadata_backend_selected"
   | "embedding_model_unavailable"
   | "insufficient_embeddings"
   | "invalid_embeddings";
+export type KnowledgeBaseClusterFallbackReason =
+  | KnowledgeBaseSemanticClusterFallbackReason
+  | "no_graph_signal";
 
 export interface KnowledgeBaseClusteringOptions {
   clusterBy: KnowledgeBaseEngineClusterBy;
@@ -335,7 +351,8 @@ export interface KnowledgeBaseSourceClusterTrace {
   backend: KnowledgeBaseClusterTraceBackend;
   method: KnowledgeBaseClusterTraceMethod;
   vectorCount?: number;
-  fallbackReason?: KnowledgeBaseSemanticClusterFallbackReason;
+  graphEdgeCount?: number;
+  fallbackReason?: KnowledgeBaseClusterFallbackReason;
   labelRefinement?: {
     status: "refined" | "unavailable" | "error";
     method: "provider_llm";
@@ -356,8 +373,11 @@ export interface KnowledgeBaseSourceCluster {
   trace?: KnowledgeBaseSourceClusterTrace;
 }
 
+export type KnowledgeBaseSearchMode = "exact" | "semantic";
+
 export interface SearchKnowledgeBasePayload {
   query: string;
+  mode?: KnowledgeBaseSearchMode;
   limit?: number;
   includeChunks?: number;
   filter?: RetrieveSourcesFilter;
@@ -376,7 +396,14 @@ export interface KnowledgeBaseExpansionTrace {
   status: "used" | "skipped";
   terms: string[];
   termSources?: KnowledgeBaseExpansionTermTrace[];
-  reason?: "empty_query" | "filter_no_match" | "no_terms" | "expanded_query_empty";
+  reason?:
+    | "empty_query"
+    | "filter_no_match"
+    | "direct_matches"
+    | "exact_mode"
+    | "semantic_mode"
+    | "no_terms"
+    | "expanded_query_empty";
   expandedQuery?: string;
   originalItemCount?: number;
   expandedItemCount?: number;
@@ -948,7 +975,7 @@ export interface GraphEvidenceAnchor {
 
 export interface BuildSourceGraphPayload {
   sourceId: string;
-  mode?: "deterministic";
+  mode?: "deterministic" | "llm";
 }
 
 export interface BuildSourceGraphResult {
@@ -956,8 +983,19 @@ export interface BuildSourceGraphResult {
   nodeCount: number;
   edgeCount: number;
   evidenceChunkCount: number;
+  requestedMode?: "deterministic" | "llm";
+  appliedMode?: "deterministic" | "llm";
+  deterministicEdgeCount?: number;
+  citationEdgeCount?: number;
+  llmEdgeCount?: number;
+  fallbackReason?: string;
   skipped?: boolean;
   reason?: string;
+}
+
+export interface EnqueueSourceGraphJobPayload {
+  sourceId: string;
+  mode: "deterministic" | "llm";
 }
 
 export interface GraphNeighborsPayload {
@@ -1026,6 +1064,15 @@ export interface CapturePdfPayload {
   sourceUrl: string;
   sourceTitle: string;
   bytes: ArrayBuffer | Uint8Array;
+  capturedAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CapturePdfTransportPayload {
+  sourceUrl: string;
+  sourceTitle: string;
+  bytesBase64: string;
+  byteLength: number;
   capturedAt?: string;
   metadata?: Record<string, unknown>;
 }
@@ -1099,6 +1146,9 @@ export interface JobSummary {
   status: JobStatus;
   attempts: number;
   maxAttempts: number;
+  progressCurrent: number;
+  progressTotal: number;
+  cancelRequested: boolean;
   lastError?: string;
   createdAt: string;
   startedAt?: string;
@@ -1443,7 +1493,7 @@ export interface UpdateChatMessagePayload {
 
 export interface EmbeddingReindexModelDescriptor {
   id: string;
-  provider: EmbeddingProviderId;
+  provider: EmbeddingReindexProviderId;
   label: string;
   dimension: number;
   metric: "cosine";
@@ -1451,7 +1501,7 @@ export interface EmbeddingReindexModelDescriptor {
 
 export interface ActiveEmbeddingModelSummary {
   id: string;
-  provider: string;
+  provider: EmbeddingRuntimeProviderId;
   label: string;
   dimension: number;
   metric: "cosine";
@@ -1526,6 +1576,7 @@ export type EngineRequest =
   | { kind: "failWikiCompileJob"; id: string; error: string; retryAfter?: string; now?: string }
   | { kind: "listTopicGraphEdges"; topicId: string; edgeKind?: TopicGraphEdgeKind }
   | { kind: "buildSourceGraph"; payload: BuildSourceGraphPayload }
+  | { kind: "enqueueSourceGraphJob"; payload: EnqueueSourceGraphJobPayload }
   | { kind: "queryGraphNeighbors"; payload: GraphNeighborsPayload }
   | { kind: "queryGraphSubgraph"; payload: GraphSubgraphPayload }
   | { kind: "queryGraphPath"; payload: GraphPathPayload }
@@ -1534,6 +1585,7 @@ export type EngineRequest =
   | { kind: "getActiveEmbeddingModel" }
   | { kind: "getJobStatus"; status?: JobStatus; limit?: number }
   | { kind: "runJob"; id: string }
+  | { kind: "cancelJob"; id: string }
   | { kind: "createOrchestrationRun"; payload: CreateOrchestrationRunPayload }
   | { kind: "listOrchestrationRuns"; filter?: OrchestrationRunFilter }
   | { kind: "runOrchestration"; id: string }
@@ -1545,6 +1597,7 @@ export type EngineRequest =
   | { kind: "clearChunkMetaTier2Audit"; filter: ChunkMetaTier2AuditFilter }
   | { kind: "reindex"; scope: "fts" }
   | { kind: "reindex"; scope: "embeddings"; model: EmbeddingReindexModelDescriptor }
+  | { kind: "enqueueEmbeddingReindex"; model: EmbeddingReindexModelDescriptor }
   | { kind: "resolveAnchor"; memoryId: string }
   | { kind: "createChatSession"; payload: CreateChatSessionPayload }
   | { kind: "listChatSessions"; limit?: number }
@@ -1568,6 +1621,10 @@ export type EngineRequest =
   | { kind: "listImageGenerationHistory"; limit?: number }
   | { kind: "appendImageGenerationHistory"; payload: ImageGenerationHistoryRecord }
   | { kind: "deleteImageGenerationHistory"; id: string };
+
+export type EngineTransportRequest =
+  | Exclude<EngineRequest, { kind: "capturePdf" }>
+  | { kind: "capturePdf"; payload: CapturePdfTransportPayload };
 
 export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health" }
   ? EngineHealth
@@ -1739,7 +1796,9 @@ export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health
                                                                                       : T extends {
                                                                                             kind:
                                                                                               | "runJob"
-                                                                                              | "enqueueChunkMetaTier2Job";
+                                                                                              | "cancelJob"
+                                                                                              | "enqueueChunkMetaTier2Job"
+                                                                                              | "enqueueSourceGraphJob";
                                                                                           }
                                                                                         ? JobSummary
                                                                                         : T extends {
@@ -1755,7 +1814,9 @@ export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health
                                                                                                 cleared: number;
                                                                                               }
                                                                                             : T extends {
-                                                                                                  kind: "reindex";
+                                                                                                  kind:
+                                                                                                    | "reindex"
+                                                                                                    | "enqueueEmbeddingReindex";
                                                                                                 }
                                                                                               ? ReindexResult
                                                                                               : T extends {
@@ -1900,15 +1961,7 @@ export type ProviderRequest =
       provider?: Exclude<VisionProviderId, "auto">;
       baseUrl?: string;
     }
-  | { kind: "getEmbeddingProviderSettings" }
-  | { kind: "saveEmbeddingProviderSettings"; settings: SaveEmbeddingProviderSettingsInput }
-  | { kind: "testEmbeddingProvider"; settings?: SaveEmbeddingProviderSettingsInput }
-  | { kind: "authorizeEmbeddingReindex" }
-  | {
-      kind: "ensureEmbeddingProviderHostPermission";
-      provider?: EmbeddingProviderId;
-      baseUrl?: string;
-    };
+  | LocalEmbeddingModelRequest;
 
 export type ProviderConfigRequest = { kind: "readActiveProviderConfig" };
 
@@ -1922,49 +1975,40 @@ export type UiResultFor<T extends UiRequest> = T extends { kind: "openOptions" }
   ? { opened: true }
   : never;
 
-export type ProviderResultFor<T extends ProviderRequest> = T extends {
-  kind:
-    | "getProviderSettings"
-    | "saveGeminiProvider"
-    | "ensureGeminiHostPermission"
-    | "saveOpenAIProvider"
-    | "ensureOpenAIHostPermission"
-    | "saveOpenAICompatibleProvider"
-    | "ensureOpenAICompatibleHostPermission"
-    | "setActiveProvider";
-}
-  ? ProviderSettings
-  : T extends { kind: "getSearchProviderSettings" | "saveSearchProviderSettings" }
-    ? SearchProviderSettings
-    : T extends { kind: "getImageGenerationSettings" | "saveImageGenerationSettings" }
-      ? ImageGenerationSettings
-      : T extends { kind: "ensureImageGenerationHostPermission" }
-        ? ProviderSettings
-        : T extends {
-              kind: "getVisionProviderSettings" | "saveVisionProviderSettings";
-            }
-          ? VisionProviderSettings
-          : T extends { kind: "ensureVisionProviderHostPermission" }
-            ? ProviderSettings
-            : T extends {
-                  kind:
-                    | "getEmbeddingProviderSettings"
-                    | "saveEmbeddingProviderSettings"
-                    | "ensureEmbeddingProviderHostPermission";
-                }
-              ? EmbeddingProviderSettings
-              : T extends { kind: "testEmbeddingProvider" }
-                ? EmbeddingProviderTestResult
-                : T extends { kind: "authorizeEmbeddingReindex" }
-                  ? ReindexResult
-                  : T extends {
-                        kind:
-                          | "testGeminiProvider"
-                          | "testOpenAIProvider"
-                          | "testOpenAICompatibleProvider";
-                      }
-                    ? TestProviderResult
-                    : never;
+export type ProviderResultFor<T extends ProviderRequest> = T extends LocalEmbeddingModelRequest
+  ? LocalEmbeddingModelResult
+  : T extends {
+        kind:
+          | "getProviderSettings"
+          | "saveGeminiProvider"
+          | "ensureGeminiHostPermission"
+          | "saveOpenAIProvider"
+          | "ensureOpenAIHostPermission"
+          | "saveOpenAICompatibleProvider"
+          | "ensureOpenAICompatibleHostPermission"
+          | "setActiveProvider";
+      }
+    ? ProviderSettings
+    : T extends { kind: "getSearchProviderSettings" | "saveSearchProviderSettings" }
+      ? SearchProviderSettings
+      : T extends { kind: "getImageGenerationSettings" | "saveImageGenerationSettings" }
+        ? ImageGenerationSettings
+        : T extends { kind: "ensureImageGenerationHostPermission" }
+          ? ProviderSettings
+          : T extends {
+                kind: "getVisionProviderSettings" | "saveVisionProviderSettings";
+              }
+            ? VisionProviderSettings
+            : T extends { kind: "ensureVisionProviderHostPermission" }
+              ? ProviderSettings
+              : T extends {
+                    kind:
+                      | "testGeminiProvider"
+                      | "testOpenAIProvider"
+                      | "testOpenAICompatibleProvider";
+                  }
+                ? TestProviderResult
+                : never;
 
 export type ProviderResponse<T = unknown> = EngineResponse<T>;
 
@@ -1972,12 +2016,12 @@ export type UiResponse<T = unknown> = EngineResponse<T>;
 
 export interface EngineRequestMessage {
   type: typeof CLIO_ENGINE_REQUEST;
-  request: EngineRequest;
+  request: EngineTransportRequest;
 }
 
 export interface OffscreenRequestMessage {
   type: typeof CLIO_OFFSCREEN_REQUEST;
-  request: EngineRequest;
+  request: EngineTransportRequest;
 }
 
 export interface WorkerRequestMessage {
@@ -1994,7 +2038,14 @@ export interface WorkerResponseMessage {
 
 export interface WorkerEmbeddingRequest {
   modelId: string;
+  provider: EmbeddingReindexProviderId;
+  purpose: LocalEmbeddingPurpose;
   inputs: string[];
+}
+
+export interface LocalEmbeddingModelRequestMessage {
+  type: typeof CLIO_LOCAL_EMBEDDING_REQUEST;
+  request: LocalEmbeddingModelRequest;
 }
 
 export interface WorkerEmbeddingRequestMessage {
@@ -2035,6 +2086,20 @@ export interface WorkerVisionAnalysisResponseMessage {
   type: typeof CLIO_WORKER_VISION_ANALYSIS_RESPONSE;
   requestId: string;
   response: EngineResponse<FigureVisionAnalysisResult>;
+}
+
+export type WorkerGraphExtractionRequest = GraphExtractionInput;
+
+export interface WorkerGraphExtractionRequestMessage {
+  type: typeof CLIO_WORKER_GRAPH_EXTRACTION_REQUEST;
+  requestId: string;
+  request: WorkerGraphExtractionRequest;
+}
+
+export interface WorkerGraphExtractionResponseMessage {
+  type: typeof CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE;
+  requestId: string;
+  response: EngineResponse<GraphExtractionResult>;
 }
 
 export type KnowledgeBaseClusterLabelRefinementRequest = KnowledgeBaseClusterLabelRefinementInput;
@@ -2221,12 +2286,90 @@ export function createRequestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+export function encodeEngineRequestForChrome(request: EngineRequest): EngineTransportRequest {
+  if (request.kind !== "capturePdf") return request;
+  const { bytes, ...payload } = request.payload;
+  const normalizedBytes = pdfBytesToUint8Array(bytes);
+  return {
+    kind: "capturePdf",
+    payload: {
+      ...payload,
+      bytesBase64: encodeBytesBase64(normalizedBytes),
+      byteLength: normalizedBytes.byteLength,
+    },
+  };
+}
+
+export function decodeEngineRequestFromChrome(request: EngineTransportRequest): EngineRequest {
+  if (request.kind !== "capturePdf") return request;
+  const { bytesBase64, byteLength, ...payload } = request.payload;
+  const bytes = decodeBytesBase64(bytesBase64);
+  if (bytes.byteLength !== byteLength) {
+    throw new EngineRpcError(
+      "PDF_TRANSPORT_LENGTH_MISMATCH",
+      "PDF upload bytes were truncated while crossing the extension message boundary.",
+    );
+  }
+  return {
+    kind: "capturePdf",
+    payload: { ...payload, bytes },
+  };
+}
+
+export function encodeEngineResponseForChrome(
+  request: EngineRequest,
+  response: EngineResponse,
+): EngineResponse {
+  if (request.kind !== "getPdfRawFile" || !response.ok) return response;
+  const value = response.value as PdfRawFileResult;
+  const { bytes, ...result } = value;
+  const normalizedBytes = pdfBytesToUint8Array(bytes);
+  return {
+    ok: true,
+    value: {
+      ...result,
+      bytesBase64: encodeBytesBase64(normalizedBytes),
+    },
+  };
+}
+
+export function decodeEngineResponseFromChrome<T>(
+  request: EngineRequest,
+  response: EngineResponse<T> | null | undefined,
+): EngineResponse<T> | null | undefined {
+  if (request.kind !== "getPdfRawFile" || response === null || response === undefined) {
+    return response;
+  }
+  if (!response.ok) return response;
+  const value = response.value as Record<string, unknown>;
+  if (typeof value.bytesBase64 !== "string") {
+    throw new EngineRpcError(
+      "PDF_TRANSPORT_RESPONSE_INVALID",
+      "Raw PDF bytes were not returned in a browser-readable format.",
+    );
+  }
+  const { bytesBase64, ...result } = value;
+  return {
+    ok: true,
+    value: {
+      ...result,
+      bytes: decodeBytesBase64(bytesBase64),
+    } as T,
+  };
+}
+
 export function isEngineRequestMessage(value: unknown): value is EngineRequestMessage {
-  return isRecord(value) && value.type === CLIO_ENGINE_REQUEST && isEngineRequest(value.request);
+  return (
+    isRecord(value) && value.type === CLIO_ENGINE_REQUEST && isEngineTransportRequest(value.request)
+  );
 }
 
 export function isOffscreenRequestMessage(value: unknown): value is OffscreenRequestMessage {
-  return isRecord(value) && value.type === CLIO_OFFSCREEN_REQUEST && isEngineRequest(value.request);
+  return (
+    isRecord(value) &&
+    value.type === CLIO_OFFSCREEN_REQUEST &&
+    isEngineTransportRequest(value.request)
+  );
 }
 
 export function isWorkerRequestMessage(value: unknown): value is WorkerRequestMessage {
@@ -2255,6 +2398,16 @@ export function isWorkerEmbeddingRequestMessage(
     value.type === CLIO_WORKER_EMBEDDING_REQUEST &&
     typeof value.requestId === "string" &&
     isWorkerEmbeddingRequest(value.request)
+  );
+}
+
+export function isLocalEmbeddingModelRequestMessage(
+  value: unknown,
+): value is LocalEmbeddingModelRequestMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_LOCAL_EMBEDDING_REQUEST &&
+    isLocalEmbeddingModelRequest(value.request)
   );
 }
 
@@ -2310,6 +2463,28 @@ export function isWorkerVisionAnalysisResponseMessage(
     value.type === CLIO_WORKER_VISION_ANALYSIS_RESPONSE &&
     typeof value.requestId === "string" &&
     isFigureVisionAnalysisResponse(value.response)
+  );
+}
+
+export function isWorkerGraphExtractionRequestMessage(
+  value: unknown,
+): value is WorkerGraphExtractionRequestMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_GRAPH_EXTRACTION_REQUEST &&
+    typeof value.requestId === "string" &&
+    isWorkerGraphExtractionRequest(value.request)
+  );
+}
+
+export function isWorkerGraphExtractionResponseMessage(
+  value: unknown,
+): value is WorkerGraphExtractionResponseMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE &&
+    typeof value.requestId === "string" &&
+    isGraphExtractionResponse(value.response)
   );
 }
 
@@ -2506,9 +2681,21 @@ export function isImageGenerationRunEventMessage(
   );
 }
 
-export function unwrapEngineResponse<T>(response: EngineResponse<T>): T {
+export function unwrapEngineResponse<T>(response: EngineResponse<T> | null | undefined): T {
+  if (response === null || response === undefined) {
+    throw new EngineRpcError(
+      "RPC_RESPONSE_MISSING",
+      "Clio background did not return a response. Reload the extension and refresh this page.",
+    );
+  }
   if (response.ok) return response.value;
   throw new EngineRpcError(response.error.code, response.error.message, response.error.detail);
+}
+
+function isEngineTransportRequest(value: unknown): value is EngineTransportRequest {
+  if (!isRecord(value) || typeof value.kind !== "string") return false;
+  if (value.kind === "capturePdf") return isCapturePdfTransportPayload(value.payload);
+  return isEngineRequest(value);
 }
 
 function isEngineRequest(value: unknown): value is EngineRequest {
@@ -2638,6 +2825,8 @@ function isEngineRequest(value: unknown): value is EngineRequest {
       );
     case "buildSourceGraph":
       return isBuildSourceGraphPayload(value.payload);
+    case "enqueueSourceGraphJob":
+      return isEnqueueSourceGraphJobPayload(value.payload);
     case "queryGraphNeighbors":
       return isGraphNeighborsPayload(value.payload);
     case "queryGraphSubgraph":
@@ -2656,6 +2845,7 @@ function isEngineRequest(value: unknown): value is EngineRequest {
         (value.limit === undefined || typeof value.limit === "number")
       );
     case "runJob":
+    case "cancelJob":
       return typeof value.id === "string";
     case "createOrchestrationRun":
       return isCreateOrchestrationRunPayload(value.payload);
@@ -2680,6 +2870,8 @@ function isEngineRequest(value: unknown): value is EngineRequest {
       if (value.scope === "fts") return true;
       if (value.scope === "embeddings") return isEmbeddingReindexModelDescriptor(value.model);
       return false;
+    case "enqueueEmbeddingReindex":
+      return isEmbeddingReindexModelDescriptor(value.model);
     case "resolveAnchor":
       return typeof value.memoryId === "string";
     case "createChatSession":
@@ -2762,12 +2954,62 @@ function isCapturePdfPayload(value: unknown): value is CapturePdfPayload {
   );
 }
 
+function isCapturePdfTransportPayload(value: unknown): value is CapturePdfTransportPayload {
+  return (
+    isRecord(value) &&
+    typeof value.sourceUrl === "string" &&
+    typeof value.sourceTitle === "string" &&
+    typeof value.bytesBase64 === "string" &&
+    value.bytesBase64.length > 0 &&
+    typeof value.byteLength === "number" &&
+    Number.isInteger(value.byteLength) &&
+    value.byteLength > 0
+  );
+}
+
 function isPdfBytes(value: unknown): value is ArrayBuffer | Uint8Array {
   return (
     value instanceof Uint8Array ||
     value instanceof ArrayBuffer ||
     Object.prototype.toString.call(value) === "[object ArrayBuffer]"
   );
+}
+
+function pdfBytesToUint8Array(bytes: ArrayBuffer | Uint8Array): Uint8Array {
+  if (bytes instanceof Uint8Array) return new Uint8Array(bytes);
+  return new Uint8Array(bytes.slice(0));
+}
+
+function encodeBytesBase64(bytes: Uint8Array): string {
+  const chunkSize = 24_576;
+  let encoded = "";
+  for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+    const end = Math.min(offset + chunkSize, bytes.byteLength);
+    let binary = "";
+    for (let index = offset; index < end; index += 1) {
+      binary += String.fromCharCode(bytes[index] ?? 0);
+    }
+    encoded += btoa(binary);
+  }
+  return encoded;
+}
+
+function decodeBytesBase64(encoded: string): Uint8Array {
+  let binary: string;
+  try {
+    binary = atob(encoded);
+  } catch (error) {
+    throw new EngineRpcError(
+      "PDF_TRANSPORT_BASE64_INVALID",
+      "PDF upload bytes were corrupted while crossing the extension message boundary.",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 function isGetMemoryEvidenceWindowsPayload(
@@ -3160,6 +3402,7 @@ function isSearchKnowledgeBasePayload(value: unknown): value is SearchKnowledgeB
   return (
     isRecord(value) &&
     typeof value.query === "string" &&
+    (value.mode === undefined || value.mode === "exact" || value.mode === "semantic") &&
     (value.limit === undefined || typeof value.limit === "number") &&
     (value.includeChunks === undefined || typeof value.includeChunks === "number") &&
     (value.filter === undefined || isRetrieveSourcesFilter(value.filter)) &&
@@ -3192,6 +3435,7 @@ function isKnowledgeBaseEngineClusterBy(value: unknown): value is KnowledgeBaseE
   return (
     value === "semantic" ||
     value === "topic" ||
+    value === "graph" ||
     value === "year" ||
     value === "venue" ||
     value === "source_type"
@@ -3369,7 +3613,16 @@ function isBuildSourceGraphPayload(value: unknown): value is BuildSourceGraphPay
   return (
     isRecord(value) &&
     typeof value.sourceId === "string" &&
-    (value.mode === undefined || value.mode === "deterministic")
+    (value.mode === undefined || value.mode === "deterministic" || value.mode === "llm")
+  );
+}
+
+function isEnqueueSourceGraphJobPayload(value: unknown): value is EnqueueSourceGraphJobPayload {
+  return (
+    isRecord(value) &&
+    typeof value.sourceId === "string" &&
+    value.sourceId.trim().length > 0 &&
+    (value.mode === "deterministic" || value.mode === "llm")
   );
 }
 
@@ -3658,6 +3911,7 @@ function isContentCommand(value: unknown): value is ContentCommand {
 
 function isProviderRequest(value: unknown): value is ProviderRequest {
   if (!isRecord(value) || typeof value.kind !== "string") return false;
+  if (isLocalEmbeddingModelRequest(value)) return true;
   switch (value.kind) {
     case "getProviderSettings":
     case "ensureGeminiHostPermission":
@@ -3733,19 +3987,6 @@ function isProviderRequest(value: unknown): value is ProviderRequest {
           value.provider === "gemini" ||
           value.provider === "openai" ||
           value.provider === "openai-compatible") &&
-        (value.baseUrl === undefined || typeof value.baseUrl === "string")
-      );
-    case "getEmbeddingProviderSettings":
-      return true;
-    case "saveEmbeddingProviderSettings":
-      return isSaveEmbeddingProviderSettingsInput(value.settings);
-    case "testEmbeddingProvider":
-      return value.settings === undefined || isSaveEmbeddingProviderSettingsInput(value.settings);
-    case "authorizeEmbeddingReindex":
-      return !("apiKey" in value);
-    case "ensureEmbeddingProviderHostPermission":
-      return (
-        (value.provider === undefined || isEmbeddingProviderId(value.provider)) &&
         (value.baseUrl === undefined || typeof value.baseUrl === "string")
       );
     default:
@@ -4160,37 +4401,6 @@ function isVisionOpenAICompatibleSettingsInput(value: unknown) {
   );
 }
 
-function isSaveEmbeddingProviderSettingsInput(
-  value: unknown,
-): value is SaveEmbeddingProviderSettingsInput {
-  return (
-    isRecord(value) &&
-    (value.activeProvider === undefined || isEmbeddingProviderId(value.activeProvider)) &&
-    (value.openai === undefined || isEmbeddingOpenAISettingsInput(value.openai)) &&
-    (value.openaiCompatible === undefined ||
-      isEmbeddingOpenAICompatibleSettingsInput(value.openaiCompatible))
-  );
-}
-
-function isEmbeddingOpenAISettingsInput(value: unknown): value is Record<string, unknown> {
-  return (
-    isRecord(value) &&
-    (value.apiKey === undefined || typeof value.apiKey === "string") &&
-    (value.model === undefined || typeof value.model === "string") &&
-    (value.baseUrl === undefined || typeof value.baseUrl === "string") &&
-    (value.dimension === undefined || typeof value.dimension === "number") &&
-    (value.lastTestAt === undefined || typeof value.lastTestAt === "string") &&
-    (value.lastError === undefined || typeof value.lastError === "string")
-  );
-}
-
-function isEmbeddingOpenAICompatibleSettingsInput(value: unknown) {
-  return (
-    isEmbeddingOpenAISettingsInput(value) &&
-    (value.providerName === undefined || typeof value.providerName === "string")
-  );
-}
-
 function isAgentToolTrace(value: unknown) {
   return (
     isRecord(value) &&
@@ -4257,6 +4467,8 @@ function isWorkerEmbeddingRequest(value: unknown): value is WorkerEmbeddingReque
     isRecord(value) &&
     typeof value.modelId === "string" &&
     value.modelId.length > 0 &&
+    isEmbeddingReindexProviderId(value.provider) &&
+    (value.purpose === "query" || value.purpose === "document") &&
     !("apiKey" in value) &&
     Array.isArray(value.inputs) &&
     value.inputs.length > 0 &&
@@ -4318,6 +4530,49 @@ function isWorkerVisionAnalysisRequest(value: unknown): value is WorkerVisionAna
     !("apiKey" in value) &&
     !("pdfBytes" in value) &&
     !("fullText" in value)
+  );
+}
+
+const forbiddenWorkerGraphExtractionFields = [
+  "apiKey",
+  "fullText",
+  "normalizedText",
+  "pdfBytes",
+  "rawBytes",
+  "rawProviderResponse",
+] as const;
+
+function hasForbiddenWorkerGraphExtractionField(value: Record<string, unknown>) {
+  return forbiddenWorkerGraphExtractionFields.some((field) => field in value);
+}
+
+function isWorkerGraphExtractionRequest(value: unknown): value is WorkerGraphExtractionRequest {
+  return (
+    isRecord(value) &&
+    !hasForbiddenWorkerGraphExtractionField(value) &&
+    typeof value.sourceId === "string" &&
+    value.sourceId.length > 0 &&
+    (value.sourceTitle === undefined || typeof value.sourceTitle === "string") &&
+    (value.sourceType === undefined || typeof value.sourceType === "string") &&
+    (value.abstract === undefined || typeof value.abstract === "string") &&
+    Array.isArray(value.chunks) &&
+    value.chunks.length > 0 &&
+    value.chunks.length <= 10 &&
+    value.chunks.every(isWorkerGraphExtractionChunk)
+  );
+}
+
+function isWorkerGraphExtractionChunk(value: unknown) {
+  return (
+    isRecord(value) &&
+    !hasForbiddenWorkerGraphExtractionField(value) &&
+    typeof value.chunkId === "string" &&
+    value.chunkId.length > 0 &&
+    typeof value.ord === "number" &&
+    Number.isFinite(value.ord) &&
+    (value.sectionPath === undefined || typeof value.sectionPath === "string") &&
+    typeof value.excerpt === "string" &&
+    value.excerpt.length > 0
   );
 }
 
@@ -4472,6 +4727,65 @@ function isFigureVisionAnalysisResponse(
   );
 }
 
+function isGraphExtractionResponse(value: unknown): value is EngineResponse<GraphExtractionResult> {
+  if (!isRecord(value) || typeof value.ok !== "boolean") return false;
+  if (!value.ok) {
+    return (
+      isRecord(value.error) &&
+      typeof value.error.code === "string" &&
+      typeof value.error.message === "string" &&
+      (value.error.detail === undefined || typeof value.error.detail === "string")
+    );
+  }
+  const result = value.value;
+  return (
+    isRecord(result) &&
+    (result.status === "extracted" ||
+      result.status === "unavailable" ||
+      result.status === "error") &&
+    (result.providerKind === undefined || result.providerKind === "chat") &&
+    Array.isArray(result.entities) &&
+    result.entities.every(isGraphExtractionEntity) &&
+    Array.isArray(result.relations) &&
+    result.relations.every(isGraphExtractionRelation) &&
+    (result.reason === undefined || typeof result.reason === "string")
+  );
+}
+
+function isGraphExtractionEntity(value: unknown) {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    (value.kind === "domain" ||
+      value.kind === "problem" ||
+      value.kind === "method" ||
+      value.kind === "dataset" ||
+      value.kind === "metric") &&
+    typeof value.label === "string" &&
+    typeof value.confidence === "number" &&
+    Number.isFinite(value.confidence) &&
+    value.confidence >= 0 &&
+    value.confidence <= 1
+  );
+}
+
+function isGraphExtractionRelation(value: unknown) {
+  return (
+    isRecord(value) &&
+    typeof value.sourceEntityId === "string" &&
+    typeof value.targetEntityId === "string" &&
+    (value.dimension === "domain" || value.dimension === "technical") &&
+    typeof value.edgeType === "string" &&
+    typeof value.confidence === "number" &&
+    Number.isFinite(value.confidence) &&
+    value.confidence >= 0 &&
+    value.confidence <= 1 &&
+    Array.isArray(value.evidenceChunkIds) &&
+    value.evidenceChunkIds.length > 0 &&
+    value.evidenceChunkIds.every((item) => typeof item === "string")
+  );
+}
+
 function isFigureVisionClaim(value: unknown) {
   return (
     isRecord(value) &&
@@ -4529,7 +4843,7 @@ function isEmbeddingReindexModelDescriptor(
     isRecord(value) &&
     typeof value.id === "string" &&
     value.id.length > 0 &&
-    isEmbeddingProviderId(value.provider) &&
+    isEmbeddingReindexProviderId(value.provider) &&
     typeof value.label === "string" &&
     value.label.length > 0 &&
     typeof value.dimension === "number" &&

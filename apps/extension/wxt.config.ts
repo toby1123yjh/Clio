@@ -1,7 +1,14 @@
 import { existsSync, readFileSync } from "node:fs";
 import { defineConfig } from "wxt";
+import { loadLocalTestWorkspaceBuildInput } from "./test-workspace-build";
 
 const sqliteOpfsProxyAsset = "assets/sqlite3-opfs-async-proxy.js";
+const onnxRuntimeAssets = [
+  "ort-wasm-simd-threaded.mjs",
+  "ort-wasm-simd-threaded.wasm",
+  "ort-wasm-simd-threaded.jsep.mjs",
+  "ort-wasm-simd-threaded.jsep.wasm",
+] as const;
 const sqliteOpfsProxySource = fileUrlPath(
   new URL(
     "./node_modules/@sqlite.org/sqlite-wasm/dist/sqlite3-opfs-async-proxy.js",
@@ -12,6 +19,9 @@ const localEnv = loadLocalEnvFiles([
   fileUrlPath(new URL("../../.env.local", import.meta.url)),
   fileUrlPath(new URL("./.env.local", import.meta.url)),
 ]);
+const localTestWorkspace = loadLocalTestWorkspaceBuildInput(
+  fileUrlPath(new URL("../../test-workspace.local.json", import.meta.url)),
+);
 const defaultOpenAIApiKey =
   process.env.VITE_CLIO_OPENAI_API_KEY ??
   localEnv.VITE_CLIO_OPENAI_API_KEY ??
@@ -116,6 +126,15 @@ export default defineConfig({
         absoluteSrc: sqliteOpfsProxySource,
         relativeDest: sqliteOpfsProxyAsset,
       });
+      for (const asset of onnxRuntimeAssets) {
+        files.push({
+          absoluteSrc: fileUrlPath(
+            new URL(`./node_modules/onnxruntime-web/dist/${asset}`, import.meta.url),
+          ),
+          relativeDest: `assets/${asset}`,
+        });
+      }
+      for (const asset of localTestWorkspace?.assets ?? []) files.push(asset);
     },
   },
   vite: () => ({
@@ -126,12 +145,16 @@ export default defineConfig({
       __CLIO_DEFAULT_OPENAI_API_KEY__: JSON.stringify(defaultOpenAIApiKey),
       __CLIO_DEFAULT_OPENAI_BASE_URL__: JSON.stringify(defaultOpenAIBaseUrl),
       __CLIO_DEFAULT_OPENAI_MODEL__: JSON.stringify(defaultOpenAIModel),
+      __CLIO_TEST_WORKSPACE_CONFIG__: JSON.stringify(localTestWorkspace?.runtime ?? null),
     },
     optimizeDeps: {
       exclude: ["@sqlite.org/sqlite-wasm"],
       esbuildOptions: {
         charset: "ascii",
       },
+    },
+    worker: {
+      format: "es",
     },
     plugins: [asciiSafeJavaScriptOutputPlugin()],
     server: {

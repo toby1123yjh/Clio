@@ -18,7 +18,7 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 21");
+    expect(workerSource).toContain("const schemaVersion = 22");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
@@ -97,7 +97,7 @@ describe("local engine source-native storage foundation", () => {
     );
   });
 
-  it("defines the local embedding substrate and default model registry", () => {
+  it("defines the local embedding substrate without a synthetic default model", () => {
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS embedding_models");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_embeddings");
     expect(workerSource).toContain("PRIMARY KEY (model_id, target_kind, target_id)");
@@ -110,10 +110,20 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain(
       "CREATE INDEX IF NOT EXISTS idx_source_embeddings_target ON source_embeddings(target_kind, target_id)",
     );
-    expect(workerSource).toContain('modelId: "clio-local-hash-v1"');
-    expect(workerSource).toContain('provider: "local-deterministic"');
-    expect(workerSource).toContain("function ensureDefaultEmbeddingModel(db: SqliteDb)");
-    expect(workerSource).toContain("ensureDefaultEmbeddingModel(db)");
+    expect(workerSource).not.toContain('modelId: "clio-local-hash-v1"');
+    expect(workerSource).not.toContain("function embedLocalDeterministic");
+    expect(workerSource).toContain(
+      "function removeLegacyDeterministicEmbeddingModel(db: SqliteDb)",
+    );
+    expect(workerSource).toContain(
+      "DELETE FROM embedding_models WHERE provider = 'local-deterministic'",
+    );
+    expect(workerSource).toContain("function disableUnsupportedEmbeddingModels(db: SqliteDb)");
+    expect(workerSource).toContain("provider <> 'local-transformers'");
+    expect(workerSource.indexOf("removeLegacyDeterministicEmbeddingModel(db)")).toBeLessThan(
+      workerSource.indexOf("disableUnsupportedEmbeddingModels(db)"),
+    );
+    expect(workerSource).not.toContain("function ensureDefaultEmbeddingModel(db: SqliteDb)");
   });
 
   it("keeps public memory RPC as a facade over source ids", () => {
@@ -136,17 +146,22 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("function runChunkMetaStageForSource");
     expect(workerSource).toContain("function runPdfFigureVisionStageForSource");
     expect(workerSource).toContain("function runEmbeddingStageForSource");
-    expect(workerSource).toContain("function runDeterministicGraphBuildForSource");
+    expect(workerSource).toContain("async function runSourceGraphBuildForSource");
+    expect(workerSource).toContain("function buildCitationGraphForSource");
+    expect(workerSource).toContain("function buildLlmGraphContribution");
     expect(workerSource).toContain("pdfFigureVisionImageExtractor");
     expect(workerSource).toContain("CLIO_WORKER_VISION_ANALYSIS_REQUEST");
     expect(workerSource).toContain("isWorkerVisionAnalysisResponseMessage");
+    expect(workerSource).toContain("CLIO_WORKER_GRAPH_EXTRACTION_REQUEST");
+    expect(workerSource).toContain("isWorkerGraphExtractionResponseMessage");
     expect(workerSource).toContain("pdf_figure_analysis_results");
     expect(workerSource).toContain("private async runQueuedJob");
     expect(workerSource).toContain('case "runJob"');
     expect(workerSource).toContain("function parsePostCaptureHardeningPayload");
     expect(workerSource).toContain('value === "paper_metadata"');
     expect(workerSource).toContain('value === "figure_vision"');
-    expect(workerSource).toContain('graphBuildMode === "deterministic"');
+    expect(workerSource).toContain('payload.graphBuildMode === "deterministic"');
+    expect(workerSource).toContain('payload.graphBuildMode === "llm"');
     expect(workerSource).toContain("function upsertSourceChunkEmbeddings");
     expect(workerSource).toContain("function upsertSourceMetaEmbedding");
     expect(workerSource).toContain("result = await runPostCaptureHardeningJob");
@@ -197,9 +212,10 @@ describe("local engine source-native storage foundation", () => {
     expect(markdownSection).toContain('adapter: "markdown"');
     expect(markdownSection).toContain('return await this.capture("page"');
     expect(pdfSection).toContain("const pdfBytes = normalizePdfBytes(payload.bytes)");
-    expect(pdfSection).toContain("const parsed = await this.pdfParser(pdfBytes)");
+    expect(pdfSection).toContain("const parsed = await this.pdfParser(parserBytes)");
     expect(pdfSection).toContain("pdfCapturePayloadFromParsedDocument");
     expect(pdfSection).toContain("afterSave");
+    expect(pdfSection).toContain("afterDuplicate");
     expect(pdfSection).toContain("persistPdfRawFile");
     expect(pdfSection).toContain("return await this.capture(");
   });
@@ -468,7 +484,7 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("function sourceFilterWhereClause");
     expect(workerSource).toContain("function fuseSourceRetrievalHits");
     expect(workerSource).toContain("function reciprocalRankFusionScore");
-    expect(workerSource).toContain("function embedLocalDeterministic");
+    expect(workerSource).not.toContain("function embedLocalDeterministic");
     expect(workerSource).toContain("function cosineSimilarity");
     expect(workerSource).toContain("function parseEmbeddingVector");
     expect(workerSource).toContain("const defaultRrfK = 60");
@@ -499,10 +515,16 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("private async retrieveSources"),
       workerSource.indexOf("private async search"),
     );
-    expect(retrieveSection).toContain("const metaHits = loadMetaSourceRetrievalHits");
-    expect(retrieveSection).toContain("const vectorMetaResult = await loadVectorMetaRetrievalHits");
+    expect(retrieveSection).toContain('mode: "hybrid" | KnowledgeBaseSearchMode = "hybrid"');
+    expect(retrieveSection).toContain('const useLexicalTracks = mode !== "semantic"');
+    expect(retrieveSection).toContain('const useVectorTracks = mode !== "exact"');
+    expect(retrieveSection).toContain("loadMetaSourceRetrievalHits");
+    expect(retrieveSection).toContain("await loadVectorMetaRetrievalHits");
+    expect(retrieveSection).toContain('vectorMetaSkippedTrace("exact_mode")');
+    expect(retrieveSection).toContain('reason: useLexicalTracks ? "no_matches" : "semantic_mode"');
+    expect(retrieveSection).toContain("pruneCrossTrackVectorHits");
     expect(retrieveSection).toContain(
-      "[...metaHits, ...vectorMetaResult.hits, ...ftsHits, ...vectorResult.hits]",
+      "[...metaHits, ...vectorMetaHits, ...ftsHits, ...vectorChunkHits]",
     );
     expect(retrieveSection).not.toContain("normalized_text");
     expect(retrieveSection).not.toContain("graph_nodes");
@@ -526,11 +548,15 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("function loadFtsChunkRetrievalHits"),
     );
     expect(metaRetrievalSection).not.toContain("normalized_text");
+    expect(metaRetrievalSection).not.toContain("graph_nodes");
+    expect(metaRetrievalSection).not.toContain("graph_edges");
     const ftsRetrievalSection = workerSource.slice(
       workerSource.indexOf("function loadFtsChunkRetrievalHits"),
       workerSource.indexOf("function fuseSourceRetrievalHits"),
     );
     expect(ftsRetrievalSection).not.toContain("normalized_text");
+    expect(ftsRetrievalSection).not.toContain("graph_nodes");
+    expect(ftsRetrievalSection).not.toContain("graph_edges");
     const vectorMetaRetrievalSection = workerSource.slice(
       workerSource.indexOf("function loadVectorMetaRetrievalHits"),
       workerSource.indexOf("function loadVectorChunkRetrievalHits"),
@@ -539,19 +565,27 @@ describe("local engine source-native storage foundation", () => {
     expect(vectorMetaRetrievalSection).toContain("se.target_id = s.id");
     expect(vectorMetaRetrievalSection).not.toContain("JOIN source_chunks");
     expect(vectorMetaRetrievalSection).not.toContain("normalized_text");
+    expect(vectorMetaRetrievalSection).not.toContain("graph_nodes");
+    expect(vectorMetaRetrievalSection).not.toContain("graph_edges");
     const vectorRetrievalSection = workerSource.slice(
       workerSource.indexOf("function loadVectorChunkRetrievalHits"),
       workerSource.indexOf("function fuseSourceRetrievalHits"),
     );
     expect(vectorRetrievalSection).not.toContain("normalized_text");
     expect(vectorRetrievalSection).toContain("AND c.role = 'child'");
+    expect(vectorRetrievalSection).not.toContain("graph_nodes");
+    expect(vectorRetrievalSection).not.toContain("graph_edges");
     const fusionSection = workerSource.slice(
       workerSource.indexOf("function fuseSourceRetrievalHits"),
-      workerSource.indexOf("function reciprocalRankFusionScore"),
+      workerSource.indexOf("function mergeKnowledgeBaseSearchItems"),
     );
     expect(fusionSection).toContain("hit.chunk !== undefined");
+    expect(fusionSection).toContain("sourceRanksByTrack");
+    expect(fusionSection).toContain("if (!existing.tracks.has(hit.track))");
     expect(fusionSection).toContain("fallbackExcerpt");
     expect(fusionSection).toContain("item.chunks[0]?.snippet || item.fallbackExcerpt");
+    expect(fusionSection).not.toContain("graph_nodes");
+    expect(fusionSection).not.toContain("graph_edges");
     const knowledgeBaseClusterSection = workerSource.slice(
       workerSource.indexOf("function buildKnowledgeBaseSourceClusters"),
       workerSource.indexOf("function mergeRetrieveTracks"),
@@ -560,8 +594,9 @@ describe("local engine source-native storage foundation", () => {
     expect(knowledgeBaseClusterSection).toContain("source_embeddings");
     expect(knowledgeBaseClusterSection).not.toContain("source_chunks");
     expect(knowledgeBaseClusterSection).not.toContain("normalized_text");
-    expect(knowledgeBaseClusterSection).not.toContain("graph_nodes");
-    expect(knowledgeBaseClusterSection).not.toContain("graph_edges");
+    expect(knowledgeBaseClusterSection).toContain("buildKnowledgeBaseGraphSourceClusters");
+    expect(knowledgeBaseClusterSection).toContain("graph_nodes");
+    expect(knowledgeBaseClusterSection).toContain("graph_edges");
   });
 
   it("keeps embedding jobs idempotent and model-scoped", () => {
@@ -576,11 +611,14 @@ describe("local engine source-native storage foundation", () => {
       "async function runEmbeddingReindexJob",
       "async function runPostCaptureHardeningJob",
     );
-    expect(reindexSection).toContain('upsertEmbeddingModel(db, payload.model, "disabled")');
+    expect(reindexSection).toContain("stagingModelId");
+    expect(reindexSection).toContain("commitStagedEmbeddingModel");
     expect(reindexSection).toContain("DELETE FROM source_embeddings WHERE model_id = ?");
     expect(reindexSection).toContain("lifecycle_status <> 'deleted'");
     expect(reindexSection).toContain("runEmbeddingStageForSourceWithProvider");
-    expect(reindexSection).toContain("activateEmbeddingModel(db, payload.model.id)");
+    expect(reindexSection).toContain(
+      "UPDATE source_embeddings SET model_id = ? WHERE model_id = ?",
+    );
     expect(reindexSection).not.toContain("normalized_text");
 
     const embeddingStageSection = sourceSection(
@@ -593,7 +631,7 @@ describe("local engine source-native storage foundation", () => {
     expect(embeddingStageSection).toContain(
       "getActiveEmbeddingProvider(\n    db,\n    embeddingProviderOverride,\n    embeddingProviderFactory,\n  )",
     );
-    expect(embeddingStageSection).toContain("EMBEDDING_MODEL_UNAVAILABLE");
+    expect(embeddingStageSection).toContain("embedding_model_unavailable");
     expect(embeddingStageSection).toContain("meta_head_json");
     expect(embeddingStageSection).toContain("AND role = 'child'");
     expect(embeddingStageSection).toContain("ORDER BY ord ASC");
@@ -613,7 +651,7 @@ describe("local engine source-native storage foundation", () => {
     expect(upsertSection).toContain("'chunk'");
     expect(upsertSection).toContain("'meta'");
     expect(upsertSection).toContain("buildChunkEmbeddingInput(chunk)");
-    expect(upsertSection).toContain("provider.embedTexts(inputs)");
+    expect(upsertSection).toContain('provider.embedTexts(inputs, "document")');
     expect(upsertSection).toContain("hashText(embeddingInput)");
     expect(upsertSection).toContain("hashText(input.text)");
     expect(upsertSection).toContain("EMBEDDING_DIMENSION_MISMATCH");

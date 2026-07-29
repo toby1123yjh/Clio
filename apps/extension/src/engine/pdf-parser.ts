@@ -1,4 +1,5 @@
 import { excerpt, hashText, normalizeText } from "@/src/shared/text";
+import pdfJsWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 
 export type ParsedPdfOcrStatus = "not_required" | "partial_text" | "not_available";
 
@@ -319,9 +320,11 @@ interface PdfJsViewport {
 
 interface PdfJsModule {
   OPS?: Record<string, unknown>;
+  GlobalWorkerOptions?: {
+    workerSrc: string;
+  };
   getDocument(input: {
     data: Uint8Array;
-    disableWorker: true;
     verbosity: number;
   }): { promise: Promise<PdfJsDocument> };
 }
@@ -464,11 +467,9 @@ export async function parsePdfDocument(
   pdfjsModule?: PdfJsModule,
 ): Promise<ParsedPdfDocument> {
   const byteLength = byteLengthOfPdfInput(bytes);
-  const pdfjs =
-    pdfjsModule ?? ((await import("pdfjs-dist/legacy/build/pdf.mjs")) as unknown as PdfJsModule);
+  const pdfjs = await resolvePdfJsModule(pdfjsModule);
   const document = await pdfjs.getDocument({
     data: bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
-    disableWorker: true,
     verbosity: 0,
   }).promise;
 
@@ -589,13 +590,13 @@ export async function extractPdfFigureVisionImageInput({
   pdfjsModule,
   canvasFactory,
 }: PdfFigureVisionImageExtractionInput): Promise<PdfFigureVisionImageExtractionResult> {
-  const pdfjs =
-    pdfjsModule ?? ((await import("pdfjs-dist/legacy/build/pdf.mjs")) as unknown as PdfJsModule);
+  const pdfjs = await resolvePdfJsModule(pdfjsModule);
   let document: PdfJsDocument | undefined;
   try {
     document = await pdfjs.getDocument({
-      data: bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
-      disableWorker: true,
+      // PDF.js transfers this buffer to its worker. A copy keeps the caller's bytes reusable
+      // when several figure crops are extracted from the same raw PDF.
+      data: new Uint8Array(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)),
       verbosity: 0,
     }).promise;
     if (
@@ -671,6 +672,16 @@ export async function extractPdfFigureVisionImageInput({
   } finally {
     await document?.destroy?.();
   }
+}
+
+async function resolvePdfJsModule(pdfjsModule?: PdfJsModule): Promise<PdfJsModule> {
+  const pdfjs =
+    pdfjsModule ?? ((await import("pdfjs-dist/legacy/build/pdf.mjs")) as unknown as PdfJsModule);
+  const workerOptions = pdfjs.GlobalWorkerOptions;
+  if (workerOptions !== undefined && workerOptions.workerSrc.trim().length === 0) {
+    workerOptions.workerSrc = new URL(pdfJsWorkerUrl, new URL("/", import.meta.url)).href;
+  }
+  return pdfjs;
 }
 
 export function pdfCapturePayloadFromParsedDocument(

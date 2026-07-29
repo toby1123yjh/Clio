@@ -10,6 +10,10 @@ const railShellSource = readFileSync(
   fileURLToPath(new URL("./components/RailShell.tsx", import.meta.url)),
   "utf8",
 );
+const railCssSource = readFileSync(
+  fileURLToPath(new URL("../ui/tailwind.css", import.meta.url)),
+  "utf8",
+);
 
 describe("content local RAG flow", () => {
   it("selects retrieval candidates before loading bounded evidence windows", () => {
@@ -57,23 +61,16 @@ describe("content local RAG flow", () => {
       contentSource.indexOf("function ClioContentApp()"),
       contentSource.indexOf("React.useEffect(() => {"),
     );
-    const loadLibrarySection = contentSource.slice(
-      contentSource.indexOf("const loadLibrary = React.useCallback"),
-      contentSource.indexOf("const loadChatHistory = React.useCallback"),
+    const knowledgeBaseResultsSection = contentSource.slice(
+      contentSource.indexOf("const requestKnowledgeBaseResults = React.useCallback"),
+      contentSource.indexOf("const loadKnowledgeBaseResults = React.useCallback"),
     );
 
-    expect(loadLibrarySection).toContain('kind: "searchKnowledgeBase"');
-    expect(loadLibrarySection).toContain("toKnowledgeBaseSearchItem");
+    expect(knowledgeBaseResultsSection).toContain('kind: "searchKnowledgeBase"');
+    expect(knowledgeBaseResultsSection).toContain("toKnowledgeBaseSearchItem");
     expect(contentStateSection).toContain("const knowledgeBaseRetrieveFilter = React.useMemo(");
     expect(contentStateSection).toContain("retrieveFilterForKnowledgeBase(knowledgeBaseFilter)");
-    expect(contentStateSection).toContain("defaultKnowledgeBaseClustering");
-    expect(contentStateSection).toContain(
-      "clusteringPayloadForKnowledgeBase(knowledgeBaseClustering)",
-    );
     expect(retrieveFilterSection).toContain('["webpage", "page", "selection"]');
-    expect(retrieveFilterSection).toContain('if (clustering.clusterBy === "none")');
-    expect(retrieveFilterSection).toContain("clusterBy: clustering.clusterBy");
-    expect(retrieveFilterSection).toContain("semanticBackend: clustering.semanticBackend");
     expect(retrieveFilterSection).toContain(
       "const years = normalizeKnowledgeBaseYears(filter.yearsText)",
     );
@@ -89,13 +86,11 @@ describe("content local RAG flow", () => {
     expect(retrieveFilterSection).toContain(
       "const arxivIds = normalizeKnowledgeBaseListText(filter.arxivIdsText",
     );
-    expect(loadLibrarySection).toContain("knowledgeBaseRetrieveFilter === undefined");
-    expect(loadLibrarySection).toContain("{ filter: knowledgeBaseRetrieveFilter }");
-    expect(loadLibrarySection).toContain("knowledgeBaseClusteringPayload === undefined");
-    expect(loadLibrarySection).toContain("{ clustering: knowledgeBaseClusteringPayload }");
-    expect(loadLibrarySection).toContain("knowledgeBaseClusterGroups(nextClusters, nextItems)");
-    expect(loadLibrarySection).not.toContain('kind: "searchMemory"');
-    expect(loadLibrarySection).not.toContain('kind: "listMemories"');
+    expect(knowledgeBaseResultsSection).toContain("knowledgeBaseRetrieveFilter === undefined");
+    expect(knowledgeBaseResultsSection).toContain("{ filter: knowledgeBaseRetrieveFilter }");
+    expect(knowledgeBaseResultsSection).not.toContain("clustering:");
+    expect(knowledgeBaseResultsSection).not.toContain('kind: "searchMemory"');
+    expect(knowledgeBaseResultsSection).not.toContain('kind: "listMemories"');
   });
 
   it("exposes Knowledge Base advanced source filters without bypassing searchKnowledgeBase", () => {
@@ -122,7 +117,11 @@ describe("content local RAG flow", () => {
     expect(railPropsSection).toContain("knowledgeBaseRetrieveFilter={knowledgeBaseRetrieveFilter}");
     expect(railPropsSection).toContain("onKnowledgeBaseFilterChange={setKnowledgeBaseFilter}");
     expect(knowledgeFilterSection).toContain('data-clio-knowledge-filters="true"');
+    expect(knowledgeFilterSection).toContain('data-clio-knowledge-filter-bar="true"');
     expect(knowledgeFilterSection).toContain('data-clio-knowledge-advanced-filters="true"');
+    expect(knowledgeFilterSection).toContain("aria-expanded={advancedOpen}");
+    expect(knowledgeFilterSection).toContain("More filters");
+    expect(knowledgeFilterSection).toContain("activeAdvancedChips.length");
     expect(knowledgeFilterSection).toContain('id="clio-kb-source-type-filter"');
     expect(knowledgeFilterSection).toContain('id="clio-kb-lifecycle-filter"');
     expect(knowledgeFilterSection).toContain('id="clio-kb-years-filter"');
@@ -136,10 +135,154 @@ describe("content local RAG flow", () => {
     expect(knowledgeFilterSection).not.toContain('kind: "listMemories"');
   });
 
-  it("exposes Knowledge Base clustering controls through content-owned search payloads", () => {
+  it("keeps Knowledge Base source browsing flat without clustering UI state", () => {
     const contentStateSection = contentSource.slice(
       contentSource.indexOf("function ClioContentApp()"),
       contentSource.indexOf("React.useEffect(() => {"),
+    );
+    const knowledgeBaseResultsSection = contentSource.slice(
+      contentSource.indexOf("const requestKnowledgeBaseResults = React.useCallback"),
+      contentSource.indexOf("const loadKnowledgeBaseResults = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const knowledgePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+    );
+    const memoryListSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryList"),
+      railShellSource.indexOf("function MemoryDetailPanel"),
+    );
+
+    expect(contentStateSection).not.toContain("KnowledgeBaseClusteringState");
+    expect(contentStateSection).not.toContain("KnowledgeBaseClusterGroup");
+    expect(knowledgeBaseResultsSection).not.toContain("clustering:");
+    expect(knowledgeBaseResultsSection).not.toContain("result.clusters");
+    expect(railPropsSection).not.toContain("knowledgeBaseClustering=");
+    expect(railPropsSection).not.toContain("knowledgeBaseClusters=");
+    expect(railPropsSection).not.toContain("onKnowledgeBaseClusteringChange=");
+    expect(knowledgePanelSection).not.toContain("KnowledgeBaseClusteringControls");
+    expect(knowledgePanelSection).not.toContain("Group by");
+    expect(knowledgePanelSection).not.toContain("clio-kb-cluster-by");
+    expect(memoryListSection).not.toContain("clusters");
+    expect(memoryListSection).not.toContain("data-clio-knowledge-cluster");
+    expect(memoryListSection).toContain("items.map((item)");
+    expect(memoryListSection).not.toContain("requestEngine");
+  });
+
+  it("adapts Knowledge Base layout to the resizable Rail container", () => {
+    const knowledgePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+    );
+    const memoryListItemSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryListItem"),
+      railShellSource.indexOf("function MemoryDetailPanel"),
+    );
+
+    expect(railShellSource).toContain('containerName: "clio-rail"');
+    expect(railShellSource).toContain('containerType: "inline-size"');
+    expect(knowledgePanelSection).toContain('data-clio-knowledge-actions="true"');
+    expect(knowledgePanelSection).toContain('data-clio-knowledge-tabs="true"');
+    expect(knowledgePanelSection).toContain('role="tablist"');
+    expect(knowledgePanelSection).toContain('role="tabpanel"');
+    expect(knowledgePanelSection).toContain('data-clio-knowledge-toolbar="true"');
+    expect(knowledgePanelSection).toContain('data-clio-knowledge-scroll="true"');
+    expect(knowledgePanelSection).toContain('aria-label="Open Research planner"');
+    expect(knowledgePanelSection).toContain("<MemoryList");
+    expect(knowledgePanelSection).not.toContain("<KnowledgeBaseWorkingSetPanel");
+    expect(knowledgePanelSection).not.toContain("<SourceContextPlannerPanel");
+    expect(knowledgePanelSection).not.toContain("<SourceContextCompressionLogPanel");
+    expect(knowledgePanelSection).not.toContain("<OrchestrationDiagnosticsPanel");
+    expect(knowledgePanelSection).not.toContain("<ChunkMetaTier2AuditPanel");
+    expect(knowledgePanelSection).not.toContain("<SourceContextMapSchedulerPanel");
+    expect(knowledgePanelSection).not.toContain("<SourceContextMapArtifactPanel");
+    expect(railShellSource).toContain('data-clio-responsive-grid="stack"');
+    expect(memoryListItemSection).toContain('data-clio-memory-actions="true"');
+    expect(memoryListItemSection).toContain(
+      'className="flex flex-wrap items-center justify-end gap-1.5 px-3 pb-2.5 pt-0"',
+    );
+    expect(memoryListItemSection).toContain('data-clio-memory-menu="true"');
+    expect(memoryListItemSection).toContain('aria-haspopup="menu"');
+    expect(memoryListItemSection).toContain("event.composedPath()");
+    expect(memoryListItemSection).toContain('data-clio-memory-title="true"');
+    expect(memoryListItemSection).toContain('data-clio-memory-snippet="true"');
+    expect(memoryListItemSection).toContain("break-all");
+    expect(memoryListItemSection).not.toContain("pr-44");
+    expect(memoryListItemSection).not.toContain("right-[120px]");
+    expect(railCssSource).toContain("@container clio-rail (max-width: 480px)");
+    expect(railCssSource).toContain("@container clio-rail (max-width: 380px)");
+    expect(railCssSource).toContain('[data-clio-responsive-grid="stack"]');
+    expect(railCssSource).toContain("grid-template-columns: minmax(0, 1fr)");
+  });
+
+  it("shows the source-list empty state directly below source filters", () => {
+    const knowledgePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+    );
+    const memoryListSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryList"),
+      railShellSource.indexOf("function MemoryListItem"),
+    );
+
+    expect(knowledgePanelSection.indexOf("<KnowledgeBaseFilterControls")).toBeLessThan(
+      knowledgePanelSection.indexOf("<MemoryList"),
+    );
+    expect(knowledgePanelSection).not.toContain("<KnowledgeBaseClusteringControls");
+    expect(knowledgePanelSection).not.toContain("<SourceContextPlannerPanel");
+    expect(memoryListSection).toContain("data-clio-knowledge-empty-state=");
+    expect(memoryListSection).toContain('"No matching sources"');
+    expect(memoryListSection).toContain('"No saved sources yet"');
+    expect(memoryListSection).not.toContain("No saved memories yet.");
+  });
+
+  it("keeps existing sources mounted during debounced Knowledge Base search", () => {
+    const contentStateSection = contentSource.slice(
+      contentSource.indexOf("function ClioContentApp()"),
+      contentSource.indexOf("const loadKnowledgeBaseResults = React.useCallback"),
+    );
+    const interactiveSearchSection = contentSource.slice(
+      contentSource.indexOf("const loadKnowledgeBaseResults = React.useCallback"),
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
+    );
+    const searchEffectSection = contentSource.slice(
+      contentSource.indexOf(
+        'if (railState.mode !== "knowledge-base" && railState.mode !== "research-planner")',
+      ),
+      contentSource.indexOf('if (railState.mode !== "agent-home")'),
+    );
+    const knowledgePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+    );
+    const memoryListSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryList"),
+      railShellSource.indexOf("function MemoryListItem"),
+    );
+
+    expect(interactiveSearchSection).toContain("requestKnowledgeBaseResults(nextQuery)");
+    expect(contentStateSection).toContain('React.useState<KnowledgeBaseSearchMode>("exact")');
+    expect(contentStateSection).toContain("mode: knowledgeBaseSearchMode");
+    expect(interactiveSearchSection).not.toContain('kind: "listTopicPages"');
+    expect(interactiveSearchSection).not.toContain('kind: "listWikiCompileJobs"');
+    expect(searchEffectSection).toContain("loadKnowledgeBaseResults(railState.query)");
+    expect(searchEffectSection).not.toContain("loadLibrary(railState.query)");
+    expect(knowledgePanelSection).toContain('data-clio-knowledge-search-loading="true"');
+    expect(knowledgePanelSection).toContain("<KnowledgeBaseSearchModeControl");
+    expect(knowledgePanelSection).toContain("mode={props.knowledgeBaseSearchMode}");
+    expect(knowledgePanelSection).toContain("props.onKnowledgeBaseSearchModeChange");
+    expect(knowledgePanelSection).toContain("aria-busy={props.knowledgeBaseSearchLoading}");
+    expect(memoryListSection).toContain("if (loading && items.length === 0)");
+  });
+
+  it("keeps existing sources mounted during explicit Knowledge Base refresh", () => {
+    const contentStateSection = contentSource.slice(
+      contentSource.indexOf("function ClioContentApp()"),
+      contentSource.indexOf("const loadLibrary = React.useCallback"),
     );
     const loadLibrarySection = contentSource.slice(
       contentSource.indexOf("const loadLibrary = React.useCallback"),
@@ -149,52 +292,22 @@ describe("content local RAG flow", () => {
       contentSource.indexOf("<RailShell"),
       contentSource.indexOf("</RailShell>"),
     );
-    const clusteringControlsSection = railShellSource.slice(
-      railShellSource.indexOf("function KnowledgeBaseClusteringControls"),
-      railShellSource.indexOf("function KnowledgeBaseWorkingSetPanel"),
-    );
-    const memoryListSection = railShellSource.slice(
-      railShellSource.indexOf("function MemoryList"),
-      railShellSource.indexOf("function MemoryDetailPanel"),
-    );
-    const refinementSection = contentSource.slice(
-      contentSource.indexOf("async function refineKnowledgeBaseClusterLabels"),
-      contentSource.indexOf("function knowledgeUploadKindForFile"),
+    const knowledgePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function ResearchPlannerPanel"),
     );
 
-    expect(contentStateSection).toContain("React.useState<KnowledgeBaseClusteringState>");
-    expect(contentStateSection).toContain("KnowledgeBaseClusterGroup[]");
-    expect(loadLibrarySection).toContain("knowledgeBaseClusteringPayload");
-    expect(loadLibrarySection).toContain("result.clusters");
-    expect(loadLibrarySection).toContain("shouldRefineKnowledgeBaseClusterLabels");
-    expect(loadLibrarySection).toContain("refineKnowledgeBaseClusterLabels(result.clusters");
-    expect(railPropsSection).toContain("knowledgeBaseClustering={knowledgeBaseClustering}");
-    expect(railPropsSection).toContain("knowledgeBaseClusters={knowledgeBaseClusters}");
-    expect(railPropsSection).toContain(
-      "onKnowledgeBaseClusteringChange={setKnowledgeBaseClustering}",
+    expect(contentStateSection).toContain("knowledgeBaseRefreshLoading");
+    expect(loadLibrarySection).toContain("options?: { background?: boolean }");
+    expect(loadLibrarySection).toContain("setKnowledgeBaseSearchLoading(false)");
+    expect(loadLibrarySection).toContain("setKnowledgeBaseRefreshLoading(true)");
+    expect(loadLibrarySection).toContain('dispatch({ type: "SET_LOADING", loading: true })');
+    expect(railPropsSection).toContain("knowledgeBaseRefreshLoading={knowledgeBaseRefreshLoading}");
+    expect(railPropsSection).toContain("loadLibrary(railState.query, { background: true })");
+    expect(knowledgePanelSection).toContain("aria-busy={props.knowledgeBaseRefreshLoading}");
+    expect(knowledgePanelSection).toContain(
+      "props.state.loading || props.knowledgeBaseRefreshLoading",
     );
-    expect(clusteringControlsSection).toContain('data-clio-knowledge-clustering="true"');
-    expect(clusteringControlsSection).toContain('id="clio-kb-cluster-by"');
-    expect(clusteringControlsSection).toContain('id="clio-kb-cluster-granularity"');
-    expect(clusteringControlsSection).toContain('id="clio-kb-cluster-semantic-backend"');
-    expect(clusteringControlsSection).toContain('id="clio-kb-cluster-llm-labels"');
-    expect(clusteringControlsSection).toContain("providerBackedLabels");
-    expect(clusteringControlsSection).toContain("providerBackedLabels: false");
-    expect(clusteringControlsSection).toContain("disabled={disabled || !topicEnabled}");
-    expect(clusteringControlsSection).toContain("knowledgeBaseSemanticClusterBackendOptions");
-    expect(clusteringControlsSection).toContain("knowledgeBaseClusterByOptions");
-    expect(railShellSource).toContain('{ value: "topic", label: "Topic" }');
-    expect(memoryListSection).toContain('data-clio-knowledge-cluster-list="true"');
-    expect(memoryListSection).toContain('data-clio-knowledge-cluster="true"');
-    expect(memoryListSection).toContain('data-clio-knowledge-cluster-summary="true"');
-    expect(memoryListSection).toContain('data-clio-knowledge-cluster-trace="true"');
-    expect(memoryListSection).toContain("knowledgeBaseClusterTraceLabel(cluster.trace)");
-    expect(memoryListSection).toContain("cluster.deterministicLabel");
-    expect(contentSource).toContain("requestKnowledgeBaseClusterLabelRefinement(request)");
-    expect(contentSource).toContain("abstractSnippet: excerpt(item.excerpt, 360)");
-    expect(refinementSection).not.toContain('kind: "getMemory"');
-    expect(clusteringControlsSection).not.toContain("requestEngine");
-    expect(memoryListSection).not.toContain("requestEngine");
   });
 
   it("exposes Working Set controls without loading full memories in the Rail", () => {
@@ -218,6 +331,10 @@ describe("content local RAG flow", () => {
       railShellSource.indexOf("function MemoryList"),
       railShellSource.indexOf("function MemoryDetailPanel"),
     );
+    const researchPlannerPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+      railShellSource.indexOf("function KnowledgeBaseFilterControls"),
+    );
 
     expect(loadLibrarySection).toContain('kind: "getWorkingSetStatus"');
     expect(contentWorkingSetSection).toContain('kind: "pinWorkingSetSource"');
@@ -228,6 +345,7 @@ describe("content local RAG flow", () => {
     expect(railPropsSection).toContain("onPinWorkingSetSource=");
     expect(workingSetPanelSection).toContain('data-clio-working-set="true"');
     expect(workingSetPanelSection).toContain("workingSetLoadDepthOptions");
+    expect(researchPlannerPanelSection).toContain("KnowledgeBaseWorkingSetPanel");
     expect(memoryListSection).toContain('onPinWorkingSetSource(item.id, "meta")');
     expect(workingSetPanelSection).not.toContain('kind: "getMemory"');
     expect(memoryListSection).not.toContain('kind: "getMemory"');
@@ -375,6 +493,8 @@ describe("content local RAG flow", () => {
     expect(contentAuditLoadSection).toContain("filter: { limit: 30 }");
     expect(loadLibrarySection).toContain('kind: "listChunkMetaTier2Audit"');
     expect(contentRunSection).toContain('kind: "enqueueChunkMetaTier2Job"');
+    expect(contentRunSection).toContain('kind: "enqueueSourceGraphJob"');
+    expect(contentRunSection).toContain('payload: { sourceId, mode: "llm" }');
     expect(contentRunSection).toContain('kind: "createOrchestrationRun"');
     expect(contentRunSection).toContain('kind: "runOrchestration"');
     expect(contentRunSection).toContain('kind: "cancelOrchestrationRun"');
@@ -388,6 +508,7 @@ describe("content local RAG flow", () => {
     expect(railPropsSection).toContain("orchestrationRuns={orchestrationRuns}");
     expect(railPropsSection).toContain("orchestrationEvents={orchestrationEvents}");
     expect(railPropsSection).toContain("onRunChunkMetaTier2Job=");
+    expect(railPropsSection).toContain("onRunSourceGraphJob=");
     expect(railPropsSection).toContain("onCancelOrchestrationRun=");
     expect(railPropsSection).toContain("onRetryOrchestrationRun=");
     expect(railPropsSection).toContain("onRefreshOrchestrationRuns=");
@@ -401,6 +522,8 @@ describe("content local RAG flow", () => {
     expect(railShellSource).toContain("row.sectionSummaryChars");
     expect(railShellSource).toContain("row.chunkSummaryChars");
     expect(memoryListSection).toContain("onRunChunkMetaTier2Job(item.id, 8)");
+    expect(memoryListSection).toContain("onRunSourceGraphJob(item.id)");
+    expect(memoryListSection).toContain("Generate research graph");
     expect(auditPanelSection).not.toContain("requestEngine");
     expect(memoryListSection).not.toContain("requestEngine");
   });
@@ -500,6 +623,8 @@ describe("content local RAG flow", () => {
     expect(researchPlannerPanelSection).toContain("SourceContextCompressionLogPanel");
     expect(researchPlannerPanelSection).toContain("SourceContextMapArtifactPanel");
     expect(researchPlannerPanelSection).toContain("OrchestrationDiagnosticsPanel");
+    expect(researchPlannerPanelSection).toContain("KnowledgeBaseWorkingSetPanel");
+    expect(researchPlannerPanelSection).toContain("ChunkMetaTier2AuditPanel");
     expect(researchPlannerPanelSection).toContain("MemoryList");
     expect(researchPlannerPanelSection).not.toContain("requestEngine");
     expect(researchPlannerPanelSection).not.toContain('kind: "getMemory"');
@@ -528,7 +653,7 @@ describe("content local RAG flow", () => {
     expect(knowledgePanelSection).toContain("props.onUploadKnowledgeFiles(files)");
   });
 
-  it("keeps raw PDF reader loading in content and renders preview in Rail", () => {
+  it("loads raw PDF in content and renders a document index in Rail", () => {
     const openDetailSection = contentSource.slice(
       contentSource.indexOf("const openDetail = React.useCallback"),
       contentSource.indexOf("const openTopicDetail = React.useCallback"),
@@ -547,15 +672,213 @@ describe("content local RAG flow", () => {
     expect(openDetailSection).toContain("URL.createObjectURL");
     expect(contentSource).toContain("URL.revokeObjectURL");
     expect(railPropsSection).toContain("pdfPreview={pdfPreview}");
-    expect(detailPanelSection).toContain("PdfReaderPreview");
-    expect(detailPanelSection).toContain('data-clio-pdf-preview="true"');
+    expect(detailPanelSection).toContain("PdfDocumentIndex");
+    expect(detailPanelSection).toContain('data-clio-pdf-document-index="true"');
+    expect(detailPanelSection).toContain('data-clio-pdf-evidence="true"');
+    expect(detailPanelSection).toContain("aria-label={`Open PDF page ${activePage} in a new tab`}");
+    expect(detailPanelSection).toContain("pdfPreviewUrl(objectUrl, item.pageNumber)");
+    expect(detailPanelSection).toContain('role="tablist"');
+    expect(detailPanelSection).not.toContain("lg:grid-cols");
     expect(detailPanelSection).toContain('data-clio-pdf-bbox-overlay="true"');
     expect(detailPanelSection).toContain('data-clio-pdf-bbox-highlight="true"');
     expect(detailPanelSection).toContain("metadataBoundingBox(record.bbox)");
     expect(detailPanelSection).toContain("pdfPageSize(detail, pageNumber)");
+    expect(detailPanelSection).not.toContain('aria-label="PDF page number"');
+    expect(detailPanelSection).not.toContain("<iframe");
     expect(detailPanelSection).toContain("pdf_figure_analysis_results");
     expect(detailPanelSection).toContain("pdfFigureAnalysisResultDetail");
+    expect(detailPanelSection).toContain("isMarkdownMemoryDetail(detail)");
+    expect(detailPanelSection).toContain("<MarkdownRenderer");
+    expect(detailPanelSection).toContain("markdown={detail.normalizedText}");
     expect(detailPanelSection).not.toContain("requestEngine");
+  });
+
+  it("shows provider connection results inline with success and error tones", () => {
+    const connectionTestSection = contentSource.slice(
+      contentSource.indexOf("const testGeminiProvider = React.useCallback"),
+      contentSource.indexOf("const saveSelectionSnapshot = React.useCallback"),
+    );
+    const settingsPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function SettingsPanel"),
+      railShellSource.indexOf("function SettingsSectionMenu"),
+    );
+
+    expect(connectionTestSection).toContain('setProviderMessageTone("success")');
+    expect(connectionTestSection).toContain('setProviderMessageTone("error")');
+    expect(connectionTestSection).toContain('setProviderMessage("Gemini connection works.")');
+    expect(connectionTestSection).toContain('setProviderMessage("OpenAI connection works.")');
+    expect(connectionTestSection).toContain(
+      'setProviderMessage("OpenAI-compatible connection works.")',
+    );
+    expect(connectionTestSection).not.toContain("showToast(");
+    expect(settingsPanelSection).toContain('data-clio-provider-message="true"');
+    expect(settingsPanelSection).toContain(
+      "data-clio-provider-message-tone={props.providerMessageTone}",
+    );
+    expect(settingsPanelSection).toContain(
+      "border-success-border bg-success-background text-success-foreground",
+    );
+    expect(settingsPanelSection).toContain("border-danger bg-danger/10 text-danger");
+  });
+
+  it("names the primary provider Main model and makes Vision reuse explicit", () => {
+    const settingsPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function SettingsPanel"),
+      railShellSource.indexOf("function SettingsSectionMenu"),
+    );
+    const settingsMenuSection = railShellSource.slice(
+      railShellSource.indexOf("function SettingsSectionMenu"),
+      railShellSource.indexOf("interface VisionProviderSettingsCardProps"),
+    );
+    const visionSettingsSection = railShellSource.slice(
+      railShellSource.indexOf("function VisionProviderSettingsCard"),
+      railShellSource.indexOf("interface ImageGenerationSettingsCardProps"),
+    );
+
+    expect(settingsPanelSection).toContain(">Main model</h4>");
+    expect(settingsPanelSection).not.toContain(">Large model</h4>");
+    expect(settingsMenuSection).toContain('aria-label="Main model settings"');
+    expect(settingsMenuSection).toContain(">Main model</span>");
+    expect(visionSettingsSection).toContain('<option value="auto">Main model</option>');
+    expect(visionSettingsSection).toContain("Main model for Vision");
+    expect(visionSettingsSection).toContain(
+      "Reuses the Main model configuration for vision analysis.",
+    );
+    expect(visionSettingsSection).not.toContain("must support image input");
+    expect(visionSettingsSection).toContain("{usesMainModel ? null : (");
+    expect(visionSettingsSection).not.toContain("Use Main model API key");
+    expect(visionSettingsSection).not.toContain("Use Main model name");
+    expect(visionSettingsSection).not.toContain("Use Main model Base URL");
+    expect(visionSettingsSection).not.toContain("Auto Vision fallback");
+    expect(visionSettingsSection).not.toContain("Use main");
+  });
+
+  it("makes the Settings directory navigate to the matching long-page section", () => {
+    const settingsPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function SettingsPanel"),
+      railShellSource.indexOf("function SettingsSectionMenu"),
+    );
+    const settingsMenuSection = railShellSource.slice(
+      railShellSource.indexOf("function SettingsSectionMenu"),
+      railShellSource.indexOf("interface VisionProviderSettingsCardProps"),
+    );
+
+    expect(settingsPanelSection).toContain("settingsScrollRef");
+    expect(settingsPanelSection).toContain("scrollToSettingsSection");
+    expect(settingsPanelSection).toContain("container.scrollTo({");
+    expect(settingsPanelSection).toContain('behavior: "smooth"');
+    expect(settingsPanelSection).toContain("onSelectSection={scrollToSettingsSection}");
+    expect(settingsMenuSection).toContain('data-clio-settings-directory="true"');
+    for (const section of [
+      "appearance",
+      "search",
+      "embeddings",
+      "vision",
+      "image-generation",
+      "model",
+    ]) {
+      expect(settingsMenuSection).toContain(`onClick={() => props.onSelectSection("${section}")}`);
+      expect(settingsMenuSection).toContain(`className={buttonClass("${section}")}`);
+    }
+  });
+
+  it("gates the local test workspace and wires initialization through existing RPCs", () => {
+    const runnerAdapterSection = contentSource.slice(
+      contentSource.indexOf("const createTestWorkspaceDependencies = React.useCallback"),
+      contentSource.indexOf("const testOpenAICompatibleProvider = React.useCallback"),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+    const settingsPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function SettingsPanel"),
+      railShellSource.indexOf("function SettingsSectionMenu"),
+    );
+    const settingsMenuSection = railShellSource.slice(
+      railShellSource.indexOf("function SettingsSectionMenu"),
+      railShellSource.indexOf("interface TestWorkspaceSettingsCardProps"),
+    );
+    const testWorkspaceCardSection = railShellSource.slice(
+      railShellSource.indexOf("function TestWorkspaceSettingsCard"),
+      railShellSource.indexOf("interface VisionProviderSettingsCardProps"),
+    );
+
+    expect(contentSource).toContain(
+      'import { testWorkspaceBuildConfig } from "@/src/test-workspace/build-config"',
+    );
+    expect(runnerAdapterSection).toContain('kind: "getLocalEmbeddingModelStatus"');
+    expect(runnerAdapterSection).toContain('kind: "installLocalEmbeddingModel"');
+    expect(runnerAdapterSection).toContain('kind: "authorizeLocalEmbeddingReindex"');
+    expect(runnerAdapterSection).toContain('kind: "capturePage"');
+    expect(runnerAdapterSection).toContain('kind: "captureSelection"');
+    expect(runnerAdapterSection).toContain('kind: "captureMarkdown"');
+    expect(runnerAdapterSection).toContain('kind: "capturePdf"');
+    expect(runnerAdapterSection).toContain("chrome.runtime.getURL(assetPath)");
+    expect(runnerAdapterSection).toContain("initializeTestWorkspace(");
+    expect(runnerAdapterSection).toContain("removeTestWorkspaceSources(");
+    expect(runnerAdapterSection).toContain('loadLibrary("")');
+    expect(runnerAdapterSection).toContain("completed: Math.max(1, result.matched)");
+    expect(railPropsSection).toContain("testWorkspaceConfig={testWorkspaceBuildConfig}");
+    expect(railPropsSection).toContain("onInitializeTestWorkspace={initializeLocalTestWorkspace}");
+    expect(railPropsSection).toContain("onRemoveTestWorkspace={removeLocalTestWorkspace}");
+    expect(settingsPanelSection).toContain("props.testWorkspaceConfig === null ? null : (");
+    expect(settingsMenuSection).toContain("props.testWorkspaceEnabled ? (");
+    expect(settingsMenuSection).toContain('className={buttonClass("test-workspace")}');
+    expect(testWorkspaceCardSection).toContain('data-clio-test-workspace="true"');
+    expect(testWorkspaceCardSection).toContain("Other Knowledge Base data will be preserved.");
+    expect(testWorkspaceCardSection).not.toContain("sm:grid-cols-2");
+    expect(testWorkspaceCardSection).not.toContain("reset_library");
+  });
+
+  it("shows Vision save feedback beside the action with explicit success and error tones", () => {
+    const saveVisionSection = contentSource.slice(
+      contentSource.indexOf("const saveVisionProviderSettings = React.useCallback"),
+      contentSource.indexOf("const runLocalEmbeddingAction = React.useCallback"),
+    );
+    const visionSettingsSection = railShellSource.slice(
+      railShellSource.indexOf("function VisionProviderSettingsCard"),
+      railShellSource.indexOf("interface ImageGenerationSettingsCardProps"),
+    );
+
+    expect(saveVisionSection).toContain('setProviderMessageTone("success")');
+    expect(saveVisionSection).toContain('setProviderMessageTone("error")');
+    expect(visionSettingsSection).toContain("saveVisionSettings");
+    expect(visionSettingsSection).toContain("await props.onSave()");
+    expect(visionSettingsSection).toContain("props.message");
+    expect(visionSettingsSection).toContain('data-clio-vision-save-feedback="true"');
+    expect(visionSettingsSection).toContain(
+      "data-clio-vision-save-feedback-tone={props.messageTone}",
+    );
+    expect(visionSettingsSection).toContain(
+      "border-success-border bg-success-background text-success-foreground",
+    );
+    expect(visionSettingsSection).toContain("border-danger bg-danger/10 text-danger");
+  });
+
+  it("keeps local embedding status in content and exposes no remote embedding settings", () => {
+    const statusOwnerSection = contentSource.slice(
+      contentSource.indexOf("const loadLocalEmbeddingStatus = React.useCallback"),
+      contentSource.indexOf("const loadWebSearchHistory = React.useCallback"),
+    );
+    const embeddingCardSection = railShellSource.slice(
+      railShellSource.indexOf("function EmbeddingProviderSettingsCard"),
+      railShellSource.indexOf("function AppearanceSettingsCard"),
+    );
+
+    expect(statusOwnerSection).toContain('kind: "getLocalEmbeddingModelStatus"');
+    expect(contentSource).toContain("window.setInterval");
+    expect(contentSource).toContain('localEmbeddingStatus?.state !== "downloading"');
+    expect(embeddingCardSection).toContain('data-clio-local-embedding-progress="true"');
+    expect(embeddingCardSection).toContain('data-clio-local-embedding-error="true"');
+    expect(embeddingCardSection).not.toContain("Advanced remote providers");
+    expect(embeddingCardSection).not.toContain("OpenAI Compatible");
+    expect(embeddingCardSection).not.toContain("embedding API key");
+    expect(embeddingCardSection).not.toContain("Base URL");
+    expect(embeddingCardSection).toContain("break-words");
+    expect(embeddingCardSection).toContain('title="Delete local embedding model"');
+    expect(embeddingCardSection).not.toContain("requestProvider(");
+    expect(embeddingCardSection).not.toContain("chrome.storage");
   });
 
   it("plans source context packs through controlled auto or explicit research mode", () => {

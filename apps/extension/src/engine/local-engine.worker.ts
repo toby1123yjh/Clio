@@ -3,11 +3,22 @@ import type {
   ChunkMetaSummaryInput,
   ChunkMetaSummaryResult,
 } from "@/src/agent-runtime/chunk-meta-summary";
+import {
+  type EmbeddingRuntimeProviderId,
+  isEmbeddingReindexProviderId,
+  isEmbeddingRuntimeProviderId,
+} from "@/src/agent-runtime/embedding-provider-ids";
 import type {
   FigureVisionAnalysisInput,
   FigureVisionAnalysisResult,
   FigureVisionAnalyzer,
 } from "@/src/agent-runtime/figure-vision-analyzer";
+import type {
+  GraphExtractionInput,
+  GraphExtractionResult,
+  GraphExtractor,
+} from "@/src/agent-runtime/graph-extractor";
+import type { LocalEmbeddingPurpose } from "@/src/local-embedding/contracts";
 import { buildMemoryVersionGroupKey } from "@/src/shared/reliability";
 import {
   type ActiveEmbeddingModelSummary,
@@ -21,6 +32,7 @@ import {
   type BuildSourceGraphResult,
   CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST,
   CLIO_WORKER_EMBEDDING_REQUEST,
+  CLIO_WORKER_GRAPH_EXTRACTION_REQUEST,
   CLIO_WORKER_RESPONSE,
   CLIO_WORKER_VISION_ANALYSIS_REQUEST,
   type CaptureBasePayload,
@@ -76,6 +88,7 @@ import {
   type KnowledgeBaseEngineClusterBy,
   type KnowledgeBaseExpansionTermSource,
   type KnowledgeBaseExpansionTermTrace,
+  type KnowledgeBaseSearchMode,
   type KnowledgeBaseSemanticClusterFallbackReason,
   type KnowledgeBaseSourceCluster,
   type KnowledgeBaseSourceClusterTrace,
@@ -160,6 +173,7 @@ import {
   engineErrorFromUnknown,
   isWorkerChunkMetaSummaryResponseMessage,
   isWorkerEmbeddingResponseMessage,
+  isWorkerGraphExtractionResponseMessage,
   isWorkerRequestMessage,
   isWorkerVisionAnalysisResponseMessage,
 } from "@/src/shared/rpc";
@@ -311,14 +325,14 @@ class OpfsPdfRawFileStore implements PdfRawFileStore {
 
   private async root(): Promise<OpfsDirectoryHandle> {
     const navigatorWithStorage = globalThis.navigator as OpfsNavigator | undefined;
-    const getDirectory = navigatorWithStorage?.storage?.getDirectory;
-    if (typeof getDirectory !== "function") {
+    const storage = navigatorWithStorage?.storage;
+    if (typeof storage?.getDirectory !== "function") {
       throw new EngineRpcError(
         "PDF_RAW_FILE_STORE_UNAVAILABLE",
         "Browser raw PDF storage is unavailable.",
       );
     }
-    return await getDirectory();
+    return await storage.getDirectory();
   }
 
   private async directory(create: boolean): Promise<OpfsDirectoryHandle> {
@@ -337,7 +351,7 @@ function normalizePdfBytes(bytes: Uint8Array | ArrayBuffer): Uint8Array {
 
 export interface ActiveEmbeddingModel {
   modelId: string;
-  provider: string;
+  provider: EmbeddingRuntimeProviderId;
   dimension: number;
 }
 export type EmbeddingProviderFactory = (model: ActiveEmbeddingModel) => EmbeddingProvider | null;
@@ -347,6 +361,7 @@ type PdfFigureVisionImageExtractor = (
 ) => Promise<PdfFigureVisionImageExtractionResult>;
 export type ChunkMetaSummarizerFactory = () => ChunkMetaSummarizer | null;
 export type FigureVisionAnalyzerFactory = () => FigureVisionAnalyzer | null;
+export type GraphExtractorFactory = () => GraphExtractor | null;
 export interface LocalEngineOptions {
   openDatabase?: LocalEngineDatabaseOpener;
   embeddingProvider?: EmbeddingProvider;
@@ -355,6 +370,8 @@ export interface LocalEngineOptions {
   chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory;
   figureVisionAnalyzer?: FigureVisionAnalyzer;
   figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory;
+  graphExtractor?: GraphExtractor;
+  graphExtractorFactory?: GraphExtractorFactory;
   pdfParser?: PdfDocumentParser;
   pdfFigureVisionImageExtractor?: PdfFigureVisionImageExtractor;
   pdfRawFileStore?: PdfRawFileStore;
@@ -362,7 +379,7 @@ export interface LocalEngineOptions {
 
 const databasePath = "/clio-browser-phase1.sqlite3";
 const pdfRawFileDirectoryName = "clio-pdf-raw-files";
-const schemaVersion = 21;
+const schemaVersion = 22;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -415,16 +432,10 @@ const figureVisionBridgeTimeoutMs = 60_000;
 const figureVisionMaxPageContextChars = 1_200;
 const figureVisionMaxAnalysesPerJob = 8;
 const chunkMetaSummaryBridgeTimeoutMs = 60_000;
+const graphExtractionBridgeTimeoutMs = 60_000;
 const defaultChunkMetaTier2MaxChunks = 8;
 const maxChunkMetaTier2MaxChunks = 32;
 const chunkMetaSummaryExcerptMaxChars = 1_800;
-const defaultEmbeddingProvider = {
-  modelId: "clio-local-hash-v1",
-  provider: "local-deterministic",
-  label: "Clio local deterministic hash v1",
-  dimension: 64,
-  metric: "cosine",
-} as const;
 const searchableSourceLifecycleStatuses = ["fresh", "stale", "archived"] as const;
 const keywordIndexStopWords = new Set([
   "about",
@@ -490,6 +501,7 @@ interface SourceRetrievalHit {
   track: SourceRetrievalTrack;
   rank: number;
   source: SqlRow;
+  rawScore?: number;
   chunk?: RetrieveSourceHitChunk;
   fallbackExcerpt?: string;
 }
@@ -502,6 +514,7 @@ interface CaptureAfterSaveContext {
 
 interface CaptureOptions {
   afterSave?: (context: CaptureAfterSaveContext) => Promise<void>;
+  afterDuplicate?: (context: CaptureAfterSaveContext) => Promise<void>;
 }
 
 interface NormalizedRetrieveSourcesFilter {
@@ -526,7 +539,7 @@ export interface EmbeddingProvider {
   readonly modelId: string;
   readonly provider: string;
   readonly dimension: number;
-  embedTexts(inputs: string[]): Promise<number[][]>;
+  embedTexts(inputs: string[], purpose?: LocalEmbeddingPurpose): Promise<number[][]>;
 }
 
 interface GraphNodeInput {
@@ -547,10 +560,13 @@ interface GraphEdgeInput {
   createdBy: GraphEdgeCreatedBy;
 }
 
-interface DeterministicGraphBuild {
+interface SourceGraphBuild {
   nodes: GraphNodeInput[];
   edges: Array<
-    Omit<GraphEdgeInput, "sourceNodeId" | "targetNodeId"> & { targetCanonicalId: string }
+    Omit<GraphEdgeInput, "sourceNodeId" | "targetNodeId"> & {
+      sourceCanonicalId: string;
+      targetCanonicalId: string;
+    }
   >;
   evidenceChunkIds: string[];
 }
@@ -758,6 +774,7 @@ export class LocalEngine {
   private readonly embeddingProviderFactory?: EmbeddingProviderFactory;
   private readonly chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory;
   private readonly figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory;
+  private readonly graphExtractorFactory?: GraphExtractorFactory;
   private readonly pdfParser: PdfDocumentParser;
   private readonly pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor;
   private readonly pdfRawFileStore: PdfRawFileStore;
@@ -774,6 +791,10 @@ export class LocalEngine {
       options.figureVisionAnalyzer === undefined
         ? options.figureVisionAnalyzerFactory
         : () => options.figureVisionAnalyzer ?? null;
+    this.graphExtractorFactory =
+      options.graphExtractor === undefined
+        ? options.graphExtractorFactory
+        : () => options.graphExtractor ?? null;
     this.pdfParser = options.pdfParser ?? parsePdfDocument;
     this.pdfFigureVisionImageExtractor =
       options.pdfFigureVisionImageExtractor ?? extractPdfFigureVisionImageInput;
@@ -900,6 +921,8 @@ export class LocalEngine {
         return await this.listTopicGraphEdges(request.topicId, request.edgeKind);
       case "buildSourceGraph":
         return await this.buildSourceGraph(request.payload);
+      case "enqueueSourceGraphJob":
+        return await this.enqueueSourceGraphJob(request.payload);
       case "queryGraphNeighbors":
         return await this.queryGraphNeighbors(request.payload);
       case "queryGraphSubgraph":
@@ -916,6 +939,8 @@ export class LocalEngine {
         return await this.getJobStatus(request.status, request.limit);
       case "runJob":
         return await this.runQueuedJob(request.id);
+      case "cancelJob":
+        return await this.cancelJob(request.id);
       case "createOrchestrationRun":
         return await this.createOrchestrationRun(request.payload);
       case "listOrchestrationRuns":
@@ -936,6 +961,8 @@ export class LocalEngine {
         return await this.clearChunkMetaTier2Audit(request.filter);
       case "reindex":
         return await this.reindex(request);
+      case "enqueueEmbeddingReindex":
+        return await this.enqueueEmbeddingReindex(request.model);
       case "resolveAnchor":
         return await this.resolveAnchor(request.memoryId);
       case "createChatSession":
@@ -1013,8 +1040,20 @@ export class LocalEngine {
   }
 
   private async capturePdf(payload: CapturePdfPayload): Promise<CaptureResult> {
+    // PDF.js transfers its input buffer to its worker. Keep an independent copy for OPFS.
     const pdfBytes = normalizePdfBytes(payload.bytes);
-    const parsed = await this.pdfParser(pdfBytes);
+    const parserBytes =
+      payload.bytes instanceof Uint8Array ? payload.bytes : new Uint8Array(payload.bytes);
+    const parsed = await this.pdfParser(parserBytes);
+    const persistRawFile = async ({ db, sourceId, draft }: CaptureAfterSaveContext) => {
+      await this.persistPdfRawFile(db, {
+        sourceId,
+        sourceUrl: draft.sourceUrl,
+        sourceTitle: draft.sourceTitle,
+        bytes: pdfBytes,
+        capturedAt: draft.capturedAt,
+      });
+    };
     return await this.capture(
       "page",
       pdfCapturePayloadFromParsedDocument({
@@ -1025,15 +1064,8 @@ export class LocalEngine {
         parsed,
       }),
       {
-        afterSave: async ({ db, sourceId, draft }) => {
-          await this.persistPdfRawFile(db, {
-            sourceId,
-            sourceUrl: draft.sourceUrl,
-            sourceTitle: draft.sourceTitle,
-            bytes: pdfBytes,
-            capturedAt: draft.capturedAt,
-          });
-        },
+        afterSave: persistRawFile,
+        afterDuplicate: persistRawFile,
       },
     );
   }
@@ -1057,6 +1089,11 @@ export class LocalEngine {
       [draft.kind, draft.normalizedSourceUrl, draft.textHash],
     );
     if (existing !== undefined) {
+      await options.afterDuplicate?.({
+        db,
+        sourceId: stringField(existing, "id"),
+        draft,
+      });
       return {
         status: "duplicate",
         memory: memorySummaryFromRow(existing),
@@ -1299,7 +1336,10 @@ export class LocalEngine {
     }
   }
 
-  private async retrieveSources(payload: RetrieveSourcesPayload): Promise<RetrieveSourcesResult> {
+  private async retrieveSources(
+    payload: RetrieveSourcesPayload,
+    mode: "hybrid" | KnowledgeBaseSearchMode = "hybrid",
+  ): Promise<RetrieveSourcesResult> {
     const db = await this.ensureReady();
     const query = normalizeText(payload.query);
     const limit = clampOptionalLimit(payload.limit, 20, 50);
@@ -1374,32 +1414,48 @@ export class LocalEngine {
       };
     }
 
-    const metaHits = loadMetaSourceRetrievalHits(db, {
-      query,
-      limit: Math.max(limit * 2, limit),
-      filter: filters,
-    });
-    const vectorMetaResult = await loadVectorMetaRetrievalHits(db, {
-      query,
-      limit: Math.max(limit * 2, limit),
-      filter: filters,
-      embeddingProviderOverride: this.embeddingProviderOverride,
-      embeddingProviderFactory: this.embeddingProviderFactory,
-    });
-    const ftsHits = loadFtsChunkRetrievalHits(db, {
-      query,
-      limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
-      filter: filters,
-    });
-    const vectorResult = await loadVectorChunkRetrievalHits(db, {
-      query,
-      limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
-      filter: filters,
-      embeddingProviderOverride: this.embeddingProviderOverride,
-      embeddingProviderFactory: this.embeddingProviderFactory,
-    });
+    const useLexicalTracks = mode !== "semantic";
+    const useVectorTracks = mode !== "exact";
+    const metaHits = useLexicalTracks
+      ? loadMetaSourceRetrievalHits(db, {
+          query,
+          limit: Math.max(limit * 2, limit),
+          filter: filters,
+        })
+      : [];
+    const vectorMetaResult = useVectorTracks
+      ? await loadVectorMetaRetrievalHits(db, {
+          query,
+          limit: Math.max(limit * 2, limit),
+          filter: filters,
+          embeddingProviderOverride: this.embeddingProviderOverride,
+          embeddingProviderFactory: this.embeddingProviderFactory,
+        })
+      : { hits: [], trace: vectorMetaSkippedTrace("exact_mode") };
+    const ftsHits = useLexicalTracks
+      ? loadFtsChunkRetrievalHits(db, {
+          query,
+          limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
+          filter: filters,
+        })
+      : [];
+    const vectorResult = useVectorTracks
+      ? await loadVectorChunkRetrievalHits(db, {
+          query,
+          limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
+          filter: filters,
+          embeddingProviderOverride: this.embeddingProviderOverride,
+          embeddingProviderFactory: this.embeddingProviderFactory,
+        })
+      : { hits: [], trace: vectorSkippedTrace("exact_mode") };
+    const selectedVectorHits = pruneCrossTrackVectorHits(
+      [...vectorMetaResult.hits, ...vectorResult.hits],
+      limit,
+    );
+    const vectorMetaHits = selectedVectorHits.filter((hit) => hit.track === "vector_meta");
+    const vectorChunkHits = selectedVectorHits.filter((hit) => hit.track === "vector_chunks");
     const items = fuseSourceRetrievalHits(
-      [...metaHits, ...vectorMetaResult.hits, ...ftsHits, ...vectorResult.hits],
+      [...metaHits, ...vectorMetaHits, ...ftsHits, ...vectorChunkHits],
       {
         limit,
         includeChunks,
@@ -1410,16 +1466,20 @@ export class LocalEngine {
       name: "meta_sources",
       status: metaHits.length > 0 ? "used" : "skipped",
       itemCount: metaHits.length,
-      ...(metaHits.length === 0 ? { reason: "no_matches" } : {}),
+      ...(metaHits.length === 0
+        ? { reason: useLexicalTracks ? "no_matches" : "semantic_mode" }
+        : {}),
     });
-    traceTracks.push(vectorMetaResult.trace);
+    traceTracks.push(vectorTraceAfterSelection(vectorMetaResult.trace, vectorMetaHits));
     traceTracks.push({
       name: "fts_chunks",
       status: ftsHits.length > 0 ? "used" : "skipped",
       itemCount: ftsHits.length,
-      ...(ftsHits.length === 0 ? { reason: "no_matches" } : {}),
+      ...(ftsHits.length === 0
+        ? { reason: useLexicalTracks ? "no_matches" : "semantic_mode" }
+        : {}),
     });
-    traceTracks.push(vectorResult.trace);
+    traceTracks.push(vectorTraceAfterSelection(vectorResult.trace, vectorChunkHits));
 
     return {
       query,
@@ -1439,12 +1499,15 @@ export class LocalEngine {
     const query = normalizeText(payload.query);
     const limit = clampOptionalLimit(payload.limit, 20, 50);
     const includeChunks = clampOptionalLimit(payload.includeChunks, 3, 8);
-    const original = await this.retrieveSources({
-      query,
-      limit,
-      includeChunks,
-      filter: payload.filter,
-    });
+    const original = await this.retrieveSources(
+      {
+        query,
+        limit,
+        includeChunks,
+        filter: payload.filter,
+      },
+      payload.mode ?? "hybrid",
+    );
 
     if (query.length === 0) {
       return knowledgeBaseSearchResultWithClusters(
@@ -1473,6 +1536,42 @@ export class LocalEngine {
             status: "skipped",
             terms: [],
             reason: "filter_no_match",
+            originalItemCount: original.items.length,
+            expandedItemCount: 0,
+          },
+        },
+        payload.clustering,
+      );
+    }
+
+    if (payload.mode !== undefined) {
+      return knowledgeBaseSearchResultWithClusters(
+        db,
+        {
+          ...original,
+          expansion: {
+            status: "skipped",
+            terms: [],
+            reason: payload.mode === "exact" ? "exact_mode" : "semantic_mode",
+            originalItemCount: original.items.length,
+            expandedItemCount: 0,
+          },
+        },
+        payload.clustering,
+      );
+    }
+
+    const directItems = original.items.filter(hasDirectKnowledgeBaseLexicalMatch);
+    if (directItems.length > 0) {
+      return knowledgeBaseSearchResultWithClusters(
+        db,
+        {
+          ...original,
+          items: directItems,
+          expansion: {
+            status: "skipped",
+            terms: [],
+            reason: "direct_matches",
             originalItemCount: original.items.length,
             expandedItemCount: 0,
           },
@@ -2641,10 +2740,37 @@ export class LocalEngine {
   ): Promise<BuildSourceGraphResult> {
     const db = await this.ensureReady();
     const sourceId = normalizeRequiredId(payload.sourceId, "sourceId");
-    if (payload.mode !== undefined && payload.mode !== "deterministic") {
-      throw new EngineRpcError("INVALID_GRAPH_MODE", `Unsupported graph mode: ${payload.mode}`);
+    return await runSourceGraphBuildForSource(
+      db,
+      sourceId,
+      payload.mode ?? "deterministic",
+      this.graphExtractorFactory,
+    );
+  }
+
+  private async enqueueSourceGraphJob(
+    payload: Extract<EngineRequest, { kind: "enqueueSourceGraphJob" }>["payload"],
+  ): Promise<JobSummary> {
+    const db = await this.ensureReady();
+    const sourceId = normalizeRequiredId(payload.sourceId, "sourceId");
+    const source = db.selectObject(
+      "SELECT id FROM sources WHERE id = ? AND lifecycle_status <> 'deleted' LIMIT 1",
+      [sourceId],
+    );
+    if (source === undefined) {
+      throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
     }
-    return runDeterministicGraphBuildForSource(db, sourceId);
+    const jobId = enqueueJob(db, "post_capture_hardening", {
+      sourceId,
+      stages: ["graph"],
+      graphBuildMode: payload.mode,
+      trigger: "manual_graph_ui",
+    });
+    const job = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [jobId]);
+    if (job === undefined) {
+      throw new EngineRpcError("JOB_NOT_FOUND", `Job not found after enqueue: ${jobId}`);
+    }
+    return jobSummaryFromRow(job);
   }
 
   private async queryGraphNeighbors(payload: GraphNeighborsPayload): Promise<GraphQueryResult> {
@@ -2790,9 +2916,46 @@ export class LocalEngine {
       this.embeddingProviderFactory,
       this.chunkMetaSummarizerFactory,
       this.figureVisionAnalyzerFactory,
+      this.graphExtractorFactory,
       this.pdfRawFileStore,
       this.pdfFigureVisionImageExtractor,
     );
+  }
+
+  private async cancelJob(id: string): Promise<JobSummary> {
+    const db = await this.ensureReady();
+    const job = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [id]);
+    if (job === undefined) throw new EngineRpcError("JOB_NOT_FOUND", `Job not found: ${id}`);
+    if (jobTypeField(job, "type") !== "reindex_embeddings") {
+      throw new EngineRpcError(
+        "JOB_CANCEL_UNSUPPORTED",
+        "Only embedding reindex jobs support direct cancellation.",
+      );
+    }
+    const status = jobStatusField(job, "status");
+    if (status === "queued") {
+      const now = new Date().toISOString();
+      db.exec({
+        sql: `UPDATE jobs
+              SET status = 'failed',
+                  cancel_requested = 1,
+                  finished_at = ?,
+                  last_error = ?
+              WHERE id = ?`,
+        bind: [now, embeddingReindexCancelledErrorMessage, id],
+      });
+    } else if (status === "running") {
+      db.exec({
+        sql: `UPDATE jobs
+              SET cancel_requested = 1,
+                  heartbeat_at = ?
+              WHERE id = ?`,
+        bind: [new Date().toISOString(), id],
+      });
+    }
+    const updated = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [id]);
+    if (updated === undefined) throw new EngineRpcError("JOB_NOT_FOUND", `Job not found: ${id}`);
+    return jobSummaryFromRow(updated);
   }
 
   private async createOrchestrationRun(
@@ -2853,6 +3016,7 @@ export class LocalEngine {
       this.embeddingProviderFactory,
       this.chunkMetaSummarizerFactory,
       this.figureVisionAnalyzerFactory,
+      this.graphExtractorFactory,
       this.pdfRawFileStore,
       this.pdfFigureVisionImageExtractor,
     );
@@ -2877,6 +3041,7 @@ export class LocalEngine {
       this.embeddingProviderFactory,
       this.chunkMetaSummarizerFactory,
       this.figureVisionAnalyzerFactory,
+      this.graphExtractorFactory,
       this.pdfRawFileStore,
       this.pdfFigureVisionImageExtractor,
     );
@@ -2884,6 +3049,34 @@ export class LocalEngine {
       jobId,
       status: job.status,
     };
+  }
+
+  private async enqueueEmbeddingReindex(
+    model: EmbeddingReindexModelDescriptor,
+  ): Promise<ReindexResult> {
+    const db = await this.ensureReady();
+    const jobId = enqueueJob(
+      db,
+      "reindex_embeddings",
+      {
+        scope: "embeddings",
+        model,
+        authorizedAt: new Date().toISOString(),
+      },
+      1,
+    );
+    void runJob(
+      db,
+      jobId,
+      this.embeddingProviderOverride,
+      this.embeddingProviderFactory,
+      this.chunkMetaSummarizerFactory,
+      this.figureVisionAnalyzerFactory,
+      this.graphExtractorFactory,
+      this.pdfRawFileStore,
+      this.pdfFigureVisionImageExtractor,
+    ).catch(() => undefined);
+    return { jobId, status: "queued" };
   }
 
   private async resolveAnchor(memoryId: string): Promise<AnchorResolveResult> {
@@ -3791,25 +3984,30 @@ function createWorkerEmbeddingProviderFactory(
       modelId: model.modelId,
       provider: model.provider,
       dimension: model.dimension,
-      embedTexts(inputs: string[]) {
+      embedTexts(inputs: string[], purpose: LocalEmbeddingPurpose = "document") {
         if (inputs.length === 0) return Promise.resolve([]);
         const requestId = createRequestId();
         return new Promise<number[][]>((resolve, reject) => {
-          const timer = setTimeout(() => {
-            pending.delete(requestId);
-            reject(
-              new EngineRpcError(
-                "EMBEDDING_BRIDGE_TIMEOUT",
-                "Embedding provider request timed out.",
-              ),
-            );
-          }, embeddingBridgeTimeoutMs);
+          const timer = setTimeout(
+            () => {
+              pending.delete(requestId);
+              reject(
+                new EngineRpcError(
+                  "EMBEDDING_BRIDGE_TIMEOUT",
+                  "Embedding provider request timed out.",
+                ),
+              );
+            },
+            model.provider === "local-transformers" ? 5 * 60_000 : embeddingBridgeTimeoutMs,
+          );
           pending.set(requestId, { resolve, reject, timer });
           workerSelf.postMessage({
             type: CLIO_WORKER_EMBEDDING_REQUEST,
             requestId,
             request: {
               modelId: model.modelId,
+              provider: model.provider,
+              purpose,
               inputs,
             },
           });
@@ -3820,7 +4018,7 @@ function createWorkerEmbeddingProviderFactory(
 }
 
 function isBridgeEmbeddingProvider(provider: string) {
-  return provider === "openai" || provider === "openai-compatible";
+  return isEmbeddingReindexProviderId(provider);
 }
 
 function createWorkerChunkMetaSummarizer(workerSelf: LocalEngineWorkerGlobal): ChunkMetaSummarizer {
@@ -3931,6 +4129,59 @@ function createWorkerFigureVisionAnalyzer(
   };
 }
 
+function createWorkerGraphExtractor(workerSelf: LocalEngineWorkerGlobal): GraphExtractor {
+  const pending = new Map<
+    string,
+    {
+      resolve: (result: GraphExtractionResult) => void;
+      reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+
+  workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (!isWorkerGraphExtractionResponseMessage(event.data)) return;
+    const entry = pending.get(event.data.requestId);
+    if (entry === undefined) return;
+    clearTimeout(entry.timer);
+    pending.delete(event.data.requestId);
+    if (event.data.response.ok) {
+      entry.resolve(event.data.response.value);
+      return;
+    }
+    entry.reject(
+      new EngineRpcError(
+        event.data.response.error.code,
+        event.data.response.error.message,
+        event.data.response.error.detail,
+      ),
+    );
+  });
+
+  return {
+    extract(input: GraphExtractionInput) {
+      const requestId = createRequestId();
+      return new Promise<GraphExtractionResult>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(requestId);
+          reject(
+            new EngineRpcError(
+              "GRAPH_EXTRACTION_BRIDGE_TIMEOUT",
+              "Graph extraction request timed out.",
+            ),
+          );
+        }, graphExtractionBridgeTimeoutMs);
+        pending.set(requestId, { resolve, reject, timer });
+        workerSelf.postMessage({
+          type: CLIO_WORKER_GRAPH_EXTRACTION_REQUEST,
+          requestId,
+          request: input,
+        });
+      });
+    },
+  };
+}
+
 function installWorkerMessageHandler(workerSelf: LocalEngineWorkerGlobal, engine: LocalEngine) {
   workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
     if (!isWorkerRequestMessage(event.data)) return;
@@ -3973,6 +4224,7 @@ if (workerSelf !== null) {
       embeddingProviderFactory: createWorkerEmbeddingProviderFactory(workerSelf),
       chunkMetaSummarizer: createWorkerChunkMetaSummarizer(workerSelf),
       figureVisionAnalyzer: createWorkerFigureVisionAnalyzer(workerSelf),
+      graphExtractor: createWorkerGraphExtractor(workerSelf),
     }),
   );
 }
@@ -4178,6 +4430,9 @@ function migrate(db: SqliteDb) {
       finished_at TEXT
     )
   `);
+  ensureColumn(db, "jobs", "progress_current", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "jobs", "progress_total", "INTEGER NOT NULL DEFAULT 1");
+  ensureColumn(db, "jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0");
   db.exec(`
     CREATE TABLE IF NOT EXISTS orchestration_runs (
       id TEXT PRIMARY KEY,
@@ -4726,7 +4981,8 @@ function migrate(db: SqliteDb) {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_graph_edges_evidence_source ON graph_edges(evidence_source_id)",
   );
-  ensureDefaultEmbeddingModel(db);
+  removeLegacyDeterministicEmbeddingModel(db);
+  disableUnsupportedEmbeddingModels(db);
   db.exec(`PRAGMA user_version = ${schemaVersion}`);
 }
 
@@ -7451,38 +7707,22 @@ function recoverStaleSourceContextMapRuns(db: SqliteDb) {
   });
 }
 
-function ensureDefaultEmbeddingModel(db: SqliteDb) {
-  const now = new Date().toISOString();
+function removeLegacyDeterministicEmbeddingModel(db: SqliteDb) {
+  transaction(db, () => {
+    db.exec(
+      "DELETE FROM source_embeddings WHERE model_id IN (SELECT id FROM embedding_models WHERE provider = 'local-deterministic')",
+    );
+    db.exec("DELETE FROM embedding_models WHERE provider = 'local-deterministic'");
+  });
+}
+
+function disableUnsupportedEmbeddingModels(db: SqliteDb) {
   db.exec({
-    sql: `INSERT INTO embedding_models (
-      id,
-      provider,
-      label,
-      dimension,
-      metric,
-      status,
-      created_at,
-      updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      provider = excluded.provider,
-      label = excluded.label,
-      dimension = excluded.dimension,
-      metric = excluded.metric,
-      status = CASE
-        WHEN embedding_models.status = 'disabled' THEN 'disabled'
-        ELSE excluded.status
-      END,
-      updated_at = excluded.updated_at`,
-    bind: [
-      defaultEmbeddingProvider.modelId,
-      defaultEmbeddingProvider.provider,
-      defaultEmbeddingProvider.label,
-      defaultEmbeddingProvider.dimension,
-      defaultEmbeddingProvider.metric,
-      now,
-      now,
-    ],
+    sql: `UPDATE embedding_models
+          SET status = 'disabled', updated_at = ?
+          WHERE status = 'active'
+            AND provider <> 'local-transformers'`,
+    bind: [new Date().toISOString()],
   });
 }
 
@@ -7494,7 +7734,7 @@ function getActiveEmbeddingProvider(
   const row = getActiveEmbeddingModelRow(db);
   if (row === undefined) return null;
   const modelId = stringField(row, "id");
-  const provider = stringField(row, "provider");
+  const provider = embeddingRuntimeProviderIdField(row, "provider");
   const dimension = numberField(row, "dimension");
   return resolveEmbeddingProviderForModel(
     { modelId, provider, dimension },
@@ -7517,13 +7757,24 @@ function getActiveEmbeddingModelRow(db: SqliteDb) {
 function activeEmbeddingModelSummaryFromRow(row: SqlRow): ActiveEmbeddingModelSummary {
   return {
     id: stringField(row, "id"),
-    provider: stringField(row, "provider"),
+    provider: embeddingRuntimeProviderIdField(row, "provider"),
     label: stringField(row, "label"),
     dimension: numberField(row, "dimension"),
     metric: "cosine",
     status: "active",
     updatedAt: stringField(row, "updated_at"),
   };
+}
+
+function embeddingRuntimeProviderIdField(row: SqlRow, field: string): EmbeddingRuntimeProviderId {
+  const value = stringField(row, field);
+  if (!isEmbeddingRuntimeProviderId(value)) {
+    throw new EngineRpcError(
+      "INVALID_EMBEDDING_MODEL_PROVIDER",
+      "Stored embedding model has an unsupported runtime provider.",
+    );
+  }
+  return value;
 }
 
 function resolveEmbeddingProviderForModel(
@@ -7540,28 +7791,15 @@ function resolveEmbeddingProviderForModel(
       return embeddingProviderOverride;
     }
   }
-  if (
-    model.modelId === defaultEmbeddingProvider.modelId &&
-    model.provider === defaultEmbeddingProvider.provider &&
-    model.dimension === defaultEmbeddingProvider.dimension
-  ) {
-    return localDeterministicEmbeddingProvider;
-  }
   return embeddingProviderFactory?.(model) ?? null;
 }
 
-const localDeterministicEmbeddingProvider: EmbeddingProvider = {
-  modelId: defaultEmbeddingProvider.modelId,
-  provider: defaultEmbeddingProvider.provider,
-  dimension: defaultEmbeddingProvider.dimension,
-  async embedTexts(inputs: string[]) {
-    return inputs.map((input) =>
-      embedLocalDeterministic(input, defaultEmbeddingProvider.dimension),
-    );
-  },
-};
-
-function enqueueJob(db: SqliteDb, type: JobType, payload: Record<string, unknown>) {
+function enqueueJob(
+  db: SqliteDb,
+  type: JobType,
+  payload: Record<string, unknown>,
+  maxAttempts = defaultJobMaxAttempts,
+) {
   const now = new Date().toISOString();
   const jobId = createId("job");
   db.exec({
@@ -7575,7 +7813,7 @@ function enqueueJob(db: SqliteDb, type: JobType, payload: Record<string, unknown
       payload_json,
       created_at
     ) VALUES (?, ?, 'queued', 0, ?, ?, ?, ?)`,
-    bind: [jobId, type, defaultJobMaxAttempts, now, JSON.stringify(payload), now],
+    bind: [jobId, type, Math.max(1, maxAttempts), now, JSON.stringify(payload), now],
   });
   return jobId;
 }
@@ -7638,6 +7876,7 @@ async function runOrchestration(
   embeddingProviderFactory?: EmbeddingProviderFactory,
   chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory,
   figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory,
+  graphExtractorFactory?: GraphExtractorFactory,
   pdfRawFileStore?: PdfRawFileStore,
   pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor = extractPdfFigureVisionImageInput,
 ): Promise<OrchestrationRunSummary> {
@@ -7689,6 +7928,7 @@ async function runOrchestration(
       embeddingProviderFactory,
       chunkMetaSummarizerFactory,
       figureVisionAnalyzerFactory,
+      graphExtractorFactory,
       pdfRawFileStore,
       pdfFigureVisionImageExtractor,
     );
@@ -8409,6 +8649,7 @@ async function runJob(
   embeddingProviderFactory?: EmbeddingProviderFactory,
   chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory,
   figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory,
+  graphExtractorFactory?: GraphExtractorFactory,
   pdfRawFileStore?: PdfRawFileStore,
   pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor = extractPdfFigureVisionImageInput,
 ): Promise<JobSummary> {
@@ -8440,6 +8681,7 @@ async function runJob(
       result = await runEmbeddingReindexJob(
         db,
         stringField(job, "payload_json"),
+        jobId,
         embeddingProviderOverride,
         embeddingProviderFactory,
       );
@@ -8452,6 +8694,7 @@ async function runJob(
         embeddingProviderFactory,
         chunkMetaSummarizerFactory,
         figureVisionAnalyzerFactory,
+        graphExtractorFactory,
         pdfRawFileStore,
         pdfFigureVisionImageExtractor,
       );
@@ -8473,7 +8716,9 @@ async function runJob(
   } catch (error) {
     const engineError = engineErrorFromUnknown(error);
     const maxAttempts = Math.max(1, numberField(job, "max_attempts"));
-    const failed = attempts >= maxAttempts;
+    const cancelled = engineError.code === "EMBEDDING_REINDEX_CANCELLED";
+    const failed = cancelled || attempts >= maxAttempts;
+    const lastError = cancelled ? embeddingReindexCancelledErrorMessage : engineError.message;
     db.exec({
       sql: `UPDATE jobs
             SET status = ?,
@@ -8486,7 +8731,7 @@ async function runJob(
         failed ? "failed" : "queued",
         new Date(Date.now() + attempts * 1000).toISOString(),
         failed ? new Date().toISOString() : null,
-        engineError.message,
+        lastError,
         jobId,
       ],
     });
@@ -8560,9 +8805,13 @@ function rebuildFtsData(db: SqliteDb) {
   });
 }
 
+const embeddingReindexCancelledErrorMessage =
+  "EMBEDDING_REINDEX_CANCELLED: Embedding rebuild cancelled by user.";
+
 async function runEmbeddingReindexJob(
   db: SqliteDb,
   payloadJson: string,
+  jobId: string,
   embeddingProviderOverride?: EmbeddingProvider,
   embeddingProviderFactory?: EmbeddingProviderFactory,
 ): Promise<Record<string, unknown>> {
@@ -8583,11 +8832,9 @@ async function runEmbeddingReindexJob(
     );
   }
 
-  upsertEmbeddingModel(db, payload.model, "disabled");
-  db.exec({
-    sql: "DELETE FROM source_embeddings WHERE model_id = ?",
-    bind: [payload.model.id],
-  });
+  const stagingModelId = `${payload.model.id}::staging::${jobId}`;
+  upsertEmbeddingModel(db, { ...payload.model, id: stagingModelId }, "disabled");
+  db.exec({ sql: "DELETE FROM source_embeddings WHERE model_id = ?", bind: [stagingModelId] });
 
   const sources = db.selectObjects(
     `SELECT id
@@ -8595,11 +8842,39 @@ async function runEmbeddingReindexJob(
      WHERE lifecycle_status <> 'deleted'
      ORDER BY captured_at ASC, id ASC`,
   );
-  for (const source of sources) {
-    await runEmbeddingStageForSourceWithProvider(db, stringField(source, "id"), provider);
+  db.exec({
+    sql: `UPDATE jobs
+          SET progress_current = 0,
+              progress_total = ?,
+              heartbeat_at = ?
+          WHERE id = ?`,
+    bind: [Math.max(1, sources.length), new Date().toISOString(), jobId],
+  });
+  try {
+    for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
+      assertEmbeddingReindexNotCancelled(db, jobId);
+      const source = sources[sourceIndex];
+      if (source === undefined) continue;
+      await runEmbeddingStageForSourceWithProvider(
+        db,
+        stringField(source, "id"),
+        provider,
+        stagingModelId,
+      );
+      db.exec({
+        sql: `UPDATE jobs
+              SET progress_current = ?,
+                  heartbeat_at = ?
+              WHERE id = ?`,
+        bind: [sourceIndex + 1, new Date().toISOString(), jobId],
+      });
+    }
+    assertEmbeddingReindexNotCancelled(db, jobId);
+    commitStagedEmbeddingModel(db, payload.model, stagingModelId);
+  } catch (error) {
+    db.exec({ sql: "DELETE FROM embedding_models WHERE id = ?", bind: [stagingModelId] });
+    throw error;
   }
-
-  activateEmbeddingModel(db, payload.model.id);
   const chunkCount = countEmbeddingsForModel(db, payload.model.id, "chunk");
   const metaCount = countEmbeddingsForModel(db, payload.model.id, "meta");
   return {
@@ -8614,6 +8889,40 @@ async function runEmbeddingReindexJob(
   };
 }
 
+function assertEmbeddingReindexNotCancelled(db: SqliteDb, jobId: string) {
+  const requested = Number(
+    db.selectValue("SELECT cancel_requested FROM jobs WHERE id = ? LIMIT 1", [jobId]) ?? 0,
+  );
+  if (requested !== 0) {
+    throw new EngineRpcError("EMBEDDING_REINDEX_CANCELLED", "Embedding rebuild cancelled by user.");
+  }
+}
+
+function commitStagedEmbeddingModel(
+  db: SqliteDb,
+  model: EmbeddingReindexModelDescriptor,
+  stagingModelId: string,
+) {
+  transaction(db, () => {
+    upsertEmbeddingModel(db, model, "disabled");
+    db.exec({ sql: "DELETE FROM source_embeddings WHERE model_id = ?", bind: [model.id] });
+    db.exec({
+      sql: "UPDATE source_embeddings SET model_id = ? WHERE model_id = ?",
+      bind: [model.id, stagingModelId],
+    });
+    db.exec({ sql: "DELETE FROM embedding_models WHERE id = ?", bind: [stagingModelId] });
+    const now = new Date().toISOString();
+    db.exec({
+      sql: "UPDATE embedding_models SET status = 'disabled', updated_at = ? WHERE id <> ?",
+      bind: [now, model.id],
+    });
+    db.exec({
+      sql: "UPDATE embedding_models SET status = 'active', updated_at = ? WHERE id = ?",
+      bind: [now, model.id],
+    });
+  });
+}
+
 function parseEmbeddingReindexPayload(payloadJson: string): {
   model: EmbeddingReindexModelDescriptor;
   authorizedAt?: string;
@@ -8626,7 +8935,7 @@ function parseEmbeddingReindexPayload(payloadJson: string): {
   const dimension = typeof model.dimension === "number" ? model.dimension : Number.NaN;
   if (
     id.length === 0 ||
-    (provider !== "openai" && provider !== "openai-compatible") ||
+    !isEmbeddingReindexProviderId(provider) ||
     label.length === 0 ||
     !Number.isInteger(dimension) ||
     dimension <= 0 ||
@@ -8677,20 +8986,6 @@ function upsertEmbeddingModel(
   });
 }
 
-function activateEmbeddingModel(db: SqliteDb, modelId: string) {
-  const now = new Date().toISOString();
-  transaction(db, () => {
-    db.exec({
-      sql: "UPDATE embedding_models SET status = 'disabled', updated_at = ? WHERE id <> ?",
-      bind: [now, modelId],
-    });
-    db.exec({
-      sql: "UPDATE embedding_models SET status = 'active', updated_at = ? WHERE id = ?",
-      bind: [now, modelId],
-    });
-  });
-}
-
 function countEmbeddingsForModel(db: SqliteDb, modelId: string, targetKind: "chunk" | "meta") {
   return Number(
     db.selectValue(
@@ -8708,6 +9003,7 @@ async function runPostCaptureHardeningJob(
   embeddingProviderFactory?: EmbeddingProviderFactory,
   chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory,
   figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory,
+  graphExtractorFactory?: GraphExtractorFactory,
   pdfRawFileStore?: PdfRawFileStore,
   pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor = extractPdfFigureVisionImageInput,
 ): Promise<Record<string, unknown>> {
@@ -8751,8 +9047,13 @@ async function runPostCaptureHardeningJob(
     : { skipped: true, reason: "stage_not_requested" };
 
   const graph =
-    shouldRunGraph && payload.graphBuildMode === "deterministic"
-      ? runDeterministicGraphBuildForSource(db, payload.sourceId)
+    shouldRunGraph && payload.graphBuildMode !== undefined
+      ? await runSourceGraphBuildForSource(
+          db,
+          payload.sourceId,
+          payload.graphBuildMode,
+          graphExtractorFactory,
+        )
       : shouldRunGraph
         ? { skipped: true, reason: "explicit_build_required" }
         : { skipped: true, reason: "stage_not_requested" };
@@ -8773,7 +9074,10 @@ function parsePostCaptureHardeningPayload(payloadJson: string) {
   const stages = Array.isArray(payload.stages)
     ? payload.stages.flatMap((stage) => (isPostCaptureStageName(stage) ? [stage] : []))
     : [];
-  const graphBuildMode = payload.graphBuildMode === "deterministic" ? "deterministic" : undefined;
+  const graphBuildMode: NonNullable<BuildSourceGraphPayload["mode"]> | undefined =
+    payload.graphBuildMode === "deterministic" || payload.graphBuildMode === "llm"
+      ? payload.graphBuildMode
+      : undefined;
   const rawChunkMetaTier2 = isRecord(payload.chunkMetaTier2) ? payload.chunkMetaTier2 : undefined;
   const chunkMetaTier2 = {
     enabled: rawChunkMetaTier2?.enabled === true,
@@ -9924,10 +10228,23 @@ async function runEmbeddingStageForSource(
     embeddingProviderFactory,
   );
   if (provider === null) {
-    throw new EngineRpcError(
-      "EMBEDDING_MODEL_UNAVAILABLE",
-      "Active embedding model is unavailable.",
-    );
+    const source = db.selectObject("SELECT lifecycle_status FROM sources WHERE id = ? LIMIT 1", [
+      sourceId,
+    ]);
+    if (source === undefined) {
+      throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
+    }
+    return {
+      ok: true,
+      embedding: {
+        chunkCount: 0,
+        skipped: true,
+        reason:
+          stringField(source, "lifecycle_status") === "deleted"
+            ? "source_deleted"
+            : "embedding_model_unavailable",
+      },
+    };
   }
   return runEmbeddingStageForSourceWithProvider(db, sourceId, provider);
 }
@@ -9936,6 +10253,7 @@ async function runEmbeddingStageForSourceWithProvider(
   db: SqliteDb,
   sourceId: string,
   provider: EmbeddingProvider,
+  storageModelId = provider.modelId,
 ): Promise<Record<string, unknown>> {
   const source = db.selectObject("SELECT id FROM sources WHERE id = ? LIMIT 1", [sourceId]);
   if (source === undefined) {
@@ -9965,13 +10283,19 @@ async function runEmbeddingStageForSourceWithProvider(
     [sourceId],
   );
   const now = new Date().toISOString();
-  await upsertSourceChunkEmbeddings(db, provider, chunks, now);
+  await upsertSourceChunkEmbeddings(db, provider, chunks, now, storageModelId);
   const metaInput = loadSourceMetaEmbeddingInput(db, sourceId);
   const metaText = metaInput === undefined ? "" : buildSourceMetaEmbeddingText(metaInput);
   if (metaText.length > 0) {
-    await upsertSourceMetaEmbedding(db, provider, { sourceId, text: metaText }, now);
+    await upsertSourceMetaEmbedding(
+      db,
+      provider,
+      { sourceId, text: metaText },
+      now,
+      storageModelId,
+    );
   } else {
-    deleteSourceMetaEmbedding(db, provider.modelId, sourceId);
+    deleteSourceMetaEmbedding(db, storageModelId, sourceId);
   }
   return {
     ok: true,
@@ -10025,10 +10349,11 @@ async function upsertSourceChunkEmbeddings(
   provider: EmbeddingProvider,
   chunks: SqlRow[],
   now: string,
+  storageModelId = provider.modelId,
 ) {
   if (chunks.length === 0) return;
   const inputs = chunks.map((chunk) => buildChunkEmbeddingInput(chunk));
-  const vectors = await provider.embedTexts(inputs);
+  const vectors = await provider.embedTexts(inputs, "document");
   if (vectors.length !== chunks.length) {
     throw new EngineRpcError("EMBEDDING_VECTOR_COUNT_MISMATCH", "Embedding vector count mismatch.");
   }
@@ -10062,7 +10387,7 @@ async function upsertSourceChunkEmbeddings(
         text_hash = excluded.text_hash,
         updated_at = excluded.updated_at`,
       bind: [
-        provider.modelId,
+        storageModelId,
         stringField(chunk, "id"),
         stringField(chunk, "source_id"),
         JSON.stringify(vector),
@@ -10079,8 +10404,9 @@ async function upsertSourceMetaEmbedding(
   provider: EmbeddingProvider,
   input: { sourceId: string; text: string },
   now: string,
+  storageModelId = provider.modelId,
 ) {
-  const [vector] = await provider.embedTexts([input.text]);
+  const [vector] = await provider.embedTexts([input.text], "document");
   if (vector === undefined) {
     throw new EngineRpcError("EMBEDDING_VECTOR_COUNT_MISMATCH", "Embedding vector count mismatch.");
   }
@@ -10104,7 +10430,7 @@ async function upsertSourceMetaEmbedding(
       text_hash = excluded.text_hash,
       updated_at = excluded.updated_at`,
     bind: [
-      provider.modelId,
+      storageModelId,
       input.sourceId,
       input.sourceId,
       JSON.stringify(vector),
@@ -10178,12 +10504,14 @@ function insertSourceMetadataFtsRow(
   });
 }
 
-function runDeterministicGraphBuildForSource(
+async function runSourceGraphBuildForSource(
   db: SqliteDb,
   sourceId: string,
-): BuildSourceGraphResult {
+  requestedMode: NonNullable<BuildSourceGraphPayload["mode"]>,
+  graphExtractorFactory?: GraphExtractorFactory,
+): Promise<BuildSourceGraphResult> {
   const source = db.selectObject(
-    `SELECT id
+    `SELECT id, source_title
      FROM sources
      WHERE id = ?
        AND lifecycle_status <> 'deleted'
@@ -10194,21 +10522,66 @@ function runDeterministicGraphBuildForSource(
     throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
   }
 
+  const deterministicBuild = buildDeterministicGraphForSource(db, sourceId);
+  const citationBuild = buildCitationGraphForSource(db, sourceId);
+  let llmBuild = emptySourceGraphBuild();
+  let fallbackReason: string | undefined;
+  if (requestedMode === "llm") {
+    const extractionInput = buildGraphExtractionInputForSource(db, sourceId);
+    const extractor = graphExtractorFactory?.() ?? null;
+    if (extractionInput.chunks.length === 0) {
+      fallbackReason = "graph_extraction_chunks_required";
+    } else if (extractor === null) {
+      fallbackReason = "graph_extractor_unavailable";
+    } else {
+      try {
+        const extraction = await extractor.extract(extractionInput);
+        if (extraction.status === "extracted") {
+          llmBuild = buildLlmGraphContribution(sourceId, extractionInput, extraction);
+          if (llmBuild.edges.length === 0) {
+            fallbackReason = "graph_extraction_missing_anchored_relations";
+          }
+        } else {
+          fallbackReason = extraction.reason ?? `graph_extraction_${extraction.status}`;
+        }
+      } catch (error) {
+        fallbackReason =
+          error instanceof Error && normalizeText(error.message).length > 0
+            ? normalizeText(error.message).slice(0, 240)
+            : "graph_extraction_provider_error";
+      }
+    }
+  }
+
+  const build = mergeSourceGraphBuilds(deterministicBuild, citationBuild, llmBuild);
+  const appliedMode =
+    requestedMode === "llm" && llmBuild.edges.length > 0 ? "llm" : "deterministic";
   let result: BuildSourceGraphResult = {
     sourceId,
-    nodeCount: 0,
-    edgeCount: 0,
-    evidenceChunkCount: 0,
+    nodeCount: build.nodes.length,
+    edgeCount: build.edges.length,
+    evidenceChunkCount: build.evidenceChunkIds.length,
+    requestedMode,
+    appliedMode,
+    deterministicEdgeCount: deterministicBuild.edges.length,
+    citationEdgeCount: citationBuild.edges.length,
+    llmEdgeCount: llmBuild.edges.length,
+    ...(fallbackReason === undefined ? {} : { fallbackReason }),
   };
   transaction(db, () => {
     deleteGraphForSource(db, sourceId);
-    const build = buildDeterministicGraphForSource(db, sourceId);
     if (build.nodes.length === 0) {
       result = {
         sourceId,
         nodeCount: 0,
         edgeCount: 0,
         evidenceChunkCount: 0,
+        requestedMode,
+        appliedMode,
+        deterministicEdgeCount: 0,
+        citationEdgeCount: 0,
+        llmEdgeCount: 0,
+        ...(fallbackReason === undefined ? {} : { fallbackReason }),
         skipped: true,
         reason: "no_graph_candidates",
       };
@@ -10222,15 +10595,15 @@ function runDeterministicGraphBuildForSource(
       nodeIdsByCanonicalId.set(node.canonicalId, nodeId);
     }
 
-    const sourceNodeId = nodeIdsByCanonicalId.get(`source:${sourceId}`);
-    if (sourceNodeId === undefined) {
+    if (!nodeIdsByCanonicalId.has(`source:${sourceId}`)) {
       throw new EngineRpcError("GRAPH_BUILD_FAILED", `Source graph node missing: ${sourceId}`);
     }
 
     let edgeCount = 0;
     for (const edge of build.edges) {
+      const sourceNodeId = nodeIdsByCanonicalId.get(edge.sourceCanonicalId);
       const targetNodeId = nodeIdsByCanonicalId.get(edge.targetCanonicalId);
-      if (targetNodeId === undefined) continue;
+      if (sourceNodeId === undefined || targetNodeId === undefined) continue;
       insertGraphEdge(
         db,
         {
@@ -10261,12 +10634,397 @@ function runDeterministicGraphBuildForSource(
       nodeCount: build.nodes.length,
       edgeCount,
       evidenceChunkCount: build.evidenceChunkIds.length,
+      requestedMode,
+      appliedMode,
+      deterministicEdgeCount: deterministicBuild.edges.length,
+      citationEdgeCount: citationBuild.edges.length,
+      llmEdgeCount: llmBuild.edges.length,
+      ...(fallbackReason === undefined ? {} : { fallbackReason }),
     };
   });
   return result;
 }
 
-function buildDeterministicGraphForSource(db: SqliteDb, sourceId: string): DeterministicGraphBuild {
+function emptySourceGraphBuild(): SourceGraphBuild {
+  return { nodes: [], edges: [], evidenceChunkIds: [] };
+}
+
+function mergeSourceGraphBuilds(...builds: SourceGraphBuild[]): SourceGraphBuild {
+  const nodes = new Map<string, GraphNodeInput>();
+  const evidenceChunkIds = new Set<string>();
+  const edges: SourceGraphBuild["edges"] = [];
+  for (const build of builds) {
+    for (const node of build.nodes) addGraphNodeInput(nodes, node);
+    for (const edge of build.edges) edges.push(edge);
+    for (const chunkId of build.evidenceChunkIds) evidenceChunkIds.add(chunkId);
+  }
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: dedupeGraphEdgeInputs(edges),
+    evidenceChunkIds: Array.from(evidenceChunkIds),
+  };
+}
+
+function buildGraphExtractionInputForSource(db: SqliteDb, sourceId: string): GraphExtractionInput {
+  const source = db.selectObject(
+    `SELECT
+       s.source_title,
+       s.source_type,
+       sm.title AS meta_title,
+       sm.abstract AS meta_abstract
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.id = ?
+       AND s.lifecycle_status <> 'deleted'
+     LIMIT 1`,
+    [sourceId],
+  );
+  const rows = db.selectObjects(
+    `SELECT id, ord, section_path, text
+     FROM source_chunks
+     WHERE source_id = ?
+       AND role = 'child'
+     ORDER BY ord ASC`,
+    [sourceId],
+  );
+  const sampled = evenlySampleRows(rows, 10);
+  return {
+    sourceId,
+    sourceTitle:
+      stringField(source ?? {}, "meta_title") || stringField(source ?? {}, "source_title"),
+    sourceType: stringField(source ?? {}, "source_type"),
+    abstract: stringField(source ?? {}, "meta_abstract"),
+    chunks: sampled.flatMap((row) => {
+      const chunkId = stringField(row, "id");
+      const chunkExcerpt = excerpt(stringField(row, "text"), 900);
+      if (chunkId.length === 0 || chunkExcerpt.length === 0) return [];
+      return [
+        {
+          chunkId,
+          ord: numberField(row, "ord"),
+          ...(stringField(row, "section_path").length === 0
+            ? {}
+            : { sectionPath: stringField(row, "section_path") }),
+          excerpt: chunkExcerpt,
+        },
+      ];
+    }),
+  };
+}
+
+function evenlySampleRows<T>(rows: T[], limit: number) {
+  if (rows.length <= limit) return rows;
+  if (limit <= 1) return rows.slice(0, Math.max(0, limit));
+  const indexes = new Set<number>();
+  for (let index = 0; index < limit; index += 1) {
+    indexes.add(Math.round((index * (rows.length - 1)) / (limit - 1)));
+  }
+  return Array.from(indexes).flatMap((index) => {
+    const row = rows[index];
+    return row === undefined ? [] : [row];
+  });
+}
+
+function buildLlmGraphContribution(
+  sourceId: string,
+  input: GraphExtractionInput,
+  extraction: GraphExtractionResult,
+): SourceGraphBuild {
+  const nodes = new Map<string, GraphNodeInput>();
+  const sourceCanonicalId = `source:${sourceId}`;
+  addGraphNodeInput(nodes, {
+    kind: "source",
+    label: normalizeGraphLabel(input.sourceTitle ?? sourceId) || sourceId,
+    canonicalId: sourceCanonicalId,
+    refId: sourceId,
+  });
+  const canonicalByEntityId = new Map<string, string>();
+  for (const entity of extraction.entities) {
+    const node = graphEntityNodeInput(entity.kind, entity.label);
+    if (node === undefined) continue;
+    addGraphNodeInput(nodes, node);
+    canonicalByEntityId.set(entity.id, node.canonicalId);
+  }
+  const inputChunkIds = new Set(input.chunks.map((chunk) => chunk.chunkId));
+  const evidenceChunkIds = new Set<string>();
+  const edges: SourceGraphBuild["edges"] = [];
+  for (const relation of extraction.relations) {
+    const sourceCanonical =
+      relation.sourceEntityId === "source"
+        ? sourceCanonicalId
+        : canonicalByEntityId.get(relation.sourceEntityId);
+    const targetCanonical =
+      relation.targetEntityId === "source"
+        ? sourceCanonicalId
+        : canonicalByEntityId.get(relation.targetEntityId);
+    if (
+      sourceCanonical === undefined ||
+      targetCanonical === undefined ||
+      sourceCanonical === targetCanonical ||
+      relation.evidenceChunkIds.length === 0 ||
+      relation.evidenceChunkIds.some((chunkId) => !inputChunkIds.has(chunkId))
+    ) {
+      continue;
+    }
+    const anchors = boundedUniqueStrings(relation.evidenceChunkIds, 8);
+    for (const chunkId of anchors) evidenceChunkIds.add(chunkId);
+    edges.push({
+      sourceCanonicalId: sourceCanonical,
+      targetCanonicalId: targetCanonical,
+      dimension: relation.dimension,
+      edgeType: relation.edgeType,
+      evidenceSourceId: sourceId,
+      evidenceChunkIds: anchors,
+      weight: clampGraphWeight(relation.confidence),
+      createdBy: "graph_builder",
+    });
+  }
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: dedupeGraphEdgeInputs(edges),
+    evidenceChunkIds: Array.from(evidenceChunkIds),
+  };
+}
+
+interface GraphCitationRange {
+  charStart: number;
+  charEnd: number;
+}
+
+interface GraphCitationReference {
+  canonicalId: string;
+  label: string;
+  indexes: number[];
+  labels: string[];
+  ranges: GraphCitationRange[];
+}
+
+function buildCitationGraphForSource(db: SqliteDb, sourceId: string): SourceGraphBuild {
+  const source = db.selectObject(
+    `SELECT s.source_title, sm.title AS meta_title, sm.metadata_json
+     FROM sources s
+     LEFT JOIN source_metadata sm ON sm.source_id = s.id
+     WHERE s.id = ?
+       AND s.lifecycle_status <> 'deleted'
+     LIMIT 1`,
+    [sourceId],
+  );
+  if (source === undefined) return emptySourceGraphBuild();
+  const metadata = parseMetadata(stringField(source, "metadata_json"));
+  const references = graphCitationReferences(metadata);
+  if (references.length === 0) return emptySourceGraphBuild();
+
+  const sourceCanonicalId = `source:${sourceId}`;
+  const nodes = new Map<string, GraphNodeInput>();
+  addGraphNodeInput(nodes, {
+    kind: "source",
+    label: stringField(source, "meta_title") || stringField(source, "source_title") || sourceId,
+    canonicalId: sourceCanonicalId,
+    refId: sourceId,
+  });
+  const chunkRows = db.selectObjects(
+    `SELECT id, char_start, char_end
+     FROM source_chunks
+     WHERE source_id = ?
+       AND role = 'child'
+     ORDER BY ord ASC`,
+    [sourceId],
+  );
+  const citationLinks = graphCitationLinks(metadata);
+  const evidenceChunkIds = new Set<string>();
+  const edges: SourceGraphBuild["edges"] = [];
+  for (const reference of references) {
+    const matchedLinks = citationLinks.filter(
+      (link) =>
+        (link.targetReferenceIndex !== undefined &&
+          reference.indexes.includes(link.targetReferenceIndex)) ||
+        (link.targetReferenceLabel !== undefined &&
+          reference.labels.includes(normalizeGraphCitationLabel(link.targetReferenceLabel))) ||
+        (link.normalizedTargetLabel !== undefined &&
+          reference.labels.includes(normalizeGraphCitationLabel(link.normalizedTargetLabel))),
+    );
+    const linkRanges = matchedLinks.map((link) => ({
+      charStart: link.charStart,
+      charEnd: link.charEnd,
+    }));
+    const anchoredFromLinks = graphChunkIdsForRanges(chunkRows, linkRanges);
+    const anchors =
+      anchoredFromLinks.length > 0
+        ? anchoredFromLinks
+        : graphChunkIdsForRanges(chunkRows, reference.ranges);
+    if (anchors.length === 0) continue;
+    addGraphNodeInput(nodes, {
+      kind: "source",
+      label: reference.label,
+      canonicalId: reference.canonicalId,
+    });
+    for (const chunkId of anchors) evidenceChunkIds.add(chunkId);
+    edges.push({
+      sourceCanonicalId,
+      targetCanonicalId: reference.canonicalId,
+      dimension: "citation",
+      edgeType: "cites",
+      evidenceSourceId: sourceId,
+      evidenceChunkIds: anchors,
+      weight: matchedLinks.some((link) => link.confidence === "high")
+        ? 0.95
+        : matchedLinks.length > 0
+          ? 0.8
+          : 0.65,
+      createdBy: "graph_builder",
+    });
+  }
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: dedupeGraphEdgeInputs(edges),
+    evidenceChunkIds: Array.from(evidenceChunkIds),
+  };
+}
+
+function graphCitationReferences(metadata: Record<string, unknown>): GraphCitationReference[] {
+  const paperMetadata = isRecord(metadata.paper_metadata) ? metadata.paper_metadata : {};
+  const arrays = [
+    paperMetadata.referenceList,
+    paperMetadata.reference_list,
+    metadata.referenceList,
+    metadata.reference_list,
+    metadata.references,
+    metadata.pdf_references,
+  ].filter(Array.isArray);
+  const byCanonicalId = new Map<string, GraphCitationReference>();
+  for (const rawArray of arrays) {
+    rawArray.forEach((item, arrayIndex) => {
+      const record = isRecord(item) ? item : {};
+      const raw =
+        typeof item === "string"
+          ? normalizeText(item)
+          : typeof record.raw === "string"
+            ? normalizeText(record.raw)
+            : typeof record.text === "string"
+              ? normalizeText(record.text)
+              : typeof record.title === "string"
+                ? normalizeText(record.title)
+                : "";
+      const explicitTitle =
+        typeof record.title === "string" ? normalizeText(record.title) : undefined;
+      const title = explicitTitle || inferReferenceTitle(raw);
+      const doi =
+        (typeof record.doi === "string" ? normalizeDoi(record.doi) : undefined) ?? extractDoi(raw);
+      const explicitArxiv =
+        typeof record.arxivId === "string"
+          ? record.arxivId
+          : typeof record.arxiv_id === "string"
+            ? record.arxiv_id
+            : undefined;
+      const arxivId =
+        (explicitArxiv === undefined
+          ? undefined
+          : arxivParseResultFromIdCandidate(explicitArxiv).arxivId) ?? parseArxivText(raw).arxivId;
+      const identityText = normalizeText(title ?? raw).toLowerCase();
+      const canonicalId =
+        doi !== undefined
+          ? `source:doi:${doi.toLowerCase()}`
+          : arxivId !== undefined
+            ? `source:arxiv:${arxivId.toLowerCase()}`
+            : identityText.length > 0
+              ? `source:reference:${hashText(identityText)}`
+              : "";
+      if (canonicalId.length === 0) return;
+      const index = finiteRecordNumber(record, "index") ?? arrayIndex;
+      const recordLabel =
+        typeof record.label === "string" ? normalizeGraphCitationLabel(record.label) : "";
+      const range = graphCitationRangeFromRecord(record);
+      const label = normalizeGraphLabel(title ?? raw) || doi || arxivId || canonicalId;
+      const existing = byCanonicalId.get(canonicalId);
+      const indexes = boundedUniqueNumbers([...(existing?.indexes ?? []), index], 12);
+      const labels = boundedUniqueStrings(
+        [...(existing?.labels ?? []), recordLabel, `[${index + 1}]`, String(index + 1)],
+        12,
+      ).map(normalizeGraphCitationLabel);
+      const ranges = dedupeGraphCitationRanges([
+        ...(existing?.ranges ?? []),
+        ...(range === undefined ? [] : [range]),
+      ]);
+      byCanonicalId.set(canonicalId, {
+        canonicalId,
+        label: existing?.label ?? label.slice(0, 180),
+        indexes,
+        labels,
+        ranges,
+      });
+    });
+  }
+  return Array.from(byCanonicalId.values()).slice(0, 80);
+}
+
+function graphCitationLinks(metadata: Record<string, unknown>) {
+  if (!Array.isArray(metadata.pdf_citation_links)) return [];
+  return metadata.pdf_citation_links.flatMap((item) => {
+    if (!isRecord(item)) return [];
+    const charStart = finiteRecordNumber(item, "charStart");
+    const charEnd = finiteRecordNumber(item, "charEnd");
+    if (charStart === undefined || charEnd === undefined || charEnd <= charStart) return [];
+    return [
+      {
+        charStart,
+        charEnd,
+        targetReferenceIndex: finiteRecordNumber(item, "targetReferenceIndex"),
+        targetReferenceLabel:
+          typeof item.targetReferenceLabel === "string" ? item.targetReferenceLabel : undefined,
+        normalizedTargetLabel:
+          typeof item.normalizedTargetLabel === "string" ? item.normalizedTargetLabel : undefined,
+        confidence: item.confidence === "high" ? ("high" as const) : ("low" as const),
+      },
+    ];
+  });
+}
+
+function graphCitationRangeFromRecord(record: Record<string, unknown>) {
+  const charStart = finiteRecordNumber(record, "charStart");
+  const charEnd = finiteRecordNumber(record, "charEnd");
+  return charStart === undefined || charEnd === undefined || charEnd <= charStart
+    ? undefined
+    : { charStart, charEnd };
+}
+
+function graphChunkIdsForRanges(rows: SqlRow[], ranges: GraphCitationRange[]) {
+  const matched: string[] = [];
+  for (const row of rows) {
+    const chunkId = stringField(row, "id");
+    const charStart = finiteRecordNumber(row, "char_start");
+    const charEnd = finiteRecordNumber(row, "char_end");
+    if (chunkId.length === 0 || charStart === undefined || charEnd === undefined) continue;
+    if (ranges.some((range) => charStart < range.charEnd && charEnd > range.charStart)) {
+      matched.push(chunkId);
+    }
+  }
+  return boundedUniqueStrings(matched, 8);
+}
+
+function finiteRecordNumber(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : undefined;
+}
+
+function boundedUniqueNumbers(values: number[], limit: number) {
+  return Array.from(new Set(values.filter((value) => Number.isFinite(value)))).slice(0, limit);
+}
+
+function normalizeGraphCitationLabel(value: string) {
+  return normalizeText(value).toLowerCase();
+}
+
+function dedupeGraphCitationRanges(ranges: GraphCitationRange[]) {
+  const seen = new Set<string>();
+  return ranges.filter((range) => {
+    const key = `${range.charStart}:${range.charEnd}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildDeterministicGraphForSource(db: SqliteDb, sourceId: string): SourceGraphBuild {
   const source = db.selectObject(
     `SELECT
       s.id,
@@ -10287,7 +11045,7 @@ function buildDeterministicGraphForSource(db: SqliteDb, sourceId: string): Deter
   if (source === undefined) return { nodes: [], edges: [], evidenceChunkIds: [] };
 
   const nodesByCanonicalId = new Map<string, GraphNodeInput>();
-  const edges: DeterministicGraphBuild["edges"] = [];
+  const edges: SourceGraphBuild["edges"] = [];
   const evidenceChunkIds = new Set<string>();
   const metadata = parseMetadata(stringField(source, "metadata_json"));
   const sourceLabel =
@@ -10316,6 +11074,7 @@ function buildDeterministicGraphForSource(db: SqliteDb, sourceId: string): Deter
     const chunks = boundedUniqueStrings(input.evidenceChunkIds, 8);
     for (const chunkId of chunks) evidenceChunkIds.add(chunkId);
     edges.push({
+      sourceCanonicalId: sourceNode.canonicalId,
       targetCanonicalId: node.canonicalId,
       dimension: input.dimension,
       edgeType: input.edgeType,
@@ -10527,7 +11286,7 @@ function deleteGraphForSource(db: SqliteDb, sourceId: string) {
   });
   db.exec(`
     DELETE FROM graph_nodes
-    WHERE kind <> 'source'
+    WHERE (kind <> 'source' OR ref_id IS NULL)
       AND id NOT IN (
         SELECT source_node_id FROM graph_edges
         UNION
@@ -11118,10 +11877,11 @@ function classifyGraphTermKind(term: string): GraphNodeKind {
   return "domain";
 }
 
-function dedupeGraphEdgeInputs(edges: DeterministicGraphBuild["edges"]) {
-  const byKey = new Map<string, DeterministicGraphBuild["edges"][number]>();
+function dedupeGraphEdgeInputs(edges: SourceGraphBuild["edges"]) {
+  const byKey = new Map<string, SourceGraphBuild["edges"][number]>();
   for (const edge of edges) {
     const key = [
+      edge.sourceCanonicalId,
       edge.targetCanonicalId,
       edge.dimension,
       normalizeText(edge.edgeType),
@@ -13680,7 +14440,7 @@ async function loadVectorMetaRetrievalHits(
       },
     };
   }
-  const ranked = rows
+  const scored = rows
     .flatMap((row) => {
       const vector = parseEmbeddingVector(stringField(row, "vector_json"), provider.dimension);
       if (vector === null) return [];
@@ -13691,9 +14451,8 @@ async function loadVectorMetaRetrievalHits(
         },
       ];
     })
-    .sort((left, right) => right.score - left.score)
-    .slice(0, clampLimit(input.limit, 200));
-  if (ranked.length === 0) {
+    .sort((left, right) => right.score - left.score);
+  if (scored.length === 0) {
     return {
       hits: [],
       trace: {
@@ -13704,11 +14463,24 @@ async function loadVectorMetaRetrievalHits(
       },
     };
   }
+  const ranked = selectRelevantVectorRows(scored, clampLimit(input.limit, 200));
+  if (ranked.length === 0) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_meta",
+        status: "skipped",
+        itemCount: 0,
+        reason: "no_relevant_matches",
+      },
+    };
+  }
   return {
-    hits: ranked.map(({ row }, index) => ({
+    hits: ranked.map(({ row, score }, index) => ({
       track: "vector_meta",
       rank: index + 1,
       source: row,
+      rawScore: score,
       fallbackExcerpt: metaSourceFallbackExcerpt(row, input.query),
     })),
     trace: {
@@ -13801,7 +14573,7 @@ async function loadVectorChunkRetrievalHits(
       },
     };
   }
-  const ranked = rows
+  const scored = rows
     .flatMap((row) => {
       const vector = parseEmbeddingVector(stringField(row, "vector_json"), provider.dimension);
       if (vector === null) return [];
@@ -13812,9 +14584,8 @@ async function loadVectorChunkRetrievalHits(
         },
       ];
     })
-    .sort((left, right) => right.score - left.score)
-    .slice(0, clampLimit(input.limit, 400));
-  if (ranked.length === 0) {
+    .sort((left, right) => right.score - left.score);
+  if (scored.length === 0) {
     return {
       hits: [],
       trace: {
@@ -13825,11 +14596,24 @@ async function loadVectorChunkRetrievalHits(
       },
     };
   }
+  const ranked = selectRelevantVectorRows(scored, clampLimit(input.limit, 400));
+  if (ranked.length === 0) {
+    return {
+      hits: [],
+      trace: {
+        name: "vector_chunks",
+        status: "skipped",
+        itemCount: 0,
+        reason: "no_relevant_matches",
+      },
+    };
+  }
   return {
     hits: ranked.map(({ row, score }, index) => ({
       track: "vector_chunks",
       rank: index + 1,
       source: row,
+      rawScore: score,
       chunk: {
         chunkId: stringField(row, "chunk_id"),
         ord: numberField(row, "chunk_ord"),
@@ -13855,7 +14639,7 @@ async function embedRetrievalQuery(
   { vector: number[]; trace?: undefined } | { vector?: undefined; trace: RetrieveSourcesTraceTrack }
 > {
   try {
-    const [vector] = await provider.embedTexts([query]);
+    const [vector] = await provider.embedTexts([query], "query");
     if (vector === undefined || vector.length !== provider.dimension) {
       return {
         trace: {
@@ -13918,6 +14702,110 @@ function metaSourceFallbackExcerpt(row: SqlRow, query: string) {
   return parts.length > 0 ? excerpt(parts.join(" - ")) : stringField(row, "source_url");
 }
 
+function hasDirectKnowledgeBaseLexicalMatch(item: RetrieveSourceItem) {
+  return item.tracks.includes("meta_sources") || item.tracks.includes("fts_chunks");
+}
+
+function selectRelevantVectorRows<T extends { row: SqlRow; score: number }>(
+  ranked: T[],
+  hitLimit: number,
+) {
+  const valid = ranked.filter((item) => Number.isFinite(item.score) && item.score > 0);
+  if (valid.length === 0) return [];
+
+  const bestScoreBySource = new Map<string, number>();
+  for (const item of valid) {
+    const sourceId = stringField(item.row, "id");
+    if (sourceId.length === 0 || bestScoreBySource.has(sourceId)) continue;
+    bestScoreBySource.set(sourceId, item.score);
+  }
+  const sourceScores = Array.from(bestScoreBySource.entries()).sort(
+    (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
+  );
+  const selectedSourceCount = adaptiveVectorSourceCount(sourceScores.map((entry) => entry[1]));
+  const selectedSourceIds = new Set(
+    sourceScores.slice(0, selectedSourceCount).map((entry) => entry[0]),
+  );
+  return valid
+    .filter((item) => selectedSourceIds.has(stringField(item.row, "id")))
+    .slice(0, hitLimit);
+}
+
+function pruneCrossTrackVectorHits(hits: SourceRetrievalHit[], sourceLimit: number) {
+  const sourceIdsByTrack = new Map<SourceRetrievalTrack, Set<string>>();
+  const bestScoreBySource = new Map<string, number>();
+  for (const hit of hits) {
+    if (hit.track !== "vector_meta" && hit.track !== "vector_chunks") continue;
+    const sourceId = stringField(hit.source, "id");
+    if (sourceId.length === 0 || !Number.isFinite(hit.rawScore)) continue;
+    const sourceIds = sourceIdsByTrack.get(hit.track) ?? new Set<string>();
+    sourceIds.add(sourceId);
+    sourceIdsByTrack.set(hit.track, sourceIds);
+    bestScoreBySource.set(
+      sourceId,
+      Math.max(bestScoreBySource.get(sourceId) ?? Number.NEGATIVE_INFINITY, hit.rawScore ?? 0),
+    );
+  }
+
+  const unionSize = bestScoreBySource.size;
+  const largestTrackSize = Math.max(
+    0,
+    ...Array.from(sourceIdsByTrack.values(), (sourceIds) => sourceIds.size),
+  );
+  if (unionSize <= largestTrackSize || largestTrackSize === 0) return hits;
+
+  const rankedSources = Array.from(bestScoreBySource.entries()).sort(
+    (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
+  );
+  const selectedSourceCount = Math.min(
+    Math.max(1, sourceLimit),
+    largestTrackSize,
+    adaptiveVectorSourceCount(rankedSources.map((entry) => entry[1])),
+  );
+  const selectedSourceIds = new Set(
+    rankedSources.slice(0, selectedSourceCount).map((entry) => entry[0]),
+  );
+  return hits.filter((hit) => selectedSourceIds.has(stringField(hit.source, "id")));
+}
+
+function vectorTraceAfterSelection(
+  trace: RetrieveSourcesTraceTrack,
+  hits: SourceRetrievalHit[],
+): RetrieveSourcesTraceTrack {
+  if (trace.status !== "used") return trace;
+  if (hits.length === 0) {
+    return {
+      name: trace.name,
+      status: "skipped",
+      itemCount: 0,
+      reason: "no_relevant_matches",
+    };
+  }
+  return { ...trace, itemCount: hits.length };
+}
+
+function adaptiveVectorSourceCount(scores: number[]) {
+  if (scores.length <= 2) return scores.length;
+  const fallbackCount = Math.max(1, Math.ceil(Math.sqrt(scores.length)));
+  const consideredCount = Math.min(scores.length, fallbackCount * 2);
+  const considered = scores.slice(0, consideredCount);
+  const topScore = considered[0] ?? 0;
+  const lastScore = considered.at(-1) ?? topScore;
+  const totalSpread = topScore - lastScore;
+  let largestGap = 0;
+  let largestGapIndex = -1;
+  for (let index = 0; index < considered.length - 1; index += 1) {
+    const gap = (considered[index] ?? 0) - (considered[index + 1] ?? 0);
+    if (gap > largestGap) {
+      largestGap = gap;
+      largestGapIndex = index;
+    }
+  }
+  const remainingSpread = Math.max(0, totalSpread - largestGap);
+  if (largestGapIndex >= 0 && largestGap > remainingSpread) return largestGapIndex + 1;
+  return fallbackCount;
+}
+
 function fuseSourceRetrievalHits(
   hits: SourceRetrievalHit[],
   input: { limit: number; includeChunks: number; rrfK: number },
@@ -13934,10 +14822,18 @@ function fuseSourceRetrievalHits(
       fallbackExcerpt: string;
     }
   >();
+  const sourceRanksByTrack = new Map<SourceRetrievalTrack, Map<string, number>>();
 
   for (const hit of hits) {
     const sourceId = stringField(hit.source, "id");
     if (sourceId.length === 0) continue;
+    const trackSourceRanks = sourceRanksByTrack.get(hit.track) ?? new Map<string, number>();
+    const existingTrackRank = trackSourceRanks.get(sourceId);
+    const sourceRank = existingTrackRank ?? trackSourceRanks.size + 1;
+    if (existingTrackRank === undefined) {
+      trackSourceRanks.set(sourceId, sourceRank);
+      sourceRanksByTrack.set(hit.track, trackSourceRanks);
+    }
     const existing = grouped.get(sourceId) ?? {
       source: hit.source,
       score: 0,
@@ -13950,9 +14846,11 @@ function fuseSourceRetrievalHits(
         stringField(hit.source, "source_title") ||
         stringField(hit.source, "source_url"),
     };
-    existing.score += reciprocalRankFusionScore(hit.rank, input.rrfK);
-    existing.bestRank = Math.min(existing.bestRank, hit.rank);
-    existing.tracks.add(hit.track);
+    if (!existing.tracks.has(hit.track)) {
+      existing.score += reciprocalRankFusionScore(sourceRank, input.rrfK);
+      existing.bestRank = Math.min(existing.bestRank, sourceRank);
+      existing.tracks.add(hit.track);
+    }
     if (
       hit.chunk !== undefined &&
       existing.chunks.length < input.includeChunks &&
@@ -14118,7 +15016,108 @@ function buildKnowledgeBaseSourceClusters(
   if (clustering.clusterBy === "topic") {
     return buildKnowledgeBaseTopicSourceClusters(items, clustering, metadataBySourceId);
   }
+  if (clustering.clusterBy === "graph") {
+    return buildKnowledgeBaseGraphSourceClusters(db, items, clustering);
+  }
   return buildKnowledgeBaseMetadataSourceClusters(items, clustering, metadataBySourceId);
+}
+
+function buildKnowledgeBaseGraphSourceClusters(
+  db: SqliteDb,
+  items: RetrieveSourceItem[],
+  clustering: KnowledgeBaseClusteringOptions,
+): KnowledgeBaseSourceCluster[] {
+  const sourceIds = items.map((item) => item.id).filter((id) => id.length > 0);
+  if (sourceIds.length === 0) return [];
+  const placeholders = sourceIds.map(() => "?").join(", ");
+  const rows = db.selectObjects(
+    `SELECT
+       source_node.ref_id AS source_id,
+       target_node.id AS target_node_id,
+       target_node.kind AS target_kind,
+       target_node.label AS target_label,
+       edge.weight AS edge_weight
+     FROM graph_nodes source_node
+     JOIN graph_edges edge
+       ON edge.source_node_id = source_node.id OR edge.target_node_id = source_node.id
+     JOIN graph_nodes target_node
+       ON target_node.id = CASE
+         WHEN edge.source_node_id = source_node.id THEN edge.target_node_id
+         ELSE edge.source_node_id
+       END
+     WHERE source_node.kind = 'source'
+       AND source_node.ref_id IN (${placeholders})
+       AND edge.dimension IN ('domain', 'technical')
+       AND target_node.kind IN ('domain', 'problem', 'method', 'dataset', 'metric')
+     ORDER BY source_node.ref_id ASC, edge.weight DESC, target_node.label ASC`,
+    sourceIds,
+  );
+  const signalsBySourceId = new Map<
+    string,
+    Array<{ nodeId: string; kind: GraphNodeKind; label: string; weight: number }>
+  >();
+  for (const row of rows) {
+    const sourceId = stringField(row, "source_id");
+    const nodeId = stringField(row, "target_node_id");
+    const label = normalizeGraphLabel(stringField(row, "target_label"));
+    if (sourceId.length === 0 || nodeId.length === 0 || label.length === 0) continue;
+    const existing = signalsBySourceId.get(sourceId) ?? [];
+    existing.push({
+      nodeId,
+      kind: graphNodeKindField(row, "target_kind"),
+      label,
+      weight: clampGraphWeight(realField(row, "edge_weight")),
+    });
+    signalsBySourceId.set(sourceId, existing);
+  }
+
+  const grouped = new Map<
+    string,
+    Array<{ item: RetrieveSourceItem; rank: number; label: string; edgeCount: number }>
+  >();
+  items.forEach((item, index) => {
+    const signals = signalsBySourceId.get(item.id) ?? [];
+    const primary = signals[0];
+    const key = primary === undefined ? "graph:unmapped" : `graph:${primary.nodeId}`;
+    const members = grouped.get(key) ?? [];
+    members.push({
+      item,
+      rank: index + 1,
+      label: primary?.label ?? "Unmapped",
+      edgeCount: signals.length,
+    });
+    grouped.set(key, members);
+  });
+
+  const drafts = Array.from(grouped.entries()).flatMap(([key, members]) => {
+    if (members.length === 0) return [];
+    const sourceCount = members.length;
+    const graphEdgeCount = members.reduce((sum, member) => sum + member.edgeCount, 0);
+    const unmapped = key === "graph:unmapped";
+    return [
+      {
+        label: members[0]?.label ?? "Unmapped",
+        sourceIds: members.map((member) => member.item.id),
+        sourceCount,
+        score: members.reduce(
+          (sum, member) => sum + (Number.isFinite(member.item.score) ? member.item.score : 0),
+          0,
+        ),
+        bestRank: Math.min(...members.map((member) => member.rank)),
+        summary: unmapped
+          ? `${sourceCount} source${sourceCount === 1 ? "" : "s"} without research graph signals.`
+          : `${sourceCount} source${sourceCount === 1 ? "" : "s"} grouped by strongest research graph affinity.`,
+        trace: {
+          backend: "graph" as const,
+          method: "graph_entity_affinity" as const,
+          graphEdgeCount,
+          ...(unmapped ? { fallbackReason: "no_graph_signal" as const } : {}),
+        },
+        idSeed: `${key}:${members.map((member) => member.item.id).join("|")}`,
+      },
+    ];
+  });
+  return finalizeKnowledgeBaseClusterDrafts(drafts, clustering.clusterBy, clustering.granularity);
 }
 
 function buildKnowledgeBaseTopicSourceClusters(
@@ -14524,7 +15523,8 @@ function sameClusterTrace(
     left?.backend === right?.backend &&
     left?.method === right?.method &&
     left?.fallbackReason === right?.fallbackReason &&
-    left?.vectorCount === right?.vectorCount
+    left?.vectorCount === right?.vectorCount &&
+    left?.graphEdgeCount === right?.graphEdgeCount
   );
 }
 
@@ -14917,6 +15917,8 @@ function knowledgeBaseClusterLabel(
       return semanticFallbackClusterLabel(item, sourceMetadata);
     case "topic":
       return knowledgeBaseSourceTopicSignal(item, sourceMetadata).label;
+    case "graph":
+      return "Unmapped";
   }
 }
 
@@ -15009,22 +16011,6 @@ function vectorMetaSkippedTrace(reason: string): RetrieveSourcesTraceTrack {
   };
 }
 
-function embedLocalDeterministic(input: string, dimension: number) {
-  const vector = Array.from({ length: dimension }, () => 0);
-  const tokens =
-    normalizeText(input)
-      .toLowerCase()
-      .match(/[\p{L}\p{N}_]+/gu) ?? [];
-  for (const token of tokens.length === 0 ? [normalizeText(input).toLowerCase()] : tokens) {
-    if (token.length === 0) continue;
-    const hash = stableHashNumber(token);
-    const index = hash % dimension;
-    const sign = (hash & 1) === 0 ? 1 : -1;
-    vector[index] = (vector[index] ?? 0) + sign;
-  }
-  return normalizeVector(vector);
-}
-
 function stableHashNumber(input: string) {
   let hash = 2166136261;
   for (let index = 0; index < input.length; index += 1) {
@@ -15071,6 +16057,9 @@ function jobSummaryFromRow(row: SqlRow): JobSummary {
     status: jobStatusField(row, "status"),
     attempts: numberField(row, "attempts"),
     maxAttempts: numberField(row, "max_attempts"),
+    progressCurrent: Math.max(0, numberField(row, "progress_current")),
+    progressTotal: Math.max(1, numberField(row, "progress_total")),
+    cancelRequested: numberField(row, "cancel_requested") !== 0,
     createdAt: stringField(row, "created_at"),
     ...(lastError === undefined ? {} : { lastError }),
     ...(startedAt === undefined ? {} : { startedAt }),

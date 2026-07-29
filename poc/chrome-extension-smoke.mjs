@@ -733,6 +733,19 @@ try {
     const firstRuntime = await resultOrError(() =>
       runBrowserPoc(firstOffscreen.target, "window.__clioPhase0Poc.workerRuntimeCsp()", 30_000),
     );
+    const localEmbedding =
+      process.env.CLIO_POC_LOCAL_EMBEDDING === "1"
+        ? await resultOrError(() =>
+            runBrowserPoc(
+              firstOffscreen.target,
+              `window.__clioPhase0Poc.localEmbeddingRuntime(${JSON.stringify(
+                process.env.CLIO_POC_LOCAL_EMBEDDING_MODEL ?? "all",
+              )})`,
+              40 * 60 * 1000,
+            ),
+          )
+        : undefined;
+    if (localEmbedding !== undefined) summary.localEmbedding = localEmbedding;
     await stopChrome(firstChrome.processHandle);
 
     secondChrome = await launchChrome(profileDir);
@@ -788,7 +801,8 @@ try {
       sqlite.status === "pass" &&
       indexedDb.status === "pass" &&
       firstRuntime.status === "pass" &&
-      secondRuntime.status === "pass"
+      secondRuntime.status === "pass" &&
+      (localEmbedding === undefined || localEmbedding.status === "pass")
         ? "pass"
         : "fail";
     summary.durationMs = Math.round(performance.now() - started);

@@ -20,6 +20,9 @@ module.exports = {
         "warning-background": "hsl(var(--clio-warning-background))",
         "warning-border": "hsl(var(--clio-warning-border))",
         "warning-foreground": "hsl(var(--clio-warning-foreground))",
+        "success-background": "hsl(var(--clio-success-background))",
+        "success-border": "hsl(var(--clio-success-border))",
+        "success-foreground": "hsl(var(--clio-success-foreground))",
         danger: "hsl(var(--clio-danger))",
       },
       boxShadow: {

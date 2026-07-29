@@ -1,4 +1,6 @@
 import sqliteWasmUrl from "@sqlite.org/sqlite-wasm/sqlite3.wasm?url";
+import { runLocalEmbeddingPoc } from "../local-embedding/local-embedding-poc-host";
+import type { LocalEmbeddingPocModelKey } from "../local-embedding/poc-models";
 import pocWorkerUrl from "./poc-worker.ts?worker&url";
 
 type PocResult = Record<string, unknown>;
@@ -28,6 +30,7 @@ declare global {
       sqliteFts5: () => Promise<PocResult>;
       indexedDbFallback: () => Promise<PocResult>;
       workerRuntimeCsp: () => Promise<PocResult>;
+      localEmbeddingRuntime: (model?: LocalEmbeddingPocModelKey | "all") => Promise<PocResult>;
     };
   }
 }
@@ -118,6 +121,7 @@ export function installPhase0PocHost(hostKind: "offscreen" | "extension-page") {
       hasOpfs: typeof navigator.storage?.getDirectory === "function",
       hasIndexedDb: typeof indexedDB !== "undefined",
     }),
+    localEmbeddingRuntime: (model = "all") => runLocalEmbeddingPoc(model),
     opfsWriteRead: async (value: string) => {
       assert(
         typeof navigator.storage?.getDirectory === "function",

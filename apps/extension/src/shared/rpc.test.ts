@@ -14,6 +14,8 @@ import {
   CLIO_IMAGE_GENERATION_STREAM_EVENT,
   CLIO_IMAGE_GENERATION_STREAM_REQUEST,
   CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
+  CLIO_LOCAL_EMBEDDING_REQUEST,
+  CLIO_OFFSCREEN_REQUEST,
   CLIO_PROVIDER_CONFIG_REQUEST,
   CLIO_PROVIDER_REQUEST,
   CLIO_UI_REQUEST,
@@ -25,10 +27,17 @@ import {
   CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
   CLIO_WORKER_EMBEDDING_REQUEST,
   CLIO_WORKER_EMBEDDING_RESPONSE,
+  CLIO_WORKER_GRAPH_EXTRACTION_REQUEST,
+  CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE,
   CLIO_WORKER_VISION_ANALYSIS_REQUEST,
   CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
+  type PdfRawFileResult,
   type RetrieveSourceHitChunk,
   type RetrieveSourceItem,
+  decodeEngineRequestFromChrome,
+  decodeEngineResponseFromChrome,
+  encodeEngineRequestForChrome,
+  encodeEngineResponseForChrome,
   isAgentRunEventMessage,
   isAgentRunRequestMessage,
   isAgentStreamCompactMessage,
@@ -43,6 +52,8 @@ import {
   isImageGenerationStreamRequestMessage,
   isKnowledgeBaseClusterLabelRefinementRequestMessage,
   isKnowledgeBaseClusterLabelRefinementResponseMessage,
+  isLocalEmbeddingModelRequestMessage,
+  isOffscreenRequestMessage,
   isProviderConfigRequestMessage,
   isProviderRequestMessage,
   isUiRequestMessage,
@@ -54,12 +65,21 @@ import {
   isWorkerChunkMetaSummaryResponseMessage,
   isWorkerEmbeddingRequestMessage,
   isWorkerEmbeddingResponseMessage,
+  isWorkerGraphExtractionRequestMessage,
+  isWorkerGraphExtractionResponseMessage,
   isWorkerVisionAnalysisRequestMessage,
   isWorkerVisionAnalysisResponseMessage,
+  unwrapEngineResponse,
 } from "./rpc";
 
 describe("session engine RPC guards", () => {
-  it("accepts typed PDF and Markdown capture requests", () => {
+  it("turns a missing background response into an actionable RPC error", () => {
+    expect(() => unwrapEngineResponse(undefined)).toThrowError(
+      "Clio background did not return a response. Reload the extension and refresh this page.",
+    );
+  });
+
+  it("accepts typed Markdown and Chrome-safe PDF capture requests", () => {
     expect(
       isEngineRequestMessage({
         type: CLIO_ENGINE_REQUEST,
@@ -78,11 +98,13 @@ describe("session engine RPC guards", () => {
       isEngineRequestMessage({
         type: CLIO_ENGINE_REQUEST,
         request: {
-          kind: "capturePdf",
-          payload: {
-            sourceUrl: "clio://upload/paper.pdf",
-            sourceTitle: "paper.pdf",
-            bytes: new Uint8Array([1, 2, 3]),
+          kind: "enqueueEmbeddingReindex",
+          model: {
+            id: "local-transformers:xenova-multilingual-e5-small:revision:int8:d384",
+            provider: "local-transformers",
+            label: "Multilingual E5 Small",
+            dimension: 384,
+            metric: "cosine",
           },
         },
       }),
@@ -91,16 +113,56 @@ describe("session engine RPC guards", () => {
     expect(
       isEngineRequestMessage({
         type: CLIO_ENGINE_REQUEST,
-        request: {
+        request: { kind: "cancelJob", id: "job:embedding-reindex" },
+      }),
+    ).toBe(true);
+
+    const bytes = Uint8Array.from({ length: 50_003 }, (_, index) => index % 256);
+    const transportRequest = JSON.parse(
+      JSON.stringify(
+        encodeEngineRequestForChrome({
           kind: "capturePdf",
           payload: {
             sourceUrl: "clio://upload/paper.pdf",
             sourceTitle: "paper.pdf",
-            bytes: new ArrayBuffer(4),
+            bytes,
           },
-        },
-      }),
+        }),
+      ),
+    );
+
+    expect(isEngineRequestMessage({ type: CLIO_ENGINE_REQUEST, request: transportRequest })).toBe(
+      true,
+    );
+    expect(
+      isOffscreenRequestMessage({ type: CLIO_OFFSCREEN_REQUEST, request: transportRequest }),
     ).toBe(true);
+
+    const decoded = decodeEngineRequestFromChrome(transportRequest);
+    expect(decoded.kind).toBe("capturePdf");
+    if (decoded.kind !== "capturePdf") throw new Error("Expected a PDF capture request.");
+    expect(Array.from(new Uint8Array(decoded.payload.bytes))).toEqual(Array.from(bytes));
+  });
+
+  it("round-trips raw PDF responses across Chrome JSON serialization", () => {
+    const request = { kind: "getPdfRawFile", id: "source-pdf-1" } as const;
+    const encoded = encodeEngineResponseForChrome(request, {
+      ok: true,
+      value: {
+        memoryId: "source-pdf-1",
+        sourceTitle: "paper.pdf",
+        sourceUrl: "clio://upload/paper.pdf",
+        bytes: new Uint8Array([37, 80, 68, 70, 45]),
+        byteLength: 5,
+        contentType: "application/pdf",
+      },
+    });
+    const chromeRoundTrip = JSON.parse(JSON.stringify(encoded));
+    const decoded = decodeEngineResponseFromChrome(request, chromeRoundTrip);
+    const value = unwrapEngineResponse(decoded) as PdfRawFileResult;
+
+    expect(Array.from(value.bytes as Uint8Array)).toEqual([37, 80, 68, 70, 45]);
+    expect(value.byteLength).toBe(5);
   });
 
   it("rejects malformed PDF and Markdown capture requests", () => {
@@ -362,6 +424,39 @@ describe("session engine RPC guards", () => {
         request: {
           kind: "buildSourceGraph",
           payload: { sourceId: "source-1", mode: "deterministic" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "buildSourceGraph",
+          payload: { sourceId: "source-1", mode: "llm" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "enqueueSourceGraphJob",
+          payload: { sourceId: "source-1", mode: "llm" },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "bounded graph",
+            clustering: { clusterBy: "graph", granularity: "medium" },
+          },
         },
       }),
     ).toBe(true);
@@ -1723,6 +1818,7 @@ describe("session engine RPC guards", () => {
           kind: "searchKnowledgeBase",
           payload: {
             query: "long context degradation",
+            mode: "semantic",
             limit: 20,
             includeChunks: 2,
             filter: {
@@ -1751,6 +1847,7 @@ describe("session engine RPC guards", () => {
           kind: "searchKnowledgeBase",
           payload: {
             query: "topic grouping",
+            mode: "exact",
             clustering: {
               clusterBy: "topic",
               granularity: "coarse",
@@ -1762,6 +1859,19 @@ describe("session engine RPC guards", () => {
         },
       }),
     ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: {
+            query: "long context degradation",
+            mode: "hybrid",
+          },
+        },
+      }),
+    ).toBe(false);
 
     expect(
       isEngineRequestMessage({
@@ -2085,10 +2195,10 @@ describe("session engine RPC guards", () => {
 
   it("accepts explicit queued job run requests", () => {
     const activeModel = {
-      id: "openai:base:model:d1536",
-      provider: "openai",
-      label: "OpenAI text-embedding-3-small",
-      dimension: 1536,
+      id: "local-transformers:test:model:d384",
+      provider: "local-transformers",
+      label: "Local multilingual embedding model",
+      dimension: 384,
       metric: "cosine",
       status: "active",
       updatedAt: "2026-07-03T00:00:00.000Z",
@@ -2545,76 +2655,30 @@ describe("session engine RPC guards", () => {
         },
       }),
     ).toBe(true);
-
-    expect(
-      isProviderRequestMessage({
-        type: CLIO_PROVIDER_REQUEST,
-        request: { kind: "getEmbeddingProviderSettings" },
-      }),
-    ).toBe(true);
-
-    expect(
-      isProviderRequestMessage({
-        type: CLIO_PROVIDER_REQUEST,
-        request: {
-          kind: "saveEmbeddingProviderSettings",
-          settings: {
-            activeProvider: "openai-compatible",
-            openai: {
-              apiKey: "sk-embedding",
-              model: "text-embedding-3-small",
-              baseUrl: "https://api.openai.example.test/v1",
-              dimension: 1536,
-            },
-            openaiCompatible: {
-              apiKey: "sk-compatible",
-              model: "embed-custom",
-              baseUrl: "https://embeddings.example.test/v1",
-              providerName: "custom",
-              dimension: 768,
-            },
-          },
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isProviderRequestMessage({
-        type: CLIO_PROVIDER_REQUEST,
-        request: {
-          kind: "testEmbeddingProvider",
-          settings: {
-            activeProvider: "openai",
-            openai: {
-              apiKey: "sk-embedding",
-              model: "text-embedding-3-small",
-              baseUrl: "https://api.openai.example.test/v1",
-            },
-          },
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isProviderRequestMessage({
-        type: CLIO_PROVIDER_REQUEST,
-        request: {
-          kind: "ensureEmbeddingProviderHostPermission",
-          provider: "openai-compatible",
-          baseUrl: "https://embeddings.example.test/v1",
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isProviderRequestMessage({
-        type: CLIO_PROVIDER_REQUEST,
-        request: { kind: "authorizeEmbeddingReindex" },
-      }),
-    ).toBe(true);
   });
 
-  it("accepts typed embedding reindex engine requests", () => {
+  it("rejects removed remote embedding provider requests", () => {
+    for (const request of [
+      { kind: "getEmbeddingProviderSettings" },
+      { kind: "saveEmbeddingProviderSettings", settings: {} },
+      { kind: "testEmbeddingProvider", settings: {} },
+      {
+        kind: "ensureEmbeddingProviderHostPermission",
+        provider: "openai-compatible",
+        baseUrl: "https://embeddings.example.test/v1",
+      },
+      { kind: "authorizeEmbeddingReindex" },
+    ]) {
+      expect(
+        isProviderRequestMessage({
+          type: CLIO_PROVIDER_REQUEST,
+          request,
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("accepts only local-transformers embedding reindex engine requests", () => {
     expect(
       isEngineRequestMessage({
         type: CLIO_ENGINE_REQUEST,
@@ -2630,16 +2694,65 @@ describe("session engine RPC guards", () => {
           },
         },
       }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "reindex",
+          scope: "embeddings",
+          model: {
+            id: "local-transformers:xenova-multilingual-e5-small:revision:int8:d384",
+            provider: "local-transformers",
+            label: "Multilingual E5 Small",
+            dimension: 384,
+            metric: "cosine",
+          },
+        },
+      }),
     ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "reindex",
+          scope: "embeddings",
+          model: {
+            id: "unsupported:test-model",
+            provider: "unsupported",
+            label: "Unsupported embedding model",
+            dimension: 64,
+            metric: "cosine",
+          },
+        },
+      }),
+    ).toBe(false);
   });
 
-  it("accepts typed worker embedding bridge messages", () => {
+  it("accepts only local worker embedding bridge requests", () => {
     expect(
       isWorkerEmbeddingRequestMessage({
         type: CLIO_WORKER_EMBEDDING_REQUEST,
         requestId: "embedding-request-1",
         request: {
           modelId: "openai:abcd:text-embedding-3-small:d1536",
+          provider: "openai",
+          purpose: "document",
+          inputs: ["bounded chunk text", "bounded meta text"],
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerEmbeddingRequestMessage({
+        type: CLIO_WORKER_EMBEDDING_REQUEST,
+        requestId: "embedding-request-local",
+        request: {
+          modelId: "local-transformers:test-model",
+          provider: "local-transformers",
+          purpose: "document",
           inputs: ["bounded chunk text", "bounded meta text"],
         },
       }),
@@ -2669,6 +2782,36 @@ describe("session engine RPC guards", () => {
             code: "PROVIDER_AUTH_ERROR",
             message: "Embedding provider auth failed.",
           },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts trusted local embedding control messages", () => {
+    expect(
+      isLocalEmbeddingModelRequestMessage({
+        type: CLIO_LOCAL_EMBEDDING_REQUEST,
+        request: { kind: "getLocalEmbeddingModelStatus" },
+      }),
+    ).toBe(true);
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "testLocalEmbeddingModel",
+          modelId: "local-transformers:test-model",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isWorkerEmbeddingRequestMessage({
+        type: CLIO_WORKER_EMBEDDING_REQUEST,
+        requestId: "local-query-1",
+        request: {
+          modelId: "local-transformers:test-model",
+          provider: "local-transformers",
+          purpose: "query",
+          inputs: ["bounded query"],
         },
       }),
     ).toBe(true);
@@ -2873,6 +3016,75 @@ describe("session engine RPC guards", () => {
           error: {
             code: "FIGURE_VISION_PROVIDER_ERROR",
             message: "Vision provider failed.",
+          },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts bounded worker graph extraction messages and rejects prompt boundary leaks", () => {
+    const request = {
+      type: CLIO_WORKER_GRAPH_EXTRACTION_REQUEST,
+      requestId: "graph-extraction-request-1",
+      request: {
+        sourceId: "source:1",
+        sourceTitle: "Bounded Graph Study",
+        sourceType: "paper",
+        abstract: "A bounded graph extraction study.",
+        chunks: [
+          {
+            chunkId: "chunk:1",
+            ord: 1,
+            sectionPath: "Methods",
+            excerpt: "The method uses bounded reciprocal rank fusion evidence.",
+          },
+        ],
+      },
+    };
+
+    expect(isWorkerGraphExtractionRequestMessage(request)).toBe(true);
+    expect(
+      isWorkerGraphExtractionRequestMessage({
+        ...request,
+        request: { ...request.request, apiKey: "sk-leak" },
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerGraphExtractionRequestMessage({
+        ...request,
+        request: { ...request.request, fullText: "Full document leak." },
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerGraphExtractionRequestMessage({
+        ...request,
+        request: {
+          ...request.request,
+          chunks: [{ ...request.request.chunks[0], pdfBytes: new Uint8Array([1, 2, 3]) }],
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isWorkerGraphExtractionResponseMessage({
+        type: CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE,
+        requestId: "graph-extraction-request-1",
+        response: {
+          ok: true,
+          value: {
+            status: "extracted",
+            providerKind: "chat",
+            entities: [{ id: "method:1", kind: "method", label: "RRF", confidence: 0.9 }],
+            relations: [
+              {
+                sourceEntityId: "source",
+                targetEntityId: "method:1",
+                dimension: "technical",
+                edgeType: "uses",
+                confidence: 0.9,
+                evidenceChunkIds: ["chunk:1"],
+              },
+            ],
           },
         },
       }),
