@@ -45,6 +45,25 @@ export interface ParsedPdfSection {
   pageEnd: number | null;
 }
 
+export type ParsedPdfParagraphContentKind =
+  | "body"
+  | "heading"
+  | "code"
+  | "table"
+  | "figure_caption"
+  | "table_caption"
+  | "reference";
+
+export interface ParsedPdfParagraph {
+  text: string;
+  pageNumber: number;
+  charStart: number;
+  charEnd: number;
+  contentKind: ParsedPdfParagraphContentKind;
+  sectionPath?: string;
+  bbox?: ParsedPdfBoundingBox;
+}
+
 export interface ParsedPdfReference {
   index: number;
   label?: string;
@@ -206,7 +225,7 @@ export interface ParsedPdfPageLabel {
 
 export interface ParsedPdfParseProfile {
   parser: "pdfjs";
-  parserVersion: "clio-pdf-structure-v2";
+  parserVersion: "clio-pdf-structure-v3";
   pageCount: number;
   textHash: string;
   ocrStatus: ParsedPdfOcrStatus;
@@ -244,6 +263,7 @@ export interface ParsedPdfParseQuality {
 export interface ParsedPdfDocument {
   text: string;
   pages: ParsedPdfPage[];
+  paragraphs: ParsedPdfParagraph[];
   sections: ParsedPdfSection[];
   references: ParsedPdfReference[];
   figures: ParsedPdfCaptionMarker[];
@@ -288,6 +308,7 @@ interface PdfJsTextItem {
   transform?: unknown;
   width?: unknown;
   height?: unknown;
+  hasEOL?: unknown;
 }
 
 interface PdfJsOperatorList {
@@ -346,6 +367,23 @@ interface PdfTextItemLayout {
 interface PdfPageLayout {
   pageNumber: number;
   items: PdfTextItemLayout[];
+}
+
+interface PdfPageParagraphDraft {
+  text: string;
+  charStart: number;
+  charEnd: number;
+  contentKind: ParsedPdfParagraphContentKind;
+  bbox?: ParsedPdfBoundingBox;
+}
+
+interface PdfLineLayout {
+  text: string;
+  items: PdfTextItemLayout[];
+  hasGeometry: boolean;
+  firstX?: number;
+  y?: number;
+  height?: number;
 }
 
 interface PdfImageOperatorMarker {
@@ -478,21 +516,28 @@ export async function parsePdfDocument(
     const pageLayouts: PdfPageLayout[] = [];
     const imageOperators: PdfImageOperatorMarker[] = [];
     const pageTexts: string[] = [];
+    const paragraphDrafts: ParsedPdfParagraph[] = [];
     let offset = 0;
 
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
       const page = await document.getPage(pageNumber);
       const textContent = await page.getTextContent();
       const operatorList = await page.getOperatorList?.();
-      const textItems = textContent.items.flatMap((item) =>
-        typeof item.str === "string" ? [item.str] : [],
-      );
-      const pageText = normalizeText(textItems.join(" "));
+      const reconstructed = reconstructPdfPage(textContent.items);
+      const pageText = reconstructed.text;
       const pageDimensions = pdfPageDimensions(page);
       const charStart = offset;
       const charEnd = charStart + pageText.length;
       pages.push({ pageNumber, text: pageText, charStart, charEnd, ...pageDimensions });
       pageLayouts.push({ pageNumber, items: extractPdfTextItemLayout(textContent.items) });
+      paragraphDrafts.push(
+        ...reconstructed.paragraphs.map((paragraph) => ({
+          ...paragraph,
+          pageNumber,
+          charStart: charStart + paragraph.charStart,
+          charEnd: charStart + paragraph.charEnd,
+        })),
+      );
       imageOperators.push(...extractPdfImageOperators(pageNumber, operatorList, pdfjs.OPS));
       pageTexts.push(pageText);
       offset = charEnd + pdfPageSeparator.length;
@@ -516,6 +561,13 @@ export async function parsePdfDocument(
     const images = extractPdfImageArtifacts(figures, imageOperators);
     const figureAnalyses = buildPdfFigureAnalyses(images);
     const citationLinks = extractPdfCitationLinks(text, pages, sections, references);
+    const paragraphs = finalizePdfParagraphs({
+      paragraphs: paragraphDrafts,
+      sections,
+      references,
+      figures,
+      tables,
+    });
     const parseQuality = buildPdfParseQuality({
       pages,
       sections,
@@ -533,6 +585,7 @@ export async function parsePdfDocument(
     return {
       text,
       pages,
+      paragraphs,
       sections,
       references,
       figures,
@@ -556,7 +609,7 @@ export async function parsePdfDocument(
       })),
       parseProfile: {
         parser: "pdfjs",
-        parserVersion: "clio-pdf-structure-v2",
+        parserVersion: "clio-pdf-structure-v3",
         pageCount: document.numPages,
         textHash,
         ocrStatus: ocrStatusForPages(pages),
@@ -707,6 +760,7 @@ export function pdfCapturePayloadFromParsedDocument(
             pageUnit: page.pageUnit,
           }),
     })),
+    pdf_paragraphs: input.parsed.paragraphs,
     pdf_parse_profile: input.parsed.parseProfile,
     pdf_sections: input.parsed.sections,
     pdf_references: input.parsed.references,
@@ -790,25 +844,34 @@ function parseSectionHeading(lineText: string) {
   const cleaned = normalizeText(lineText).replace(/\s+/g, " ");
   if (cleaned.length === 0 || cleaned.length > 180) return null;
 
+  const numberedPrefix = /^(?:section\s+)?(\d+(?:\.\d+)*)\.?\s+/i.exec(cleaned);
+  const level = numberedPrefix === null ? 1 : (numberedPrefix[1]?.split(".").length ?? 1);
   const withoutNumber = cleaned.replace(/^(?:section\s+)?\d+(?:\.\d+)*\.?\s+/i, "");
   const match =
     /^(abstract|introduction|related work|background|method|methods|approach|materials and methods|experiments|experimental setup|evaluation|results|discussion|limitations|conclusion|references|bibliography|appendix(?:\s+[a-z0-9]+)?)(?:\s*[:.\-]\s*)?$/i.exec(
       withoutNumber,
     );
-  const prefixMatch =
-    cleaned.length <= 120
-      ? /^(abstract|introduction|references|bibliography|appendix)(?:\s*[:.\-]\s+).+/i.exec(
-          withoutNumber,
-        )
-      : null;
-  const title = match?.[1] ?? prefixMatch?.[1];
-  if (title === undefined) return null;
-  const kind = sectionKindForTitle(title);
+  const title = match?.[1];
+  if (title !== undefined) {
+    const kind = sectionKindForTitle(title);
+    return {
+      level,
+      text: normalizeSectionTitle(title, kind),
+      kind,
+    };
+  }
+  if (numberedPrefix === null || !looksLikeGenericPdfSectionTitle(withoutNumber)) return null;
   return {
-    level: title.toLowerCase().startsWith("appendix") ? 1 : 1,
-    text: normalizeSectionTitle(title, kind),
-    kind,
+    level,
+    text: withoutNumber,
+    kind: sectionKindForTitle(withoutNumber),
   };
+}
+
+function looksLikeGenericPdfSectionTitle(input: string) {
+  if (input.length < 2 || input.length > 120 || !/^\p{L}/u.test(input)) return false;
+  if (/[.!?\u3002\uff01\uff1f]$/u.test(input)) return false;
+  return input.split(/\s+/).length <= 16;
 }
 
 function normalizeSectionTitle(title: string, kind: ParsedPdfSectionKind) {
@@ -933,7 +996,9 @@ function materializeReferenceEntries(
 
 function referenceStartFromLine(lineText: string) {
   const line = normalizeText(lineText).replace(/\s+/g, " ");
-  const match = /^(\[\d+\]|\d+\.|\d+\))\s*(.+)$/.exec(line);
+  const bracketed = /^(\[\d+\])\s*(.+)$/.exec(line);
+  const numbered = /^(\d+[.)])\s+(.+)$/.exec(line);
+  const match = bracketed ?? numbered;
   if (match === null) return null;
   const text = normalizeText(match[2] ?? "");
   if (text.length === 0) return null;
@@ -992,23 +1057,294 @@ function parseCaptionMarker(lineText: string) {
   };
 }
 
+function reconstructPdfPage(items: PdfJsTextItem[]): {
+  text: string;
+  paragraphs: PdfPageParagraphDraft[];
+} {
+  const lines = pdfLinesFromTextItems(items);
+  const grouped = groupPdfLinesIntoParagraphs(lines);
+  const paragraphs: PdfPageParagraphDraft[] = [];
+  const parts: string[] = [];
+  let offset = 0;
+  for (const paragraph of grouped) {
+    const text = normalizeText(paragraph.text);
+    if (text.length === 0) continue;
+    if (parts.length > 0) {
+      parts.push(pdfPageSeparator);
+      offset += pdfPageSeparator.length;
+    }
+    const charStart = offset;
+    parts.push(text);
+    offset += text.length;
+    paragraphs.push({
+      text,
+      charStart,
+      charEnd: offset,
+      contentKind: paragraph.contentKind,
+      ...(paragraph.bbox === undefined ? {} : { bbox: paragraph.bbox }),
+    });
+  }
+  return { text: normalizeText(parts.join("")), paragraphs };
+}
+
+function pdfLinesFromTextItems(items: PdfJsTextItem[]): PdfLineLayout[] {
+  const lines: PdfLineLayout[] = [];
+  let textParts: string[] = [];
+  let layoutItems: PdfTextItemLayout[] = [];
+
+  const flush = () => {
+    const text = normalizeText(textParts.join(" "));
+    if (text.length > 0) {
+      const first = layoutItems[0];
+      lines.push({
+        text,
+        items: layoutItems,
+        hasGeometry: layoutItems.length > 0,
+        ...(first === undefined
+          ? {}
+          : {
+              firstX: first.x,
+              y: first.y,
+              height: Math.max(...layoutItems.map((item) => item.height)),
+            }),
+      });
+    }
+    textParts = [];
+    layoutItems = [];
+  };
+
+  for (const item of items) {
+    if (typeof item.str !== "string") continue;
+    const rawParts = item.str.split(/\r?\n/);
+    for (let index = 0; index < rawParts.length; index += 1) {
+      const text = normalizeText(rawParts[index] ?? "");
+      const layout = pdfTextItemLayout(item, text);
+      const previous = layoutItems[layoutItems.length - 1];
+      if (
+        textParts.length > 0 &&
+        layout !== undefined &&
+        previous !== undefined &&
+        Math.abs(previous.y - layout.y) > pdfTableRowYTolerance
+      ) {
+        flush();
+      }
+      if (text.length > 0) textParts.push(text);
+      if (layout !== undefined) layoutItems.push(layout);
+      if (index < rawParts.length - 1) flush();
+    }
+    if (item.hasEOL === true) flush();
+  }
+  flush();
+  return lines;
+}
+
+function groupPdfLinesIntoParagraphs(lines: PdfLineLayout[]) {
+  const paragraphs: Array<{
+    text: string;
+    contentKind: ParsedPdfParagraphContentKind;
+    bbox?: ParsedPdfBoundingBox;
+  }> = [];
+  let pendingLines: PdfLineLayout[] = [];
+  let pendingKind: ParsedPdfParagraphContentKind | undefined;
+
+  const flush = () => {
+    if (pendingLines.length === 0 || pendingKind === undefined) return;
+    paragraphs.push({
+      text: joinPdfParagraphLines(pendingLines.map((line) => line.text)),
+      contentKind: pendingKind,
+      bbox: bboxForItems(pendingLines.flatMap((line) => line.items)),
+    });
+    pendingLines = [];
+    pendingKind = undefined;
+  };
+
+  for (const line of lines) {
+    const detectedKind = pdfLineContentKind(line);
+    const previous = pendingLines[pendingLines.length - 1];
+    const continuesSpecialParagraph =
+      previous !== undefined &&
+      detectedKind === "body" &&
+      (pendingKind === "reference" ||
+        pendingKind === "figure_caption" ||
+        pendingKind === "table_caption") &&
+      !shouldStartPdfParagraph(previous, line, pendingKind ?? detectedKind);
+    const inheritedKind = continuesSpecialParagraph ? (pendingKind ?? detectedKind) : detectedKind;
+    if (
+      previous !== undefined &&
+      (pendingKind !== inheritedKind || shouldStartPdfParagraph(previous, line, inheritedKind))
+    ) {
+      flush();
+    }
+    pendingLines.push(line);
+    pendingKind = inheritedKind;
+    if (inheritedKind === "heading") flush();
+  }
+  flush();
+  return paragraphs;
+}
+
+function shouldStartPdfParagraph(
+  previous: PdfLineLayout,
+  current: PdfLineLayout,
+  contentKind: ParsedPdfParagraphContentKind,
+) {
+  if (contentKind === "heading") return true;
+  if (!previous.hasGeometry || !current.hasGeometry) return true;
+  const previousY = previous.y ?? 0;
+  const currentY = current.y ?? 0;
+  const lineHeight = Math.max(previous.height ?? 10, current.height ?? 10, 1);
+  const verticalGap = previousY - currentY;
+  if (currentY > previousY + lineHeight * 0.6) return true;
+  if (verticalGap > lineHeight * 1.8) return true;
+  const indentShift = (current.firstX ?? 0) - (previous.firstX ?? 0);
+  return indentShift > Math.max(12, lineHeight * 1.2) && endsWithSentenceBoundary(previous.text);
+}
+
+function pdfLineContentKind(line: PdfLineLayout): ParsedPdfParagraphContentKind {
+  const text = normalizeText(line.text);
+  if (looksLikePdfHeadingLine(text)) return "heading";
+  const caption = parseCaptionMarker(text);
+  if (caption?.kind === "figure") return "figure_caption";
+  if (caption?.kind === "table") return "table_caption";
+  if (/^(?:\[\d+\]|\d+\.)\s+.+(?:19|20)\d{2}\b/u.test(text)) return "reference";
+  if (looksLikePdfCodeLine(text)) return "code";
+  if (looksLikePdfTableLine(line)) return "table";
+  return "body";
+}
+
+function looksLikePdfHeadingLine(input: string) {
+  if (parseSectionHeading(input) !== null) return true;
+  if (/^(?:\d+(?:\.\d+){0,3}|[IVXLCDM]+)\.?\s+[\p{L}][^.!?]{1,100}$/u.test(input)) {
+    return input.split(/\s+/).length <= 14;
+  }
+  return input.length <= 90 && /\p{L}/u.test(input) && input === input.toUpperCase();
+}
+
+function looksLikePdfCodeLine(input: string) {
+  if (/^(?:class|interface|function|def|public|private|protected|const|let|var)\b/u.test(input)) {
+    return true;
+  }
+  const syntaxMarks = input.match(/[{};=<>]/g)?.length ?? 0;
+  return input.length >= 20 && syntaxMarks >= 4;
+}
+
+function looksLikePdfTableLine(line: PdfLineLayout) {
+  if (line.items.length < 2) return false;
+  const sorted = [...line.items].sort((left, right) => left.x - right.x);
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1];
+    const current = sorted[index];
+    if (previous === undefined || current === undefined) continue;
+    const gap = current.x - (previous.x + previous.width);
+    if (gap > Math.max(24, Math.max(previous.height, current.height) * 3)) return true;
+  }
+  return false;
+}
+
+function joinPdfParagraphLines(lines: string[]) {
+  let text = "";
+  for (const line of lines) {
+    const normalized = normalizeText(line);
+    if (normalized.length === 0) continue;
+    if (text.endsWith("-") && /^\p{Ll}/u.test(normalized)) {
+      text = `${text.slice(0, -1)}${normalized}`;
+    } else {
+      text = normalizeText(`${text} ${normalized}`);
+    }
+  }
+  return text;
+}
+
+function endsWithSentenceBoundary(input: string) {
+  return /[.!?\u3002\uff01\uff1f]["'\u201d\u2019)\]]*$/u.test(input);
+}
+
+function finalizePdfParagraphs(input: {
+  paragraphs: ParsedPdfParagraph[];
+  sections: ParsedPdfSection[];
+  references: ParsedPdfReference[];
+  figures: ParsedPdfCaptionMarker[];
+  tables: ParsedPdfCaptionMarker[];
+}): ParsedPdfParagraph[] {
+  const sectionPaths = pdfSectionPaths(input.sections);
+  return input.paragraphs.map((paragraph) => {
+    const section = input.sections.find(
+      (candidate) =>
+        paragraph.charStart >= candidate.charStart && paragraph.charStart < candidate.charEnd,
+    );
+    const contentKind = finalizedPdfParagraphContentKind(paragraph, input, section);
+    return {
+      ...paragraph,
+      contentKind,
+      ...(section === undefined ? {} : { sectionPath: sectionPaths.get(section) ?? section.text }),
+    };
+  });
+}
+
+function pdfSectionPaths(sections: ParsedPdfSection[]) {
+  const paths = new Map<ParsedPdfSection, string>();
+  const stack: ParsedPdfSection[] = [];
+  for (const section of sections) {
+    while (stack.length > 0 && (stack[stack.length - 1]?.level ?? 0) >= section.level) {
+      stack.pop();
+    }
+    paths.set(section, [...stack.map((ancestor) => ancestor.text), section.text].join(" > "));
+    stack.push(section);
+  }
+  return paths;
+}
+
+function finalizedPdfParagraphContentKind(
+  paragraph: ParsedPdfParagraph,
+  input: {
+    sections: ParsedPdfSection[];
+    references: ParsedPdfReference[];
+    figures: ParsedPdfCaptionMarker[];
+    tables: ParsedPdfCaptionMarker[];
+  },
+  section: ParsedPdfSection | undefined,
+): ParsedPdfParagraphContentKind {
+  if (
+    section !== undefined &&
+    paragraph.charStart <= section.charStart &&
+    paragraph.charEnd > section.charStart
+  ) {
+    return "heading";
+  }
+  if (input.figures.some((marker) => rangesOverlap(paragraph, marker))) return "figure_caption";
+  if (input.tables.some((marker) => rangesOverlap(paragraph, marker))) return "table_caption";
+  if (section?.kind === "references") return "reference";
+  if (input.references.some((reference) => rangesOverlap(paragraph, reference))) return "reference";
+  return paragraph.contentKind;
+}
+
+function rangesOverlap(
+  left: Pick<ParsedPdfParagraph, "charEnd" | "charStart">,
+  right: { charEnd: number; charStart: number },
+) {
+  return left.charEnd > right.charStart && left.charStart < right.charEnd;
+}
+
 function extractPdfTextItemLayout(items: PdfJsTextItem[]): PdfTextItemLayout[] {
   return items.flatMap((item) => {
     if (typeof item.str !== "string") return [];
     const text = normalizeText(item.str);
-    if (text.length === 0) return [];
-    const point = pdfTextItemPoint(item.transform);
-    if (point === undefined) return [];
-    return [
-      {
-        text,
-        x: point.x,
-        y: point.y,
-        width: finiteNumber(item.width) ?? Math.max(8, text.length * 6),
-        height: finiteNumber(item.height) ?? 10,
-      },
-    ];
+    const layout = pdfTextItemLayout(item, text);
+    return layout === undefined ? [] : [layout];
   });
+}
+
+function pdfTextItemLayout(item: PdfJsTextItem, text: string): PdfTextItemLayout | undefined {
+  if (text.length === 0) return undefined;
+  const point = pdfTextItemPoint(item.transform);
+  if (point === undefined) return undefined;
+  return {
+    text,
+    x: point.x,
+    y: point.y,
+    width: finiteNumber(item.width) ?? Math.max(8, text.length * 6),
+    height: finiteNumber(item.height) ?? 10,
+  };
 }
 
 function pdfTextItemPoint(transform: unknown) {

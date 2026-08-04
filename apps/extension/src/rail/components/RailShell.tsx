@@ -4012,8 +4012,8 @@ function TestWorkspaceSettingsCard(props: TestWorkspaceSettingsCardProps) {
       </div>
 
       <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
-        Multilingual E5 Small is installed when needed. All sources are imported before one
-        embedding rebuild.
+        Multilingual E5 Base is installed when needed. All sources are imported before one embedding
+        rebuild.
       </p>
 
       {props.progress === null ? null : (

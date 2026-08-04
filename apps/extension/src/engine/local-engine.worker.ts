@@ -178,9 +178,11 @@ import {
   isWorkerVisionAnalysisResponseMessage,
 } from "@/src/shared/rpc";
 import {
+  type TextBlock,
+  type TextBlockContentKind,
   type TextChunk,
   buildFtsQuery,
-  chunkText,
+  chunkTextByParagraphs,
   excerpt,
   expandChineseBigrams,
   hashText,
@@ -408,7 +410,10 @@ const chunkMetaSectionSummaryMaxChars = 500;
 const chunkMetaChunkSummaryMaxChars = 360;
 const chunkMetaRelationLabelMaxChars = 160;
 const chunkMetaMaxRelations = 12;
-const chunkMetaEmbeddingPrefixMaxChars = 2_000;
+const sourceChunkStrategyVersion = "e5-a-paragraph-v1";
+const sourceChunkSoftTargetTokens = 300;
+const sourceChunkHardMaxTokens = 420;
+const sourceChunkOversizedOverlapTokens = 48;
 const parentChunkTextMaxChars = 24_000;
 const parentChunkOrdBase = 1_000_000;
 const defaultWorkingSetBudgetTokens = 32_000;
@@ -636,6 +641,12 @@ interface DocumentDraft {
   versionGroupKey: string;
   pdfPages: PdfPageTextRange[];
   sectionHeadings: SectionHeadingRange[];
+  textBlocks: DocumentTextBlock[];
+}
+
+interface DocumentTextBlock extends Required<TextBlock> {
+  charStart: number;
+  charEnd: number;
 }
 
 interface PdfPageTextRange {
@@ -658,6 +669,7 @@ interface SectionHeadingRange {
   level: number;
   text: string;
   charStart: number;
+  charEnd: number;
   path: string;
 }
 
@@ -5234,7 +5246,20 @@ function buildDocumentDraft(
   const sourceTitle =
     (overrides.sourceTitle ?? payload.sourceTitle).trim() || fallbackTitle(sourceUrl);
   const textHash = hashText(normalizedText);
-  const metadata = overrides.metadata ?? payload.metadata ?? {};
+  const metadata: Record<string, unknown> = {
+    ...(overrides.metadata ?? payload.metadata ?? {}),
+    chunk_strategy: {
+      version: sourceChunkStrategyVersion,
+      embeddingInput: "passage_only",
+      softTargetTokens: sourceChunkSoftTargetTokens,
+      hardMaxTokens: sourceChunkHardMaxTokens,
+      oversizedOverlapTokens: sourceChunkOversizedOverlapTokens,
+    },
+  };
+  const sectionHeadings = sectionHeadingRanges(
+    normalizedText,
+    sectionOutlineFromMetadata(metadata),
+  );
   return {
     kind,
     sourceUrl,
@@ -5246,7 +5271,8 @@ function buildDocumentDraft(
     metadataJson: JSON.stringify(metadata),
     versionGroupKey: buildMemoryVersionGroupKey(kind, normalizedSourceUrl, textHash),
     pdfPages: pdfPageTextRanges(metadata),
-    sectionHeadings: sectionHeadingRanges(normalizedText, sectionOutlineFromMetadata(metadata)),
+    sectionHeadings,
+    textBlocks: documentTextBlocks(normalizedText, metadata, sectionHeadings),
   };
 }
 
@@ -5278,6 +5304,143 @@ function pdfPageTextRanges(metadata: Record<string, unknown>): PdfPageTextRange[
       ];
     })
     .sort((left, right) => left.charStart - right.charStart || left.pageNumber - right.pageNumber);
+}
+
+function documentTextBlocks(
+  normalizedText: string,
+  metadata: Record<string, unknown>,
+  sectionHeadings: SectionHeadingRange[],
+): DocumentTextBlock[] {
+  const pdfParagraphs = pdfParagraphTextBlocks(normalizedText, metadata.pdf_paragraphs);
+  if (pdfParagraphs.length > 0) return pdfParagraphs;
+  return deriveDocumentTextBlocks(normalizedText, sectionHeadings);
+}
+
+function pdfParagraphTextBlocks(normalizedText: string, input: unknown): DocumentTextBlock[] {
+  if (!Array.isArray(input)) return [];
+  const blocks = input.flatMap((paragraph): DocumentTextBlock[] => {
+    if (!isRecord(paragraph)) return [];
+    const charStart = metadataNumber(paragraph.charStart);
+    const charEnd = metadataNumber(paragraph.charEnd);
+    const contentKind = normalizeTextBlockContentKind(paragraph.contentKind);
+    if (
+      charStart === undefined ||
+      charEnd === undefined ||
+      contentKind === undefined ||
+      charStart < 0 ||
+      charEnd <= charStart ||
+      charEnd > normalizedText.length
+    ) {
+      return [];
+    }
+    const start = Math.floor(charStart);
+    const end = Math.floor(charEnd);
+    const text = normalizeText(normalizedText.slice(start, end));
+    if (text.length === 0) return [];
+    return [{ text, contentKind, charStart: start, charEnd: end }];
+  });
+  blocks.sort((left, right) => left.charStart - right.charStart || left.charEnd - right.charEnd);
+  for (let index = 1; index < blocks.length; index += 1) {
+    const previous = blocks[index - 1];
+    const current = blocks[index];
+    if (previous !== undefined && current !== undefined && current.charStart < previous.charEnd) {
+      return [];
+    }
+  }
+  return blocks;
+}
+
+function deriveDocumentTextBlocks(
+  normalizedText: string,
+  sectionHeadings: SectionHeadingRange[],
+): DocumentTextBlock[] {
+  const blocks: DocumentTextBlock[] = [];
+  let cursor = 0;
+  for (const separator of normalizedText.matchAll(/\n{2,}/g)) {
+    const separatorStart = separator.index ?? cursor;
+    appendDerivedDocumentBlock(blocks, normalizedText, cursor, separatorStart, sectionHeadings);
+    cursor = separatorStart + (separator[0]?.length ?? 0);
+  }
+  appendDerivedDocumentBlock(
+    blocks,
+    normalizedText,
+    cursor,
+    normalizedText.length,
+    sectionHeadings,
+  );
+  return blocks;
+}
+
+function appendDerivedDocumentBlock(
+  blocks: DocumentTextBlock[],
+  normalizedText: string,
+  start: number,
+  end: number,
+  sectionHeadings: SectionHeadingRange[],
+) {
+  let charStart = start;
+  let charEnd = end;
+  while (charStart < charEnd && /\s/u.test(normalizedText[charStart] ?? "")) charStart += 1;
+  while (charEnd > charStart && /\s/u.test(normalizedText[charEnd - 1] ?? "")) charEnd -= 1;
+  if (charEnd <= charStart) return;
+  const text = normalizedText.slice(charStart, charEnd);
+  blocks.push({
+    text,
+    charStart,
+    charEnd,
+    contentKind: inferDocumentTextBlockContentKind(text, charStart, sectionHeadings),
+  });
+}
+
+function inferDocumentTextBlockContentKind(
+  text: string,
+  charStart: number,
+  sectionHeadings: SectionHeadingRange[],
+): TextBlockContentKind {
+  if (
+    sectionHeadings.some(
+      (heading) => charStart <= heading.charStart && heading.charStart < charStart + text.length,
+    )
+  ) {
+    const lines = textLineRanges(text);
+    if (lines.length === 1) return "heading";
+  }
+  if (/^(?:```|~~~)/u.test(text)) return "code";
+  const lines = text.split("\n").map((line) => normalizeText(line));
+  if (lines.length >= 2 && lines.filter((line) => /^\|.+\|$/u.test(line)).length >= 2) {
+    return "table";
+  }
+  if (/^(?:fig\.?|figure)\s*\d+[a-z]?\s*[:.\-]/iu.test(text)) return "figure_caption";
+  if (/^table\s*\d+[a-z]?\s*[:.\-]/iu.test(text)) return "table_caption";
+  const activeSection = sectionPathAtOffset(charStart, sectionHeadings);
+  if (
+    /(?:^|\s>)\s*(?:references|bibliography)\s*$/iu.test(activeSection ?? "") ||
+    /^(?:\[\d+\]|\d+\.)\s+.+(?:19|20)\d{2}\b/u.test(text)
+  ) {
+    return "reference";
+  }
+  return "body";
+}
+
+function normalizeTextBlockContentKind(value: unknown): TextBlockContentKind | undefined {
+  return value === "body" ||
+    value === "heading" ||
+    value === "code" ||
+    value === "table" ||
+    value === "figure_caption" ||
+    value === "table_caption" ||
+    value === "reference"
+    ? value
+    : undefined;
+}
+
+function sectionPathAtOffset(offset: number, headings: SectionHeadingRange[]) {
+  let active: SectionHeadingRange | undefined;
+  for (const heading of headings) {
+    if (heading.charStart > offset) break;
+    active = heading;
+  }
+  return active?.path;
 }
 
 function locateChunkTextRanges(
@@ -5389,14 +5552,31 @@ function pageRangeForChunk(
 
 function chunkTextForDocument(draft: DocumentDraft): TextChunk[] {
   const segments = chunkSegmentsForDocument(draft);
-  if (segments.length <= 1 && segments[0]?.charStart === 0) return chunkText(draft.normalizedText);
-
   const chunks: TextChunk[] = [];
   for (const segment of segments) {
-    const segmentChunks = chunkText(segment.text, 900, 120, chunks.length);
+    const blocks = textBlocksForSegment(draft, segment);
+    const segmentChunks = chunkTextByParagraphs(blocks, {
+      softTargetTokens: sourceChunkSoftTargetTokens,
+      hardMaxTokens: sourceChunkHardMaxTokens,
+      oversizedOverlapTokens: sourceChunkOversizedOverlapTokens,
+      ordOffset: chunks.length,
+    });
     chunks.push(...segmentChunks);
   }
   return chunks;
+}
+
+function textBlocksForSegment(draft: DocumentDraft, segment: DocumentChunkSegment): TextBlock[] {
+  const blocks = draft.textBlocks.flatMap((block): TextBlock[] => {
+    if (block.contentKind === "heading") return [];
+    const charStart = Math.max(block.charStart, segment.charStart);
+    const charEnd = Math.min(block.charEnd, segment.charEnd);
+    if (charEnd <= charStart) return [];
+    const text = normalizeText(draft.normalizedText.slice(charStart, charEnd));
+    return text.length === 0 ? [] : [{ text, contentKind: block.contentKind }];
+  });
+  if (blocks.length > 0) return blocks;
+  return [{ text: segment.text, contentKind: "body" }];
 }
 
 function chunkSegmentsForDocument(draft: DocumentDraft): DocumentChunkSegment[] {
@@ -5416,8 +5596,11 @@ function chunkSegmentsForDocument(draft: DocumentDraft): DocumentChunkSegment[] 
     const heading = draft.sectionHeadings[index];
     const nextHeading = draft.sectionHeadings[index + 1];
     if (heading === undefined) continue;
-    const charStart = heading.charStart;
+    let charStart = heading.charEnd;
     const charEnd = nextHeading?.charStart ?? draft.normalizedText.length;
+    while (charStart < charEnd && /\s/u.test(draft.normalizedText[charStart] ?? "")) {
+      charStart += 1;
+    }
     const text = normalizeText(draft.normalizedText.slice(charStart, charEnd));
     if (text.length === 0) continue;
     segments.push({
@@ -5438,7 +5621,7 @@ function chunkSegmentsForDocument(draft: DocumentDraft): DocumentChunkSegment[] 
       },
     ];
   }
-  const firstSectionStart = segments[0]?.charStart ?? 0;
+  const firstSectionStart = draft.sectionHeadings[0]?.charStart ?? 0;
   if (firstSectionStart > 0) {
     const prefaceText = normalizeText(draft.normalizedText.slice(0, firstSectionStart));
     if (prefaceText.length > 0) {
@@ -5471,7 +5654,7 @@ function materializeSourceChunks(
       metaHeadJson: buildChunkMetaHeadJson(draft, {
         chunkText: chunk.text,
         sectionPath,
-        roleHint: "child",
+        roleHint: chunk.contentKind,
       }),
       parentChunkId: null,
     };
@@ -5508,7 +5691,7 @@ function materializeSourceChunks(
       child.metaHeadJson = buildChunkMetaHeadJson(draft, {
         chunkText: child.chunk.text,
         sectionPath: child.sectionPath,
-        roleHint: "child",
+        roleHint: child.chunk.contentKind,
         relations: [
           {
             kind: "parent",
@@ -5534,7 +5717,7 @@ function materializeSourceChunks(
     child.metaHeadJson = buildChunkMetaHeadJson(draft, {
       chunkText: child.chunk.text,
       sectionPath: child.sectionPath,
-      roleHint: "child",
+      roleHint: child.chunk.contentKind,
       relations,
     });
   }
@@ -5623,6 +5806,7 @@ function sectionHeadingRanges(
       level: item.level,
       text: item.text,
       charStart: line.charStart,
+      charEnd: line.charEnd,
       path,
     };
     headings.push(heading);
@@ -6058,41 +6242,7 @@ function normalizeChunkMetaSemanticRelationSource(
 }
 
 function buildChunkEmbeddingInput(chunk: SqlRow) {
-  const text = stringField(chunk, "text");
-  const prefix = buildChunkMetaEmbeddingPrefix(stringField(chunk, "meta_head_json"));
-  return prefix.length === 0 ? text : `${prefix}\n\n${text}`;
-}
-
-function buildChunkMetaEmbeddingPrefix(metaHeadJson: string) {
-  const metaHead = parseMetadata(metaHeadJson);
-  const selectedTier =
-    stringMetadataField(metaHead, "selectedTier") ?? stringMetadataField(metaHead, "tier");
-  const selectedTierState = selectedChunkMetaTierState(metaHead, selectedTier);
-  const docContext = stringMetadataField(metaHead, "docContext") ?? "";
-  const sectionPath = stringMetadataField(metaHead, "sectionPath") ?? "";
-  const sectionSummary =
-    stringMetadataField(selectedTierState, "sectionSummary") ??
-    stringMetadataField(metaHead, "sectionSummary") ??
-    "";
-  const chunkSummary =
-    stringMetadataField(selectedTierState, "chunkSummary") ??
-    stringMetadataField(metaHead, "chunkSummary") ??
-    "";
-  const roleHint = stringMetadataField(metaHead, "roleHint") ?? "";
-  const relationHints = chunkMetaRelationHintsForEmbedding(metaHead, selectedTierState);
-  return boundedNormalizedText(
-    [
-      docContext,
-      sectionPath.length > 0 ? `Section: ${sectionPath}` : "",
-      sectionSummary.length > 0 ? `Section summary: ${sectionSummary}` : "",
-      chunkSummary.length > 0 ? `Chunk summary: ${chunkSummary}` : "",
-      roleHint.length > 0 ? `Role: ${roleHint}` : "",
-      relationHints.length > 0 ? `Relations: ${relationHints.join("; ")}` : "",
-    ]
-      .filter((part) => part.length > 0)
-      .join("\n"),
-    chunkMetaEmbeddingPrefixMaxChars,
-  );
+  return stringField(chunk, "text");
 }
 
 function selectedChunkMetaTierState(
@@ -6107,25 +6257,6 @@ function selectedChunkMetaTierState(
   if (isRecord(tier1) && tier1.status === "available") return tier1;
   const tier0 = tiers.tier0;
   return isRecord(tier0) ? tier0 : {};
-}
-
-function chunkMetaRelationHintsForEmbedding(
-  metaHead: Record<string, unknown>,
-  selectedTierState: Record<string, unknown>,
-): string[] {
-  const semanticRelations = Array.isArray(selectedTierState.semanticRelations)
-    ? selectedTierState.semanticRelations
-    : Array.isArray(metaHead.semanticRelations)
-      ? metaHead.semanticRelations
-      : [];
-  const hints = semanticRelations.flatMap((relation): string[] => {
-    if (!isRecord(relation)) return [];
-    const kind = typeof relation.kind === "string" ? normalizeText(relation.kind) : "";
-    const target = typeof relation.target === "string" ? normalizeText(relation.target) : "";
-    if (kind.length === 0 || target.length === 0) return [];
-    return [`${kind}:${target}`];
-  });
-  return hints.slice(0, 6);
 }
 
 function boundedNormalizedText(input: string, maxLength: number) {
@@ -9714,7 +9845,7 @@ async function runChunkMetaStageForSource(
   }
 
   const chunks = db.selectObjects(
-    `SELECT id, ord, text, char_start, char_end, role, parent_chunk_id
+    `SELECT id, ord, text, char_start, char_end, role, parent_chunk_id, meta_head_json
      FROM source_chunks
      WHERE source_id = ?
      ORDER BY ord ASC`,
@@ -9726,10 +9857,23 @@ async function runChunkMetaStageForSource(
   );
   const resolvedChunks = chunks.map((chunk) => {
     const chunkRange = chunkTextRangeFromRow(chunk);
+    const role = stringField(chunk, "role") || "child";
+    const existingMetaHead = parseMetadata(stringField(chunk, "meta_head_json"));
+    const existingContentKind = normalizeTextBlockContentKind(existingMetaHead.roleHint);
+    const roleHint =
+      role === "parent"
+        ? "parent"
+        : (existingContentKind ??
+          inferDocumentTextBlockContentKind(
+            stringField(chunk, "text"),
+            chunkRange?.charStart ?? 0,
+            headings,
+          ));
     return {
       row: chunk,
       id: stringField(chunk, "id"),
-      role: stringField(chunk, "role") || "child",
+      role,
+      roleHint,
       sectionPath: sectionPathForChunk(chunkRange, headings),
     };
   });
@@ -9771,7 +9915,7 @@ async function runChunkMetaStageForSource(
         metadataJson: stringField(source, "metadata_json"),
         chunkText: stringField(chunk.row, "text"),
         sectionPath: chunk.sectionPath,
-        roleHint: chunk.role,
+        roleHint: chunk.roleHint,
         relations,
         selectedTier: "tier1",
       });

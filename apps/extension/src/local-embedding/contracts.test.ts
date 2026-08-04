@@ -25,9 +25,9 @@ function manifestFile(manifest: LocalEmbeddingModelManifest, index: number) {
 describe("trusted local embedding manifest", () => {
   it("freezes the E5 model identity and exact downloadable bytes", () => {
     expect(isLocalEmbeddingModelManifest(recommendedLocalEmbeddingModelManifest)).toBe(true);
-    expect(recommendedLocalEmbeddingDownloadBytes).toBe(135_138_424);
+    expect(recommendedLocalEmbeddingDownloadBytes).toBe(295_267_926);
     expect(recommendedLocalEmbeddingModelManifest.modelId).toBe(
-      "local-transformers:xenova-multilingual-e5-small:761b726dd34fb83930e26aab4e9ac3899aa1fa78:int8:d384",
+      "local-transformers:xenova-multilingual-e5-base:1ec9243030a27d1a115d5c340572074c125b58b2:int8:d768",
     );
     expect(
       getTrustedLocalEmbeddingModelManifest(recommendedLocalEmbeddingModelManifest.modelId),
@@ -36,15 +36,15 @@ describe("trusted local embedding manifest", () => {
 
   it("derives different vector-space identities for revision, dtype, and dimension changes", () => {
     const base = {
-      repository: "Xenova/multilingual-e5-small",
-      revision: "761b726dd34fb83930e26aab4e9ac3899aa1fa78",
+      repository: "Xenova/multilingual-e5-base",
+      revision: "1ec9243030a27d1a115d5c340572074c125b58b2",
       dtype: "int8" as const,
-      dimension: 384,
+      dimension: 768,
     };
     const baseId = deriveLocalEmbeddingModelId(base);
 
     expect(deriveLocalEmbeddingModelId({ ...base, revision: "a".repeat(40) })).not.toBe(baseId);
-    expect(deriveLocalEmbeddingModelId({ ...base, dimension: 768 })).not.toBe(baseId);
+    expect(deriveLocalEmbeddingModelId({ ...base, dimension: 384 })).not.toBe(baseId);
   });
 
   it.each([

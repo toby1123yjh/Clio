@@ -18,7 +18,7 @@ function testManifest(dimension = 3): LocalEmbeddingModelManifest {
     files: recommendedLocalEmbeddingModelManifest.files.map((file) => ({
       ...file,
       url: file.url.replace(
-        /Xenova\/multilingual-e5-small\/resolve\/[a-f0-9]{40}/,
+        /Xenova\/multilingual-e5-base\/resolve\/[a-f0-9]{40}/,
         `test/model/resolve/${"a".repeat(40)}`,
       ),
     })),

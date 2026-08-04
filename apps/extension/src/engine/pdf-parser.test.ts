@@ -73,7 +73,7 @@ describe("pdf parser", () => {
     });
     expect(parsed.parseProfile).toEqual({
       parser: "pdfjs",
-      parserVersion: "clio-pdf-structure-v2",
+      parserVersion: "clio-pdf-structure-v3",
       pageCount: 2,
       textHash: hashText(parsed.text),
       ocrStatus: "not_required",
@@ -125,6 +125,83 @@ describe("pdf parser", () => {
       warnings: ["section_outline_unavailable"],
     });
     expect(destroy).toHaveBeenCalledOnce();
+  });
+
+  it("reconstructs bounded natural paragraphs with section and layout metadata", async () => {
+    const heading = "1 Introduction";
+    const firstLine = "This study presents a local retrieval";
+    const secondLine = "pipeline with bounded evidence.";
+    const secondParagraph = "A second paragraph starts after a larger gap.";
+    const figureCaption = "Figure 1: Retrieval architecture.";
+    const nestedHeading = "1.1 Retrieval Pipeline";
+    const nestedBody = "The nested section keeps its own heading path.";
+    const parsed = await parsePdfDocument(
+      new Uint8Array([1, 2, 3]),
+      fakePdfJs({
+        pages: [
+          [
+            { str: heading, x: 40, y: 720, width: 90, height: 12, hasEOL: true },
+            { str: firstLine, x: 40, y: 690, width: 180, height: 10, hasEOL: true },
+            { str: secondLine, x: 40, y: 678, width: 160, height: 10, hasEOL: true },
+            {
+              str: secondParagraph,
+              x: 55,
+              y: 640,
+              width: 220,
+              height: 10,
+              hasEOL: true,
+            },
+            { str: figureCaption, x: 40, y: 600, width: 190, height: 10, hasEOL: true },
+            { str: nestedHeading, x: 40, y: 560, width: 140, height: 11, hasEOL: true },
+            { str: nestedBody, x: 40, y: 530, width: 210, height: 10, hasEOL: true },
+          ],
+        ],
+      }),
+    );
+
+    expect(parsed.paragraphs.map((paragraph) => paragraph.text)).toEqual([
+      heading,
+      `${firstLine} ${secondLine}`,
+      secondParagraph,
+      figureCaption,
+      nestedHeading,
+      nestedBody,
+    ]);
+    expect(parsed.paragraphs.map((paragraph) => paragraph.contentKind)).toEqual([
+      "heading",
+      "body",
+      "body",
+      "figure_caption",
+      "heading",
+      "body",
+    ]);
+    expect(parsed.paragraphs.map((paragraph) => paragraph.sectionPath)).toEqual([
+      "Introduction",
+      "Introduction",
+      "Introduction",
+      "Introduction",
+      "Introduction > Retrieval Pipeline",
+      "Introduction > Retrieval Pipeline",
+    ]);
+    expect(
+      parsed.paragraphs.every(
+        (paragraph) => parsed.text.slice(paragraph.charStart, paragraph.charEnd) === paragraph.text,
+      ),
+    ).toBe(true);
+    expect(parsed.paragraphs[1]?.bbox).toEqual({
+      xMin: 40,
+      yMin: 678,
+      xMax: 220,
+      yMax: 700,
+      unit: "pdf_user_space",
+    });
+
+    const payload = pdfCapturePayloadFromParsedDocument({
+      parsed,
+      sourceUrl: "https://example.test/paragraphs.pdf",
+      sourceTitle: "paragraphs.pdf",
+    });
+    expect(payload.metadata.pdf_paragraphs).toEqual(parsed.paragraphs);
   });
 
   it("extracts scientific PDF structure for downstream metadata consumers", async () => {
@@ -290,7 +367,7 @@ describe("pdf parser", () => {
     expect(payload.metadata.pdf_citation_links).toHaveLength(1);
     expect(payload.metadata.pdf_parse_profile).toMatchObject({
       parser: "pdfjs",
-      parserVersion: "clio-pdf-structure-v2",
+      parserVersion: "clio-pdf-structure-v3",
       pageCount: 2,
       ocrStatus: "not_required",
       warnings: [],
@@ -376,7 +453,7 @@ describe("pdf parser", () => {
     });
     expect(payload.metadata.pdf_parse_profile).toMatchObject({
       parser: "pdfjs",
-      parserVersion: "clio-pdf-structure-v2",
+      parserVersion: "clio-pdf-structure-v3",
       pageCount: 2,
       ocrStatus: "not_required",
       warnings: ["section_outline_unavailable"],
@@ -738,7 +815,16 @@ describe("pdf parser", () => {
   });
 });
 
-type FakePdfItem = string | { str: string; x: number; y: number; width?: number; height?: number };
+type FakePdfItem =
+  | string
+  | {
+      str: string;
+      x: number;
+      y: number;
+      width?: number;
+      height?: number;
+      hasEOL?: boolean;
+    };
 
 function fakePdfJs(input: {
   pages: FakePdfItem[][];
@@ -767,6 +853,7 @@ function fakePdfJs(input: {
                           transform: [1, 0, 0, 1, item.x, item.y],
                           width: item.width,
                           height: item.height,
+                          hasEOL: item.hasEOL,
                         },
                   ),
                 };

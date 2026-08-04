@@ -5,17 +5,17 @@ import {
 } from "./contracts";
 
 const e5Identity = {
-  repository: "Xenova/multilingual-e5-small",
-  revision: "761b726dd34fb83930e26aab4e9ac3899aa1fa78",
+  repository: "Xenova/multilingual-e5-base",
+  revision: "1ec9243030a27d1a115d5c340572074c125b58b2",
   dtype: "int8",
-  dimension: 384,
+  dimension: 768,
 } as const;
 
 export const recommendedLocalEmbeddingModelManifest = {
   schemaVersion: 1,
   modelId: deriveLocalEmbeddingModelId(e5Identity),
   ...e5Identity,
-  label: "Multilingual E5 Small",
+  label: "Multilingual E5 Base",
   license: "MIT",
   metric: "cosine",
   maxInputTokens: 512,
@@ -29,27 +29,27 @@ export const recommendedLocalEmbeddingModelManifest = {
   files: [
     {
       path: "config.json",
-      url: "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/config.json",
-      bytes: 658,
-      sha256: "cb99455288675345e1a4f411438d5d0adbba5fbd3a67ea4fb03c015433b996c1",
+      url: "https://huggingface.co/Xenova/multilingual-e5-base/resolve/1ec9243030a27d1a115d5c340572074c125b58b2/config.json",
+      bytes: 686,
+      sha256: "4c27930e59106027abab56f7531c1fa6b14bbf31e8229ec36d68affa4e869bcd",
     },
     {
       path: "tokenizer_config.json",
-      url: "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/tokenizer_config.json",
-      bytes: 443,
-      sha256: "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
+      url: "https://huggingface.co/Xenova/multilingual-e5-base/resolve/1ec9243030a27d1a115d5c340572074c125b58b2/tokenizer_config.json",
+      bytes: 418,
+      sha256: "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15",
     },
     {
       path: "tokenizer.json",
-      url: "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/tokenizer.json",
-      bytes: 17_082_730,
-      sha256: "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+      url: "https://huggingface.co/Xenova/multilingual-e5-base/resolve/1ec9243030a27d1a115d5c340572074c125b58b2/tokenizer.json",
+      bytes: 17_082_660,
+      sha256: "31cfad7e457e392bdebe2bd63796205ff3f6ab825e13da0a03d83dfbf932c919",
     },
     {
       path: "onnx/model_int8.onnx",
-      url: "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/onnx/model_int8.onnx",
-      bytes: 118_054_593,
-      sha256: "4d24e2bc01a447951524466ef533e52944bf48509e6552810bcee1a2711cb02c",
+      url: "https://huggingface.co/Xenova/multilingual-e5-base/resolve/1ec9243030a27d1a115d5c340572074c125b58b2/onnx/model_int8.onnx",
+      bytes: 278_184_162,
+      sha256: "4a034acfb09fb03c0489c7518e26ec44c2004a304d0dba81a4543744799bccac",
     },
   ],
 } as const satisfies LocalEmbeddingModelManifest;

@@ -655,7 +655,7 @@ describe("local engine behavior harness", () => {
     expect(metaHead.source?.type).toBe("research-note");
     expect(metaHead.sectionSummary).toBeNull();
     expect(metaHead.chunkSummary).toContain("alpha metadata retrieval evidence");
-    expect(metaHead.roleHint).toBe("child");
+    expect(metaHead.roleHint).toBe("body");
     expect(metaHead.relations).toEqual(expect.any(Array));
 
     const queued = await harness.request({ kind: "getJobStatus", status: "queued" });
@@ -694,12 +694,8 @@ describe("local engine behavior harness", () => {
     expect(repairedMetaHead.semanticRelations?.some((relation) => relation.kind === "role")).toBe(
       true,
     );
-    const prefixedEmbeddingInput = chunkMetaEmbeddingInputForTest(
-      repairedMetaHead,
-      String(repairedFirstChunk?.text ?? ""),
-    );
-    expect(chunkEmbedding?.text_hash).toBe(hashText(prefixedEmbeddingInput));
-    expect(chunkEmbedding?.text_hash).not.toBe(firstChunk?.hash);
+    expect(chunkEmbedding?.text_hash).toBe(firstChunk?.hash);
+    expect(chunkEmbedding?.text_hash).toBe(hashText(String(repairedFirstChunk?.text ?? "")));
 
     const retrieved = await harness.request({
       kind: "retrieveSources",
@@ -952,10 +948,8 @@ describe("local engine behavior harness", () => {
       "SELECT text_hash FROM source_embeddings WHERE source_id = ? AND target_kind = 'chunk' ORDER BY target_id ASC LIMIT 1",
       [sourceId],
     );
-    expect(embedding?.text_hash).toBe(
-      hashText(chunkMetaEmbeddingInputForTest(metaHead, String(chunk?.text ?? ""))),
-    );
-    expect(embedding?.text_hash).not.toBe(chunk?.hash);
+    expect(embedding?.text_hash).toBe(chunk?.hash);
+    expect(embedding?.text_hash).toBe(hashText(String(chunk?.text ?? "")));
   });
 
   it("keeps Tier1 selected when explicit Tier2 chunk summary returns an error", async () => {
@@ -1127,7 +1121,7 @@ describe("local engine behavior harness", () => {
     expect(capturedMetaHead.sectionPath).toBe(expectedSectionPath);
     expect(capturedMetaHead.sectionSummary).toBe("Section: Registry Design");
     expect(capturedMetaHead.chunkSummary).toContain("registry design adapter");
-    expect(capturedMetaHead.roleHint).toBe("child");
+    expect(capturedMetaHead.roleHint).toBe("body");
     expect(capturedMetaHead.relations?.some((relation) => relation.kind === "parent")).toBe(true);
 
     harness.exec("UPDATE source_chunks SET section_path = NULL, meta_head_json = ? WHERE id = ?", [
@@ -1165,7 +1159,7 @@ describe("local engine behavior harness", () => {
     expect(repairedMetaHead.sectionPath).toBe(expectedSectionPath);
     expect(repairedMetaHead.sectionSummary).toContain("Section: Registry Design");
     expect(repairedMetaHead.chunkSummary).toContain("registry design adapter");
-    expect(repairedMetaHead.roleHint).toBe("child");
+    expect(repairedMetaHead.roleHint).toBe("body");
     expect(repairedMetaHead.relations?.some((relation) => relation.kind === "parent")).toBe(true);
     expect(repairedMetaHead.semanticRelations?.some((relation) => relation.kind === "parent")).toBe(
       true,
@@ -1175,10 +1169,8 @@ describe("local engine behavior harness", () => {
       "SELECT text_hash FROM source_embeddings WHERE target_id = ? AND target_kind = 'chunk' LIMIT 1",
       [String(sectionChunk?.id ?? "")],
     );
-    expect(embedding?.text_hash).toBe(
-      hashText(chunkMetaEmbeddingInputForTest(repairedMetaHead, String(repairedChunk?.text ?? ""))),
-    );
-    expect(embedding?.text_hash).not.toBe(repairedChunk?.hash);
+    expect(embedding?.text_hash).toBe(repairedChunk?.hash);
+    expect(embedding?.text_hash).toBe(hashText(String(repairedChunk?.text ?? "")));
   });
 
   it("chunks markdown sections without crossing section boundaries", async () => {
@@ -1422,6 +1414,16 @@ describe("local engine behavior harness", () => {
       ]),
     ).toBeGreaterThan(1);
     expect(harness.count("embedding_models", "provider = 'local-deterministic'")).toBe(0);
+    const childChunkTexts = harness
+      .selectObjects("SELECT text FROM source_chunks WHERE source_id = ? AND role = 'child'", [
+        sourceId,
+      ])
+      .map((row) => String(row.text ?? ""));
+    expect(childChunkTexts.length).toBeGreaterThan(0);
+    for (const chunkText of childChunkTexts) expect(embeddedInputs).toContain(chunkText);
+    expect(
+      embeddedInputs.filter((input) => input.startsWith("Title: Remote Semantic Bridge")),
+    ).toHaveLength(0);
 
     const retrieved = await harness.request({
       kind: "retrieveSources",
@@ -2483,7 +2485,7 @@ describe("local engine behavior harness", () => {
     expect(metaHead.docContext).toContain("Malformed Meta Head");
     expect(metaHead.source?.abstract).toBeNull();
     expect(metaHead.chunkSummary).toContain("malformed meta head fallback");
-    expect(metaHead.roleHint).toBe("child");
+    expect(metaHead.roleHint).toBe("body");
 
     harness.exec("UPDATE source_chunks SET meta_head_json = ? WHERE id = ?", [
       "{not valid json",
@@ -2533,7 +2535,7 @@ describe("local engine behavior harness", () => {
     expect(repairedMetaHead.tiers?.tier2?.reason).toBe("explicit_llm_chunk_meta_not_configured");
     expect(repairedMetaHead.docContext).toContain("Malformed Meta Head");
     expect(repairedMetaHead.chunkSummary).toContain("malformed meta head fallback");
-    expect(repairedMetaHead.roleHint).toBe("child");
+    expect(repairedMetaHead.roleHint).toBe("body");
     expect(repairedMetaHead.semanticRelations?.some((relation) => relation.kind === "role")).toBe(
       true,
     );
@@ -2542,10 +2544,8 @@ describe("local engine behavior harness", () => {
       "SELECT text_hash FROM source_embeddings WHERE source_id = ? AND target_kind = 'chunk' ORDER BY target_id ASC LIMIT 1",
       [sourceId],
     );
-    expect(embedding?.text_hash).toBe(
-      hashText(chunkMetaEmbeddingInputForTest(repairedMetaHead, String(repairedChunk?.text ?? ""))),
-    );
-    expect(embedding?.text_hash).not.toBe(repairedChunk?.hash);
+    expect(embedding?.text_hash).toBe(repairedChunk?.hash);
+    expect(embedding?.text_hash).toBe(hashText(String(repairedChunk?.text ?? "")));
   });
 
   it("keeps duplicate, page version, and selection capture behavior distinct", async () => {
@@ -4031,6 +4031,22 @@ describe("local engine behavior harness", () => {
           charEnd: page2Start + page2.length,
         },
       ],
+      paragraphs: [
+        {
+          text: page1,
+          pageNumber: 1,
+          charStart: 0,
+          charEnd: page1.length,
+          contentKind: "body",
+        },
+        {
+          text: page2,
+          pageNumber: 2,
+          charStart: page2Start,
+          charEnd: page2Start + page2.length,
+          contentKind: "body",
+        },
+      ],
       sections: [
         {
           level: 1,
@@ -4214,7 +4230,7 @@ describe("local engine behavior harness", () => {
       ],
       parseProfile: {
         parser: "pdfjs",
-        parserVersion: "clio-pdf-structure-v2",
+        parserVersion: "clio-pdf-structure-v3",
         pageCount: 2,
         textHash: hashText(text),
         ocrStatus: "not_required",
@@ -4301,7 +4317,7 @@ describe("local engine behavior harness", () => {
     expect(detail?.metadata.pdf_page_count).toBe(2);
     expect(detail?.metadata.pdf_parse_profile).toMatchObject({
       parser: "pdfjs",
-      parserVersion: "clio-pdf-structure-v2",
+      parserVersion: "clio-pdf-structure-v3",
       pageCount: 2,
       ocrStatus: "not_required",
       warnings: [],
@@ -4458,6 +4474,7 @@ describe("local engine behavior harness", () => {
         { pageNumber: 1, text: page1, charStart: 0, charEnd: page1.length },
         { pageNumber: 2, text: page2, charStart: page2Start, charEnd: page2Start + page2.length },
       ],
+      paragraphs: [],
       sections: [
         {
           level: 1,
@@ -4539,7 +4556,7 @@ describe("local engine behavior harness", () => {
       ],
       parseProfile: {
         parser: "pdfjs",
-        parserVersion: "clio-pdf-structure-v2",
+        parserVersion: "clio-pdf-structure-v3",
         pageCount: 2,
         textHash: hashText(text),
         ocrStatus: "not_required",
@@ -4767,6 +4784,15 @@ describe("local engine behavior harness", () => {
     const parsed: ParsedPdfDocument = {
       text,
       pages: [{ pageNumber: 1, text, charStart: 0, charEnd: text.length }],
+      paragraphs: [
+        {
+          text,
+          pageNumber: 1,
+          charStart: 0,
+          charEnd: text.length,
+          contentKind: "body",
+        },
+      ],
       sections: [],
       references: [],
       figures: [],
@@ -4778,7 +4804,7 @@ describe("local engine behavior harness", () => {
       pageLabels: [{ pageNumber: 1, label: "Page 1", charStart: 0, charEnd: text.length }],
       parseProfile: {
         parser: "pdfjs",
-        parserVersion: "clio-pdf-structure-v2",
+        parserVersion: "clio-pdf-structure-v3",
         pageCount: 1,
         textHash: hashText(text),
         ocrStatus: "not_required",
@@ -5248,6 +5274,15 @@ function minimalParsedPdf(text: string): ParsedPdfDocument {
   return {
     text,
     pages: [{ pageNumber: 1, text, charStart: 0, charEnd: text.length }],
+    paragraphs: [
+      {
+        text,
+        pageNumber: 1,
+        charStart: 0,
+        charEnd: text.length,
+        contentKind: "body",
+      },
+    ],
     sections: [],
     references: [],
     figures: [],
@@ -5259,7 +5294,7 @@ function minimalParsedPdf(text: string): ParsedPdfDocument {
     pageLabels: [{ pageNumber: 1, label: "Page 1", charStart: 0, charEnd: text.length }],
     parseProfile: {
       parser: "pdfjs",
-      parserVersion: "clio-pdf-structure-v2",
+      parserVersion: "clio-pdf-structure-v3",
       pageCount: 1,
       textHash: hashText(text),
       ocrStatus: "not_required",
@@ -5404,81 +5439,6 @@ type ChunkMetaHeadForTest = {
   tiers?: Record<string, ChunkMetaTierStateForTest | undefined>;
   semanticRelations?: ChunkMetaSemanticRelationForTest[];
 };
-
-function chunkMetaEmbeddingInputForTest(metaHead: ChunkMetaHeadForTest, text: string) {
-  const selectedTierState = selectedChunkMetaTierStateForTest(metaHead);
-  const sectionSummary =
-    stringFieldForTest(selectedTierState?.sectionSummary) ?? metaHead.sectionSummary;
-  const chunkSummary = stringFieldForTest(selectedTierState?.chunkSummary) ?? metaHead.chunkSummary;
-  const relationHints = chunkMetaRelationHintsForTest(metaHead, selectedTierState);
-  const prefix = [
-    metaHead.docContext ?? "",
-    metaHead.sectionPath === null || metaHead.sectionPath === undefined
-      ? ""
-      : `Section: ${metaHead.sectionPath}`,
-    sectionSummary === null || sectionSummary === undefined
-      ? ""
-      : `Section summary: ${sectionSummary}`,
-    chunkSummary === null || chunkSummary === undefined ? "" : `Chunk summary: ${chunkSummary}`,
-    metaHead.roleHint === null || metaHead.roleHint === undefined
-      ? ""
-      : `Role: ${metaHead.roleHint}`,
-    relationHints.length === 0 ? "" : `Relations: ${relationHints.join("; ")}`,
-  ]
-    .filter((part) => part.length > 0)
-    .join("\n");
-  const normalizedPrefix = boundedNormalizedTextForTest(prefix, 2_000);
-  return normalizedPrefix.length === 0 ? text : `${normalizedPrefix}\n\n${text}`;
-}
-
-function selectedChunkMetaTierStateForTest(
-  metaHead: ChunkMetaHeadForTest,
-): ChunkMetaTierStateForTest | undefined {
-  const tiers = metaHead.tiers;
-  if (tiers === undefined) return undefined;
-  const selectedTier = metaHead.selectedTier ?? metaHead.tier;
-  const preferred = selectedTier === undefined ? undefined : tiers[selectedTier];
-  if (preferred?.status === "available") return preferred;
-  if (tiers.tier1?.status === "available") return tiers.tier1;
-  return tiers.tier0;
-}
-
-function chunkMetaRelationHintsForTest(
-  metaHead: ChunkMetaHeadForTest,
-  selectedTierState: ChunkMetaTierStateForTest | undefined,
-) {
-  const relations = selectedTierState?.semanticRelations ?? metaHead.semanticRelations ?? [];
-  return relations
-    .flatMap((relation): string[] => {
-      const kind = typeof relation.kind === "string" ? normalizeTextForTest(relation.kind) : "";
-      const target =
-        typeof relation.target === "string" ? normalizeTextForTest(relation.target) : "";
-      if (kind.length === 0 || target.length === 0) return [];
-      return [`${kind}:${target}`];
-    })
-    .slice(0, 6);
-}
-
-function stringFieldForTest(input: unknown): string | null | undefined {
-  if (input === null || input === undefined) return input;
-  return typeof input === "string" ? input : undefined;
-}
-
-function boundedNormalizedTextForTest(input: string, maxLength: number) {
-  const normalized = normalizeTextForTest(input);
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
-}
-
-function normalizeTextForTest(input: string) {
-  return input
-    .normalize("NFKC")
-    .replace(/\u00a0/g, " ")
-    .replace(/\r\n?/g, "\n")
-    .replace(/[ \t\f\v]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
 
 function knowledgeBasePrecisionVector(input: string) {
   const normalized = input.toLowerCase();

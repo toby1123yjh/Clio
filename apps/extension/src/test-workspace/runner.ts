@@ -81,7 +81,7 @@ export async function initializeTestWorkspace(
       phase: "installing_model",
       completed: embeddingStatus.downloadedBytes,
       total: Math.max(1, embeddingStatus.totalBytes),
-      message: "Installing Multilingual E5 Small.",
+      message: "Installing Multilingual E5 Base.",
       currentItem: embeddingStatus.currentFile,
     });
     if (embeddingStatus.state !== "downloading" && embeddingStatus.state !== "verifying") {
@@ -231,7 +231,7 @@ async function waitForEmbeddingInstall(
       phase: "installing_model",
       completed: status.downloadedBytes,
       total: Math.max(1, status.totalBytes),
-      message: "Installing Multilingual E5 Small.",
+      message: "Installing Multilingual E5 Base.",
       currentItem: status.currentFile,
     });
     if (isEmbeddingInstalled(status)) return "done";

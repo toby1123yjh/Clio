@@ -733,7 +733,6 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("function isChunkMetaRelationKind");
     expect(workerSource).toContain("Section: ${sectionPath}");
     expect(workerSource).toContain("Section summary: ${sectionSummary}");
-    expect(workerSource).toContain("Role: ${roleHint}");
     expect(workerSource).toContain(
       "UPDATE source_chunks SET section_path = ?, meta_head_json = ? WHERE id = ?",
     );
@@ -741,8 +740,21 @@ describe("local engine source-native storage foundation", () => {
       "SELECT id, ord, text, char_start, char_end, role, parent_chunk_id",
     );
     expect(workerSource).toContain("function buildChunkEmbeddingInput");
-    expect(workerSource).toContain("function buildChunkMetaEmbeddingPrefix");
-    expect(workerSource).toContain('Relations: ${relationHints.join("; ")}');
+    expect(workerSource).not.toContain("function buildChunkMetaEmbeddingPrefix");
+    expect(workerSource).toContain('const sourceChunkStrategyVersion = "e5-a-paragraph-v1"');
+    expect(workerSource).toContain("const sourceChunkSoftTargetTokens = 300");
+    expect(workerSource).toContain("const sourceChunkHardMaxTokens = 420");
+    expect(workerSource).toContain("const sourceChunkOversizedOverlapTokens = 48");
+    expect(workerSource).toContain("chunkTextByParagraphs(blocks");
+    expect(workerSource).toContain('embeddingInput: "passage_only"');
+    const embeddingInputSection = workerSource.slice(
+      workerSource.indexOf("function buildChunkEmbeddingInput"),
+      workerSource.indexOf("function selectedChunkMetaTierState"),
+    );
+    expect(embeddingInputSection).toContain('return stringField(chunk, "text");');
+    expect(embeddingInputSection).not.toContain("meta_head_json");
+    expect(embeddingInputSection).not.toContain("sectionPath");
+    expect(embeddingInputSection).not.toContain("relationHints");
     expect(rpcSource).toContain("CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST");
     expect(rpcSource).toContain("isWorkerChunkMetaSummaryRequestMessage");
     expect(rpcSource).toContain("forbiddenWorkerChunkMetaSummaryFields");
