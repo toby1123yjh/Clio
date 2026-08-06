@@ -120,7 +120,11 @@ import type {
   OrchestrationEvent,
   OrchestrationRunSummary,
   RetrieveSourceLifecycleFilter,
+  RetrieveSourceRelevanceBand,
   RetrieveSourcesFilter,
+  RetrieveSourcesRelevanceTrace,
+  RetrieveSourcesStageTrace,
+  RetrieveStrength,
   SearchMemoryItem,
   SourceContextCompressionLogRecord,
   SourceContextMapArtifactRecord,
@@ -221,10 +225,16 @@ export interface RailShellProps {
   health: EngineHealth | null;
   items: SearchMemoryItem[];
   knowledgeBaseFilter: KnowledgeBaseFilterState;
+  knowledgeBaseRelevance: {
+    bands: RetrieveSourceRelevanceBand[];
+    stages: RetrieveSourcesStageTrace[];
+    trace?: RetrieveSourcesRelevanceTrace;
+  };
   knowledgeBaseRefreshLoading: boolean;
   knowledgeBaseRetrieveFilter?: RetrieveSourcesFilter;
   knowledgeBaseSearchMode: KnowledgeBaseSearchMode;
   knowledgeBaseSearchLoading: boolean;
+  knowledgeBaseStrength: RetrieveStrength;
   workingSetStatus: WorkingSetStatusResult | null;
   chunkMetaTier2Audit: ChunkMetaTier2AuditRecord[];
   orchestrationRuns: OrchestrationRunSummary[];
@@ -321,6 +331,7 @@ export interface RailShellProps {
   onOpenSource: (memory: MemoryDetail) => void;
   onKnowledgeBaseFilterChange: (filter: KnowledgeBaseFilterState) => void;
   onKnowledgeBaseSearchModeChange: (mode: KnowledgeBaseSearchMode) => void;
+  onKnowledgeBaseStrengthChange: (strength: RetrieveStrength) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onEvictWorkingSetSource: (sourceId: string) => void;
   onSetWorkingSetSourceDepth: (sourceId: string, loadDepth: WorkingSetLoadDepth) => void;
@@ -5449,12 +5460,19 @@ function KnowledgeBasePanel(props: RailShellProps) {
             ) : null}
           </div>
           {section === "memories" ? (
-            <KnowledgeBaseSearchModeControl
-              disabled={props.state.loading}
-              mode={props.knowledgeBaseSearchMode}
-              semanticAvailable={props.activeEmbeddingModel !== null}
-              onModeChange={props.onKnowledgeBaseSearchModeChange}
-            />
+            <>
+              <KnowledgeBaseSearchModeControl
+                disabled={props.state.loading}
+                mode={props.knowledgeBaseSearchMode}
+                semanticAvailable={props.activeEmbeddingModel !== null}
+                onModeChange={props.onKnowledgeBaseSearchModeChange}
+              />
+              <KnowledgeBaseStrengthControl
+                disabled={props.state.loading}
+                strength={props.knowledgeBaseStrength}
+                onStrengthChange={props.onKnowledgeBaseStrengthChange}
+              />
+            </>
           ) : null}
           <div className="grid gap-2" data-clio-knowledge-toolbar-controls="true">
             {section === "memories" ? (
@@ -5505,12 +5523,15 @@ function KnowledgeBasePanel(props: RailShellProps) {
             id="clio-knowledge-sources-panel"
             role="tabpanel"
           >
-            <MemoryList
+            <KnowledgeBaseResultGroups
+              bands={props.knowledgeBaseRelevance.bands}
               hasActiveCriteria={hasActiveListCriteria}
               highlightedId={props.state.highlightedMemoryId}
               items={props.items}
               loading={props.state.loading || props.knowledgeBaseSearchLoading}
               selectedPlannerSourceIds={selectedPlannerSourceIds}
+              stages={props.knowledgeBaseRelevance.stages}
+              relevanceTrace={props.knowledgeBaseRelevance.trace}
               workingSetSourceIds={workingSetSourceIds}
               onOpenDetail={props.onOpenDetail}
               onPinWorkingSetSource={props.onPinWorkingSetSource}
@@ -5735,6 +5756,148 @@ function KnowledgeBaseSearchModeControl(props: {
           </label>
         );
       })}
+    </div>
+  );
+}
+
+function KnowledgeBaseStrengthControl(props: {
+  disabled: boolean;
+  strength: RetrieveStrength;
+  onStrengthChange: (strength: RetrieveStrength) => void;
+}) {
+  const labels: Record<RetrieveStrength, string> = {
+    strict: "Strong relevance",
+    balanced: "Balanced",
+    broad: "Explore broadly",
+  };
+  return (
+    <label className="grid gap-1 text-[11px]" data-clio-knowledge-strength="true">
+      <span className="font-medium text-muted-foreground">Retrieval strength</span>
+      <select
+        aria-label="Knowledge Base retrieval strength"
+        className="h-9 rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45"
+        disabled={props.disabled}
+        onChange={(event) => props.onStrengthChange(event.target.value as RetrieveStrength)}
+        value={props.strength}
+      >
+        {(Object.keys(labels) as RetrieveStrength[]).map((strength) => (
+          <option key={strength} value={strength}>
+            {labels[strength]}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function KnowledgeBaseResultGroups(props: {
+  bands: RetrieveSourceRelevanceBand[];
+  hasActiveCriteria: boolean;
+  highlightedId?: string;
+  items: SearchMemoryItem[];
+  loading: boolean;
+  relevanceTrace?: RetrieveSourcesRelevanceTrace;
+  stages: RetrieveSourcesStageTrace[];
+  selectedPlannerSourceIds: ReadonlySet<string>;
+  workingSetSourceIds: ReadonlySet<string>;
+  onOpenDetail: (id: string) => void;
+  onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
+  onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
+  onRunSourceGraphJob: (sourceId: string) => void;
+  onSelectSourceContextPlannerSource: (sourceId: string) => void;
+}) {
+  const selectedIds = React.useMemo(
+    () => new Set(props.items.map((item) => item.id)),
+    [props.items],
+  );
+  const labels: Record<RetrieveSourceRelevanceBand["band"], string> = {
+    high: "High relevance",
+    medium: "Medium relevance",
+    low: "Low relevance",
+  };
+  const hasBands = props.bands.some((band) => band.itemCount > 0);
+  return (
+    <div className="grid gap-3" data-clio-knowledge-relevance="true">
+      {props.relevanceTrace !== undefined ? (
+        <details
+          className="rounded-md border border-border bg-surface px-3 py-2"
+          data-clio-retrieval-trace="true"
+        >
+          <summary className="cursor-pointer text-[12px] font-medium text-foreground">
+            Retrieval process · {props.relevanceTrace.candidateCount} candidates ·{" "}
+            {props.relevanceTrace.selectedCount} selected
+          </summary>
+          <div className="mt-2 grid gap-1 text-[11px] text-muted-foreground">
+            {props.stages.map((stage) => (
+              <div className="flex items-center justify-between gap-3" key={stage.id}>
+                <span>{stage.id}</span>
+                <span>
+                  {stage.inputCount} → {stage.outputCount} · dropped {stage.droppedCount}
+                  {stage.reason === undefined ? "" : ` · ${stage.reason}`}
+                </span>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+      {hasBands
+        ? props.bands.map((band) => {
+            const visibleItems = band.items
+              .filter((item) => selectedIds.has(item.id))
+              .map((item) => ({
+                ...item,
+                snippet: item.hitChunks[0]?.snippet ?? item.excerpt,
+              }));
+            return (
+              <section
+                className="grid gap-2"
+                data-clio-knowledge-relevance-band={band.band}
+                key={band.band}
+              >
+                <div className="flex items-center justify-between gap-2 px-1">
+                  <h4 className="text-[12px] font-semibold">{labels[band.band]}</h4>
+                  <Badge className="border-border bg-surface-subtle text-[10px] text-muted-foreground">
+                    {band.itemCount}
+                  </Badge>
+                </div>
+                {visibleItems.length > 0 ? (
+                  <MemoryList
+                    hasActiveCriteria={props.hasActiveCriteria}
+                    highlightedId={props.highlightedId}
+                    items={visibleItems}
+                    loading={props.loading}
+                    selectedPlannerSourceIds={props.selectedPlannerSourceIds}
+                    workingSetSourceIds={props.workingSetSourceIds}
+                    onOpenDetail={props.onOpenDetail}
+                    onPinWorkingSetSource={props.onPinWorkingSetSource}
+                    onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
+                    onRunSourceGraphJob={props.onRunSourceGraphJob}
+                    onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
+                  />
+                ) : (
+                  <p className="rounded-md border border-dashed border-border px-3 py-3 text-[11px] text-muted-foreground">
+                    Not included by the selected retrieval strength.
+                  </p>
+                )}
+              </section>
+            );
+          })
+        : null}
+      {!hasBands ? (
+        <MemoryList
+          hasActiveCriteria={props.hasActiveCriteria}
+          highlightedId={props.highlightedId}
+          items={props.items}
+          loading={props.loading}
+          selectedPlannerSourceIds={props.selectedPlannerSourceIds}
+          workingSetSourceIds={props.workingSetSourceIds}
+          onOpenDetail={props.onOpenDetail}
+          onPinWorkingSetSource={props.onPinWorkingSetSource}
+          onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
+          onRunSourceGraphJob={props.onRunSourceGraphJob}
+          onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
+        />
+      ) : null}
     </div>
   );
 }

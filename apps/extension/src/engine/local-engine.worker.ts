@@ -112,12 +112,17 @@ import {
   type ReindexResult,
   type RepairAction,
   type RepairResult,
+  type RetrieveRelevanceBand,
   type RetrieveSourceHitChunk,
   type RetrieveSourceItem,
+  type RetrieveSourceRelevanceBand,
   type RetrieveSourcesFilter,
   type RetrieveSourcesPayload,
+  type RetrieveSourcesRelevanceTrace,
   type RetrieveSourcesResult,
+  type RetrieveSourcesStageTrace,
   type RetrieveSourcesTraceTrack,
+  type RetrieveStrength,
   type RetrieveTrackName,
   type SearchKnowledgeBasePayload,
   type SearchKnowledgeBaseResult,
@@ -202,10 +207,17 @@ import {
   pdfCapturePayloadFromParsedDocument,
 } from "./pdf-parser";
 import {
+  type EvidenceSelectionStrategy,
+  RankedEvidenceSelectionStrategy,
+  type RelevanceBandStrategy,
+  ScoreGapRelevanceBandStrategy,
+  type SourceCoarseBandResult,
   type SourceCoarseRankCandidate,
+  type SourceCoarseRankedCandidate,
   type SourceFineRanker,
   rankSourceCoarseCandidates,
   runSourceFineRanker,
+  selectSourceCoarseBandItems,
   selectSourceCoarseCandidates,
 } from "./source-coarse-ranker";
 
@@ -385,6 +397,8 @@ export interface LocalEngineOptions {
   pdfFigureVisionImageExtractor?: PdfFigureVisionImageExtractor;
   pdfRawFileStore?: PdfRawFileStore;
   sourceFineRanker?: SourceFineRanker<RetrieveSourceItem>;
+  sourceRelevanceBandStrategy?: RelevanceBandStrategy;
+  evidenceSelectionStrategy?: EvidenceSelectionStrategy;
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
@@ -803,6 +817,8 @@ export class LocalEngine {
   private readonly pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor;
   private readonly pdfRawFileStore: PdfRawFileStore;
   private readonly sourceFineRanker?: SourceFineRanker<RetrieveSourceItem>;
+  private readonly sourceRelevanceBandStrategy: RelevanceBandStrategy;
+  private readonly evidenceSelectionStrategy: EvidenceSelectionStrategy;
 
   constructor(options: LocalEngineOptions = {}) {
     this.openDatabase = options.openDatabase ?? openProductionDatabase;
@@ -825,6 +841,10 @@ export class LocalEngine {
       options.pdfFigureVisionImageExtractor ?? extractPdfFigureVisionImageInput;
     this.pdfRawFileStore = options.pdfRawFileStore ?? new OpfsPdfRawFileStore();
     this.sourceFineRanker = options.sourceFineRanker;
+    this.sourceRelevanceBandStrategy =
+      options.sourceRelevanceBandStrategy ?? new ScoreGapRelevanceBandStrategy();
+    this.evidenceSelectionStrategy =
+      options.evidenceSelectionStrategy ?? new RankedEvidenceSelectionStrategy();
   }
 
   async handle(request: EngineRequest) {
@@ -1370,6 +1390,8 @@ export class LocalEngine {
     const query = normalizeText(payload.query);
     const limit = clampOptionalLimit(payload.limit, 20, 50);
     const includeChunks = clampOptionalLimit(payload.includeChunks, 3, 8);
+    const strength = normalizeRetrieveStrength(payload.strength);
+    const coarsePoolLimit = retrievalCoarsePoolLimit(limit);
     const ftsQuery = buildFtsQuery(query);
     const filters = normalizeRetrieveSourcesFilter(payload.filter);
     const traceTracks: RetrieveSourcesTraceTrack[] = [];
@@ -1421,21 +1443,60 @@ export class LocalEngine {
         reason: "empty_query",
       });
       traceTracks.push(vectorSkippedTrace("empty_query"));
+      const recentItems = rows.map((row, index) => ({
+        ...memorySummaryFromRetrievalRow(
+          row,
+          stringField(row, "source_title") || stringField(row, "source_url"),
+        ),
+        score: reciprocalRankFusionScore(index + 1),
+        tracks: ["recent_sources" as const],
+        hitChunks: [],
+      }));
+      const recentBands: RetrieveSourceRelevanceBand[] = [
+        { band: "high", items: recentItems, itemCount: recentItems.length },
+        { band: "medium", items: [], itemCount: 0 },
+        { band: "low", items: [], itemCount: 0 },
+      ];
+      const recentSelected = recentItems.slice(0, Math.min(limit, recentItems.length));
       return {
         query,
-        items: rows.map((row, index) => ({
-          ...memorySummaryFromRetrievalRow(
-            row,
-            stringField(row, "source_title") || stringField(row, "source_url"),
-          ),
-          score: reciprocalRankFusionScore(index + 1),
-          tracks: ["recent_sources"],
-          hitChunks: [],
-        })),
+        items: recentSelected,
+        bands: recentBands,
         trace: {
           strategy: "rrf",
           rrfK: defaultRrfK,
           tracks: traceTracks,
+          stages: [
+            retrievalStage("recall", "recent_sources", rows.length, rows.length),
+            retrievalStage("source_grouping", "source_id_dedupe", rows.length, rows.length),
+            retrievalStage("coarse_rank", "recent_sources_captured_at", rows.length, rows.length),
+            retrievalStage("relevance_banding", "empty_query_browse", rows.length, rows.length),
+            retrievalStage(
+              "strength_selection",
+              "browse_default",
+              rows.length,
+              recentSelected.length,
+              rows.length - recentSelected.length,
+              recentSelected.length < rows.length ? "safety_cap" : undefined,
+            ),
+            retrievalStage(
+              "evidence_selection",
+              "no_chunk_evidence",
+              recentSelected.length,
+              recentSelected.length,
+            ),
+          ],
+          relevance: relevanceTraceFromBands({
+            strategy: "empty_query_browse",
+            strength,
+            candidateCount: rows.length,
+            eligibleCount: rows.length,
+            selectedCount: recentSelected.length,
+            selectedBands: ["high"],
+            safetyCapped: recentSelected.length < rows.length,
+            boundaries: [],
+            bands: recentBands,
+          }),
           fineRank: { status: "skipped", reason: "empty_query" },
         },
       };
@@ -1443,7 +1504,7 @@ export class LocalEngine {
 
     const useLexicalTracks = mode !== "semantic";
     const useVectorTracks = mode !== "exact";
-    const vectorSourceLimit = vectorDocumentCandidatePoolLimit(limit);
+    const vectorSourceLimit = vectorDocumentCandidatePoolLimit(coarsePoolLimit);
     const metaHits = useLexicalTracks
       ? loadMetaSourceRetrievalHits(db, {
           query,
@@ -1488,12 +1549,33 @@ export class LocalEngine {
     const coarseItems = fuseSourceRetrievalHits(retrievalHits, {
       query,
       sourceStats,
-      limit,
+      coarsePoolLimit,
       includeChunks,
       rrfK: defaultRrfK,
     });
-    const fineRank = await runSourceFineRanker(query, coarseItems, this.sourceFineRanker);
-    const items = fineRank.items.slice(0, limit);
+    const relevanceResult = this.sourceRelevanceBandStrategy.classify({
+      query,
+      ranked: coarseItems.map((ranked) => ({
+        item: retrieveSourceItemFromRanked(ranked),
+        score: ranked.score,
+        topicEvidence: ranked.signals.topicEvidence,
+        localPeak: ranked.signals.localPeak,
+      })),
+    });
+    const selected = selectSourceCoarseBandItems(relevanceResult, strength, limit);
+    const selectedItems = selected.items.map((entry) =>
+      this.evidenceSelectionStrategy.select({
+        candidate: entry.item,
+        strength,
+        band: relevanceBandForItem(relevanceResult, entry.item.id),
+        maxChunks: includeChunks,
+      }),
+    );
+    const fineRank = await runSourceFineRanker(query, selectedItems, this.sourceFineRanker);
+    const items = fineRank.items;
+    const sourceCount = new Set(
+      retrievalHits.map((hit) => stringField(hit.source, "id")).filter(Boolean),
+    ).size;
     traceTracks.push({
       name: "meta_sources",
       status: metaHits.length > 0 ? "used" : "skipped",
@@ -1520,17 +1602,160 @@ export class LocalEngine {
         strategy: "rrf",
         rrfK: defaultRrfK,
         tracks: traceTracks,
+        stages: [
+          retrievalStage(
+            "recall",
+            "multi_track_recall",
+            retrievalHits.length,
+            retrievalHits.length,
+          ),
+          retrievalStage(
+            "source_grouping",
+            "source_id_dedupe",
+            retrievalHits.length,
+            sourceCount,
+            Math.max(0, retrievalHits.length - sourceCount),
+          ),
+          retrievalStage(
+            "coarse_rank",
+            "document_lanes_strength_aware_rrf",
+            sourceCount,
+            coarseItems.length,
+          ),
+          retrievalStage(
+            "relevance_banding",
+            relevanceResult.strategy,
+            coarseItems.length,
+            relevanceResult.eligibleCount,
+            relevanceResult.droppedCount,
+            relevanceResult.droppedCount > 0 ? "no_relevant_anchor" : undefined,
+          ),
+          retrievalStage(
+            "strength_selection",
+            `${strength}_bands`,
+            relevanceResult.eligibleCount,
+            selectedItems.length,
+            Math.max(0, relevanceResult.eligibleCount - selectedItems.length),
+            selected.safetyCapped ? "safety_cap" : undefined,
+          ),
+          retrievalStage(
+            "evidence_selection",
+            this.evidenceSelectionStrategy.name,
+            selectedItems.length,
+            items.length,
+          ),
+        ],
+        relevance: relevanceTraceFromBands({
+          strategy: relevanceResult.strategy,
+          strength,
+          candidateCount: relevanceResult.candidateCount,
+          eligibleCount: relevanceResult.eligibleCount,
+          selectedCount: items.length,
+          selectedBands: selected.selectedBands,
+          safetyCapped: selected.safetyCapped,
+          boundaries: relevanceResult.boundaries,
+          bands: relevanceBandsFromResult(relevanceResult),
+        }),
         coarseRank: {
           strategy: "document_lanes_strength_aware_rrf",
           lanes: ["topic", "local_peak", "breadth", "specificity", "agreement"],
-          candidateCount: new Set(
-            retrievalHits.map((hit) => stringField(hit.source, "id")).filter(Boolean),
-          ).size,
+          candidateCount: sourceCount,
         },
         fineRank: {
           status: fineRank.status,
           ...(fineRank.reason === undefined ? {} : { reason: fineRank.reason }),
         },
+      },
+    };
+  }
+
+  private applyKnowledgeBaseStrength(
+    result: RetrieveSourcesResult,
+    query: string,
+    sourceItems: RetrieveSourceItem[],
+    strength: RetrieveStrength,
+    limit: number,
+  ): RetrieveSourcesResult {
+    if (query.length === 0) {
+      const selectedItems = sourceItems.slice(0, limit);
+      return {
+        ...result,
+        items: selectedItems,
+        trace: {
+          ...result.trace,
+          relevance: result.trace.relevance
+            ? { ...result.trace.relevance, strength, selectedCount: selectedItems.length }
+            : undefined,
+        },
+      };
+    }
+    const relevanceResult = this.sourceRelevanceBandStrategy.classify({
+      query,
+      ranked: sourceItems.map((item) => ({
+        item,
+        score: item.score,
+        topicEvidence: item.coarseSignals?.topicEvidence ?? 0,
+        localPeak: item.coarseSignals?.localPeak ?? 0,
+      })),
+    });
+    const selected = selectSourceCoarseBandItems(relevanceResult, strength, limit);
+    const selectedItems = selected.items.map((entry) =>
+      this.evidenceSelectionStrategy.select({
+        candidate: entry.item,
+        strength,
+        band: relevanceBandForItem(relevanceResult, entry.item.id),
+        maxChunks: Math.max(1, entry.item.hitChunks.length),
+      }),
+    );
+    const bands = relevanceBandsFromResult(relevanceResult);
+    const stages = [
+      ...(result.trace.stages ?? []).filter(
+        (stage) =>
+          stage.id !== "relevance_banding" &&
+          stage.id !== "strength_selection" &&
+          stage.id !== "evidence_selection",
+      ),
+      retrievalStage(
+        "relevance_banding",
+        relevanceResult.strategy,
+        sourceItems.length,
+        relevanceResult.eligibleCount,
+        relevanceResult.droppedCount,
+        relevanceResult.droppedCount > 0 ? "no_relevant_anchor" : undefined,
+      ),
+      retrievalStage(
+        "strength_selection",
+        `${strength}_bands`,
+        relevanceResult.eligibleCount,
+        selectedItems.length,
+        Math.max(0, relevanceResult.eligibleCount - selectedItems.length),
+        selected.safetyCapped ? "safety_cap" : undefined,
+      ),
+      retrievalStage(
+        "evidence_selection",
+        this.evidenceSelectionStrategy.name,
+        selectedItems.length,
+        selectedItems.length,
+      ),
+    ];
+    return {
+      ...result,
+      items: selectedItems,
+      bands,
+      trace: {
+        ...result.trace,
+        stages,
+        relevance: relevanceTraceFromBands({
+          strategy: relevanceResult.strategy,
+          strength,
+          candidateCount: relevanceResult.candidateCount,
+          eligibleCount: relevanceResult.eligibleCount,
+          selectedCount: selectedItems.length,
+          selectedBands: selected.selectedBands,
+          safetyCapped: selected.safetyCapped,
+          boundaries: relevanceResult.boundaries,
+          bands,
+        }),
       },
     };
   }
@@ -1542,10 +1767,12 @@ export class LocalEngine {
     const query = normalizeText(payload.query);
     const limit = clampOptionalLimit(payload.limit, 20, 50);
     const includeChunks = clampOptionalLimit(payload.includeChunks, 3, 8);
+    const retrievalPoolLimit = Math.min(50, retrievalCoarsePoolLimit(limit));
     const original = await this.retrieveSources(
       {
         query,
-        limit,
+        strength: "broad",
+        limit: retrievalPoolLimit,
         includeChunks,
         filter: payload.filter,
       },
@@ -1553,10 +1780,17 @@ export class LocalEngine {
     );
 
     if (query.length === 0) {
+      const selected = this.applyKnowledgeBaseStrength(
+        original,
+        query,
+        original.items,
+        normalizeRetrieveStrength(payload.strength),
+        limit,
+      );
       return knowledgeBaseSearchResultWithClusters(
         db,
         {
-          ...original,
+          ...selected,
           expansion: {
             status: "skipped",
             terms: [],
@@ -1571,10 +1805,17 @@ export class LocalEngine {
 
     const filters = normalizeRetrieveSourcesFilter(payload.filter);
     if (filters.hasImpossibleFilter) {
+      const selected = this.applyKnowledgeBaseStrength(
+        original,
+        query,
+        original.items,
+        normalizeRetrieveStrength(payload.strength),
+        limit,
+      );
       return knowledgeBaseSearchResultWithClusters(
         db,
         {
-          ...original,
+          ...selected,
           expansion: {
             status: "skipped",
             terms: [],
@@ -1588,10 +1829,17 @@ export class LocalEngine {
     }
 
     if (payload.mode !== undefined) {
+      const selected = this.applyKnowledgeBaseStrength(
+        original,
+        query,
+        original.items,
+        normalizeRetrieveStrength(payload.strength),
+        limit,
+      );
       return knowledgeBaseSearchResultWithClusters(
         db,
         {
-          ...original,
+          ...selected,
           expansion: {
             status: "skipped",
             terms: [],
@@ -1606,11 +1854,17 @@ export class LocalEngine {
 
     const directItems = original.items.filter(hasDirectKnowledgeBaseLexicalMatch);
     if (directItems.length > 0) {
+      const selected = this.applyKnowledgeBaseStrength(
+        original,
+        query,
+        directItems,
+        normalizeRetrieveStrength(payload.strength),
+        limit,
+      );
       return knowledgeBaseSearchResultWithClusters(
         db,
         {
-          ...original,
-          items: directItems,
+          ...selected,
           expansion: {
             status: "skipped",
             terms: [],
@@ -1630,10 +1884,17 @@ export class LocalEngine {
     });
     const { terms } = expansionTerms;
     if (terms.length === 0) {
+      const selected = this.applyKnowledgeBaseStrength(
+        original,
+        query,
+        original.items,
+        normalizeRetrieveStrength(payload.strength),
+        limit,
+      );
       return knowledgeBaseSearchResultWithClusters(
         db,
         {
-          ...original,
+          ...selected,
           expansion: {
             status: "skipped",
             terms: [],
@@ -1648,10 +1909,17 @@ export class LocalEngine {
 
     const expandedQuery = normalizeText([query, ...terms].join(" "));
     if (buildFtsQuery(expandedQuery).length === 0) {
+      const selected = this.applyKnowledgeBaseStrength(
+        original,
+        query,
+        original.items,
+        normalizeRetrieveStrength(payload.strength),
+        limit,
+      );
       return knowledgeBaseSearchResultWithClusters(
         db,
         {
-          ...original,
+          ...selected,
           expansion: {
             status: "skipped",
             terms,
@@ -1667,19 +1935,27 @@ export class LocalEngine {
 
     const expanded = await this.retrieveSources({
       query: expandedQuery,
-      limit,
+      strength: "broad",
+      limit: retrievalPoolLimit,
       includeChunks,
       filter: payload.filter,
     });
 
+    const mergedItems = mergeKnowledgeBaseSearchItems(original.items, expanded.items, {
+      limit: retrievalPoolLimit,
+      includeChunks,
+    });
+    const selected = this.applyKnowledgeBaseStrength(
+      original,
+      query,
+      mergedItems,
+      normalizeRetrieveStrength(payload.strength),
+      limit,
+    );
     return knowledgeBaseSearchResultWithClusters(
       db,
       {
-        ...original,
-        items: mergeKnowledgeBaseSearchItems(original.items, expanded.items, {
-          limit,
-          includeChunks,
-        }),
+        ...selected,
         expansion: {
           status: "used",
           terms,
@@ -14166,6 +14442,91 @@ function emptyFilteredRetrieveSourcesResult(
   };
 }
 
+function normalizeRetrieveStrength(value: RetrieveStrength | undefined): RetrieveStrength {
+  return value === "strict" || value === "broad" ? value : "balanced";
+}
+
+function retrievalCoarsePoolLimit(resultLimit: number) {
+  return Math.min(100, Math.max(40, resultLimit * 4));
+}
+
+function retrieveSourceItemFromRanked(
+  ranked: SourceCoarseRankedCandidate<RetrieveSourceItem>,
+): RetrieveSourceItem {
+  return {
+    ...ranked.candidate.item,
+    score: ranked.score,
+    coarseSignals: ranked.signals,
+  };
+}
+
+function retrievalStage(
+  id: RetrieveSourcesStageTrace["id"],
+  strategy: string,
+  inputCount: number,
+  outputCount: number,
+  droppedCount = Math.max(0, inputCount - outputCount),
+  reason?: string,
+): RetrieveSourcesStageTrace {
+  return {
+    id,
+    strategy,
+    inputCount,
+    outputCount,
+    droppedCount,
+    ...(reason === undefined ? {} : { reason }),
+  };
+}
+
+function relevanceTraceFromBands(input: {
+  strategy: string;
+  strength: RetrieveStrength;
+  candidateCount: number;
+  eligibleCount: number;
+  selectedCount: number;
+  selectedBands: RetrieveRelevanceBand[];
+  safetyCapped: boolean;
+  boundaries: Array<{ afterRank: number; gap: number; relativeGap: number }>;
+  bands: RetrieveSourceRelevanceBand[];
+}): RetrieveSourcesRelevanceTrace {
+  return {
+    strategy: input.strategy,
+    strength: input.strength,
+    candidateCount: input.candidateCount,
+    eligibleCount: input.eligibleCount,
+    selectedCount: input.selectedCount,
+    selectedBands: input.selectedBands,
+    bandCounts: {
+      high: input.bands.find((band) => band.band === "high")?.itemCount ?? 0,
+      medium: input.bands.find((band) => band.band === "medium")?.itemCount ?? 0,
+      low: input.bands.find((band) => band.band === "low")?.itemCount ?? 0,
+    },
+    safetyCapped: input.safetyCapped,
+    boundaries: input.boundaries,
+  };
+}
+
+function relevanceBandsFromResult(
+  result: SourceCoarseBandResult<RetrieveSourceItem>,
+): RetrieveSourceRelevanceBand[] {
+  return result.bands.map((band) => ({
+    band: band.band,
+    items: band.items.map((entry) => entry.item),
+    itemCount: band.items.length,
+    ...(band.scoreFloor === undefined ? {} : { scoreFloor: band.scoreFloor }),
+    ...(band.scoreCeiling === undefined ? {} : { scoreCeiling: band.scoreCeiling }),
+  }));
+}
+
+function relevanceBandForItem(
+  result: SourceCoarseBandResult<RetrieveSourceItem>,
+  itemId: string,
+): RetrieveRelevanceBand {
+  return (
+    result.bands.find((band) => band.items.some((entry) => entry.item.id === itemId))?.band ?? "low"
+  );
+}
+
 interface KnowledgeBaseExpansionCandidate {
   term: string;
   source: KnowledgeBaseExpansionTermSource;
@@ -15055,12 +15416,12 @@ function fuseSourceRetrievalHits(
   hits: SourceRetrievalHit[],
   input: {
     query: string;
-    limit: number;
+    coarsePoolLimit: number;
     includeChunks: number;
     rrfK: number;
     sourceStats: ReadonlyMap<string, SourceRetrievalStats>;
   },
-): RetrieveSourceItem[] {
+): SourceCoarseRankedCandidate<RetrieveSourceItem>[] {
   const grouped = new Map<
     string,
     {
@@ -15170,11 +15531,7 @@ function fuseSourceRetrievalHits(
     };
   });
   const ranked = rankSourceCoarseCandidates(input.query, candidates, input.rrfK);
-  return selectSourceCoarseCandidates(ranked, input.limit).map((rankedItem) => ({
-    ...rankedItem.candidate.item,
-    score: rankedItem.score,
-    coarseSignals: rankedItem.signals,
-  }));
+  return selectSourceCoarseCandidates(ranked, input.coarsePoolLimit);
 }
 
 function mergeKnowledgeBaseSearchItems(

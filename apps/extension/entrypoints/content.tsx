@@ -179,8 +179,12 @@ import {
   type OrchestrationEvent,
   type OrchestrationRunSummary,
   type RetrieveSourceItem,
+  type RetrieveSourceRelevanceBand,
   type RetrieveSourcesFilter,
+  type RetrieveSourcesRelevanceTrace,
   type RetrieveSourcesResult,
+  type RetrieveSourcesStageTrace,
+  type RetrieveStrength,
   type SearchMemoryItem,
   type SourceContextCompressionLogRecord,
   type SourceContextMapArtifactRecord,
@@ -1097,6 +1101,17 @@ function ClioContentApp() {
   const [knowledgeBaseRefreshLoading, setKnowledgeBaseRefreshLoading] = React.useState(false);
   const [knowledgeBaseSearchMode, setKnowledgeBaseSearchMode] =
     React.useState<KnowledgeBaseSearchMode>("exact");
+  const [knowledgeBaseStrength, setKnowledgeBaseStrength] =
+    React.useState<RetrieveStrength>("balanced");
+  const [knowledgeBaseRelevance, setKnowledgeBaseRelevance] = React.useState<{
+    bands: RetrieveSourceRelevanceBand[];
+    stages: RetrieveSourcesStageTrace[];
+    trace?: RetrieveSourcesRelevanceTrace;
+  }>({ bands: [], stages: [] });
+  const knowledgeBaseStrengthRef = React.useRef<RetrieveStrength>("balanced");
+  React.useEffect(() => {
+    knowledgeBaseStrengthRef.current = knowledgeBaseStrength;
+  }, [knowledgeBaseStrength]);
   const [knowledgeBaseFilter, setKnowledgeBaseFilter] = React.useState<KnowledgeBaseFilterState>(
     defaultKnowledgeBaseFilter,
   );
@@ -1519,12 +1534,13 @@ function ClioContentApp() {
   }, [loadOrchestrationEvents]);
 
   const requestKnowledgeBaseResults = React.useCallback(
-    async (nextQuery: string) => {
+    async (nextQuery: string, strength: RetrieveStrength) => {
       const result = await requestEngine({
         kind: "searchKnowledgeBase",
         payload: {
           query: nextQuery,
           mode: knowledgeBaseSearchMode,
+          strength,
           limit: 40,
           includeChunks: 2,
           ...(knowledgeBaseRetrieveFilter === undefined
@@ -1532,7 +1548,12 @@ function ClioContentApp() {
             : { filter: knowledgeBaseRetrieveFilter }),
         },
       });
-      return result.items.map(toKnowledgeBaseSearchItem);
+      return {
+        items: result.items.map(toKnowledgeBaseSearchItem),
+        bands: result.bands ?? [],
+        stages: result.trace.stages ?? [],
+        trace: result.trace.relevance,
+      };
     },
     [knowledgeBaseRetrieveFilter, knowledgeBaseSearchMode],
   );
@@ -1542,9 +1563,17 @@ function ClioContentApp() {
       const sequence = ++knowledgeBaseSearchSequenceRef.current;
       setKnowledgeBaseSearchLoading(true);
       try {
-        const nextItems = await requestKnowledgeBaseResults(nextQuery);
+        const nextResult = await requestKnowledgeBaseResults(
+          nextQuery,
+          knowledgeBaseStrengthRef.current,
+        );
         if (sequence !== knowledgeBaseSearchSequenceRef.current) return;
-        setItems(nextItems);
+        setItems(nextResult.items);
+        setKnowledgeBaseRelevance({
+          bands: nextResult.bands,
+          stages: nextResult.stages,
+          trace: nextResult.trace,
+        });
       } catch (error) {
         if (sequence === knowledgeBaseSearchSequenceRef.current) showToast(errorToast(error));
       } finally {
@@ -1579,7 +1608,7 @@ function ClioContentApp() {
               kind: "listWikiCompileJobs",
               limit: 8,
             }),
-            requestKnowledgeBaseResults(nextQuery),
+            requestKnowledgeBaseResults(nextQuery, knowledgeBaseStrengthRef.current),
             requestEngine({ kind: "getWorkingSetStatus" }),
             requestEngine({
               kind: "listChunkMetaTier2Audit",
@@ -1602,7 +1631,12 @@ function ClioContentApp() {
           setWikiCompileJobEvents([]);
         }
         if (searchSequence === knowledgeBaseSearchSequenceRef.current) {
-          setItems(nextItems);
+          setItems(nextItems.items);
+          setKnowledgeBaseRelevance({
+            bands: nextItems.bands,
+            stages: nextItems.stages,
+            trace: nextItems.trace,
+          });
         }
       } catch (error) {
         showToast(errorToast(error));
@@ -1624,6 +1658,60 @@ function ClioContentApp() {
       requestKnowledgeBaseResults,
       showToast,
     ],
+  );
+
+  const handleKnowledgeBaseStrengthChange = React.useCallback(
+    (nextStrength: RetrieveStrength) => {
+      setKnowledgeBaseStrength(nextStrength);
+      knowledgeBaseStrengthRef.current = nextStrength;
+      const selectedBands =
+        nextStrength === "strict"
+          ? ["high"]
+          : nextStrength === "balanced"
+            ? ["high", "medium"]
+            : ["high", "medium", "low"];
+      const selectedItems = Array.from(
+        new Map(
+          knowledgeBaseRelevance.bands
+            .filter((band) => selectedBands.includes(band.band))
+            .flatMap((band) => band.items.map((item) => [item.id, item] as const)),
+        ).values(),
+      ).slice(0, 40);
+      if (knowledgeBaseRelevance.bands.length === 0) return;
+      const bandCandidateCount = selectedBands.reduce(
+        (total, band) =>
+          total +
+          (knowledgeBaseRelevance.bands.find((entry) => entry.band === band)?.itemCount ?? 0),
+        0,
+      );
+      const safetyCapped = selectedItems.length < bandCandidateCount;
+      setItems(selectedItems.map(toKnowledgeBaseSearchItem));
+      setKnowledgeBaseRelevance((current) => ({
+        ...current,
+        trace:
+          current.trace === undefined
+            ? current.trace
+            : {
+                ...current.trace,
+                strength: nextStrength,
+                selectedBands: selectedBands as RetrieveSourcesRelevanceTrace["selectedBands"],
+                selectedCount: selectedItems.length,
+                safetyCapped,
+              },
+        stages: current.stages.map((stage) =>
+          stage.id !== "strength_selection"
+            ? stage
+            : {
+                ...stage,
+                strategy: `${nextStrength}_bands`,
+                outputCount: selectedItems.length,
+                droppedCount: Math.max(0, stage.inputCount - selectedItems.length),
+                reason: safetyCapped ? "safety_cap" : undefined,
+              },
+        ),
+      }));
+    },
+    [knowledgeBaseRelevance.bands],
   );
 
   const pinWorkingSetSource = React.useCallback(
@@ -4723,10 +4811,12 @@ function ClioContentApp() {
         imageGenerationState={imageGenerationState}
         items={items}
         knowledgeBaseFilter={knowledgeBaseFilter}
+        knowledgeBaseRelevance={knowledgeBaseRelevance}
         knowledgeBaseRefreshLoading={knowledgeBaseRefreshLoading}
         knowledgeBaseRetrieveFilter={knowledgeBaseRetrieveFilter}
         knowledgeBaseSearchMode={knowledgeBaseSearchMode}
         knowledgeBaseSearchLoading={knowledgeBaseSearchLoading}
+        knowledgeBaseStrength={knowledgeBaseStrength}
         workingSetStatus={workingSetStatus}
         chunkMetaTier2Audit={chunkMetaTier2Audit}
         orchestrationRuns={orchestrationRuns}
@@ -4869,6 +4959,7 @@ function ClioContentApp() {
         onOpenTopicSource={(memoryId) => void openTopicSource(memoryId)}
         onQueryChange={(query) => dispatch({ type: "SET_QUERY", query })}
         onKnowledgeBaseSearchModeChange={setKnowledgeBaseSearchMode}
+        onKnowledgeBaseStrengthChange={handleKnowledgeBaseStrengthChange}
         onRefresh={() => void loadLibrary(railState.query, { background: true })}
         onRefreshProvider={refreshSettingsProviders}
         onRuntimeStatus={(message) => dispatch({ type: "SET_RUNTIME_STATUS", message })}

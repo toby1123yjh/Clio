@@ -2030,6 +2030,15 @@ describe("local engine behavior harness", () => {
     });
     expect(semantic.items[0]?.id).toBe(relevant.memory.id);
     expect(semantic.items).toHaveLength(5);
+    expect(semantic.bands).toHaveLength(3);
+    expect(semantic.trace.stages?.map((stage) => stage.id)).toEqual([
+      "recall",
+      "source_grouping",
+      "coarse_rank",
+      "relevance_banding",
+      "strength_selection",
+      "evidence_selection",
+    ]);
     expect(semantic.trace.coarseRank?.strategy).toBe("document_lanes_strength_aware_rrf");
     expect(semantic.trace.coarseRank?.candidateCount).toBe(sourceIds.length);
     expect(semantic.expansion).toMatchObject({
@@ -3714,6 +3723,15 @@ describe("local engine behavior harness", () => {
     expect(trackReason(retrieved, "fts_chunks")).toBe("empty_query");
     expect(trackStatus(retrieved, "vector_chunks")).toBe("skipped");
     expect(trackReason(retrieved, "vector_chunks")).toBe("empty_query");
+    expect(retrieved.trace.stages?.map((stage) => stage.id)).toEqual([
+      "recall",
+      "source_grouping",
+      "coarse_rank",
+      "relevance_banding",
+      "strength_selection",
+      "evidence_selection",
+    ]);
+    expect(retrieved.bands?.find((band) => band.band === "high")?.itemCount).toBe(2);
 
     const filtered = await harness.request({
       kind: "retrieveSources",

@@ -251,6 +251,8 @@ export interface GetMemoryEvidenceWindowsResult {
 }
 
 export type RetrieveSourcesScope = "all";
+export type RetrieveStrength = "strict" | "balanced" | "broad";
+export type RetrieveRelevanceBand = "high" | "medium" | "low";
 export type RetrieveTrackName =
   | "meta_sources"
   | "vector_meta"
@@ -273,6 +275,7 @@ export interface RetrieveSourcesFilter {
 
 export interface RetrieveSourcesPayload {
   query: string;
+  strength?: RetrieveStrength;
   limit?: number;
   scope?: RetrieveSourcesScope;
   includeChunks?: number;
@@ -335,13 +338,55 @@ export interface RetrieveSourcesTraceTrack {
   reason?: string;
 }
 
+export interface RetrieveSourcesStageTrace {
+  id:
+    | "recall"
+    | "source_grouping"
+    | "coarse_rank"
+    | "relevance_banding"
+    | "strength_selection"
+    | "evidence_selection";
+  strategy: string;
+  inputCount: number;
+  outputCount: number;
+  droppedCount: number;
+  reason?: string;
+}
+
+export interface RetrieveSourceRelevanceBand {
+  band: RetrieveRelevanceBand;
+  items: RetrieveSourceItem[];
+  itemCount: number;
+  scoreFloor?: number;
+  scoreCeiling?: number;
+}
+
+export interface RetrieveSourcesRelevanceTrace {
+  strategy: string;
+  strength: RetrieveStrength;
+  candidateCount: number;
+  eligibleCount: number;
+  selectedCount: number;
+  selectedBands: RetrieveRelevanceBand[];
+  bandCounts: Record<RetrieveRelevanceBand, number>;
+  safetyCapped: boolean;
+  boundaries: Array<{
+    afterRank: number;
+    gap: number;
+    relativeGap: number;
+  }>;
+}
+
 export interface RetrieveSourcesResult {
   query: string;
   items: RetrieveSourceItem[];
+  bands?: RetrieveSourceRelevanceBand[];
   trace: {
     strategy: RetrieveFusionStrategy;
     rrfK: number;
     tracks: RetrieveSourcesTraceTrack[];
+    stages?: RetrieveSourcesStageTrace[];
+    relevance?: RetrieveSourcesRelevanceTrace;
     coarseRank?: {
       strategy: "document_lanes_strength_aware_rrf";
       lanes: RetrieveSourceCoarseLaneName[];
@@ -420,6 +465,7 @@ export type KnowledgeBaseSearchMode = "exact" | "semantic";
 export interface SearchKnowledgeBasePayload {
   query: string;
   mode?: KnowledgeBaseSearchMode;
+  strength?: RetrieveStrength;
   limit?: number;
   includeChunks?: number;
   filter?: RetrieveSourcesFilter;
@@ -3433,6 +3479,7 @@ function isRetrieveSourcesPayload(value: unknown): value is RetrieveSourcesPaylo
   return (
     isRecord(value) &&
     typeof value.query === "string" &&
+    (value.strength === undefined || isRetrieveStrength(value.strength)) &&
     (value.limit === undefined || typeof value.limit === "number") &&
     (value.scope === undefined || value.scope === "all") &&
     (value.includeChunks === undefined || typeof value.includeChunks === "number") &&
@@ -3445,11 +3492,16 @@ function isSearchKnowledgeBasePayload(value: unknown): value is SearchKnowledgeB
     isRecord(value) &&
     typeof value.query === "string" &&
     (value.mode === undefined || value.mode === "exact" || value.mode === "semantic") &&
+    (value.strength === undefined || isRetrieveStrength(value.strength)) &&
     (value.limit === undefined || typeof value.limit === "number") &&
     (value.includeChunks === undefined || typeof value.includeChunks === "number") &&
     (value.filter === undefined || isRetrieveSourcesFilter(value.filter)) &&
     (value.clustering === undefined || isKnowledgeBaseClusteringOptions(value.clustering))
   );
+}
+
+function isRetrieveStrength(value: unknown): value is RetrieveStrength {
+  return value === "strict" || value === "balanced" || value === "broad";
 }
 
 function isKnowledgeBaseClusteringOptions(value: unknown): value is KnowledgeBaseClusteringOptions {

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  ScoreGapRelevanceBandStrategy,
   type SourceCoarseRankCandidate,
   rankSourceCoarseCandidates,
   runSourceFineRanker,
+  selectSourceCoarseBandItems,
   selectSourceCoarseCandidates,
 } from "./source-coarse-ranker";
 
@@ -280,6 +282,93 @@ describe("source document coarse ranker", () => {
       },
     });
     expect(failed).toEqual({ items: input, status: "failed", reason: "fine_ranker_failed" });
+  });
+
+  it("uses a score cliff instead of a fixed top-N count for high relevance", () => {
+    const strategy = new ScoreGapRelevanceBandStrategy();
+    const ranked = [0.92, 0.9, 0.88, 0.86, 0.61, 0.6].map((score, index) => ({
+      item: `source-${index}`,
+      score,
+      topicEvidence: score,
+      localPeak: score,
+    }));
+
+    const result = strategy.classify({ query: "query", ranked });
+
+    expect(result.bands[0]?.items.map((item) => item.item)).toEqual([
+      "source-0",
+      "source-1",
+      "source-2",
+      "source-3",
+    ]);
+    expect(result.bands[0]?.scoreFloor).toBe(0.86);
+    expect(result.boundaries[0]?.afterRank).toBe(4);
+  });
+
+  it("has deterministic fallbacks for flat, empty, single, and irrelevant candidates", () => {
+    const strategy = new ScoreGapRelevanceBandStrategy();
+    expect(strategy.classify({ query: "query", ranked: [] }).bands).toHaveLength(3);
+    expect(
+      strategy
+        .classify({
+          query: "query",
+          ranked: [{ item: "single", score: 0.4, topicEvidence: 0.4, localPeak: 0 }],
+        })
+        .bands[0]?.items.map((item) => item.item),
+    ).toEqual(["single"]);
+    expect(
+      strategy
+        .classify({
+          query: "query",
+          ranked: [0.5, 0.49, 0.48].map((score, index) => ({
+            item: `flat-${index}`,
+            score,
+            topicEvidence: score,
+            localPeak: 0,
+          })),
+        })
+        .bands.flatMap((band) => band.items)
+        .map((item) => item.item),
+    ).toEqual(["flat-0", "flat-1", "flat-2"]);
+    expect(
+      strategy.classify({
+        query: "query",
+        ranked: [{ item: "zero", score: 0, topicEvidence: 0, localPeak: 0 }],
+      }).droppedCount,
+    ).toBe(1);
+    expect(
+      strategy.classify({
+        query: "query",
+        ranked: [0.036, 0.034, 0.031].map((score, index) => ({
+          item: `rrf-noise-${index}`,
+          score,
+          topicEvidence: score,
+          localPeak: 0,
+        })),
+      }).boundaries,
+    ).toEqual([]);
+  });
+
+  it("selects bands by strength and reports a safety cap separately", () => {
+    const strategy = new ScoreGapRelevanceBandStrategy();
+    const result = strategy.classify({
+      query: "query",
+      ranked: [0.9, 0.5, 0.1].map((score, index) => ({
+        item: index,
+        score,
+        topicEvidence: score,
+        localPeak: score,
+      })),
+    });
+
+    expect(selectSourceCoarseBandItems(result, "strict")).toMatchObject({
+      selectedBands: ["high"],
+      safetyCapped: false,
+    });
+    expect(selectSourceCoarseBandItems(result, "broad", 1)).toMatchObject({
+      items: [{ item: 0 }],
+      safetyCapped: true,
+    });
   });
 });
 

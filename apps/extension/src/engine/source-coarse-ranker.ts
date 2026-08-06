@@ -1,7 +1,10 @@
 import type {
+  RetrieveRelevanceBand,
   RetrieveSourceCoarseLaneName,
   RetrieveSourceCoarseLaneSignal,
   RetrieveSourceCoarseSignals,
+  RetrieveSourceItem,
+  RetrieveStrength,
   RetrieveTrackName,
 } from "@/src/shared/rpc";
 import { expandChineseBigrams, normalizeText } from "@/src/shared/text";
@@ -48,6 +51,264 @@ export interface SourceFineRankResult<T> {
   items: T[];
   status: "not_configured" | "applied" | "failed";
   reason?: string;
+}
+
+export interface EvidenceSelectionStrategy {
+  readonly name: string;
+  select(input: {
+    candidate: RetrieveSourceItem;
+    strength: RetrieveStrength;
+    band: RetrieveRelevanceBand;
+    maxChunks: number;
+  }): RetrieveSourceItem;
+}
+
+/** Keeps ranked anchor chunks; adjacent context is loaded by a separate evidence-window API. */
+export class RankedEvidenceSelectionStrategy implements EvidenceSelectionStrategy {
+  readonly name = "ranked_anchor_chunks_v1";
+
+  select(input: {
+    candidate: RetrieveSourceItem;
+    strength: RetrieveStrength;
+    band: RetrieveRelevanceBand;
+    maxChunks: number;
+  }): RetrieveSourceItem {
+    const maxChunks = Math.max(1, Math.floor(input.maxChunks));
+    return {
+      ...input.candidate,
+      hitChunks: input.candidate.hitChunks.slice(0, maxChunks),
+    };
+  }
+}
+
+export interface RankedRelevanceCandidate<T> {
+  item: T;
+  score: number;
+  topicEvidence: number;
+  localPeak: number;
+}
+
+export interface SourceCoarseBand<T> {
+  band: RetrieveRelevanceBand;
+  items: RankedRelevanceCandidate<T>[];
+  scoreFloor?: number;
+  scoreCeiling?: number;
+}
+
+export interface SourceCoarseBandBoundary {
+  afterRank: number;
+  gap: number;
+  relativeGap: number;
+}
+
+export interface SourceCoarseBandResult<T> {
+  strategy: string;
+  bands: SourceCoarseBand<T>[];
+  candidateCount: number;
+  eligibleCount: number;
+  droppedCount: number;
+  boundaries: SourceCoarseBandBoundary[];
+}
+
+export interface RelevanceBandStrategy {
+  readonly name: string;
+  classify<T>(input: {
+    query: string;
+    ranked: readonly RankedRelevanceCandidate<T>[];
+  }): SourceCoarseBandResult<T>;
+}
+
+export interface RetrievalIntent {
+  kind: "answer" | "explore" | "compare" | "summarize";
+  recommendedStrength: RetrieveStrength;
+}
+
+export interface RetrievalIntentRecognizer {
+  recognize(input: { query: string }): Promise<RetrievalIntent>;
+}
+
+export class RuleRetrievalIntentRecognizer implements RetrievalIntentRecognizer {
+  async recognize(input: { query: string }): Promise<RetrievalIntent> {
+    const query = normalizeForMatch(input.query);
+    if (/(比较|对比|compare|versus|vs\.)/u.test(query)) {
+      return { kind: "compare", recommendedStrength: "broad" };
+    }
+    if (/(总结|概括|总结一下|summarize|summary)/u.test(query)) {
+      return { kind: "summarize", recommendedStrength: "balanced" };
+    }
+    if (/(了解|全面|综述|调研|explore|survey|overview)/u.test(query)) {
+      return { kind: "explore", recommendedStrength: "broad" };
+    }
+    return { kind: "answer", recommendedStrength: "strict" };
+  }
+}
+
+export class ScoreGapRelevanceBandStrategy implements RelevanceBandStrategy {
+  readonly name = "score_gap_v1";
+
+  classify<T>(input: {
+    query: string;
+    ranked: readonly RankedRelevanceCandidate<T>[];
+  }): SourceCoarseBandResult<T> {
+    const eligible = input.ranked.filter(hasRelevantAnchor);
+    const droppedCount = input.ranked.length - eligible.length;
+    if (eligible.length === 0) {
+      return {
+        strategy: this.name,
+        bands: emptyBands(),
+        candidateCount: input.ranked.length,
+        eligibleCount: 0,
+        droppedCount,
+        boundaries: [],
+      };
+    }
+
+    const scores = eligible.map((item) => item.score);
+    const gaps = scores.slice(0, -1).map((score, index) => {
+      const next = scores[index + 1] ?? score;
+      const gap = Math.max(0, score - next);
+      return {
+        afterRank: index + 1,
+        gap,
+        relativeGap: gap / Math.max(Math.abs(score), Number.EPSILON),
+      } satisfies SourceCoarseBandBoundary;
+    });
+    const meaningful = meaningfulGaps(gaps, scores);
+    const selectedBoundaries = meaningful
+      .sort((left, right) => right.gap - left.gap || left.afterRank - right.afterRank)
+      .slice(0, 2)
+      .sort((left, right) => left.afterRank - right.afterRank);
+    const boundaries =
+      selectedBoundaries.length > 0 ? selectedBoundaries : fallbackBoundaries(eligible);
+    const sections = splitByBoundaries(eligible, boundaries);
+    const bands: SourceCoarseBand<T>[] = [
+      bandFromItems("high", sections[0] ?? []),
+      bandFromItems("medium", sections[1] ?? []),
+      bandFromItems("low", sections[2] ?? []),
+    ];
+    return {
+      strategy: this.name,
+      bands,
+      candidateCount: input.ranked.length,
+      eligibleCount: eligible.length,
+      droppedCount,
+      boundaries,
+    };
+  }
+}
+
+export function selectSourceCoarseBandItems<T>(
+  result: SourceCoarseBandResult<T>,
+  strength: RetrieveStrength,
+  safetyLimit?: number,
+) {
+  const selectedBands: RetrieveRelevanceBand[] =
+    strength === "strict"
+      ? ["high"]
+      : strength === "balanced"
+        ? ["high", "medium"]
+        : ["high", "medium", "low"];
+  const items = result.bands
+    .filter((band) => selectedBands.includes(band.band))
+    .flatMap((band) => band.items);
+  const boundedLimit =
+    safetyLimit === undefined || !Number.isFinite(safetyLimit)
+      ? undefined
+      : Math.max(1, Math.floor(safetyLimit));
+  return {
+    selectedBands,
+    items: boundedLimit === undefined ? items : items.slice(0, boundedLimit),
+    safetyCapped: boundedLimit !== undefined && items.length > boundedLimit,
+  };
+}
+
+function hasRelevantAnchor<T>(item: RankedRelevanceCandidate<T>) {
+  return item.score > 0 && (item.topicEvidence > 0 || item.localPeak > 0);
+}
+
+function meaningfulGaps(gaps: readonly SourceCoarseBandBoundary[], scores: readonly number[]) {
+  const positiveGaps = gaps.filter((gap) => gap.gap > 0);
+  if (positiveGaps.length === 0 || scores.length < 2) return [];
+  const medianGap = median(positiveGaps.map((gap) => gap.gap));
+  const medianRelativeGap = median(positiveGaps.map((gap) => gap.relativeGap));
+  // RRF scores are often only a few hundredths apart; treat tiny absolute gaps
+  // as rank noise so a balanced search does not discard an otherwise coherent pool.
+  const minimumGap = Math.max((scores[0] ?? 0) * 0.08, medianGap * 2, 0.02);
+  const minimumRelativeGap = Math.max(0.12, medianRelativeGap * 2);
+  return gaps.filter((gap) => gap.gap >= minimumGap && gap.relativeGap >= minimumRelativeGap);
+}
+
+function fallbackBoundaries<T>(ranked: readonly RankedRelevanceCandidate<T>[]) {
+  if (ranked.length < 2) return [];
+  const topScore = ranked[0]?.score ?? 0;
+  if (topScore < 0.05) return [];
+  const highCount = ranked.findIndex((item) => item.score < topScore * 0.85);
+  if (highCount < 1) return [];
+  const boundaries: SourceCoarseBandBoundary[] = [fallbackBoundary(ranked, highCount)];
+  const mediumOffset = ranked.slice(highCount).findIndex((item) => item.score < topScore * 0.6);
+  const mediumCount = mediumOffset < 0 ? ranked.length : highCount + mediumOffset;
+  if (mediumCount > highCount && mediumCount < ranked.length) {
+    boundaries.push(fallbackBoundary(ranked, mediumCount));
+  }
+  return boundaries;
+}
+
+function fallbackBoundary<T>(ranked: readonly RankedRelevanceCandidate<T>[], afterRank: number) {
+  const left = ranked[afterRank - 1]?.score ?? 0;
+  const right = ranked[afterRank]?.score ?? 0;
+  const gap = Math.max(0, left - right);
+  return {
+    afterRank,
+    gap,
+    relativeGap: gap / Math.max(Math.abs(left), Number.EPSILON),
+  } satisfies SourceCoarseBandBoundary;
+}
+
+function splitByBoundaries<T>(
+  ranked: readonly RankedRelevanceCandidate<T>[],
+  boundaries: readonly SourceCoarseBandBoundary[],
+) {
+  const sections: RankedRelevanceCandidate<T>[][] = [];
+  let start = 0;
+  for (const boundary of boundaries) {
+    const end = Math.max(start, Math.min(ranked.length, boundary.afterRank));
+    sections.push(ranked.slice(start, end));
+    start = end;
+  }
+  sections.push(ranked.slice(start));
+  while (sections.length < 3) sections.push([]);
+  return sections.slice(0, 3);
+}
+
+function bandFromItems<T>(
+  band: RetrieveRelevanceBand,
+  items: RankedRelevanceCandidate<T>[],
+): SourceCoarseBand<T> {
+  if (items.length === 0) return { band, items };
+  const scores = items.map((item) => item.score);
+  return {
+    band,
+    items,
+    scoreFloor: Math.min(...scores),
+    scoreCeiling: Math.max(...scores),
+  };
+}
+
+function emptyBands<T>(): SourceCoarseBand<T>[] {
+  return [
+    { band: "high", items: [] },
+    { band: "medium", items: [] },
+    { band: "low", items: [] },
+  ];
+}
+
+function median(values: readonly number[]) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2
+    : (sorted[middle] ?? 0);
 }
 
 const laneNames: readonly RetrieveSourceCoarseLaneName[] = [

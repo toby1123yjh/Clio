@@ -196,6 +196,27 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("validates retrieval strength values at the RPC boundary", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "retrieveSources",
+          payload: { query: "graph retrieval", strength: "strict" },
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "searchKnowledgeBase",
+          payload: { query: "graph retrieval", strength: "invalid" },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts raw PDF file read requests by memory id", () => {
     expect(
       isEngineRequestMessage({
