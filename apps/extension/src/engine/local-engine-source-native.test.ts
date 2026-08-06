@@ -554,6 +554,8 @@ describe("local engine source-native storage foundation", () => {
       workerSource.indexOf("function loadFtsChunkRetrievalHits"),
       workerSource.indexOf("function fuseSourceRetrievalHits"),
     );
+    expect(ftsRetrievalSection).toContain("const bodyFtsQuery = `body : (${ftsQuery})`");
+    expect(ftsRetrievalSection).toContain("[bodyFtsQuery, ...sourceFilter.bind");
     expect(ftsRetrievalSection).not.toContain("normalized_text");
     expect(ftsRetrievalSection).not.toContain("graph_nodes");
     expect(ftsRetrievalSection).not.toContain("graph_edges");
@@ -583,7 +585,9 @@ describe("local engine source-native storage foundation", () => {
     expect(fusionSection).toContain("sourceRanksByTrack");
     expect(fusionSection).toContain("if (!existing.tracks.has(hit.track))");
     expect(fusionSection).toContain("fallbackExcerpt");
-    expect(fusionSection).toContain("item.chunks[0]?.snippet || item.fallbackExcerpt");
+    expect(fusionSection).toContain("chunks[0]?.snippet || item.fallbackExcerpt");
+    expect(fusionSection).toContain("rankSourceCoarseCandidates");
+    expect(fusionSection).toContain("selectSourceCoarseCandidates");
     expect(fusionSection).not.toContain("graph_nodes");
     expect(fusionSection).not.toContain("graph_edges");
     const knowledgeBaseClusterSection = workerSource.slice(

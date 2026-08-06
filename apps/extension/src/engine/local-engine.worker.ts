@@ -201,6 +201,13 @@ import {
   parsePdfDocument,
   pdfCapturePayloadFromParsedDocument,
 } from "./pdf-parser";
+import {
+  type SourceCoarseRankCandidate,
+  type SourceFineRanker,
+  rankSourceCoarseCandidates,
+  runSourceFineRanker,
+  selectSourceCoarseCandidates,
+} from "./source-coarse-ranker";
 
 type SqlValue = string | number | bigint | null | Uint8Array;
 type SqlRow = Record<string, SqlValue>;
@@ -377,6 +384,7 @@ export interface LocalEngineOptions {
   pdfParser?: PdfDocumentParser;
   pdfFigureVisionImageExtractor?: PdfFigureVisionImageExtractor;
   pdfRawFileStore?: PdfRawFileStore;
+  sourceFineRanker?: SourceFineRanker<RetrieveSourceItem>;
 }
 
 const databasePath = "/clio-browser-phase1.sqlite3";
@@ -387,6 +395,10 @@ const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
 const staleSessionLeaseMs = 30_000;
 const defaultRrfK = 60;
+const vectorDocumentCandidateFloor = 12;
+const vectorDocumentCandidateMultiplier = 4;
+const vectorDocumentCandidateCeiling = 50;
+const vectorEvidenceChunkCeiling = 12;
 const keywordIndexMaxExpansionTerms = 6;
 const keywordIndexMaxTermsPerSource = 160;
 const keywordIndexMaxTermChars = 160;
@@ -790,6 +802,7 @@ export class LocalEngine {
   private readonly pdfParser: PdfDocumentParser;
   private readonly pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor;
   private readonly pdfRawFileStore: PdfRawFileStore;
+  private readonly sourceFineRanker?: SourceFineRanker<RetrieveSourceItem>;
 
   constructor(options: LocalEngineOptions = {}) {
     this.openDatabase = options.openDatabase ?? openProductionDatabase;
@@ -811,6 +824,7 @@ export class LocalEngine {
     this.pdfFigureVisionImageExtractor =
       options.pdfFigureVisionImageExtractor ?? extractPdfFigureVisionImageInput;
     this.pdfRawFileStore = options.pdfRawFileStore ?? new OpfsPdfRawFileStore();
+    this.sourceFineRanker = options.sourceFineRanker;
   }
 
   async handle(request: EngineRequest) {
@@ -1422,12 +1436,14 @@ export class LocalEngine {
           strategy: "rrf",
           rrfK: defaultRrfK,
           tracks: traceTracks,
+          fineRank: { status: "skipped", reason: "empty_query" },
         },
       };
     }
 
     const useLexicalTracks = mode !== "semantic";
     const useVectorTracks = mode !== "exact";
+    const vectorSourceLimit = vectorDocumentCandidatePoolLimit(limit);
     const metaHits = useLexicalTracks
       ? loadMetaSourceRetrievalHits(db, {
           query,
@@ -1438,7 +1454,7 @@ export class LocalEngine {
     const vectorMetaResult = useVectorTracks
       ? await loadVectorMetaRetrievalHits(db, {
           query,
-          limit: Math.max(limit * 2, limit),
+          sourceLimit: vectorSourceLimit,
           filter: filters,
           embeddingProviderOverride: this.embeddingProviderOverride,
           embeddingProviderFactory: this.embeddingProviderFactory,
@@ -1454,7 +1470,8 @@ export class LocalEngine {
     const vectorResult = useVectorTracks
       ? await loadVectorChunkRetrievalHits(db, {
           query,
-          limit: Math.max(limit * Math.max(includeChunks, 1) * 2, limit),
+          sourceLimit: vectorSourceLimit,
+          maxHitsPerSource: vectorEvidenceChunkCeiling,
           filter: filters,
           embeddingProviderOverride: this.embeddingProviderOverride,
           embeddingProviderFactory: this.embeddingProviderFactory,
@@ -1462,18 +1479,21 @@ export class LocalEngine {
       : { hits: [], trace: vectorSkippedTrace("exact_mode") };
     const selectedVectorHits = pruneCrossTrackVectorHits(
       [...vectorMetaResult.hits, ...vectorResult.hits],
-      limit,
+      vectorSourceLimit,
     );
     const vectorMetaHits = selectedVectorHits.filter((hit) => hit.track === "vector_meta");
     const vectorChunkHits = selectedVectorHits.filter((hit) => hit.track === "vector_chunks");
-    const items = fuseSourceRetrievalHits(
-      [...metaHits, ...vectorMetaHits, ...ftsHits, ...vectorChunkHits],
-      {
-        limit,
-        includeChunks,
-        rrfK: defaultRrfK,
-      },
-    );
+    const retrievalHits = [...metaHits, ...vectorMetaHits, ...ftsHits, ...vectorChunkHits];
+    const sourceStats = loadSourceRetrievalStats(db, retrievalHits);
+    const coarseItems = fuseSourceRetrievalHits(retrievalHits, {
+      query,
+      sourceStats,
+      limit,
+      includeChunks,
+      rrfK: defaultRrfK,
+    });
+    const fineRank = await runSourceFineRanker(query, coarseItems, this.sourceFineRanker);
+    const items = fineRank.items.slice(0, limit);
     traceTracks.push({
       name: "meta_sources",
       status: metaHits.length > 0 ? "used" : "skipped",
@@ -1500,6 +1520,17 @@ export class LocalEngine {
         strategy: "rrf",
         rrfK: defaultRrfK,
         tracks: traceTracks,
+        coarseRank: {
+          strategy: "document_lanes_strength_aware_rrf",
+          lanes: ["topic", "local_peak", "breadth", "specificity", "agreement"],
+          candidateCount: new Set(
+            retrievalHits.map((hit) => stringField(hit.source, "id")).filter(Boolean),
+          ).size,
+        },
+        fineRank: {
+          status: fineRank.status,
+          ...(fineRank.reason === undefined ? {} : { reason: fineRank.reason }),
+        },
       },
     };
   }
@@ -14130,6 +14161,7 @@ function emptyFilteredRetrieveSourcesResult(
       strategy: "rrf",
       rrfK: defaultRrfK,
       tracks,
+      fineRank: { status: "skipped", reason: "filter_no_match" },
     },
   };
 }
@@ -14433,6 +14465,8 @@ function loadMetaSourceRetrievalHits(
       sm.title AS meta_title,
       sm.abstract AS meta_abstract,
       sm.source_type AS meta_source_type,
+      sm.metadata_json AS meta_metadata_json,
+      sm.section_outline_json AS meta_section_outline_json,
       bm25(source_metadata_fts) AS score
      FROM source_metadata_fts
      JOIN sources s ON s.id = source_metadata_fts.source_id
@@ -14458,6 +14492,7 @@ function loadFtsChunkRetrievalHits(
   if (input.filter.hasImpossibleFilter) return [];
   const ftsQuery = buildFtsQuery(input.query);
   if (ftsQuery.length === 0) return [];
+  const bodyFtsQuery = `body : (${ftsQuery})`;
   const sourceFilter = sourceFilterWhereClause(input.filter);
   const rows = db.selectObjects(
     `SELECT
@@ -14473,8 +14508,13 @@ function loadFtsChunkRetrievalHits(
       s.supersedes_source_id,
       s.superseded_by_source_id,
       s.is_current,
+      sm.title AS meta_title,
+      sm.abstract AS meta_abstract,
+      sm.metadata_json AS meta_metadata_json,
+      sm.section_outline_json AS meta_section_outline_json,
       c.id AS chunk_id,
       c.ord AS chunk_ord,
+      c.section_path AS chunk_section_path,
       c.text AS chunk_text,
       c.page_start AS chunk_page_start,
       c.page_end AS chunk_page_end,
@@ -14488,7 +14528,7 @@ function loadFtsChunkRetrievalHits(
        AND c.role = 'child'
      ORDER BY score ASC
      LIMIT ?`,
-    [ftsQuery, ...sourceFilter.bind, clampLimit(input.limit, 400)],
+    [bodyFtsQuery, ...sourceFilter.bind, clampLimit(input.limit, 400)],
   );
   return rows.map((row, index) => ({
     track: "fts_chunks",
@@ -14500,6 +14540,9 @@ function loadFtsChunkRetrievalHits(
       snippet: excerpt(stringField(row, "chunk_text")),
       score: realField(row, "score"),
       track: "fts_chunks",
+      ...(stringField(row, "chunk_section_path").length === 0
+        ? {}
+        : { sectionPath: stringField(row, "chunk_section_path") }),
       ...optionalChunkPageRangeFromRow(row),
     },
   }));
@@ -14509,7 +14552,7 @@ async function loadVectorMetaRetrievalHits(
   db: SqliteDb,
   input: {
     query: string;
-    limit: number;
+    sourceLimit: number;
     filter: NormalizedRetrieveSourcesFilter;
     embeddingProviderOverride?: EmbeddingProvider;
     embeddingProviderFactory?: EmbeddingProviderFactory;
@@ -14562,6 +14605,8 @@ async function loadVectorMetaRetrievalHits(
       sm.title AS meta_title,
       sm.abstract AS meta_abstract,
       sm.source_type AS meta_source_type,
+      sm.metadata_json AS meta_metadata_json,
+      sm.section_outline_json AS meta_section_outline_json,
       se.vector_json,
       se.text_hash
      FROM source_embeddings se
@@ -14607,7 +14652,10 @@ async function loadVectorMetaRetrievalHits(
       },
     };
   }
-  const ranked = selectRelevantVectorRows(scored, clampLimit(input.limit, 200));
+  const ranked = selectRelevantVectorRows(scored, {
+    sourceLimit: input.sourceLimit,
+    maxHitsPerSource: 1,
+  });
   if (ranked.length === 0) {
     return {
       hits: [],
@@ -14639,7 +14687,8 @@ async function loadVectorChunkRetrievalHits(
   db: SqliteDb,
   input: {
     query: string;
-    limit: number;
+    sourceLimit: number;
+    maxHitsPerSource: number;
     filter: NormalizedRetrieveSourcesFilter;
     embeddingProviderOverride?: EmbeddingProvider;
     embeddingProviderFactory?: EmbeddingProviderFactory;
@@ -14689,8 +14738,13 @@ async function loadVectorChunkRetrievalHits(
       s.supersedes_source_id,
       s.superseded_by_source_id,
       s.is_current,
+      sm.title AS meta_title,
+      sm.abstract AS meta_abstract,
+      sm.metadata_json AS meta_metadata_json,
+      sm.section_outline_json AS meta_section_outline_json,
       c.id AS chunk_id,
       c.ord AS chunk_ord,
+      c.section_path AS chunk_section_path,
       c.text AS chunk_text,
       c.page_start AS chunk_page_start,
       c.page_end AS chunk_page_end,
@@ -14740,7 +14794,10 @@ async function loadVectorChunkRetrievalHits(
       },
     };
   }
-  const ranked = selectRelevantVectorRows(scored, clampLimit(input.limit, 400));
+  const ranked = selectRelevantVectorRows(scored, {
+    sourceLimit: input.sourceLimit,
+    maxHitsPerSource: input.maxHitsPerSource,
+  });
   if (ranked.length === 0) {
     return {
       hits: [],
@@ -14764,6 +14821,9 @@ async function loadVectorChunkRetrievalHits(
         snippet: excerpt(stringField(row, "chunk_text")),
         score,
         track: "vector_chunks",
+        ...(stringField(row, "chunk_section_path").length === 0
+          ? {}
+          : { sectionPath: stringField(row, "chunk_section_path") }),
         ...optionalChunkPageRangeFromRow(row),
       },
     })),
@@ -14852,62 +14912,54 @@ function hasDirectKnowledgeBaseLexicalMatch(item: RetrieveSourceItem) {
 
 function selectRelevantVectorRows<T extends { row: SqlRow; score: number }>(
   ranked: T[],
-  hitLimit: number,
+  input: { sourceLimit: number; maxHitsPerSource: number },
 ) {
   const valid = ranked.filter((item) => Number.isFinite(item.score) && item.score > 0);
   if (valid.length === 0) return [];
 
-  const bestScoreBySource = new Map<string, number>();
+  const rowsBySource = new Map<string, T[]>();
   for (const item of valid) {
     const sourceId = stringField(item.row, "id");
-    if (sourceId.length === 0 || bestScoreBySource.has(sourceId)) continue;
-    bestScoreBySource.set(sourceId, item.score);
+    if (sourceId.length === 0) continue;
+    const sourceRows = rowsBySource.get(sourceId) ?? [];
+    sourceRows.push(item);
+    rowsBySource.set(sourceId, sourceRows);
   }
-  const sourceScores = Array.from(bestScoreBySource.entries()).sort(
-    (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
+  const rankedSources = Array.from(rowsBySource.entries()).sort(
+    (left, right) =>
+      (right[1][0]?.score ?? Number.NEGATIVE_INFINITY) -
+        (left[1][0]?.score ?? Number.NEGATIVE_INFINITY) || left[0].localeCompare(right[0]),
   );
-  const selectedSourceCount = adaptiveVectorSourceCount(sourceScores.map((entry) => entry[1]));
-  const selectedSourceIds = new Set(
-    sourceScores.slice(0, selectedSourceCount).map((entry) => entry[0]),
-  );
-  return valid
-    .filter((item) => selectedSourceIds.has(stringField(item.row, "id")))
-    .slice(0, hitLimit);
+  const selectedRows = new Set<T>();
+  for (const [, sourceRows] of rankedSources.slice(0, Math.max(1, input.sourceLimit))) {
+    const evidenceCount = adaptiveVectorEvidenceCount(
+      sourceRows.map((item) => item.score),
+      input.maxHitsPerSource,
+    );
+    for (const item of sourceRows.slice(0, evidenceCount)) selectedRows.add(item);
+  }
+  return valid.filter((item) => selectedRows.has(item));
 }
 
 function pruneCrossTrackVectorHits(hits: SourceRetrievalHit[], sourceLimit: number) {
-  const sourceIdsByTrack = new Map<SourceRetrievalTrack, Set<string>>();
   const bestScoreBySource = new Map<string, number>();
   for (const hit of hits) {
     if (hit.track !== "vector_meta" && hit.track !== "vector_chunks") continue;
     const sourceId = stringField(hit.source, "id");
     if (sourceId.length === 0 || !Number.isFinite(hit.rawScore)) continue;
-    const sourceIds = sourceIdsByTrack.get(hit.track) ?? new Set<string>();
-    sourceIds.add(sourceId);
-    sourceIdsByTrack.set(hit.track, sourceIds);
     bestScoreBySource.set(
       sourceId,
       Math.max(bestScoreBySource.get(sourceId) ?? Number.NEGATIVE_INFINITY, hit.rawScore ?? 0),
     );
   }
 
-  const unionSize = bestScoreBySource.size;
-  const largestTrackSize = Math.max(
-    0,
-    ...Array.from(sourceIdsByTrack.values(), (sourceIds) => sourceIds.size),
-  );
-  if (unionSize <= largestTrackSize || largestTrackSize === 0) return hits;
+  if (bestScoreBySource.size <= sourceLimit) return hits;
 
   const rankedSources = Array.from(bestScoreBySource.entries()).sort(
     (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
   );
-  const selectedSourceCount = Math.min(
-    Math.max(1, sourceLimit),
-    largestTrackSize,
-    adaptiveVectorSourceCount(rankedSources.map((entry) => entry[1])),
-  );
   const selectedSourceIds = new Set(
-    rankedSources.slice(0, selectedSourceCount).map((entry) => entry[0]),
+    rankedSources.slice(0, Math.max(1, sourceLimit)).map((entry) => entry[0]),
   );
   return hits.filter((hit) => selectedSourceIds.has(stringField(hit.source, "id")));
 }
@@ -14928,9 +14980,17 @@ function vectorTraceAfterSelection(
   return { ...trace, itemCount: hits.length };
 }
 
-function adaptiveVectorSourceCount(scores: number[]) {
-  if (scores.length <= 2) return scores.length;
-  const fallbackCount = Math.max(1, Math.ceil(Math.sqrt(scores.length)));
+function vectorDocumentCandidatePoolLimit(resultLimit: number) {
+  return Math.min(
+    vectorDocumentCandidateCeiling,
+    Math.max(vectorDocumentCandidateFloor, resultLimit * vectorDocumentCandidateMultiplier),
+  );
+}
+
+function adaptiveVectorEvidenceCount(scores: number[], maxHits: number) {
+  const boundedMaxHits = Math.max(1, Math.floor(maxHits));
+  if (scores.length <= 2) return Math.min(scores.length, boundedMaxHits);
+  const fallbackCount = Math.min(boundedMaxHits, Math.max(1, Math.ceil(Math.sqrt(scores.length))));
   const consideredCount = Math.min(scores.length, fallbackCount * 2);
   const considered = scores.slice(0, consideredCount);
   const topScore = considered[0] ?? 0;
@@ -14946,23 +15006,74 @@ function adaptiveVectorSourceCount(scores: number[]) {
     }
   }
   const remainingSpread = Math.max(0, totalSpread - largestGap);
-  if (largestGapIndex >= 0 && largestGap > remainingSpread) return largestGapIndex + 1;
+  if (largestGapIndex >= 0 && largestGap > remainingSpread) {
+    return Math.min(boundedMaxHits, largestGapIndex + 1);
+  }
   return fallbackCount;
+}
+
+interface SourceRetrievalStats {
+  totalChunkCount: number;
+  totalSectionCount: number;
+}
+
+function loadSourceRetrievalStats(
+  db: SqliteDb,
+  hits: readonly SourceRetrievalHit[],
+): Map<string, SourceRetrievalStats> {
+  const sourceIds = Array.from(
+    new Set(hits.map((hit) => stringField(hit.source, "id")).filter(Boolean)),
+  );
+  if (sourceIds.length === 0) return new Map();
+  const placeholders = sourceIds.map(() => "?").join(", ");
+  const rows = db.selectObjects(
+    `SELECT
+       source_id,
+       COUNT(*) AS child_chunk_count,
+       COUNT(DISTINCT CASE
+         WHEN TRIM(COALESCE(section_path, '')) = '' THEN NULL
+         ELSE section_path
+       END) AS section_count
+     FROM source_chunks
+     WHERE role = 'child'
+       AND source_id IN (${placeholders})
+     GROUP BY source_id`,
+    sourceIds,
+  );
+  return new Map(
+    rows.map((row) => [
+      stringField(row, "source_id"),
+      {
+        totalChunkCount: numberField(row, "child_chunk_count"),
+        totalSectionCount: numberField(row, "section_count"),
+      },
+    ]),
+  );
 }
 
 function fuseSourceRetrievalHits(
   hits: SourceRetrievalHit[],
-  input: { limit: number; includeChunks: number; rrfK: number },
+  input: {
+    query: string;
+    limit: number;
+    includeChunks: number;
+    rrfK: number;
+    sourceStats: ReadonlyMap<string, SourceRetrievalStats>;
+  },
 ): RetrieveSourceItem[] {
   const grouped = new Map<
     string,
     {
       source: SqlRow;
-      score: number;
+      fallbackScore: number;
       bestRank: number;
       tracks: Set<RetrieveTrackName>;
-      chunks: RetrieveSourceHitChunk[];
-      seenChunks: Set<string>;
+      trackRanks: Partial<Record<SourceRetrievalTrack, number>>;
+      chunks: Array<{
+        chunk: RetrieveSourceHitChunk;
+        rank: number;
+        rawScore?: number;
+      }>;
       fallbackExcerpt: string;
     }
   >();
@@ -14980,55 +15091,90 @@ function fuseSourceRetrievalHits(
     }
     const existing = grouped.get(sourceId) ?? {
       source: hit.source,
-      score: 0,
+      fallbackScore: 0,
       bestRank: Number.MAX_SAFE_INTEGER,
       tracks: new Set<RetrieveTrackName>(),
+      trackRanks: {},
       chunks: [],
-      seenChunks: new Set<string>(),
       fallbackExcerpt:
         hit.fallbackExcerpt ||
         stringField(hit.source, "source_title") ||
         stringField(hit.source, "source_url"),
     };
     if (!existing.tracks.has(hit.track)) {
-      existing.score += reciprocalRankFusionScore(sourceRank, input.rrfK);
+      existing.fallbackScore += reciprocalRankFusionScore(sourceRank, input.rrfK);
       existing.bestRank = Math.min(existing.bestRank, sourceRank);
       existing.tracks.add(hit.track);
+      existing.trackRanks[hit.track] = sourceRank;
     }
-    if (
-      hit.chunk !== undefined &&
-      existing.chunks.length < input.includeChunks &&
-      hit.chunk.chunkId.length > 0 &&
-      !existing.seenChunks.has(hit.chunk.chunkId)
-    ) {
-      existing.seenChunks.add(hit.chunk.chunkId);
-      existing.chunks.push(hit.chunk);
+    if (hit.chunk !== undefined && hit.chunk.chunkId.length > 0) {
+      existing.chunks.push({
+        chunk: hit.chunk,
+        rank: hit.rank,
+        ...(hit.rawScore === undefined ? {} : { rawScore: hit.rawScore }),
+      });
     }
     grouped.set(sourceId, existing);
   }
 
-  return Array.from(grouped.values())
-    .sort(
-      (left, right) =>
-        right.score - left.score ||
-        left.bestRank - right.bestRank ||
-        stringField(right.source, "captured_at").localeCompare(
-          stringField(left.source, "captured_at"),
-        ) ||
-        stringField(left.source, "source_title").localeCompare(
-          stringField(right.source, "source_title"),
-        ),
-    )
-    .slice(0, input.limit)
-    .map((item) => ({
-      ...memorySummaryFromRetrievalRow(
-        item.source,
-        item.chunks[0]?.snippet || item.fallbackExcerpt,
-      ),
-      score: item.score,
+  const candidates: SourceCoarseRankCandidate<RetrieveSourceItem>[] = Array.from(
+    grouped.entries(),
+  ).map(([sourceId, item]) => {
+    const metadata = parseMetadata(stringField(item.source, "meta_metadata_json"));
+    const chunks = mergeRetrieveHitChunks(
+      [],
+      item.chunks.map((entry) => entry.chunk),
+      input.includeChunks,
+    );
+    const title =
+      stringField(item.source, "meta_title") || stringField(item.source, "source_title");
+    const stats = input.sourceStats.get(sourceId) ?? {
+      totalChunkCount: 0,
+      totalSectionCount: 0,
+    };
+    const retrieveItem: RetrieveSourceItem = {
+      ...memorySummaryFromRetrievalRow(item.source, chunks[0]?.snippet || item.fallbackExcerpt),
+      score: item.fallbackScore,
       tracks: Array.from(item.tracks),
-      hitChunks: item.chunks,
-    }));
+      hitChunks: chunks,
+    };
+    return {
+      id: sourceId,
+      item: retrieveItem,
+      title,
+      abstract: stringField(item.source, "meta_abstract"),
+      keywords: boundedUniqueStrings(
+        [
+          ...stringArrayMetadataField(metadata, "keywords"),
+          ...stringArrayMetadataField(metadata, "categories"),
+          ...stringArrayMetadataField(metadata, "subjects"),
+        ],
+        40,
+      ),
+      headings: graphSectionHeadingLabels(stringField(item.source, "meta_section_outline_json")),
+      capturedAt: stringField(item.source, "captured_at"),
+      trackRanks: item.trackRanks,
+      hits: item.chunks.map((entry) => ({
+        chunkId: entry.chunk.chunkId,
+        ord: entry.chunk.ord,
+        snippet: entry.chunk.snippet,
+        track: entry.chunk.track,
+        rank: entry.rank,
+        ...(entry.rawScore === undefined ? {} : { rawScore: entry.rawScore }),
+        ...(entry.chunk.sectionPath === undefined ? {} : { sectionPath: entry.chunk.sectionPath }),
+      })),
+      totalChunkCount: stats.totalChunkCount,
+      totalSectionCount: stats.totalSectionCount,
+      fallbackScore: item.fallbackScore,
+      bestRank: item.bestRank,
+    };
+  });
+  const ranked = rankSourceCoarseCandidates(input.query, candidates, input.rrfK);
+  return selectSourceCoarseCandidates(ranked, input.limit).map((rankedItem) => ({
+    ...rankedItem.candidate.item,
+    score: rankedItem.score,
+    coarseSignals: rankedItem.signals,
+  }));
 }
 
 function mergeKnowledgeBaseSearchItems(

@@ -81,6 +81,71 @@ describe("local engine behavior harness", () => {
     expect(trackReason(retrieved, "vector_meta")).toBe("embedding_model_unavailable");
   });
 
+  it("keeps title-only matches in metadata instead of multiplying them across chunks", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceTitle: "PurityChecker ZXQ Evaluation",
+        normalizedText: ragText("generic benchmark content", 80),
+        metadata: {
+          title: "PurityChecker ZXQ Evaluation",
+          abstract: "A benchmark report.",
+          source_type: "paper",
+        },
+      }),
+    });
+
+    const result = await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "PurityChecker ZXQ", limit: 5, includeChunks: 8 },
+    });
+    const item = result.items.find((candidate) => candidate.id === capture.memory.id);
+
+    expect(item?.tracks).toContain("meta_sources");
+    expect(item?.tracks).not.toContain("fts_chunks");
+    expect(item?.hitChunks).toEqual([]);
+    expect(item?.coarseSignals?.matchedMetadataFields).toContain("title");
+    expect(item?.coarseSignals?.breadth).toBe(0);
+  });
+
+  it("exposes an optional document fine-rank boundary after coarse ranking", async () => {
+    let fineRankInputIds: string[] = [];
+    const harness = createHarness({
+      sourceFineRanker: {
+        async rerank({ candidates }) {
+          fineRankInputIds = candidates.map((candidate) => candidate.id);
+          return [...candidates].reverse();
+        },
+      },
+    });
+    await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/fine-rank-first",
+        sourceTitle: "Fine rank first",
+        normalizedText: ragText("fine rank boundary evidence", 12),
+      }),
+    });
+    await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/fine-rank-second",
+        sourceTitle: "Fine rank second",
+        normalizedText: ragText("fine rank boundary evidence", 12),
+      }),
+    });
+
+    const result = await harness.request({
+      kind: "retrieveSources",
+      payload: { query: "fine rank boundary", limit: 5, includeChunks: 2 },
+    });
+
+    expect(fineRankInputIds).toHaveLength(2);
+    expect(result.items.map((item) => item.id)).toEqual([...fineRankInputIds].reverse());
+    expect(result.trace.fineRank?.status).toBe("applied");
+  });
+
   it("removes legacy deterministic embedding rows during migration", async () => {
     const harness = createHarness({
       prepareDatabase(db) {
@@ -1897,7 +1962,7 @@ describe("local engine behavior harness", () => {
     expect(harness.count("keyword_index", "term = ?", ["degradation"])).toBe(1);
   });
 
-  it("keeps direct knowledge-base matches precise and bounds semantic vector candidates", async () => {
+  it("keeps direct knowledge-base matches precise and bounds final semantic results", async () => {
     const model = embeddingModelDescriptor(
       "local-transformers:knowledge-base-search-precision:d3",
       "local-transformers",
@@ -1959,12 +2024,14 @@ describe("local engine behavior harness", () => {
       payload: {
         query: "classify hidden mutation risks",
         mode: "semantic",
-        limit: 40,
+        limit: 5,
         includeChunks: 2,
       },
     });
     expect(semantic.items[0]?.id).toBe(relevant.memory.id);
-    expect(semantic.items.length).toBeLessThan(sourceIds.length);
+    expect(semantic.items).toHaveLength(5);
+    expect(semantic.trace.coarseRank?.strategy).toBe("document_lanes_strength_aware_rrf");
+    expect(semantic.trace.coarseRank?.candidateCount).toBe(sourceIds.length);
     expect(semantic.expansion).toMatchObject({
       status: "skipped",
       reason: "semantic_mode",
@@ -1977,7 +2044,7 @@ describe("local engine behavior harness", () => {
     );
   });
 
-  it("prunes divergent meta and chunk vector candidates at the source boundary", async () => {
+  it("keeps a wide cross-track vector pool before applying the final result limit", async () => {
     const model = embeddingModelDescriptor(
       "local-transformers:cross-track-source-pruning:d3",
       "local-transformers",
@@ -2018,18 +2085,65 @@ describe("local engine behavior harness", () => {
       payload: {
         query: "cross-track query",
         mode: "semantic",
-        limit: 40,
+        limit: 5,
         includeChunks: 2,
       },
     });
 
-    expect(semantic.items.length).toBeGreaterThan(0);
-    expect(semantic.items.length).toBeLessThanOrEqual(4);
+    expect(semantic.items).toHaveLength(5);
+    expect(semantic.trace.coarseRank?.candidateCount).toBe(12);
     expect(trackStatus(semantic, "vector_meta")).toBe("used");
     expect(trackStatus(semantic, "vector_chunks")).toBe("used");
   });
 
-  it("counts each source only once per RRF track while retaining multiple hit chunks", async () => {
+  it("caps positive vector chunk evidence per source before calculating breadth", async () => {
+    const model = embeddingModelDescriptor(
+      "local-transformers:bounded-vector-evidence:d3",
+      "local-transformers",
+    );
+    const harness = createHarness({
+      embeddingProviderFactory: (candidate) =>
+        candidate.modelId === model.id
+          ? {
+              modelId: candidate.modelId,
+              provider: candidate.provider,
+              dimension: candidate.dimension,
+              embedTexts: async (inputs) => inputs.map(() => [1, 0, 0]),
+            }
+          : null,
+    });
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/bounded-vector-evidence",
+        sourceTitle: "Bounded vector evidence source",
+        normalizedText: ragText("uniform semantic evidence", 4_000),
+      }),
+    });
+
+    const reindex = await harness.request({ kind: "reindex", scope: "embeddings", model });
+    expect(reindex.status).toBe("done");
+
+    const semantic = await harness.request({
+      kind: "searchKnowledgeBase",
+      payload: {
+        query: "uniform semantic query",
+        mode: "semantic",
+        limit: 5,
+        includeChunks: 8,
+      },
+    });
+    const item = semantic.items.find((candidate) => candidate.id === capture.memory.id);
+    const totalChunkCount = item?.coarseSignals?.totalChunkCount ?? 0;
+    const uniqueHitChunkCount = item?.coarseSignals?.uniqueHitChunkCount ?? 0;
+
+    expect(totalChunkCount).toBeGreaterThan(12);
+    expect(uniqueHitChunkCount).toBeGreaterThan(1);
+    expect(uniqueHitChunkCount).toBeLessThanOrEqual(12);
+    expect(uniqueHitChunkCount).toBeLessThan(totalChunkCount);
+  });
+
+  it("counts each source once per track but uses normalized chunk breadth for document rank", async () => {
     const harness = createHarness();
     const dense = await harness.request({
       kind: "capturePage",
@@ -2064,8 +2178,12 @@ describe("local engine behavior harness", () => {
     expect(sparseItem).toBeDefined();
     expect(denseItem?.tracks).toEqual(["fts_chunks"]);
     expect(sparseItem?.tracks).toEqual(["fts_chunks"]);
-    expect(denseItem?.score ?? 1).toBeLessThan(0.017);
-    expect(sparseItem?.score ?? 1).toBeLessThan(0.017);
+    expect(denseItem?.coarseSignals?.uniqueHitChunkCount ?? 0).toBeGreaterThan(1);
+    expect(denseItem?.coarseSignals?.breadth ?? 0).toBeGreaterThan(
+      sparseItem?.coarseSignals?.breadth ?? 1,
+    );
+    expect(denseItem?.score ?? 0).toBeGreaterThan(sparseItem?.score ?? 1);
+    expect(result.trace.fineRank?.status).toBe("not_configured");
   });
 
   it("uses source graph terms only as knowledge-base page expansion diagnostics", async () => {

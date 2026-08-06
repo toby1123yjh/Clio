@@ -285,14 +285,47 @@ export interface RetrieveSourceHitChunk {
   snippet: string;
   score: number;
   track: "fts_chunks" | "vector_chunks";
+  sectionPath?: string;
   pageStart?: number;
   pageEnd?: number;
+}
+
+export type RetrieveSourceCoarseLaneName =
+  | "topic"
+  | "local_peak"
+  | "breadth"
+  | "specificity"
+  | "agreement";
+
+export interface RetrieveSourceCoarseLaneSignal {
+  name: RetrieveSourceCoarseLaneName;
+  eligible: boolean;
+  rawScore: number;
+  fusionStrength: number;
+  rank?: number;
+}
+
+export interface RetrieveSourceCoarseSignals {
+  topicEvidence: number;
+  localPeak: number;
+  breadth: number;
+  specificity: number;
+  agreement: number;
+  uniqueHitChunkCount: number;
+  totalChunkCount: number;
+  hitChunkRatio: number;
+  evidenceRegionCount: number;
+  distinctSectionCount: number;
+  totalSectionCount: number;
+  matchedMetadataFields: Array<"title" | "abstract" | "keywords" | "heading">;
+  lanes: RetrieveSourceCoarseLaneSignal[];
 }
 
 export interface RetrieveSourceItem extends MemorySummary {
   score: number;
   tracks: RetrieveTrackName[];
   hitChunks: RetrieveSourceHitChunk[];
+  coarseSignals?: RetrieveSourceCoarseSignals;
 }
 
 export interface RetrieveSourcesTraceTrack {
@@ -309,6 +342,15 @@ export interface RetrieveSourcesResult {
     strategy: RetrieveFusionStrategy;
     rrfK: number;
     tracks: RetrieveSourcesTraceTrack[];
+    coarseRank?: {
+      strategy: "document_lanes_strength_aware_rrf";
+      lanes: RetrieveSourceCoarseLaneName[];
+      candidateCount: number;
+    };
+    fineRank?: {
+      status: "not_configured" | "applied" | "failed" | "skipped";
+      reason?: string;
+    };
   };
 }
 

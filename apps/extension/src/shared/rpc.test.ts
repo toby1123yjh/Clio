@@ -32,6 +32,7 @@ import {
   CLIO_WORKER_VISION_ANALYSIS_REQUEST,
   CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
   type PdfRawFileResult,
+  type RetrieveSourceCoarseSignals,
   type RetrieveSourceHitChunk,
   type RetrieveSourceItem,
   decodeEngineRequestFromChrome,
@@ -2164,6 +2165,21 @@ describe("session engine RPC guards", () => {
   });
 
   it("types meta source hits as source-level tracks without widening chunk tracks", () => {
+    const coarseSignals = {
+      topicEvidence: 1,
+      localPeak: 0.8,
+      breadth: 0.6,
+      specificity: 0.9,
+      agreement: 0.7,
+      uniqueHitChunkCount: 3,
+      totalChunkCount: 12,
+      hitChunkRatio: 0.25,
+      evidenceRegionCount: 2,
+      distinctSectionCount: 2,
+      totalSectionCount: 5,
+      matchedMetadataFields: ["title", "abstract"],
+      lanes: [{ name: "topic", eligible: true, rawScore: 1, fusionStrength: 1, rank: 1 }],
+    } satisfies RetrieveSourceCoarseSignals;
     const item = {
       id: "source-1",
       sourceKind: "page",
@@ -2179,6 +2195,7 @@ describe("session engine RPC guards", () => {
       score: 1,
       tracks: ["meta_sources", "vector_meta", "fts_chunks"],
       hitChunks: [],
+      coarseSignals,
     } satisfies RetrieveSourceItem;
     const chunk = {
       chunkId: "chunk-1",
@@ -2186,11 +2203,13 @@ describe("session engine RPC guards", () => {
       snippet: "chunk snippet",
       score: 1,
       track: "fts_chunks",
+      sectionPath: "Methods",
     } satisfies RetrieveSourceHitChunk;
 
     expect(item.tracks).toContain("meta_sources");
     expect(item.tracks).toContain("vector_meta");
     expect(chunk.track).toBe("fts_chunks");
+    expect(item.coarseSignals.matchedMetadataFields).toContain("abstract");
   });
 
   it("accepts explicit queued job run requests", () => {
