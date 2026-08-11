@@ -23,6 +23,7 @@ import {
   CLIO_WEB_SEARCH_RUN_REQUEST,
   CLIO_WEB_SEARCH_STREAM_EVENT,
   CLIO_WEB_SEARCH_STREAM_REQUEST,
+  CLIO_WIKI_COMPILE_WAKE,
   CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST,
   CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
   CLIO_WORKER_EMBEDDING_REQUEST,
@@ -62,18 +63,87 @@ import {
   isWebSearchRunRequestMessage,
   isWebSearchStreamEventMessage,
   isWebSearchStreamRequestMessage,
+  isWikiCompileWakeMessage,
   isWorkerChunkMetaSummaryRequestMessage,
   isWorkerChunkMetaSummaryResponseMessage,
   isWorkerEmbeddingRequestMessage,
   isWorkerEmbeddingResponseMessage,
   isWorkerGraphExtractionRequestMessage,
   isWorkerGraphExtractionResponseMessage,
+  isWorkerRequestMessage,
   isWorkerVisionAnalysisRequestMessage,
   isWorkerVisionAnalysisResponseMessage,
   unwrapEngineResponse,
 } from "./rpc";
 
 describe("session engine RPC guards", () => {
+  it("recognizes the fixed Wiki compiler wake message", () => {
+    expect(isWikiCompileWakeMessage({ type: CLIO_WIKI_COMPILE_WAKE })).toBe(true);
+    expect(isWikiCompileWakeMessage({ type: "clio:wiki-compile:other" })).toBe(false);
+    expect(isWikiCompileWakeMessage({ type: CLIO_WIKI_COMPILE_WAKE, value: false })).toBe(true);
+  });
+
+  it("separates public Wiki compile requests from Worker-only scheduler requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "enqueueWikiCompileRun", payload: { sourceId: "source-1" } },
+      }),
+    ).toBe(true);
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listWikiCompileRuns", filter: { status: "paused", limit: 20 } },
+      }),
+    ).toBe(true);
+
+    const internalRequest = {
+      kind: "claimNextWikiCompileStep",
+      leaseOwner: "offscreen-runner-1",
+      leaseMs: 30_000,
+    } as const;
+    expect(isEngineRequestMessage({ type: CLIO_ENGINE_REQUEST, request: internalRequest })).toBe(
+      false,
+    );
+    expect(
+      isOffscreenRequestMessage({ type: CLIO_OFFSCREEN_REQUEST, request: internalRequest }),
+    ).toBe(false);
+    expect(
+      isWorkerRequestMessage({
+        type: "clio:worker:request",
+        requestId: "request-1",
+        request: internalRequest,
+      }),
+    ).toBe(true);
+  });
+
+  it("validates Knowledge Base AI settings without a second fine-rank switch", () => {
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: { kind: "getKnowledgeBaseAiSettings" },
+      }),
+    ).toBe(true);
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "saveKnowledgeBaseAiSettings",
+          settings: { wiki: { enabled: true } },
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isProviderRequestMessage({
+        type: CLIO_PROVIDER_REQUEST,
+        request: {
+          kind: "saveKnowledgeBaseAiSettings",
+          settings: { wiki: { enabled: "yes" }, fineRank: { enabled: true } },
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("turns a missing background response into an actionable RPC error", () => {
     expect(() => unwrapEngineResponse(undefined)).toThrowError(
       "Clio background did not return a response. Reload the extension and refresh this page.",

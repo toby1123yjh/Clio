@@ -9,6 +9,7 @@ import { PiAgentCoreRunAdapter } from "@/src/agent-runtime/pi-agent-core-run-ada
 import { type ProviderId, defaultActiveProvider } from "@/src/agent-runtime/provider-settings";
 import { ProviderBackedSemanticCitationJudge } from "@/src/agent-runtime/semantic-citation-judge";
 import { ClioWebToolRuntime } from "@/src/agent-runtime/web-search-runtime";
+import { WikiCompileRunner } from "@/src/agent-runtime/wiki-compile-runner";
 import engineWorkerUrl from "@/src/engine/local-engine.worker.ts?worker&url";
 import { LocalEmbeddingManager } from "@/src/local-embedding/local-embedding-manager";
 import { installPhase0PocHost } from "@/src/phase0/poc-host";
@@ -41,6 +42,7 @@ import {
   isLocalEmbeddingModelRequestMessage,
   isOffscreenRequestMessage,
   isWebSearchRunRequestMessage,
+  isWikiCompileWakeMessage,
   isWorkerChunkMetaSummaryRequestMessage,
   isWorkerEmbeddingRequestMessage,
   isWorkerGraphExtractionRequestMessage,
@@ -134,6 +136,18 @@ const graphExtractor = new ProviderBackedGraphExtractor({
   loadConfig: () => requestProviderConfig(),
   loadProviderId: async () => (await requestProviderConfig())?.provider ?? defaultActiveProvider,
   ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
+});
+const wikiCompileRunner = new WikiCompileRunner({
+  requestEngine: requestEngineValue,
+  loadSettings: () => requestProvider({ kind: "getKnowledgeBaseAiSettings" }),
+  loadProviderConfig: () => requestProviderConfig(),
+  ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
+});
+void wikiCompileRunner.wake().catch((error) => {
+  console.debug(
+    "clio:offscreen Wiki compiler recovery failed",
+    engineErrorFromUnknown(error).message,
+  );
 });
 const knowledgeBaseClusterLabelRefiner = new ProviderBackedKnowledgeBaseClusterLabelRefiner({
   loadConfig: () => requestProviderConfig(),
@@ -268,6 +282,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (isWikiCompileWakeMessage(message)) {
+    void wikiCompileRunner.wake().catch((error) => {
+      console.debug(
+        "clio:offscreen Wiki compiler wake failed",
+        engineErrorFromUnknown(error).message,
+      );
+    });
+    sendResponse({ ok: true, value: { accepted: true } });
+    return false;
+  }
+
   if (!isOffscreenRequestMessage(message)) return false;
 
   let request: EngineRequest;
@@ -278,6 +303,42 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       ok: false,
       error: engineErrorFromUnknown(error, "OFFSCREEN_ENGINE_TRANSPORT_ERROR"),
     });
+    return true;
+  }
+  if (request.kind === "enqueueWikiCompileRun") {
+    wikiCompileRunner
+      .enqueue(request.payload.sourceId)
+      .then((value) => sendResponse(encodeEngineResponseForChrome(request, { ok: true, value })))
+      .catch((error) =>
+        sendResponse({
+          ok: false,
+          error: engineErrorFromUnknown(error, "WIKI_COMPILE_ENQUEUE_ERROR"),
+        }),
+      );
+    return true;
+  }
+  if (request.kind === "retryWikiCompileRun") {
+    wikiCompileRunner
+      .retry(request.id)
+      .then((value) => sendResponse(encodeEngineResponseForChrome(request, { ok: true, value })))
+      .catch((error) =>
+        sendResponse({
+          ok: false,
+          error: engineErrorFromUnknown(error, "WIKI_COMPILE_RETRY_ERROR"),
+        }),
+      );
+    return true;
+  }
+  if (request.kind === "resumeWikiCompileRun") {
+    wikiCompileRunner
+      .resume(request.id)
+      .then((value) => sendResponse(encodeEngineResponseForChrome(request, { ok: true, value })))
+      .catch((error) =>
+        sendResponse({
+          ok: false,
+          error: engineErrorFromUnknown(error, "WIKI_COMPILE_RESUME_ERROR"),
+        }),
+      );
     return true;
   }
   requestEngine(request)

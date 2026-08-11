@@ -18,7 +18,7 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 23");
+    expect(workerSource).toContain("const schemaVersion = 24");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");

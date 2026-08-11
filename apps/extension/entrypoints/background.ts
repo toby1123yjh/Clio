@@ -6,6 +6,10 @@ import {
   saveImageGenerationSettings,
 } from "@/src/agent-runtime/image-generation-settings";
 import {
+  readKnowledgeBaseAiSettings,
+  saveKnowledgeBaseAiSettings,
+} from "@/src/agent-runtime/knowledge-base-ai-settings";
+import {
   hasOpenAICompatibleHostPermission,
   hasOpenAIHostPermission,
 } from "@/src/agent-runtime/openai-permission";
@@ -62,6 +66,7 @@ import {
   CLIO_WEB_SEARCH_RUN_REQUEST,
   CLIO_WEB_SEARCH_STREAM_EVENT,
   CLIO_WEB_SEARCH_STREAM_PORT,
+  CLIO_WIKI_COMPILE_WAKE,
   type ContentCommand,
   type EngineResponse,
   EngineRpcError,
@@ -96,6 +101,9 @@ const menuIds = {
   savePage: "clio-save-page",
 } as const;
 
+const WIKI_COMPILE_ALARM = "clio-wiki-compile-wake";
+const WIKI_COMPILE_ALARM_PERIOD_MINUTES = 1;
+
 type RuntimeWithContexts = typeof chrome.runtime & {
   ContextType?: {
     OFFSCREEN_DOCUMENT: string;
@@ -123,8 +131,10 @@ let pendingOffscreenCreation: Promise<void> | null = null;
 export default defineBackground(() => {
   console.info("clio:bg service worker loaded");
   setupSessionStorageAccess();
+  setupWikiCompileAlarm();
   chrome.runtime.onInstalled.addListener(() => {
     setupContextMenus();
+    setupWikiCompileAlarm();
   });
   setupContextMenus();
 
@@ -249,6 +259,11 @@ export default defineBackground(() => {
     if (port.name === CLIO_IMAGE_GENERATION_STREAM_PORT) {
       handleImageGenerationStreamPort(port);
     }
+  });
+
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== WIKI_COMPILE_ALARM) return;
+    void wakeWikiCompileRunner();
   });
 });
 
@@ -825,6 +840,13 @@ async function routeProviderRequest(request: ProviderRequest) {
       return readImageGenerationSettings();
     case "saveImageGenerationSettings":
       return saveImageGenerationSettings(request.settings);
+    case "getKnowledgeBaseAiSettings":
+      return readKnowledgeBaseAiSettings();
+    case "saveKnowledgeBaseAiSettings": {
+      const settings = await saveKnowledgeBaseAiSettings(request.settings);
+      if (settings.wiki.enabled) void wakeWikiCompileRunner();
+      return settings;
+    }
     case "ensureImageGenerationHostPermission": {
       const baseUrl = normalizeImageBaseUrl(request.baseUrl) ?? defaultOpenAIBaseUrl;
       await requireOpenAIHostPermission(
@@ -911,6 +933,28 @@ async function ensureOffscreen() {
     await pendingOffscreenCreation;
   } finally {
     pendingOffscreenCreation = null;
+  }
+}
+
+function setupWikiCompileAlarm() {
+  void chrome.alarms
+    .create(WIKI_COMPILE_ALARM, { periodInMinutes: WIKI_COMPILE_ALARM_PERIOD_MINUTES })
+    .catch((error) => {
+      console.debug(
+        "clio:bg Wiki compiler alarm setup failed",
+        engineErrorFromUnknown(error).message,
+      );
+    });
+}
+
+async function wakeWikiCompileRunner() {
+  const settings = await readKnowledgeBaseAiSettings().catch(() => undefined);
+  if (settings?.wiki.enabled !== true) return;
+  try {
+    await ensureOffscreen();
+    await chrome.runtime.sendMessage({ type: CLIO_WIKI_COMPILE_WAKE });
+  } catch (error) {
+    console.debug("clio:bg Wiki compiler wake failed", engineErrorFromUnknown(error).message);
   }
 }
 

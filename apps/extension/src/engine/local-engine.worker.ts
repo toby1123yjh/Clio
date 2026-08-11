@@ -51,6 +51,8 @@ import {
   type ChunkMetaTier2AuditStatus,
   type CompactionRecord,
   type CompleteSourceContextMapStepPayload,
+  type CompleteWikiCompileReducePayload,
+  type CompleteWikiCompileStepPayload,
   type CreateChatSessionPayload,
   type CreateCompactionPayload,
   type CreateOrResumeSourceContextMapRunPayload,
@@ -58,6 +60,7 @@ import {
   type CreateTopicPagePayload,
   type CreateWikiCompileJobEventPayload,
   type CreateWikiCompileJobPayload,
+  type CreateWikiCompileRunPayload,
   type DeleteMemoryResult,
   type DeleteTopicPageResult,
   type DeleteWikiArtifactResult,
@@ -66,6 +69,7 @@ import {
   type EngineRequest,
   EngineRpcError,
   type FailSourceContextMapStepPayload,
+  type FailWikiCompileStagePayload,
   type GetJobStatusResult,
   type GetMemoryEvidenceWindowAnchor,
   type GetMemoryEvidenceWindowsPayload,
@@ -98,6 +102,8 @@ import {
   type ListSourceContextMapEventsResult,
   type ListSourceContextMapRunsResult,
   type ListWikiArtifactsResult,
+  type ListWikiCompileEventsResult,
+  type ListWikiCompileRunsResult,
   type ListWikiUserEditsResult,
   type MarkSourceContextMapReduceCompletedPayload,
   type MarkSourceContextMapReduceFailedPayload,
@@ -112,9 +118,12 @@ import {
   type OrchestrationRunFilter,
   type OrchestrationRunStatus,
   type OrchestrationRunSummary,
+  type PauseWikiCompileRunPayload,
   type PdfRawFileResult,
   type PublishWikiArtifactsPayload,
   type PublishWikiArtifactsResult,
+  type RecoverWikiCompileRunsPayload,
+  type RecoverWikiCompileRunsResult,
   type ReindexResult,
   type RepairAction,
   type RepairResult,
@@ -175,6 +184,7 @@ import {
   type WebSearchHistoryRecord,
   type WikiArtifactBatchRef,
   type WikiArtifactDetail,
+  type WikiArtifactDraft,
   type WikiArtifactEvidence,
   type WikiArtifactFilter,
   type WikiArtifactFreshness,
@@ -182,16 +192,31 @@ import {
   type WikiArtifactKind,
   type WikiArtifactLink,
   type WikiArtifactLinkCreatedBy,
+  type WikiArtifactLinkInput,
   type WikiArtifactLinkKind,
   type WikiArtifactMachineVersion,
   type WikiArtifactScope,
   type WikiArtifactScopeKind,
+  type WikiCompileClaimReduceResult,
+  type WikiCompileClaimStepResult,
+  type WikiCompileCreateResult,
+  type WikiCompileEvent,
   type WikiCompileEventKind,
   type WikiCompileEventLevel,
+  type WikiCompileInputManifest,
   type WikiCompileJobEvent,
   type WikiCompileJobStatus,
   type WikiCompileJobSummary,
+  type WikiCompileMapInput,
+  type WikiCompileMapResult,
+  type WikiCompileReduceInput,
+  type WikiCompileReduceResult,
   type WikiCompileResultPayload,
+  type WikiCompileRunDetail,
+  type WikiCompileRunFilter,
+  type WikiCompileRunStatus,
+  type WikiCompileRunSummary,
+  type WikiCompileStepRecord,
   type WikiUserEdit,
   type WikiUserEditKind,
   type WikiUserEditMergeOutcome,
@@ -218,6 +243,20 @@ import {
   normalizeSourceUrl,
   normalizeText,
 } from "@/src/shared/text";
+import {
+  type WikiCompileEventKind as RuntimeWikiCompileEventKind,
+  type WikiCompileEventLevel as RuntimeWikiCompileEventLevel,
+  WIKI_COMPILER_VERSION,
+  WIKI_COMPILE_LIMITS,
+  WIKI_PROMPT_VERSION,
+  type WikiCompileBudget,
+  type WikiCompileCheckpoint,
+  type WikiCompileChunkText,
+  type WikiCompilePauseReason,
+  isWikiCompileBudget,
+  isWikiCompileMapResult,
+  isWikiCompileReduceResult,
+} from "@/src/shared/wiki-compile";
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import sqliteWasmUrl from "@sqlite.org/sqlite-wasm/sqlite3.wasm?url";
 import { compareChatMessagesForDisplay } from "./chat-message-order";
@@ -244,6 +283,7 @@ import {
   selectSourceCoarseBandItems,
   selectSourceCoarseCandidates,
 } from "./source-coarse-ranker";
+import { buildWikiCompilePlan } from "./wiki-compile-plan";
 
 type SqlValue = string | number | bigint | null | Uint8Array;
 type SqlRow = Record<string, SqlValue>;
@@ -427,7 +467,7 @@ export interface LocalEngineOptions {
 
 const databasePath = "/clio-browser-phase1.sqlite3";
 const pdfRawFileDirectoryName = "clio-pdf-raw-files";
-const schemaVersion = 23;
+const schemaVersion = 24;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -1035,6 +1075,53 @@ export class LocalEngine {
         return await this.listWikiUserEdits(request.artifactId, request.limit);
       case "deleteWikiArtifact":
         return await this.deleteWikiArtifact(request.id);
+      case "enqueueWikiCompileRun":
+        throw new EngineRpcError(
+          "WIKI_COMPILE_TRUSTED_ROUTE_REQUIRED",
+          "Wiki compilation must be enqueued through the trusted Offscreen runtime.",
+        );
+      case "listWikiCompileRuns":
+        return await this.listWikiCompileRuns(request.filter);
+      case "getWikiCompileRun":
+        return await this.getWikiCompileRun(request.id);
+      case "cancelWikiCompileRun":
+        return await this.cancelWikiCompileRun(request.id);
+      case "retryWikiCompileRun":
+        return await this.retryWikiCompileRun(request.id);
+      case "resumeWikiCompileRun":
+        return await this.resumeWikiCompileRun(request.id);
+      case "listWikiCompileEvents":
+        return await this.listWikiCompileEvents(request.runId, request.limit);
+      case "createWikiCompileRun":
+        return await this.createWikiCompileRun(request.payload);
+      case "recoverWikiCompileRuns":
+        return await this.recoverWikiCompileRuns(request.payload);
+      case "claimNextWikiCompileStep":
+        return await this.claimNextWikiCompileStep(
+          request.leaseOwner,
+          request.now,
+          request.leaseMs,
+        );
+      case "getWikiCompileStepInput":
+        return await this.getWikiCompileStepInput(
+          request.runId,
+          request.stepId,
+          request.leaseOwner,
+        );
+      case "completeWikiCompileStep":
+        return await this.completeWikiCompileStep(request.payload);
+      case "failWikiCompileStep":
+        return await this.failWikiCompileStage(request.payload, "map");
+      case "pauseWikiCompileRun":
+        return await this.pauseWikiCompileRun(request.payload);
+      case "claimWikiCompileReduce":
+        return await this.claimWikiCompileReduce(request.leaseOwner, request.now, request.leaseMs);
+      case "getWikiCompileReduceInput":
+        return await this.getWikiCompileReduceInput(request.runId, request.leaseOwner);
+      case "completeWikiCompileReduce":
+        return await this.completeWikiCompileReduce(request.payload);
+      case "failWikiCompileReduce":
+        return await this.failWikiCompileStage(request.payload, "reduce");
       case "enqueueWikiCompile":
         return await this.enqueueWikiCompile(request.payload);
       case "listWikiCompileJobs":
@@ -2728,6 +2815,7 @@ export class LocalEngine {
       });
       deleteSourceContextMapArtifactsForSource(db, id);
       deleteSourceContextMapSchedulerForSource(db, id);
+      cancelWikiCompileRunsForDeletedSource(db, id, deletedAt);
       db.exec({
         sql: "DELETE FROM chunk_meta_tier2_audit WHERE source_id = ?",
         bind: [id],
@@ -2837,62 +2925,182 @@ export class LocalEngine {
   ): Promise<PublishWikiArtifactsResult> {
     const db = await this.ensureReady();
     const publication = normalizeWikiArtifactPublication(payload);
+    return transaction(db, () => this.publishWikiArtifactsInTransaction(db, publication));
+  }
 
-    return transaction(db, () => {
-      assertWikiArtifactScopeExists(db, publication.scope);
-      assertWikiArtifactEvidenceTargetsExist(db, publication.artifacts);
-      assertExistingWikiArtifactLinkTargetsExist(db, publication.links);
+  private async createWikiCompileRun(
+    payload: CreateWikiCompileRunPayload,
+  ): Promise<WikiCompileCreateResult> {
+    const db = await this.ensureReady();
+    return createWikiCompileRun(db, payload);
+  }
 
-      const signatureRows = db.selectObjects(
-        `SELECT *
+  private async listWikiCompileRuns(
+    filter: WikiCompileRunFilter = {},
+  ): Promise<ListWikiCompileRunsResult> {
+    const db = await this.ensureReady();
+    return listWikiCompileRuns(db, filter);
+  }
+
+  private async getWikiCompileRun(id: string): Promise<WikiCompileRunDetail | null> {
+    const db = await this.ensureReady();
+    return loadWikiCompileRunDetail(db, id);
+  }
+
+  private async cancelWikiCompileRun(id: string): Promise<WikiCompileRunSummary> {
+    const db = await this.ensureReady();
+    return cancelWikiCompileRun(db, id);
+  }
+
+  private async retryWikiCompileRun(id: string): Promise<WikiCompileRunSummary> {
+    const db = await this.ensureReady();
+    return retryWikiCompileRun(db, id);
+  }
+
+  private async resumeWikiCompileRun(id: string): Promise<WikiCompileRunSummary> {
+    const db = await this.ensureReady();
+    return resumeWikiCompileRun(db, id);
+  }
+
+  private async listWikiCompileEvents(
+    runId: string,
+    limit?: number,
+  ): Promise<ListWikiCompileEventsResult> {
+    const db = await this.ensureReady();
+    return listWikiCompileEvents(db, runId, limit);
+  }
+
+  private async recoverWikiCompileRuns(
+    payload: RecoverWikiCompileRunsPayload,
+  ): Promise<RecoverWikiCompileRunsResult> {
+    const db = await this.ensureReady();
+    return recoverWikiCompileRuns(db, payload);
+  }
+
+  private async claimNextWikiCompileStep(
+    leaseOwner: string,
+    now?: string,
+    leaseMs?: number,
+  ): Promise<WikiCompileClaimStepResult> {
+    const db = await this.ensureReady();
+    return claimNextWikiCompileStep(db, leaseOwner, now, leaseMs);
+  }
+
+  private async getWikiCompileStepInput(
+    runId: string,
+    stepId: string,
+    leaseOwner: string,
+  ): Promise<WikiCompileMapInput> {
+    const db = await this.ensureReady();
+    return getWikiCompileStepInput(db, runId, stepId, leaseOwner);
+  }
+
+  private async completeWikiCompileStep(
+    payload: CompleteWikiCompileStepPayload,
+  ): Promise<WikiCompileStepRecord> {
+    const db = await this.ensureReady();
+    return completeWikiCompileStep(db, payload);
+  }
+
+  private async failWikiCompileStage(
+    payload: FailWikiCompileStagePayload,
+    stage: "map" | "reduce",
+  ): Promise<WikiCompileRunSummary> {
+    const db = await this.ensureReady();
+    return failWikiCompileStage(db, payload, stage);
+  }
+
+  private async pauseWikiCompileRun(
+    payload: PauseWikiCompileRunPayload,
+  ): Promise<WikiCompileRunSummary> {
+    const db = await this.ensureReady();
+    return pauseWikiCompileRun(db, payload);
+  }
+
+  private async claimWikiCompileReduce(
+    leaseOwner: string,
+    now?: string,
+    leaseMs?: number,
+  ): Promise<WikiCompileClaimReduceResult> {
+    const db = await this.ensureReady();
+    return claimWikiCompileReduce(db, leaseOwner, now, leaseMs);
+  }
+
+  private async getWikiCompileReduceInput(
+    runId: string,
+    leaseOwner: string,
+  ): Promise<WikiCompileReduceInput> {
+    const db = await this.ensureReady();
+    return getWikiCompileReduceInput(db, runId, leaseOwner);
+  }
+
+  private async completeWikiCompileReduce(
+    payload: CompleteWikiCompileReducePayload,
+  ): Promise<WikiCompileRunSummary> {
+    const db = await this.ensureReady();
+    return completeWikiCompileReduce(db, payload, (publication) =>
+      this.publishWikiArtifactsInTransaction(db, publication),
+    );
+  }
+
+  private publishWikiArtifactsInTransaction(
+    db: SqliteDb,
+    publication: NormalizedWikiArtifactPublication,
+  ): PublishWikiArtifactsResult {
+    assertWikiArtifactScopeExists(db, publication.scope);
+    assertWikiArtifactEvidenceTargetsExist(db, publication.artifacts);
+    assertExistingWikiArtifactLinkTargetsExist(db, publication.links);
+
+    const signatureRows = db.selectObjects(
+      `SELECT *
          FROM wiki_artifacts
          WHERE scope_kind = ?
            AND scope_id = ?
            AND input_signature = ?
          ORDER BY artifact_kind ASC, artifact_key ASC`,
-        [publication.scope.kind, publication.scope.id, publication.inputSignature],
+      [publication.scope.kind, publication.scope.id, publication.inputSignature],
+    );
+    if (signatureRows.length > 0) {
+      const signatureArtifacts = signatureRows.map(wikiArtifactMachineVersionFromRow);
+      const artifactsByRef = new Map(
+        signatureArtifacts.map((artifact) => [wikiArtifactBatchRefKey(artifact), artifact]),
       );
-      if (signatureRows.length > 0) {
-        const signatureArtifacts = signatureRows.map(wikiArtifactMachineVersionFromRow);
-        const artifactsByRef = new Map(
-          signatureArtifacts.map((artifact) => [wikiArtifactBatchRefKey(artifact), artifact]),
+      if (signatureArtifacts.length !== publication.artifacts.length) {
+        throw new EngineRpcError(
+          "WIKI_ARTIFACT_PARTIAL_IDEMPOTENCY_CONFLICT",
+          "The input signature must reuse the complete original publication batch.",
         );
-        if (signatureArtifacts.length !== publication.artifacts.length) {
+      }
+      const artifacts = publication.artifacts.map((artifact) => {
+        const existing = artifactsByRef.get(wikiArtifactBatchRefKey(artifact));
+        if (existing === undefined) {
           throw new EngineRpcError(
             "WIKI_ARTIFACT_PARTIAL_IDEMPOTENCY_CONFLICT",
             "The input signature must reuse the complete original publication batch.",
           );
         }
-        const artifacts = publication.artifacts.map((artifact) => {
-          const existing = artifactsByRef.get(wikiArtifactBatchRefKey(artifact));
-          if (existing === undefined) {
-            throw new EngineRpcError(
-              "WIKI_ARTIFACT_PARTIAL_IDEMPOTENCY_CONFLICT",
-              "The input signature must reuse the complete original publication batch.",
-            );
-          }
-          return existing;
-        });
-        const versionGroupIds = new Set(artifacts.map((artifact) => artifact.versionGroupId));
-        if (versionGroupIds.size !== 1) {
-          throw new EngineRpcError(
-            "WIKI_ARTIFACT_VERSION_GROUP_CONFLICT",
-            "Idempotent artifact rows do not share one version group.",
-          );
-        }
-        return {
-          versionGroupId: artifacts[0]?.versionGroupId ?? "",
-          items: artifacts.map((artifact) => ({ artifact, disposition: "reused" as const })),
-          createdCount: 0,
-          reusedCount: artifacts.length,
-        };
+        return existing;
+      });
+      const versionGroupIds = new Set(artifacts.map((artifact) => artifact.versionGroupId));
+      if (versionGroupIds.size !== 1) {
+        throw new EngineRpcError(
+          "WIKI_ARTIFACT_VERSION_GROUP_CONFLICT",
+          "Idempotent artifact rows do not share one version group.",
+        );
       }
+      return {
+        versionGroupId: artifacts[0]?.versionGroupId ?? "",
+        items: artifacts.map((artifact) => ({ artifact, disposition: "reused" as const })),
+        createdCount: 0,
+        reusedCount: artifacts.length,
+      };
+    }
 
-      const versionGroupId = createId("wiki_version_group");
-      const publishedAt = new Date().toISOString();
-      const prepared = publication.artifacts.map((artifact) => {
-        const latest = db.selectObject(
-          `SELECT *
+    const versionGroupId = createId("wiki_version_group");
+    const publishedAt = new Date().toISOString();
+    const prepared = publication.artifacts.map((artifact) => {
+      const latest = db.selectObject(
+        `SELECT *
            FROM wiki_artifacts
            WHERE scope_kind = ?
              AND scope_id = ?
@@ -2900,28 +3108,23 @@ export class LocalEngine {
              AND artifact_key = ?
            ORDER BY version_no DESC
            LIMIT 1`,
-          [
-            publication.scope.kind,
-            publication.scope.id,
-            artifact.artifactKind,
-            artifact.artifactKey,
-          ],
-        );
-        return {
-          artifact,
-          id: createId("wiki_artifact"),
-          versionNo: latest === undefined ? 1 : wikiArtifactVersionNoFromRow(latest) + 1,
-          supersedesArtifactId:
-            latest === undefined ? undefined : wikiArtifactRequiredRowString(latest, "id"),
-        };
-      });
-      const artifactIdsByRef = new Map(
-        prepared.map((item) => [wikiArtifactBatchRefKey(item.artifact), item.id]),
+        [publication.scope.kind, publication.scope.id, artifact.artifactKind, artifact.artifactKey],
       );
+      return {
+        artifact,
+        id: createId("wiki_artifact"),
+        versionNo: latest === undefined ? 1 : wikiArtifactVersionNoFromRow(latest) + 1,
+        supersedesArtifactId:
+          latest === undefined ? undefined : wikiArtifactRequiredRowString(latest, "id"),
+      };
+    });
+    const artifactIdsByRef = new Map(
+      prepared.map((item) => [wikiArtifactBatchRefKey(item.artifact), item.id]),
+    );
 
-      for (const item of prepared) {
-        db.exec({
-          sql: `INSERT INTO wiki_artifacts (
+    for (const item of prepared) {
+      db.exec({
+        sql: `INSERT INTO wiki_artifacts (
             id,
             scope_kind,
             scope_id,
@@ -2943,33 +3146,33 @@ export class LocalEngine {
             created_at,
             published_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          bind: [
-            item.id,
-            publication.scope.kind,
-            publication.scope.id,
-            publication.scope.kind === "source" ? publication.scope.id : null,
-            item.artifact.artifactKind,
-            item.artifact.artifactKey,
-            item.versionNo,
-            versionGroupId,
-            item.supersedesArtifactId ?? null,
-            publication.inputSignature,
-            publication.compilerVersion,
-            publication.promptVersion,
-            publication.modelId ?? null,
-            item.artifact.title,
-            item.artifact.content,
-            JSON.stringify(item.artifact.payload),
-            JSON.stringify(item.artifact.coverage),
-            publication.freshness,
-            publishedAt,
-            publishedAt,
-          ],
-        });
+        bind: [
+          item.id,
+          publication.scope.kind,
+          publication.scope.id,
+          publication.scope.kind === "source" ? publication.scope.id : null,
+          item.artifact.artifactKind,
+          item.artifact.artifactKey,
+          item.versionNo,
+          versionGroupId,
+          item.supersedesArtifactId ?? null,
+          publication.inputSignature,
+          publication.compilerVersion,
+          publication.promptVersion,
+          publication.modelId ?? null,
+          item.artifact.title,
+          item.artifact.content,
+          JSON.stringify(item.artifact.payload),
+          JSON.stringify(item.artifact.coverage),
+          publication.freshness,
+          publishedAt,
+          publishedAt,
+        ],
+      });
 
-        item.artifact.evidence.forEach((evidence, ordinal) => {
-          db.exec({
-            sql: `INSERT INTO wiki_artifact_evidence (
+      item.artifact.evidence.forEach((evidence, ordinal) => {
+        db.exec({
+          sql: `INSERT INTO wiki_artifact_evidence (
               id,
               artifact_id,
               source_id,
@@ -2981,42 +3184,42 @@ export class LocalEngine {
               anchor_json,
               ordinal
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            bind: [
-              createId("wiki_evidence"),
-              item.id,
-              evidence.sourceId,
-              evidence.chunkId,
-              evidence.pageNo ?? null,
-              evidence.bbox === undefined ? null : JSON.stringify(evidence.bbox),
-              evidence.parserArtifactKind ?? null,
-              evidence.parserArtifactId ?? null,
-              evidence.anchor === undefined ? null : JSON.stringify(evidence.anchor),
-              ordinal,
-            ],
-          });
+          bind: [
+            createId("wiki_evidence"),
+            item.id,
+            evidence.sourceId,
+            evidence.chunkId,
+            evidence.pageNo ?? null,
+            evidence.bbox === undefined ? null : JSON.stringify(evidence.bbox),
+            evidence.parserArtifactKind ?? null,
+            evidence.parserArtifactId ?? null,
+            evidence.anchor === undefined ? null : JSON.stringify(evidence.anchor),
+            ordinal,
+          ],
         });
-      }
+      });
+    }
 
-      for (const link of publication.links) {
-        const fromArtifactId = artifactIdsByRef.get(wikiArtifactBatchRefKey(link.from));
-        const toArtifactId =
-          "artifactId" in link.to
-            ? link.to.artifactId
-            : artifactIdsByRef.get(wikiArtifactBatchRefKey(link.to));
-        if (fromArtifactId === undefined || toArtifactId === undefined) {
-          throw new EngineRpcError(
-            "WIKI_ARTIFACT_LINK_TARGET_NOT_FOUND",
-            "Wiki artifact link target was not resolved inside the publication batch.",
-          );
-        }
-        if (fromArtifactId === toArtifactId) {
-          throw new EngineRpcError(
-            "WIKI_ARTIFACT_LINK_SELF_REFERENCE",
-            "Wiki artifact links cannot reference the same machine version.",
-          );
-        }
-        db.exec({
-          sql: `INSERT INTO wiki_artifact_links (
+    for (const link of publication.links) {
+      const fromArtifactId = artifactIdsByRef.get(wikiArtifactBatchRefKey(link.from));
+      const toArtifactId =
+        "artifactId" in link.to
+          ? link.to.artifactId
+          : artifactIdsByRef.get(wikiArtifactBatchRefKey(link.to));
+      if (fromArtifactId === undefined || toArtifactId === undefined) {
+        throw new EngineRpcError(
+          "WIKI_ARTIFACT_LINK_TARGET_NOT_FOUND",
+          "Wiki artifact link target was not resolved inside the publication batch.",
+        );
+      }
+      if (fromArtifactId === toArtifactId) {
+        throw new EngineRpcError(
+          "WIKI_ARTIFACT_LINK_SELF_REFERENCE",
+          "Wiki artifact links cannot reference the same machine version.",
+        );
+      }
+      db.exec({
+        sql: `INSERT INTO wiki_artifact_links (
             id,
             from_artifact_id,
             to_artifact_id,
@@ -3025,21 +3228,21 @@ export class LocalEngine {
             creator_version,
             created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          bind: [
-            createId("wiki_link"),
-            fromArtifactId,
-            toArtifactId,
-            link.kind,
-            link.createdBy,
-            link.creatorVersion ?? null,
-            publishedAt,
-          ],
-        });
-      }
+        bind: [
+          createId("wiki_link"),
+          fromArtifactId,
+          toArtifactId,
+          link.kind,
+          link.createdBy,
+          link.creatorVersion ?? null,
+          publishedAt,
+        ],
+      });
+    }
 
-      for (const item of prepared) {
-        db.exec({
-          sql: `UPDATE wiki_artifacts
+    for (const item of prepared) {
+      db.exec({
+        sql: `UPDATE wiki_artifacts
                 SET freshness = 'stale'
                 WHERE scope_kind = ?
                   AND scope_id = ?
@@ -3047,33 +3250,32 @@ export class LocalEngine {
                   AND artifact_key = ?
                   AND id <> ?
                   AND freshness <> 'stale'`,
-          bind: [
-            publication.scope.kind,
-            publication.scope.id,
-            item.artifact.artifactKind,
-            item.artifact.artifactKey,
-            item.id,
-          ],
-        });
-      }
-
-      const artifacts = prepared.map((item) => {
-        const row = db.selectObject("SELECT * FROM wiki_artifacts WHERE id = ? LIMIT 1", [item.id]);
-        if (row === undefined) {
-          throw new EngineRpcError(
-            "WIKI_ARTIFACT_PUBLISH_FAILED",
-            "Published Wiki artifact could not be loaded.",
-          );
-        }
-        return wikiArtifactMachineVersionFromRow(row);
+        bind: [
+          publication.scope.kind,
+          publication.scope.id,
+          item.artifact.artifactKind,
+          item.artifact.artifactKey,
+          item.id,
+        ],
       });
-      return {
-        versionGroupId,
-        items: artifacts.map((artifact) => ({ artifact, disposition: "created" as const })),
-        createdCount: artifacts.length,
-        reusedCount: 0,
-      };
+    }
+
+    const artifacts = prepared.map((item) => {
+      const row = db.selectObject("SELECT * FROM wiki_artifacts WHERE id = ? LIMIT 1", [item.id]);
+      if (row === undefined) {
+        throw new EngineRpcError(
+          "WIKI_ARTIFACT_PUBLISH_FAILED",
+          "Published Wiki artifact could not be loaded.",
+        );
+      }
+      return wikiArtifactMachineVersionFromRow(row);
     });
+    return {
+      versionGroupId,
+      items: artifacts.map((artifact) => ({ artifact, disposition: "created" as const })),
+      createdCount: artifacts.length,
+      reusedCount: 0,
+    };
   }
 
   private async listWikiArtifacts(filter?: WikiArtifactFilter): Promise<ListWikiArtifactsResult> {
@@ -4651,6 +4853,9 @@ export class LocalEngine {
       db.exec("DELETE FROM wiki_artifact_links");
       db.exec("DELETE FROM wiki_artifact_evidence");
       db.exec("DELETE FROM wiki_artifacts");
+      db.exec("DELETE FROM wiki_compile_events");
+      db.exec("DELETE FROM wiki_compile_steps");
+      db.exec("DELETE FROM wiki_compile_runs");
       db.exec("DELETE FROM topic_graph_edges");
       db.exec("DELETE FROM wiki_compile_job_events");
       db.exec("DELETE FROM wiki_compile_jobs");
@@ -5624,6 +5829,93 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS wiki_compile_runs (
+      id TEXT PRIMARY KEY,
+      scope_kind TEXT NOT NULL CHECK (scope_kind = 'source'),
+      scope_id TEXT NOT NULL,
+      source_id TEXT NOT NULL REFERENCES sources(id),
+      input_signature TEXT NOT NULL,
+      compiler_version TEXT NOT NULL,
+      prompt_version TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      manifest_json TEXT NOT NULL,
+      budget_json TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (
+        status IN ('queued', 'running', 'reducing', 'paused', 'completed', 'failed', 'cancelled')
+      ),
+      pause_reason TEXT CHECK (pause_reason IS NULL OR pause_reason IN ('wiki_disabled', 'manual')),
+      cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0, 1)),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
+      step_count INTEGER NOT NULL CHECK (step_count > 0),
+      completed_step_count INTEGER NOT NULL DEFAULT 0 CHECK (completed_step_count >= 0),
+      covered_chunk_count INTEGER NOT NULL DEFAULT 0 CHECK (covered_chunk_count >= 0),
+      total_chunk_count INTEGER NOT NULL CHECK (total_chunk_count > 0),
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      heartbeat_at TEXT,
+      version_group_id TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT,
+      CHECK (scope_id = source_id),
+      CHECK (completed_step_count <= step_count),
+      CHECK (covered_chunk_count <= total_chunk_count)
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wiki_compile_steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES wiki_compile_runs(id) ON DELETE CASCADE,
+      step_index INTEGER NOT NULL CHECK (step_index >= 0),
+      step_signature TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+      main_chunk_ids_json TEXT NOT NULL,
+      overlap_chunk_ids_json TEXT NOT NULL,
+      token_estimate INTEGER NOT NULL CHECK (token_estimate > 0),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      rolling_digest TEXT,
+      findings_json TEXT NOT NULL DEFAULT '[]',
+      claims_json TEXT NOT NULL DEFAULT '[]',
+      covered_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+      input_token_estimate INTEGER CHECK (input_token_estimate IS NULL OR input_token_estimate >= 0),
+      output_token_estimate INTEGER CHECK (output_token_estimate IS NULL OR output_token_estimate >= 0),
+      latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+      error_code TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      UNIQUE (run_id, step_index),
+      UNIQUE (run_id, step_signature)
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wiki_compile_events (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES wiki_compile_runs(id) ON DELETE CASCADE,
+      step_id TEXT REFERENCES wiki_compile_steps(id) ON DELETE SET NULL,
+      kind TEXT NOT NULL CHECK (
+        kind IN (
+          'queued', 'reused', 'recovered', 'resumed', 'step_claimed', 'step_completed',
+          'step_failed', 'reduce_claimed', 'published', 'completed', 'pause_requested',
+          'paused', 'cancel_requested', 'cancelled', 'retry_started', 'failed'
+        )
+      ),
+      level TEXT NOT NULL CHECK (level IN ('info', 'warning', 'error')),
+      message TEXT NOT NULL,
+      detail_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS wiki_compile_jobs (
       id TEXT PRIMARY KEY,
       status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'done', 'failed')),
@@ -5879,6 +6171,30 @@ function migrate(db: SqliteDb) {
   db.exec("CREATE INDEX IF NOT EXISTS idx_topic_pages_updated ON topic_pages(updated_at DESC)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_topic_pages_slug ON topic_pages(slug)");
   db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_compile_runs_status_created
+     ON wiki_compile_runs(status, created_at ASC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_compile_runs_source_signature
+     ON wiki_compile_runs(source_id, input_signature, created_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_compile_runs_lease
+     ON wiki_compile_runs(status, lease_expires_at)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_compile_steps_run_status
+     ON wiki_compile_steps(run_id, status, step_index ASC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_compile_steps_lease
+     ON wiki_compile_steps(status, lease_expires_at)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_compile_events_run_created
+     ON wiki_compile_events(run_id, created_at DESC)`,
+  );
+  db.exec(
     "CREATE INDEX IF NOT EXISTS idx_wiki_compile_jobs_status ON wiki_compile_jobs(status, run_after)",
   );
   db.exec("CREATE INDEX IF NOT EXISTS idx_wiki_compile_jobs_topic ON wiki_compile_jobs(topic_id)");
@@ -5913,6 +6229,9 @@ function migrate(db: SqliteDb) {
 }
 
 function dropPreSourceNativeTables(db: SqliteDb) {
+  db.exec("DROP TABLE IF EXISTS wiki_compile_events");
+  db.exec("DROP TABLE IF EXISTS wiki_compile_steps");
+  db.exec("DROP TABLE IF EXISTS wiki_compile_runs");
   db.exec("DROP TABLE IF EXISTS wiki_user_edits");
   db.exec("DROP TABLE IF EXISTS wiki_artifact_links");
   db.exec("DROP TABLE IF EXISTS wiki_artifact_evidence");
@@ -14600,6 +14919,1670 @@ function transaction<T>(db: SqliteDb, work: () => T): T {
   }
 }
 
+const wikiCompileDefaultMaxAttempts = 3;
+const wikiCompileDefaultLeaseMs = 180_000;
+
+function createWikiCompileRun(
+  db: SqliteDb,
+  payload: CreateWikiCompileRunPayload,
+): WikiCompileCreateResult {
+  return transaction(db, () => {
+    if (!isWikiCompileBudget(payload.budget)) {
+      throw new EngineRpcError("INVALID_WIKI_COMPILE_BUDGET", "Wiki compile budget is invalid.");
+    }
+    const sourceId = normalizeText(payload.sourceId);
+    const provider = boundedNormalizedText(payload.provider, 80);
+    const modelId = boundedNormalizedText(payload.modelId, WIKI_COMPILE_LIMITS.modelChars);
+    if (sourceId.length === 0 || provider.length === 0 || modelId.length === 0) {
+      throw new EngineRpcError(
+        "INVALID_WIKI_COMPILE_REQUEST",
+        "Wiki compilation requires a Source, provider and model.",
+      );
+    }
+    const source = db.selectObject(
+      `SELECT s.*, COALESCE(sm.metadata_json, '{}') AS metadata_json
+       FROM sources s
+       LEFT JOIN source_metadata sm ON sm.source_id = s.id
+       WHERE s.id = ?
+         AND s.lifecycle_status = 'fresh'
+         AND s.is_current = 1
+       LIMIT 1`,
+      [sourceId],
+    );
+    if (source === undefined) {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_SOURCE_NOT_FRESH",
+        `Current fresh Source not found: ${sourceId}`,
+      );
+    }
+    const chunkRows = db.selectObjects(
+      `SELECT id, ord, hash, token_count, section_path, page_start, page_end
+       FROM source_chunks
+       WHERE source_id = ? AND role = 'child'
+       ORDER BY ord ASC, id ASC`,
+      [sourceId],
+    );
+    if (chunkRows.length > WIKI_COMPILE_LIMITS.maxChunks) {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_SOURCE_TOO_LARGE",
+        `Wiki compilation supports at most ${WIKI_COMPILE_LIMITS.maxChunks} child Chunks.`,
+      );
+    }
+    const metadata = parseMetadata(stringField(source, "metadata_json"));
+    const plan = buildWikiCompilePlan({
+      source: {
+        id: sourceId,
+        contentHash: stringField(source, "content_hash"),
+        title: stringField(source, "source_title"),
+        sourceType: stringField(source, "source_type"),
+        ...(wikiParserVersionFromMetadata(metadata) === undefined
+          ? {}
+          : { parserVersion: wikiParserVersionFromMetadata(metadata) }),
+      },
+      chunks: chunkRows.map((row) => ({
+        id: stringField(row, "id"),
+        ord: numberField(row, "ord"),
+        hash: stringField(row, "hash"),
+        tokenCount: numberField(row, "token_count"),
+        ...(optionalWikiPositiveInteger(row, "page_start") === undefined
+          ? {}
+          : { pageStart: optionalWikiPositiveInteger(row, "page_start") }),
+        ...(optionalWikiPositiveInteger(row, "page_end") === undefined
+          ? {}
+          : { pageEnd: optionalWikiPositiveInteger(row, "page_end") }),
+        ...(optionalString(row, "section_path") === undefined
+          ? {}
+          : { sectionPath: optionalString(row, "section_path") }),
+      })),
+      provider,
+      modelId,
+      budget: payload.budget,
+      chunkStrategyVersion:
+        wikiChunkStrategyVersionFromMetadata(metadata) ?? sourceChunkStrategyVersion,
+      compilerVersion: boundedNormalizedText(payload.compilerVersion ?? WIKI_COMPILER_VERSION, 120),
+      promptVersion: boundedNormalizedText(payload.promptVersion ?? WIKI_PROMPT_VERSION, 120),
+    });
+    if (plan.steps.length > WIKI_COMPILE_LIMITS.maxSteps) {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_TOO_MANY_STEPS",
+        `Wiki compilation supports at most ${WIKI_COMPILE_LIMITS.maxSteps} steps.`,
+      );
+    }
+
+    const artifact = db.selectObject(
+      `SELECT version_group_id
+       FROM wiki_artifacts
+       WHERE scope_kind = 'source'
+         AND scope_id = ?
+         AND input_signature = ?
+         AND freshness = 'fresh'
+       ORDER BY published_at DESC
+       LIMIT 1`,
+      [sourceId, plan.inputSignature],
+    );
+    if (artifact !== undefined) {
+      return {
+        disposition: "reused_artifact",
+        versionGroupId: stringField(artifact, "version_group_id"),
+      };
+    }
+
+    const existing = db.selectObject(
+      `SELECT *
+       FROM wiki_compile_runs
+       WHERE source_id = ?
+         AND input_signature = ?
+         AND status IN ('queued', 'running', 'reducing', 'paused')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [sourceId, plan.inputSignature],
+    );
+    if (existing !== undefined) {
+      return {
+        disposition: "reused_run",
+        run: loadWikiCompileRunDetailOrThrow(db, stringField(existing, "id")),
+      };
+    }
+
+    const runId = createId("wiki_run");
+    const createdAt = normalizeOptionalIso(payload.createdAt) ?? new Date().toISOString();
+    db.exec({
+      sql: `INSERT INTO wiki_compile_runs (
+        id, scope_kind, scope_id, source_id, input_signature, compiler_version,
+        prompt_version, provider, model_id, manifest_json, budget_json, status,
+        attempt_count, max_attempts, step_count, completed_step_count,
+        covered_chunk_count, total_chunk_count, created_at, updated_at
+      ) VALUES (?, 'source', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, 0, 0, ?, ?, ?)`,
+      bind: [
+        runId,
+        sourceId,
+        sourceId,
+        plan.inputSignature,
+        plan.manifest.compilerVersion,
+        plan.manifest.promptVersion,
+        provider,
+        modelId,
+        JSON.stringify(plan.manifest),
+        JSON.stringify(payload.budget),
+        wikiCompileDefaultMaxAttempts,
+        plan.steps.length,
+        plan.manifest.chunks.length,
+        createdAt,
+        createdAt,
+      ],
+    });
+    for (const step of plan.steps) {
+      db.exec({
+        sql: `INSERT INTO wiki_compile_steps (
+          id, run_id, step_index, step_signature, status, main_chunk_ids_json,
+          overlap_chunk_ids_json, token_estimate, attempt_count, max_attempts,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?)`,
+        bind: [
+          createId("wiki_step"),
+          runId,
+          step.index,
+          step.signature,
+          JSON.stringify(step.mainChunkIds),
+          JSON.stringify(step.overlapChunkIds),
+          step.tokenEstimate,
+          wikiCompileDefaultMaxAttempts,
+          createdAt,
+          createdAt,
+        ],
+      });
+    }
+    insertWikiCompileRuntimeEvent(db, {
+      runId,
+      kind: "queued",
+      message: "Wiki compilation queued.",
+      detail: { stepCount: plan.steps.length, chunkCount: plan.manifest.chunks.length },
+      createdAt,
+    });
+    return { disposition: "created", run: loadWikiCompileRunDetailOrThrow(db, runId) };
+  });
+}
+
+function listWikiCompileRuns(
+  db: SqliteDb,
+  filter: WikiCompileRunFilter,
+): ListWikiCompileRunsResult {
+  const clauses: string[] = [];
+  const bind: unknown[] = [];
+  if (filter.sourceId !== undefined && normalizeText(filter.sourceId).length > 0) {
+    clauses.push("source_id = ?");
+    bind.push(normalizeText(filter.sourceId));
+  }
+  if (filter.status !== undefined) {
+    clauses.push("status = ?");
+    bind.push(filter.status);
+  }
+  const rows = db.selectObjects(
+    `SELECT * FROM wiki_compile_runs
+     ${clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`}
+     ORDER BY created_at DESC, id DESC
+     LIMIT ?`,
+    [...bind, clampOptionalLimit(filter.limit, 30, 200)],
+  );
+  return { runs: rows.map(wikiCompileRunFromRow) };
+}
+
+function loadWikiCompileRunDetail(db: SqliteDb, idInput: string): WikiCompileRunDetail | null {
+  const id = normalizeText(idInput);
+  const row = db.selectObject("SELECT * FROM wiki_compile_runs WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) return null;
+  return {
+    ...wikiCompileRunFromRow(row),
+    manifest: parseWikiCompileManifest(stringField(row, "manifest_json")),
+    budget: parseWikiCompileBudget(stringField(row, "budget_json")),
+    steps: loadWikiCompileSteps(db, id),
+  };
+}
+
+function loadWikiCompileRunDetailOrThrow(db: SqliteDb, id: string): WikiCompileRunDetail {
+  const run = loadWikiCompileRunDetail(db, id);
+  if (run === null) {
+    throw new EngineRpcError("WIKI_COMPILE_RUN_NOT_FOUND", `Wiki compile run not found: ${id}`);
+  }
+  return run;
+}
+
+function loadWikiCompileRunOrThrow(db: SqliteDb, id: string): WikiCompileRunSummary {
+  const row = db.selectObject("SELECT * FROM wiki_compile_runs WHERE id = ? LIMIT 1", [
+    normalizeText(id),
+  ]);
+  if (row === undefined) {
+    throw new EngineRpcError("WIKI_COMPILE_RUN_NOT_FOUND", `Wiki compile run not found: ${id}`);
+  }
+  return wikiCompileRunFromRow(row);
+}
+
+function loadWikiCompileStepOrThrow(db: SqliteDb, id: string): WikiCompileStepRecord {
+  const row = db.selectObject("SELECT * FROM wiki_compile_steps WHERE id = ? LIMIT 1", [
+    normalizeText(id),
+  ]);
+  if (row === undefined) {
+    throw new EngineRpcError("WIKI_COMPILE_STEP_NOT_FOUND", `Wiki compile step not found: ${id}`);
+  }
+  return wikiCompileStepFromRow(row);
+}
+
+function loadWikiCompileSteps(db: SqliteDb, runId: string): WikiCompileStepRecord[] {
+  return db
+    .selectObjects("SELECT * FROM wiki_compile_steps WHERE run_id = ? ORDER BY step_index ASC", [
+      runId,
+    ])
+    .map(wikiCompileStepFromRow);
+}
+
+function cancelWikiCompileRun(db: SqliteDb, id: string): WikiCompileRunSummary {
+  return transaction(db, () => {
+    const run = loadWikiCompileRunOrThrow(db, id);
+    if (isTerminalWikiCompileRunStatus(run.status)) return run;
+    const now = new Date().toISOString();
+    insertWikiCompileRuntimeEvent(db, {
+      runId: run.id,
+      kind: "cancel_requested",
+      level: "warning",
+      message: "Wiki compilation cancellation requested.",
+      createdAt: now,
+    });
+    if (run.status === "queued" || run.status === "paused") {
+      return finishCancelledWikiCompileRun(db, run.id, "Wiki compilation cancelled.", now);
+    }
+    db.exec({
+      sql: `UPDATE wiki_compile_runs
+            SET cancel_requested = 1, updated_at = ?
+            WHERE id = ?`,
+      bind: [now, run.id],
+    });
+    return loadWikiCompileRunOrThrow(db, run.id);
+  });
+}
+
+function retryWikiCompileRun(db: SqliteDb, id: string): WikiCompileRunSummary {
+  return transaction(db, () => {
+    const run = loadWikiCompileRunOrThrow(db, id);
+    if (run.status !== "failed") {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_INVALID_TRANSITION",
+        "Only failed Wiki compilation runs can be retried.",
+      );
+    }
+    const now = new Date().toISOString();
+    db.exec({
+      sql: `UPDATE wiki_compile_steps
+            SET status = 'queued', attempt_count = 0, lease_owner = NULL,
+                lease_expires_at = NULL, error_code = NULL, error_message = NULL,
+                updated_at = ?
+            WHERE run_id = ? AND status = 'failed'`,
+      bind: [now, run.id],
+    });
+    const incomplete = Number(
+      db.selectValue(
+        "SELECT COUNT(*) FROM wiki_compile_steps WHERE run_id = ? AND status <> 'completed'",
+        [run.id],
+      ) ?? 0,
+    );
+    db.exec({
+      sql: `UPDATE wiki_compile_runs
+            SET status = ?, pause_reason = NULL, cancel_requested = 0,
+                attempt_count = 0, lease_owner = NULL, lease_expires_at = NULL,
+                heartbeat_at = NULL, error_code = NULL, error_message = NULL,
+                finished_at = NULL, updated_at = ?
+            WHERE id = ?`,
+      bind: [incomplete === 0 ? "running" : "queued", now, run.id],
+    });
+    insertWikiCompileRuntimeEvent(db, {
+      runId: run.id,
+      kind: "retry_started",
+      message: "Wiki compilation retry started.",
+      createdAt: now,
+    });
+    return refreshWikiCompileRunProgress(db, run.id, now);
+  });
+}
+
+function resumeWikiCompileRun(db: SqliteDb, id: string): WikiCompileRunSummary {
+  return transaction(db, () => {
+    const run = loadWikiCompileRunOrThrow(db, id);
+    if (run.status !== "paused") {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_INVALID_TRANSITION",
+        "Only paused Wiki compilation runs can be resumed.",
+      );
+    }
+    const now = new Date().toISOString();
+    const incomplete = Number(
+      db.selectValue(
+        "SELECT COUNT(*) FROM wiki_compile_steps WHERE run_id = ? AND status <> 'completed'",
+        [run.id],
+      ) ?? 0,
+    );
+    db.exec({
+      sql: `UPDATE wiki_compile_runs
+            SET status = ?, pause_reason = NULL, cancel_requested = 0,
+                lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+                error_code = NULL, error_message = NULL, updated_at = ?
+            WHERE id = ?`,
+      bind: [incomplete === 0 ? "running" : "queued", now, run.id],
+    });
+    insertWikiCompileRuntimeEvent(db, {
+      runId: run.id,
+      kind: "resumed",
+      message: "Wiki compilation resumed.",
+      createdAt: now,
+    });
+    return loadWikiCompileRunOrThrow(db, run.id);
+  });
+}
+
+function listWikiCompileEvents(
+  db: SqliteDb,
+  runIdInput: string,
+  limit?: number,
+): ListWikiCompileEventsResult {
+  const runId = normalizeText(runIdInput);
+  loadWikiCompileRunOrThrow(db, runId);
+  const rows = db.selectObjects(
+    `SELECT * FROM wiki_compile_events
+     WHERE run_id = ?
+     ORDER BY created_at DESC, id DESC
+     LIMIT ?`,
+    [runId, clampOptionalLimit(limit, 40, WIKI_COMPILE_LIMITS.maxEvents)],
+  );
+  return { events: rows.map(wikiCompileRuntimeEventFromRow) };
+}
+
+function recoverWikiCompileRuns(
+  db: SqliteDb,
+  payload: RecoverWikiCompileRunsPayload,
+): RecoverWikiCompileRunsResult {
+  return transaction(db, () => {
+    const now = normalizeOptionalIso(payload.now) ?? new Date().toISOString();
+    let recoveredStepCount = 0;
+    const recoveredRuns = new Set<string>();
+    const expiredSteps = db.selectObjects(
+      `SELECT * FROM wiki_compile_steps
+       WHERE status = 'running'
+         AND lease_expires_at IS NOT NULL
+         AND lease_expires_at <= ?
+       ORDER BY updated_at ASC`,
+      [now],
+    );
+    for (const row of expiredSteps) {
+      const step = wikiCompileStepFromRow(row);
+      const run = loadWikiCompileRunOrThrow(db, step.runId);
+      if (run.cancelRequested) {
+        finishCancelledWikiCompileRun(
+          db,
+          run.id,
+          "Wiki compilation cancelled during recovery.",
+          now,
+        );
+      } else if (step.attemptCount >= step.maxAttempts) {
+        db.exec({
+          sql: `UPDATE wiki_compile_steps
+                SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL,
+                    error_code = 'timeout', error_message = 'Wiki map lease expired.', updated_at = ?
+                WHERE id = ?`,
+          bind: [now, step.id],
+        });
+        failWikiCompileRun(db, run.id, "timeout", "Wiki map lease expired.", now);
+      } else {
+        db.exec({
+          sql: `UPDATE wiki_compile_steps
+                SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ?`,
+          bind: [now, step.id],
+        });
+        db.exec({
+          sql: `UPDATE wiki_compile_runs
+                SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL,
+                    heartbeat_at = NULL, updated_at = ?
+                WHERE id = ?`,
+          bind: [now, run.id],
+        });
+        insertWikiCompileRuntimeEvent(db, {
+          runId: run.id,
+          stepId: step.id,
+          kind: "recovered",
+          level: "warning",
+          message: "Expired Wiki map lease recovered.",
+          detail: { previousLeaseOwner: optionalString(row, "lease_owner") ?? "" },
+          createdAt: now,
+        });
+      }
+      recoveredStepCount += 1;
+      recoveredRuns.add(run.id);
+    }
+
+    const expiredReductions = db.selectObjects(
+      `SELECT * FROM wiki_compile_runs
+       WHERE status = 'reducing'
+         AND lease_expires_at IS NOT NULL
+         AND lease_expires_at <= ?`,
+      [now],
+    );
+    for (const row of expiredReductions) {
+      const run = wikiCompileRunFromRow(row);
+      if (run.cancelRequested) {
+        finishCancelledWikiCompileRun(
+          db,
+          run.id,
+          "Wiki compilation cancelled during recovery.",
+          now,
+        );
+      } else if (run.attemptCount >= run.maxAttempts) {
+        failWikiCompileRun(db, run.id, "timeout", "Wiki reduce lease expired.", now);
+      } else {
+        db.exec({
+          sql: `UPDATE wiki_compile_runs
+                SET status = 'running', lease_owner = NULL, lease_expires_at = NULL,
+                    heartbeat_at = NULL, updated_at = ?
+                WHERE id = ?`,
+          bind: [now, run.id],
+        });
+        insertWikiCompileRuntimeEvent(db, {
+          runId: run.id,
+          kind: "recovered",
+          level: "warning",
+          message: "Expired Wiki reduce lease recovered.",
+          createdAt: now,
+        });
+      }
+      recoveredRuns.add(run.id);
+    }
+
+    let resumedRunCount = 0;
+    if (payload.resumeWikiDisabled === true) {
+      const paused = db.selectObjects(
+        `SELECT id FROM wiki_compile_runs
+         WHERE status = 'paused' AND pause_reason = 'wiki_disabled'`,
+      );
+      for (const row of paused) {
+        resumeWikiCompileRunInTransaction(db, stringField(row, "id"), now);
+        resumedRunCount += 1;
+      }
+    }
+    return {
+      recoveredRunCount: recoveredRuns.size,
+      recoveredStepCount,
+      resumedRunCount,
+    };
+  });
+}
+
+function claimNextWikiCompileStep(
+  db: SqliteDb,
+  leaseOwnerInput: string,
+  nowInput?: string,
+  leaseMsInput?: number,
+): WikiCompileClaimStepResult {
+  return transaction(db, () => {
+    const leaseOwner = normalizeWikiCompileLeaseOwner(leaseOwnerInput);
+    const now = normalizeOptionalIso(nowInput) ?? new Date().toISOString();
+    const leaseExpiresAt = wikiCompileLeaseExpiry(now, leaseMsInput);
+    const row = db.selectObject(
+      `SELECT s.*
+       FROM wiki_compile_steps s
+       JOIN wiki_compile_runs r ON r.id = s.run_id
+       WHERE s.status = 'queued'
+         AND r.status IN ('queued', 'running')
+         AND r.cancel_requested = 0
+         AND NOT EXISTS (
+           SELECT 1 FROM wiki_compile_steps prior
+           WHERE prior.run_id = s.run_id
+             AND prior.step_index < s.step_index
+             AND prior.status <> 'completed'
+         )
+       ORDER BY r.created_at ASC, s.step_index ASC
+       LIMIT 1`,
+    );
+    if (row === undefined) return {};
+    const step = wikiCompileStepFromRow(row);
+    if (step.attemptCount >= step.maxAttempts) {
+      db.exec({
+        sql: `UPDATE wiki_compile_steps
+              SET status = 'failed', error_code = 'timeout',
+                  error_message = 'Wiki map attempts exhausted.', updated_at = ?
+              WHERE id = ?`,
+        bind: [now, step.id],
+      });
+      failWikiCompileRun(db, step.runId, "timeout", "Wiki map attempts exhausted.", now);
+      return {};
+    }
+    db.exec({
+      sql: `UPDATE wiki_compile_steps
+            SET status = 'running', attempt_count = attempt_count + 1,
+                lease_owner = ?, lease_expires_at = ?, error_code = NULL,
+                error_message = NULL, updated_at = ?
+            WHERE id = ? AND status = 'queued'`,
+      bind: [leaseOwner, leaseExpiresAt, now, step.id],
+    });
+    if (Number(db.selectValue("SELECT changes()") ?? 0) !== 1) return {};
+    db.exec({
+      sql: `UPDATE wiki_compile_runs
+            SET status = 'running', lease_owner = ?, lease_expires_at = ?,
+                heartbeat_at = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+            WHERE id = ? AND status IN ('queued', 'running')`,
+      bind: [leaseOwner, leaseExpiresAt, now, now, now, step.runId],
+    });
+    insertWikiCompileRuntimeEvent(db, {
+      runId: step.runId,
+      stepId: step.id,
+      kind: "step_claimed",
+      message: "Wiki map step claimed.",
+      detail: { stepIndex: step.index, leaseOwner },
+      createdAt: now,
+    });
+    return {
+      run: loadWikiCompileRunOrThrow(db, step.runId),
+      step: loadWikiCompileStepOrThrow(db, step.id),
+    };
+  });
+}
+
+function getWikiCompileStepInput(
+  db: SqliteDb,
+  runIdInput: string,
+  stepIdInput: string,
+  leaseOwnerInput: string,
+): WikiCompileMapInput {
+  const run = loadWikiCompileRunDetailOrThrow(db, normalizeText(runIdInput));
+  const step = loadWikiCompileStepOrThrow(db, normalizeText(stepIdInput));
+  const leaseOwner = normalizeWikiCompileLeaseOwner(leaseOwnerInput);
+  assertWikiCompileStepLease(run, step, leaseOwner);
+  const rows = assertWikiCompileSourceSnapshot(db, run.manifest);
+  const chunksById = new Map(rows.map((row) => [stringField(row, "id"), row]));
+  const prior = db.selectObject(
+    `SELECT rolling_digest
+     FROM wiki_compile_steps
+     WHERE run_id = ? AND step_index < ? AND status = 'completed'
+     ORDER BY step_index DESC LIMIT 1`,
+    [run.id, step.index],
+  );
+  return {
+    runId: run.id,
+    stepId: step.id,
+    inputSignature: run.inputSignature,
+    source: wikiCompileSourceCard(run.manifest),
+    mainChunks: step.mainChunkIds.map((id) => wikiCompileChunkFromRow(chunksById, id)),
+    overlapChunks: step.overlapChunkIds.map((id) => wikiCompileChunkFromRow(chunksById, id)),
+    priorDigest: prior === undefined ? "" : stringField(prior, "rolling_digest"),
+    budget: run.budget,
+  };
+}
+
+function completeWikiCompileStep(
+  db: SqliteDb,
+  payload: CompleteWikiCompileStepPayload,
+): WikiCompileStepRecord {
+  return transaction(db, () => {
+    if (!isWikiCompileMapResult(payload.result)) {
+      throw new EngineRpcError("WIKI_COMPILE_MAP_INVALID", "Wiki map result is invalid.");
+    }
+    const run = loadWikiCompileRunDetailOrThrow(db, payload.runId);
+    const step = loadWikiCompileStepOrThrow(db, payload.stepId);
+    assertWikiCompileStepLease(run, step, payload.leaseOwner);
+    if (payload.inputSignature !== run.inputSignature) {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_SIGNATURE_MISMATCH",
+        "Wiki map result does not match the persisted input signature.",
+      );
+    }
+    assertExactWikiChunkIds(payload.result.coveredChunkIds, step.mainChunkIds, "map coverage");
+    assertWikiCompileMapEvidence(run.manifest, payload.result);
+    const completedAt = normalizeOptionalIso(payload.completedAt) ?? new Date().toISOString();
+    db.exec({
+      sql: `UPDATE wiki_compile_steps
+            SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL,
+                rolling_digest = ?, findings_json = ?, claims_json = ?,
+                covered_chunk_ids_json = ?, input_token_estimate = ?,
+                output_token_estimate = ?, latency_ms = ?, error_code = NULL,
+                error_message = NULL, updated_at = ?, completed_at = ?
+            WHERE id = ? AND run_id = ? AND status = 'running' AND lease_owner = ?`,
+      bind: [
+        payload.result.rollingDigest,
+        JSON.stringify(payload.result.findings),
+        JSON.stringify(payload.result.claims),
+        JSON.stringify(payload.result.coveredChunkIds),
+        wikiOptionalMetric(payload.inputTokenEstimate),
+        wikiOptionalMetric(payload.outputTokenEstimate),
+        wikiOptionalMetric(payload.latencyMs),
+        completedAt,
+        completedAt,
+        step.id,
+        run.id,
+        payload.leaseOwner,
+      ],
+    });
+    if (Number(db.selectValue("SELECT changes()") ?? 0) !== 1) {
+      throw new EngineRpcError("WIKI_COMPILE_LEASE_LOST", "Wiki map step lease was lost.");
+    }
+    db.exec({
+      sql: `UPDATE wiki_compile_runs
+            SET lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?
+            WHERE id = ?`,
+      bind: [completedAt, run.id],
+    });
+    insertWikiCompileRuntimeEvent(db, {
+      runId: run.id,
+      stepId: step.id,
+      kind: "step_completed",
+      message: "Wiki map step completed.",
+      detail: { stepIndex: step.index, coveredChunkCount: step.mainChunkIds.length },
+      createdAt: completedAt,
+    });
+    refreshWikiCompileRunProgress(db, run.id, completedAt);
+    const refreshedRun = loadWikiCompileRunOrThrow(db, run.id);
+    if (refreshedRun.cancelRequested) {
+      finishCancelledWikiCompileRun(
+        db,
+        run.id,
+        "Wiki compilation cancelled after checkpoint.",
+        completedAt,
+      );
+    }
+    return loadWikiCompileStepOrThrow(db, step.id);
+  });
+}
+
+function failWikiCompileStage(
+  db: SqliteDb,
+  payload: FailWikiCompileStagePayload,
+  stage: "map" | "reduce",
+): WikiCompileRunSummary {
+  return transaction(db, () => {
+    const run = loadWikiCompileRunOrThrow(db, payload.runId);
+    const failedAt = normalizeOptionalIso(payload.failedAt) ?? new Date().toISOString();
+    if (stage === "map") {
+      if (payload.stepId === undefined) {
+        throw new EngineRpcError("WIKI_COMPILE_STEP_REQUIRED", "Wiki map failure requires a step.");
+      }
+      const step = loadWikiCompileStepOrThrow(db, payload.stepId);
+      assertWikiCompileStepLease(run, step, payload.leaseOwner);
+      if (run.cancelRequested) {
+        return finishCancelledWikiCompileRun(
+          db,
+          run.id,
+          "Wiki compilation cancelled after provider completion.",
+          failedAt,
+        );
+      }
+      const exhausted = step.attemptCount >= step.maxAttempts;
+      db.exec({
+        sql: `UPDATE wiki_compile_steps
+              SET status = ?, lease_owner = NULL, lease_expires_at = NULL,
+                  error_code = ?, error_message = ?, updated_at = ?
+              WHERE id = ? AND status = 'running' AND lease_owner = ?`,
+        bind: [
+          exhausted ? "failed" : "queued",
+          payload.errorCode,
+          boundedNormalizedText(payload.errorMessage, WIKI_COMPILE_LIMITS.errorChars),
+          failedAt,
+          step.id,
+          payload.leaseOwner,
+        ],
+      });
+      if (Number(db.selectValue("SELECT changes()") ?? 0) !== 1) {
+        throw new EngineRpcError("WIKI_COMPILE_LEASE_LOST", "Wiki map step lease was lost.");
+      }
+      insertWikiCompileRuntimeEvent(db, {
+        runId: run.id,
+        stepId: step.id,
+        kind: "step_failed",
+        level: exhausted ? "error" : "warning",
+        message: exhausted ? "Wiki map step attempts exhausted." : "Wiki map step will retry.",
+        detail: { errorCode: payload.errorCode, attemptCount: step.attemptCount },
+        createdAt: failedAt,
+      });
+      if (exhausted) {
+        return failWikiCompileRun(db, run.id, payload.errorCode, payload.errorMessage, failedAt);
+      }
+      db.exec({
+        sql: `UPDATE wiki_compile_runs
+              SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL,
+                  heartbeat_at = NULL, error_code = ?, error_message = ?, updated_at = ?
+              WHERE id = ?`,
+        bind: [payload.errorCode, payload.errorMessage, failedAt, run.id],
+      });
+      return loadWikiCompileRunOrThrow(db, run.id);
+    }
+
+    assertWikiCompileReduceLease(run, payload.leaseOwner);
+    if (run.cancelRequested) {
+      return finishCancelledWikiCompileRun(
+        db,
+        run.id,
+        "Wiki compilation cancelled after provider completion.",
+        failedAt,
+      );
+    }
+    if (run.attemptCount < run.maxAttempts) {
+      db.exec({
+        sql: `UPDATE wiki_compile_runs
+              SET status = 'running', lease_owner = NULL, lease_expires_at = NULL,
+                  heartbeat_at = NULL, error_code = ?, error_message = ?, updated_at = ?
+              WHERE id = ?`,
+        bind: [payload.errorCode, payload.errorMessage, failedAt, run.id],
+      });
+      insertWikiCompileRuntimeEvent(db, {
+        runId: run.id,
+        kind: "step_failed",
+        level: "warning",
+        message: "Wiki reduce will retry.",
+        detail: { errorCode: payload.errorCode, attemptCount: run.attemptCount },
+        createdAt: failedAt,
+      });
+      return loadWikiCompileRunOrThrow(db, run.id);
+    }
+    return failWikiCompileRun(db, run.id, payload.errorCode, payload.errorMessage, failedAt);
+  });
+}
+
+function pauseWikiCompileRun(
+  db: SqliteDb,
+  payload: PauseWikiCompileRunPayload,
+): WikiCompileRunSummary {
+  return transaction(db, () => {
+    const run = loadWikiCompileRunOrThrow(db, payload.runId);
+    if (isTerminalWikiCompileRunStatus(run.status)) return run;
+    if (payload.leaseOwner !== undefined && run.leaseOwner !== payload.leaseOwner) {
+      throw new EngineRpcError("WIKI_COMPILE_LEASE_LOST", "Wiki compile run lease was lost.");
+    }
+    const pausedAt = normalizeOptionalIso(payload.pausedAt) ?? new Date().toISOString();
+    insertWikiCompileRuntimeEvent(db, {
+      runId: run.id,
+      kind: "pause_requested",
+      level: "warning",
+      message: "Wiki compilation pause requested.",
+      detail: { reason: payload.reason },
+      createdAt: pausedAt,
+    });
+    db.exec({
+      sql: `UPDATE wiki_compile_steps
+            SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+            WHERE run_id = ? AND status = 'running'`,
+      bind: [pausedAt, run.id],
+    });
+    db.exec({
+      sql: `UPDATE wiki_compile_runs
+            SET status = 'paused', pause_reason = ?, lease_owner = NULL,
+                lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?
+            WHERE id = ?`,
+      bind: [payload.reason, pausedAt, run.id],
+    });
+    insertWikiCompileRuntimeEvent(db, {
+      runId: run.id,
+      kind: "paused",
+      level: "warning",
+      message: "Wiki compilation paused.",
+      detail: { reason: payload.reason },
+      createdAt: pausedAt,
+    });
+    return loadWikiCompileRunOrThrow(db, run.id);
+  });
+}
+
+function claimWikiCompileReduce(
+  db: SqliteDb,
+  leaseOwnerInput: string,
+  nowInput?: string,
+  leaseMsInput?: number,
+): WikiCompileClaimReduceResult {
+  return transaction(db, () => {
+    const leaseOwner = normalizeWikiCompileLeaseOwner(leaseOwnerInput);
+    const now = normalizeOptionalIso(nowInput) ?? new Date().toISOString();
+    const row = db.selectObject(
+      `SELECT r.* FROM wiki_compile_runs r
+       WHERE r.status = 'running'
+         AND r.cancel_requested = 0
+         AND r.completed_step_count = r.step_count
+         AND r.attempt_count < r.max_attempts
+         AND NOT EXISTS (
+           SELECT 1 FROM wiki_compile_steps s
+           WHERE s.run_id = r.id AND s.status <> 'completed'
+         )
+       ORDER BY r.created_at ASC
+       LIMIT 1`,
+    );
+    if (row === undefined) return {};
+    const run = wikiCompileRunFromRow(row);
+    const leaseExpiresAt = wikiCompileLeaseExpiry(now, leaseMsInput);
+    db.exec({
+      sql: `UPDATE wiki_compile_runs
+            SET status = 'reducing', attempt_count = attempt_count + 1,
+                lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'running' AND cancel_requested = 0`,
+      bind: [leaseOwner, leaseExpiresAt, now, now, run.id],
+    });
+    if (Number(db.selectValue("SELECT changes()") ?? 0) !== 1) return {};
+    insertWikiCompileRuntimeEvent(db, {
+      runId: run.id,
+      kind: "reduce_claimed",
+      message: "Wiki reduce claimed.",
+      detail: { leaseOwner, attemptCount: run.attemptCount + 1 },
+      createdAt: now,
+    });
+    return { run: loadWikiCompileRunOrThrow(db, run.id), leaseOwner };
+  });
+}
+
+function getWikiCompileReduceInput(
+  db: SqliteDb,
+  runIdInput: string,
+  leaseOwnerInput: string,
+): WikiCompileReduceInput {
+  const run = loadWikiCompileRunDetailOrThrow(db, normalizeText(runIdInput));
+  assertWikiCompileReduceLease(run, normalizeWikiCompileLeaseOwner(leaseOwnerInput));
+  assertWikiCompileSourceSnapshot(db, run.manifest);
+  const checkpoints = run.steps.map((step): WikiCompileCheckpoint => {
+    if (step.status !== "completed" || step.rollingDigest === undefined) {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_CHECKPOINT_INCOMPLETE",
+        "Wiki reduce requires every map checkpoint.",
+      );
+    }
+    assertExactWikiChunkIds(step.coveredChunkIds, step.mainChunkIds, "checkpoint coverage");
+    return {
+      stepId: step.id,
+      stepIndex: step.index,
+      findings: step.findings,
+      claims: step.claims,
+      rollingDigest: step.rollingDigest,
+      coveredChunkIds: step.coveredChunkIds,
+    };
+  });
+  assertExactWikiChunkIds(
+    checkpoints.flatMap((checkpoint) => checkpoint.coveredChunkIds),
+    run.manifest.chunks.map((chunk) => chunk.id),
+    "reduce checkpoint coverage",
+  );
+  return {
+    runId: run.id,
+    inputSignature: run.inputSignature,
+    source: wikiCompileSourceCard(run.manifest),
+    checkpoints,
+    manifestChunkIds: run.manifest.chunks.map((chunk) => chunk.id),
+    budget: run.budget,
+  };
+}
+
+function completeWikiCompileReduce(
+  db: SqliteDb,
+  payload: CompleteWikiCompileReducePayload,
+  publish: (publication: NormalizedWikiArtifactPublication) => PublishWikiArtifactsResult,
+): WikiCompileRunSummary {
+  return transaction(db, () => {
+    if (!isWikiCompileReduceResult(payload.result)) {
+      throw new EngineRpcError("WIKI_COMPILE_REDUCE_INVALID", "Wiki reduce result is invalid.");
+    }
+    const run = loadWikiCompileRunDetailOrThrow(db, payload.runId);
+    assertWikiCompileReduceLease(run, payload.leaseOwner);
+    if (payload.inputSignature !== run.inputSignature) {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_SIGNATURE_MISMATCH",
+        "Wiki reduce result does not match the persisted input signature.",
+      );
+    }
+    if (run.cancelRequested) {
+      return finishCancelledWikiCompileRun(
+        db,
+        run.id,
+        "Wiki compilation cancelled before publication.",
+        normalizeOptionalIso(payload.completedAt) ?? new Date().toISOString(),
+      );
+    }
+    const reduceInput = getWikiCompileReduceInput(db, run.id, payload.leaseOwner);
+    assertExactWikiChunkIds(
+      payload.result.coveredChunkIds,
+      reduceInput.manifestChunkIds,
+      "reduce coverage",
+    );
+    assertWikiCompileReduceEvidence(run.manifest, payload.result);
+    const publication = normalizeWikiArtifactPublication(
+      wikiCompilePublicationFromReduce(run, payload.result),
+    );
+    const published = publish(publication);
+    const completedAt = normalizeOptionalIso(payload.completedAt) ?? new Date().toISOString();
+    db.exec({
+      sql: `UPDATE wiki_compile_runs
+            SET status = 'completed', pause_reason = NULL, cancel_requested = 0,
+                lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+                version_group_id = ?, error_code = NULL, error_message = NULL,
+                completed_step_count = step_count, covered_chunk_count = total_chunk_count,
+                updated_at = ?, finished_at = ?
+            WHERE id = ? AND status = 'reducing' AND lease_owner = ?`,
+      bind: [published.versionGroupId, completedAt, completedAt, run.id, payload.leaseOwner],
+    });
+    if (Number(db.selectValue("SELECT changes()") ?? 0) !== 1) {
+      throw new EngineRpcError("WIKI_COMPILE_LEASE_LOST", "Wiki reduce lease was lost.");
+    }
+    insertWikiCompileRuntimeEvent(db, {
+      runId: run.id,
+      kind: "published",
+      message: "Wiki artifacts published.",
+      detail: {
+        versionGroupId: published.versionGroupId,
+        createdCount: published.createdCount,
+        reusedCount: published.reusedCount,
+      },
+      createdAt: completedAt,
+    });
+    insertWikiCompileRuntimeEvent(db, {
+      runId: run.id,
+      kind: "completed",
+      message: "Wiki compilation completed.",
+      createdAt: completedAt,
+    });
+    return loadWikiCompileRunOrThrow(db, run.id);
+  });
+}
+
+function wikiCompilePublicationFromReduce(
+  run: WikiCompileRunDetail,
+  result: WikiCompileReduceResult,
+): PublishWikiArtifactsPayload {
+  if (1 + result.sections.length + result.claims.length > WIKI_ARTIFACT_RPC_LIMITS.batchItems) {
+    throw new EngineRpcError(
+      "WIKI_COMPILE_ARTIFACT_LIMIT",
+      "Wiki reduce output exceeds the atomic artifact publication limit.",
+    );
+  }
+  const manifestById = new Map(run.manifest.chunks.map((chunk) => [chunk.id, chunk]));
+  const evidence = (chunkIds: string[]) => {
+    if (chunkIds.length > WIKI_ARTIFACT_RPC_LIMITS.evidenceItems) {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_EVIDENCE_LIMIT",
+        "Wiki artifact evidence exceeds the atomic publication limit.",
+      );
+    }
+    return uniqueWikiIds(chunkIds).map((chunkId) => {
+      const chunk = manifestById.get(chunkId);
+      if (chunk === undefined) {
+        throw new EngineRpcError(
+          "WIKI_COMPILE_EVIDENCE_MISMATCH",
+          `Wiki evidence Chunk is outside the manifest: ${chunkId}`,
+        );
+      }
+      return {
+        sourceId: run.sourceId,
+        chunkId,
+        ...(chunk.pageStart === undefined ? {} : { pageNo: chunk.pageStart }),
+      };
+    });
+  };
+  const coverage: WikiArtifactJsonObject = {
+    inputSignature: run.inputSignature,
+    coveredChunkCount: result.coveredChunkIds.length,
+    totalChunkCount: run.totalChunkCount,
+  };
+  const digestRef: WikiArtifactBatchRef = {
+    artifactKind: "source_digest",
+    artifactKey: "source",
+  };
+  const artifacts: WikiArtifactDraft[] = [
+    {
+      ...digestRef,
+      title: result.digest.title,
+      content: result.digest.content,
+      payload: { kind: "source_digest" },
+      coverage,
+      evidence: evidence(result.digest.evidenceChunkIds),
+    },
+  ];
+  const links: WikiArtifactLinkInput[] = [];
+  const refs = new Set<string>([wikiArtifactBatchRefKey(digestRef)]);
+  for (const section of result.sections) {
+    const ref: WikiArtifactBatchRef = {
+      artifactKind: "section",
+      artifactKey: `section:${section.key}`,
+    };
+    assertUniqueWikiArtifactRef(refs, ref);
+    artifacts.push({
+      ...ref,
+      title: section.title,
+      content: section.content,
+      payload: { kind: "section", key: section.key },
+      coverage,
+      evidence: evidence(section.evidenceChunkIds),
+    });
+    links.push({
+      from: digestRef,
+      to: ref,
+      kind: "contains",
+      createdBy: "compiler",
+      creatorVersion: run.manifest.compilerVersion,
+    });
+  }
+  for (const claim of result.claims) {
+    if (claim.evidenceChunkIds.length === 0) {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_CLAIM_EVIDENCE_REQUIRED",
+        "Wiki claims require Chunk evidence.",
+      );
+    }
+    const ref: WikiArtifactBatchRef = {
+      artifactKind: "claim",
+      artifactKey: `claim:${claim.key}`,
+    };
+    assertUniqueWikiArtifactRef(refs, ref);
+    artifacts.push({
+      ...ref,
+      title: claim.text.slice(0, Math.min(120, claim.text.length)),
+      content: claim.text,
+      payload: { kind: "claim", key: claim.key, confidence: claim.confidence },
+      coverage,
+      evidence: evidence(claim.evidenceChunkIds),
+    });
+    links.push({
+      from: digestRef,
+      to: ref,
+      kind: "contains",
+      createdBy: "compiler",
+      creatorVersion: run.manifest.compilerVersion,
+    });
+  }
+  return {
+    scope: { kind: "source", id: run.sourceId },
+    inputSignature: run.inputSignature,
+    compilerVersion: run.manifest.compilerVersion,
+    promptVersion: run.manifest.promptVersion,
+    modelId: run.modelId,
+    freshness: "fresh",
+    artifacts,
+    links,
+  };
+}
+
+function wikiCompileRunFromRow(row: SqlRow): WikiCompileRunSummary {
+  const pauseReason = wikiCompilePauseReasonFromRow(row);
+  const versionGroupId = optionalString(row, "version_group_id");
+  const errorCode = optionalString(row, "error_code");
+  const errorMessage = optionalString(row, "error_message");
+  const startedAt = optionalString(row, "started_at");
+  const finishedAt = optionalString(row, "finished_at");
+  return {
+    id: stringField(row, "id"),
+    sourceId: stringField(row, "source_id"),
+    inputSignature: stringField(row, "input_signature"),
+    status: wikiCompileRunStatusFromRow(row),
+    ...(pauseReason === undefined ? {} : { pauseReason }),
+    provider: stringField(row, "provider"),
+    modelId: stringField(row, "model_id"),
+    stepCount: Math.max(0, numberField(row, "step_count")),
+    completedStepCount: Math.max(0, numberField(row, "completed_step_count")),
+    coveredChunkCount: Math.max(0, numberField(row, "covered_chunk_count")),
+    totalChunkCount: Math.max(0, numberField(row, "total_chunk_count")),
+    attemptCount: Math.max(0, numberField(row, "attempt_count")),
+    maxAttempts: Math.max(1, numberField(row, "max_attempts")),
+    cancelRequested: numberField(row, "cancel_requested") !== 0,
+    ...(optionalString(row, "lease_owner") === undefined
+      ? {}
+      : { leaseOwner: optionalString(row, "lease_owner") }),
+    ...(versionGroupId === undefined ? {} : { versionGroupId }),
+    ...(errorCode === undefined ? {} : { errorCode }),
+    ...(errorMessage === undefined ? {} : { errorMessage }),
+    createdAt: stringField(row, "created_at"),
+    updatedAt: stringField(row, "updated_at"),
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(finishedAt === undefined ? {} : { finishedAt }),
+  };
+}
+
+function wikiCompileStepFromRow(row: SqlRow): WikiCompileStepRecord {
+  const candidate = {
+    findings: wikiCompileJsonArray(row, "findings_json"),
+    claims: wikiCompileJsonArray(row, "claims_json"),
+    rollingDigest: optionalString(row, "rolling_digest") ?? "",
+    coveredChunkIds: parseStringArray(stringField(row, "covered_chunk_ids_json")),
+  };
+  if (!isWikiCompileMapResult(candidate)) {
+    throw new EngineRpcError(
+      "WIKI_COMPILE_CHECKPOINT_CORRUPT",
+      `Wiki compile checkpoint is corrupt: ${stringField(row, "id")}`,
+    );
+  }
+  const mapResult = candidate;
+  const inputTokenEstimate = optionalWikiNonNegativeInteger(row, "input_token_estimate");
+  const outputTokenEstimate = optionalWikiNonNegativeInteger(row, "output_token_estimate");
+  const latencyMs = optionalWikiNonNegativeInteger(row, "latency_ms");
+  const errorCode = optionalString(row, "error_code");
+  const errorMessage = optionalString(row, "error_message");
+  const completedAt = optionalString(row, "completed_at");
+  return {
+    id: stringField(row, "id"),
+    runId: stringField(row, "run_id"),
+    index: Math.max(0, numberField(row, "step_index")),
+    signature: stringField(row, "step_signature"),
+    status: wikiCompileStepStatusFromRow(row),
+    mainChunkIds: parseStringArray(stringField(row, "main_chunk_ids_json")),
+    overlapChunkIds: parseStringArray(stringField(row, "overlap_chunk_ids_json")),
+    tokenEstimate: Math.max(0, numberField(row, "token_estimate")),
+    attemptCount: Math.max(0, numberField(row, "attempt_count")),
+    maxAttempts: Math.max(1, numberField(row, "max_attempts")),
+    ...(mapResult.rollingDigest.length === 0 ? {} : { rollingDigest: mapResult.rollingDigest }),
+    findings: mapResult.findings,
+    claims: mapResult.claims,
+    coveredChunkIds: mapResult.coveredChunkIds,
+    ...(inputTokenEstimate === undefined ? {} : { inputTokenEstimate }),
+    ...(outputTokenEstimate === undefined ? {} : { outputTokenEstimate }),
+    ...(latencyMs === undefined ? {} : { latencyMs }),
+    ...(errorCode === undefined ? {} : { errorCode }),
+    ...(errorMessage === undefined ? {} : { errorMessage }),
+    createdAt: stringField(row, "created_at"),
+    updatedAt: stringField(row, "updated_at"),
+    ...(completedAt === undefined ? {} : { completedAt }),
+  };
+}
+
+function wikiCompileRuntimeEventFromRow(row: SqlRow): WikiCompileEvent {
+  const stepId = optionalString(row, "step_id");
+  return {
+    id: stringField(row, "id"),
+    runId: stringField(row, "run_id"),
+    ...(stepId === undefined ? {} : { stepId }),
+    kind: wikiCompileRuntimeEventKindFromRow(row),
+    level: wikiCompileRuntimeEventLevelFromRow(row),
+    message: stringField(row, "message"),
+    detail: parseMetadata(stringField(row, "detail_json")),
+    createdAt: stringField(row, "created_at"),
+  };
+}
+
+function insertWikiCompileRuntimeEvent(
+  db: SqliteDb,
+  input: {
+    runId: string;
+    stepId?: string;
+    kind: RuntimeWikiCompileEventKind;
+    level?: RuntimeWikiCompileEventLevel;
+    message: string;
+    detail?: Record<string, unknown>;
+    createdAt?: string;
+  },
+): WikiCompileEvent {
+  const id = createId("wiki_evt");
+  const createdAt = input.createdAt ?? new Date().toISOString();
+  db.exec({
+    sql: `INSERT INTO wiki_compile_events (
+      id, run_id, step_id, kind, level, message, detail_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    bind: [
+      id,
+      input.runId,
+      input.stepId ?? null,
+      input.kind,
+      input.level ?? "info",
+      boundedNormalizedText(input.message, WIKI_COMPILE_LIMITS.eventMessageChars),
+      JSON.stringify(boundAuditPayload(input.detail ?? {})),
+      createdAt,
+    ],
+  });
+  const row = db.selectObject("SELECT * FROM wiki_compile_events WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) {
+    throw new EngineRpcError("WIKI_COMPILE_EVENT_FAILED", "Wiki compile event was not saved.");
+  }
+  return wikiCompileRuntimeEventFromRow(row);
+}
+
+function refreshWikiCompileRunProgress(
+  db: SqliteDb,
+  runId: string,
+  now: string,
+): WikiCompileRunSummary {
+  const completedRows = db.selectObjects(
+    `SELECT main_chunk_ids_json FROM wiki_compile_steps
+     WHERE run_id = ? AND status = 'completed'`,
+    [runId],
+  );
+  const covered = completedRows.reduce(
+    (sum, row) => sum + parseStringArray(stringField(row, "main_chunk_ids_json")).length,
+    0,
+  );
+  db.exec({
+    sql: `UPDATE wiki_compile_runs
+          SET completed_step_count = ?, covered_chunk_count = ?, updated_at = ?
+          WHERE id = ?`,
+    bind: [completedRows.length, covered, now, runId],
+  });
+  return loadWikiCompileRunOrThrow(db, runId);
+}
+
+function finishCancelledWikiCompileRun(
+  db: SqliteDb,
+  runId: string,
+  message: string,
+  now: string,
+): WikiCompileRunSummary {
+  const current = loadWikiCompileRunOrThrow(db, runId);
+  if (current.status === "cancelled") return current;
+  db.exec({
+    sql: `UPDATE wiki_compile_steps
+          SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+          WHERE run_id = ? AND status IN ('queued', 'running', 'failed')`,
+    bind: [now, runId],
+  });
+  db.exec({
+    sql: `UPDATE wiki_compile_runs
+          SET status = 'cancelled', cancel_requested = 1, pause_reason = NULL,
+              lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+              error_code = NULL, error_message = NULL, updated_at = ?, finished_at = ?
+          WHERE id = ?`,
+    bind: [now, now, runId],
+  });
+  insertWikiCompileRuntimeEvent(db, {
+    runId,
+    kind: "cancelled",
+    level: "warning",
+    message,
+    createdAt: now,
+  });
+  return refreshWikiCompileRunProgress(db, runId, now);
+}
+
+function failWikiCompileRun(
+  db: SqliteDb,
+  runId: string,
+  errorCode: string,
+  errorMessage: string,
+  now: string,
+): WikiCompileRunSummary {
+  db.exec({
+    sql: `UPDATE wiki_compile_runs
+          SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL,
+              heartbeat_at = NULL, error_code = ?, error_message = ?,
+              updated_at = ?, finished_at = ?
+          WHERE id = ?`,
+    bind: [
+      boundedNormalizedText(errorCode, 120),
+      boundedNormalizedText(errorMessage, WIKI_COMPILE_LIMITS.errorChars),
+      now,
+      now,
+      runId,
+    ],
+  });
+  insertWikiCompileRuntimeEvent(db, {
+    runId,
+    kind: "failed",
+    level: "error",
+    message: "Wiki compilation failed.",
+    detail: { errorCode: boundedNormalizedText(errorCode, 120) },
+    createdAt: now,
+  });
+  return refreshWikiCompileRunProgress(db, runId, now);
+}
+
+function resumeWikiCompileRunInTransaction(db: SqliteDb, runId: string, now: string) {
+  const incomplete = Number(
+    db.selectValue(
+      "SELECT COUNT(*) FROM wiki_compile_steps WHERE run_id = ? AND status <> 'completed'",
+      [runId],
+    ) ?? 0,
+  );
+  db.exec({
+    sql: `UPDATE wiki_compile_runs
+          SET status = ?, pause_reason = NULL, cancel_requested = 0,
+              lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+              error_code = NULL, error_message = NULL, updated_at = ?
+          WHERE id = ? AND status = 'paused'`,
+    bind: [incomplete === 0 ? "running" : "queued", now, runId],
+  });
+  insertWikiCompileRuntimeEvent(db, {
+    runId,
+    kind: "resumed",
+    message: "Wiki compilation resumed after Wiki was enabled.",
+    createdAt: now,
+  });
+}
+
+function cancelWikiCompileRunsForDeletedSource(db: SqliteDb, sourceId: string, now: string) {
+  const rows = db.selectObjects(
+    `SELECT id FROM wiki_compile_runs
+     WHERE source_id = ? AND status IN ('queued', 'running', 'reducing', 'paused')`,
+    [sourceId],
+  );
+  for (const row of rows) {
+    finishCancelledWikiCompileRun(
+      db,
+      stringField(row, "id"),
+      "Wiki compilation cancelled because its Source was deleted.",
+      now,
+    );
+  }
+}
+
+function assertWikiCompileStepLease(
+  run: WikiCompileRunSummary,
+  step: WikiCompileStepRecord,
+  leaseOwnerInput: string,
+) {
+  const leaseOwner = normalizeWikiCompileLeaseOwner(leaseOwnerInput);
+  if (
+    run.id !== step.runId ||
+    run.status !== "running" ||
+    step.status !== "running" ||
+    run.leaseOwner !== leaseOwner
+  ) {
+    throw new EngineRpcError("WIKI_COMPILE_LEASE_LOST", "Wiki map step lease was lost.");
+  }
+}
+
+function assertWikiCompileReduceLease(run: WikiCompileRunSummary, leaseOwnerInput: string) {
+  const leaseOwner = normalizeWikiCompileLeaseOwner(leaseOwnerInput);
+  if (run.status !== "reducing" || run.leaseOwner !== leaseOwner) {
+    throw new EngineRpcError("WIKI_COMPILE_LEASE_LOST", "Wiki reduce lease was lost.");
+  }
+}
+
+function assertWikiCompileSourceSnapshot(db: SqliteDb, manifest: WikiCompileInputManifest) {
+  const source = db.selectObject(
+    `SELECT id, content_hash FROM sources
+     WHERE id = ? AND lifecycle_status = 'fresh' AND is_current = 1 LIMIT 1`,
+    [manifest.source.id],
+  );
+  if (source === undefined || stringField(source, "content_hash") !== manifest.source.contentHash) {
+    throw new EngineRpcError(
+      "WIKI_COMPILE_SOURCE_STALE",
+      "Wiki compile Source no longer matches its input manifest.",
+    );
+  }
+  const rows = db.selectObjects(
+    `SELECT id, ord, text, token_count, hash, section_path, page_start, page_end
+     FROM source_chunks
+     WHERE source_id = ? AND role = 'child'
+     ORDER BY ord ASC, id ASC`,
+    [manifest.source.id],
+  );
+  if (rows.length !== manifest.chunks.length) {
+    throw new EngineRpcError(
+      "WIKI_COMPILE_SOURCE_STALE",
+      "Wiki compile Chunk set no longer matches its input manifest.",
+    );
+  }
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const chunk = manifest.chunks[index];
+    if (
+      row === undefined ||
+      chunk === undefined ||
+      stringField(row, "id") !== chunk.id ||
+      numberField(row, "ord") !== chunk.ord ||
+      stringField(row, "hash") !== chunk.hash ||
+      numberField(row, "token_count") !== chunk.tokenCount
+    ) {
+      throw new EngineRpcError(
+        "WIKI_COMPILE_SOURCE_STALE",
+        "Wiki compile Chunk facts no longer match its input manifest.",
+      );
+    }
+  }
+  return rows;
+}
+
+function assertWikiCompileMapEvidence(
+  manifest: WikiCompileInputManifest,
+  result: WikiCompileMapResult,
+) {
+  const allowed = new Set(manifest.chunks.map((chunk) => chunk.id));
+  const refs = [
+    ...result.findings.flatMap((finding) => finding.evidenceChunkIds),
+    ...result.claims.flatMap((claim) => claim.evidenceChunkIds),
+  ];
+  if (refs.some((id) => !allowed.has(id))) {
+    throw new EngineRpcError(
+      "WIKI_COMPILE_EVIDENCE_MISMATCH",
+      "Wiki map result references Chunk evidence outside the manifest.",
+    );
+  }
+}
+
+function assertWikiCompileReduceEvidence(
+  manifest: WikiCompileInputManifest,
+  result: WikiCompileReduceResult,
+) {
+  const allowed = new Set(manifest.chunks.map((chunk) => chunk.id));
+  const refs = [
+    ...result.digest.evidenceChunkIds,
+    ...result.sections.flatMap((section) => section.evidenceChunkIds),
+    ...result.claims.flatMap((claim) => claim.evidenceChunkIds),
+  ];
+  if (refs.some((id) => !allowed.has(id))) {
+    throw new EngineRpcError(
+      "WIKI_COMPILE_EVIDENCE_MISMATCH",
+      "Wiki reduce result references Chunk evidence outside the manifest.",
+    );
+  }
+}
+
+function assertExactWikiChunkIds(actual: string[], expected: string[], label: string) {
+  if (
+    actual.length !== expected.length ||
+    new Set(actual).size !== actual.length ||
+    actual.some((id, index) => id !== expected[index])
+  ) {
+    throw new EngineRpcError(
+      "WIKI_COMPILE_COVERAGE_MISMATCH",
+      `Wiki ${label} must preserve exact ordered Chunk coverage.`,
+    );
+  }
+}
+
+function wikiCompileSourceCard(manifest: WikiCompileInputManifest) {
+  return {
+    id: manifest.source.id,
+    title: manifest.source.title,
+    ...(manifest.source.sourceType === undefined ? {} : { sourceType: manifest.source.sourceType }),
+    contentHash: manifest.source.contentHash,
+  };
+}
+
+function wikiCompileChunkFromRow(rows: Map<string, SqlRow>, id: string): WikiCompileChunkText {
+  const row = rows.get(id);
+  if (row === undefined) {
+    throw new EngineRpcError("WIKI_COMPILE_CHUNK_NOT_FOUND", `Wiki compile Chunk not found: ${id}`);
+  }
+  const sectionPath = optionalString(row, "section_path");
+  const pageStart = optionalWikiPositiveInteger(row, "page_start");
+  const pageEnd = optionalWikiPositiveInteger(row, "page_end");
+  return {
+    id,
+    ord: numberField(row, "ord"),
+    text: stringField(row, "text"),
+    tokenCount: numberField(row, "token_count"),
+    ...(sectionPath === undefined ? {} : { sectionPath }),
+    ...(pageStart === undefined ? {} : { pageStart }),
+    ...(pageEnd === undefined ? {} : { pageEnd }),
+  };
+}
+
+function parseWikiCompileManifest(value: string): WikiCompileInputManifest {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    parsed = undefined;
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.source) || !isRecord(parsed.scope)) {
+    throw new EngineRpcError("WIKI_COMPILE_MANIFEST_CORRUPT", "Wiki input manifest is corrupt.");
+  }
+  const manifest = parsed as unknown as WikiCompileInputManifest;
+  if (
+    manifest.version !== "wiki-input-manifest-v1" ||
+    manifest.scope.kind !== "source" ||
+    typeof manifest.scope.id !== "string" ||
+    typeof manifest.source.id !== "string" ||
+    manifest.scope.id !== manifest.source.id ||
+    typeof manifest.source.contentHash !== "string" ||
+    typeof manifest.source.title !== "string" ||
+    !Array.isArray(manifest.chunks) ||
+    manifest.chunks.length === 0 ||
+    manifest.chunks.length > WIKI_COMPILE_LIMITS.maxChunks ||
+    !isWikiCompileBudget(manifest.budget)
+  ) {
+    throw new EngineRpcError("WIKI_COMPILE_MANIFEST_CORRUPT", "Wiki input manifest is corrupt.");
+  }
+  return manifest;
+}
+
+function parseWikiCompileBudget(value: string): WikiCompileBudget {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    parsed = undefined;
+  }
+  if (!isWikiCompileBudget(parsed)) {
+    throw new EngineRpcError("WIKI_COMPILE_BUDGET_CORRUPT", "Wiki compile budget is corrupt.");
+  }
+  return parsed;
+}
+
+function wikiCompileJsonArray(row: SqlRow, key: string): unknown[] {
+  try {
+    const parsed = JSON.parse(stringField(row, key));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function wikiCompileRunStatusFromRow(row: SqlRow): WikiCompileRunStatus {
+  const value = stringField(row, "status");
+  if (
+    value === "queued" ||
+    value === "running" ||
+    value === "reducing" ||
+    value === "paused" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "cancelled"
+  ) {
+    return value;
+  }
+  throw new EngineRpcError("WIKI_COMPILE_STATUS_CORRUPT", `Invalid Wiki run status: ${value}`);
+}
+
+function wikiCompileStepStatusFromRow(row: SqlRow): WikiCompileStepRecord["status"] {
+  const value = stringField(row, "status");
+  if (
+    value === "queued" ||
+    value === "running" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "cancelled"
+  ) {
+    return value;
+  }
+  throw new EngineRpcError("WIKI_COMPILE_STATUS_CORRUPT", `Invalid Wiki step status: ${value}`);
+}
+
+function wikiCompilePauseReasonFromRow(row: SqlRow): WikiCompilePauseReason | undefined {
+  const value = optionalString(row, "pause_reason");
+  if (value === undefined || value === "wiki_disabled" || value === "manual") return value;
+  throw new EngineRpcError("WIKI_COMPILE_STATUS_CORRUPT", `Invalid Wiki pause reason: ${value}`);
+}
+
+function wikiCompileRuntimeEventKindFromRow(row: SqlRow): RuntimeWikiCompileEventKind {
+  const value = stringField(row, "kind");
+  const kinds: RuntimeWikiCompileEventKind[] = [
+    "queued",
+    "reused",
+    "recovered",
+    "resumed",
+    "step_claimed",
+    "step_completed",
+    "step_failed",
+    "reduce_claimed",
+    "published",
+    "completed",
+    "pause_requested",
+    "paused",
+    "cancel_requested",
+    "cancelled",
+    "retry_started",
+    "failed",
+  ];
+  if (kinds.includes(value as RuntimeWikiCompileEventKind)) {
+    return value as RuntimeWikiCompileEventKind;
+  }
+  throw new EngineRpcError("WIKI_COMPILE_EVENT_CORRUPT", `Invalid Wiki event kind: ${value}`);
+}
+
+function wikiCompileRuntimeEventLevelFromRow(row: SqlRow): RuntimeWikiCompileEventLevel {
+  const value = stringField(row, "level");
+  if (value === "info" || value === "warning" || value === "error") return value;
+  throw new EngineRpcError("WIKI_COMPILE_EVENT_CORRUPT", `Invalid Wiki event level: ${value}`);
+}
+
+function isTerminalWikiCompileRunStatus(status: WikiCompileRunStatus) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function normalizeWikiCompileLeaseOwner(value: string) {
+  const normalized = boundedNormalizedText(value, WIKI_COMPILE_LIMITS.idChars);
+  if (normalized.length === 0) {
+    throw new EngineRpcError("INVALID_WIKI_COMPILE_LEASE", "Wiki compile lease owner is required.");
+  }
+  return normalized;
+}
+
+function wikiCompileLeaseExpiry(now: string, leaseMsInput?: number) {
+  const epoch = Date.parse(now);
+  if (!Number.isFinite(epoch)) {
+    throw new EngineRpcError("INVALID_WIKI_COMPILE_TIME", "Wiki compile time is invalid.");
+  }
+  const leaseMs =
+    leaseMsInput === undefined || !Number.isFinite(leaseMsInput)
+      ? wikiCompileDefaultLeaseMs
+      : Math.max(5_000, Math.min(600_000, Math.floor(leaseMsInput)));
+  return new Date(epoch + leaseMs).toISOString();
+}
+
+function wikiParserVersionFromMetadata(metadata: Record<string, unknown>) {
+  const profile = metadata.parseProfile;
+  return isRecord(profile) && typeof profile.parserVersion === "string"
+    ? boundedNormalizedText(profile.parserVersion, 120)
+    : undefined;
+}
+
+function wikiChunkStrategyVersionFromMetadata(metadata: Record<string, unknown>) {
+  const strategy = metadata.chunk_strategy;
+  return isRecord(strategy) && typeof strategy.version === "string"
+    ? boundedNormalizedText(strategy.version, 120)
+    : undefined;
+}
+
+function optionalWikiPositiveInteger(row: SqlRow, key: string): number | undefined {
+  const value = row[key];
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function optionalWikiNonNegativeInteger(row: SqlRow, key: string): number | undefined {
+  const value = row[key];
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function wikiOptionalMetric(value: number | undefined) {
+  return value === undefined ? null : Math.max(0, Math.floor(value));
+}
+
+function uniqueWikiIds(values: string[]) {
+  return [...new Set(values)];
+}
+
+function assertUniqueWikiArtifactRef(refs: Set<string>, ref: WikiArtifactBatchRef) {
+  const key = wikiArtifactBatchRefKey(ref);
+  if (refs.has(key)) {
+    throw new EngineRpcError(
+      "WIKI_COMPILE_DUPLICATE_ARTIFACT_KEY",
+      `Wiki reduce output contains a duplicate artifact key: ${ref.artifactKey}`,
+    );
+  }
+  refs.add(key);
+}
+
 function memorySummaryFromRow(row: SqlRow): MemorySummary {
   const sourceKind = sourceKindField(row, "source_kind");
   const normalizedSourceUrl =
@@ -17612,6 +19595,9 @@ function jobSummaryFromRow(row: SqlRow): JobSummary {
     progressCurrent: Math.max(0, numberField(row, "progress_current")),
     progressTotal: Math.max(1, numberField(row, "progress_total")),
     cancelRequested: numberField(row, "cancel_requested") !== 0,
+    ...(optionalString(row, "lease_owner") === undefined
+      ? {}
+      : { leaseOwner: optionalString(row, "lease_owner") }),
     createdAt: stringField(row, "created_at"),
     ...(lastError === undefined ? {} : { lastError }),
     ...(startedAt === undefined ? {} : { startedAt }),
