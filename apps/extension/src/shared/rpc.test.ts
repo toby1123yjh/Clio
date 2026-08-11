@@ -300,6 +300,255 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
+  it("accepts typed Wiki Artifact Core requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "publishWikiArtifacts",
+          payload: {
+            scope: { kind: "source", id: "source-1" },
+            inputSignature: "sha256:source-1:v1",
+            compilerVersion: "wiki-compiler-v1",
+            promptVersion: "source-digest-v1",
+            modelId: "provider:model",
+            freshness: "fresh",
+            artifacts: [
+              {
+                artifactKind: "source_digest",
+                artifactKey: "root",
+                title: "Source digest",
+                content: "A bounded machine-authored digest.",
+                payload: { outline: ["Overview", "Findings"] },
+                coverage: { sourceIds: ["source-1"], ratio: 1 },
+              },
+              {
+                artifactKind: "claim",
+                artifactKey: "claim:1",
+                title: "Primary claim",
+                content: "The source supports the primary claim.",
+                evidence: [
+                  {
+                    sourceId: "source-1",
+                    chunkId: "chunk-1",
+                    pageNo: 2,
+                    bbox: { x: 0.1, y: 0.2, width: 0.4, height: 0.1 },
+                    parserArtifactKind: "pdf_text_block",
+                    parserArtifactId: "block-1",
+                    anchor: { quote: "primary claim" },
+                  },
+                ],
+              },
+            ],
+            links: [
+              {
+                from: { artifactKind: "source_digest", artifactKey: "root" },
+                to: { artifactKind: "claim", artifactKey: "claim:1" },
+                kind: "contains",
+                createdBy: "compiler",
+                creatorVersion: "wiki-compiler-v1",
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listWikiArtifacts",
+          filter: {
+            scope: { kind: "source", id: "source-1" },
+            artifactKind: "claim",
+            freshness: "stale",
+            inputSignature: "sha256:source-1:v1",
+            includeHistory: true,
+            limit: 50,
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "getWikiArtifact", id: "wiki-artifact-1" },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendWikiUserEdit",
+          payload: {
+            baseArtifactId: "wiki-artifact-1",
+            previousEditId: "wiki-edit-1",
+            candidateArtifactId: "wiki-artifact-2",
+            editKind: "patch",
+            payload: { operations: [{ op: "replace", path: "/title", value: "Edited" }] },
+            mergeOutcome: "manual_merge",
+          },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listWikiUserEdits", artifactId: "wiki-artifact-1", limit: 20 },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "deleteWikiArtifact", id: "wiki-artifact-1" },
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects invalid or unbounded Wiki Artifact Core requests", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "publishWikiArtifacts",
+          payload: {
+            scope: { kind: "source", id: "source-1" },
+            inputSignature: "sig-1",
+            compilerVersion: "compiler-v1",
+            promptVersion: "prompt-v1",
+            freshness: "stale",
+            artifacts: [
+              {
+                artifactKind: "source_digest",
+                artifactKey: "root",
+                title: "Digest",
+                content: "Content",
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "publishWikiArtifacts",
+          payload: {
+            scope: { kind: "source", id: "source-1" },
+            inputSignature: "sig-1",
+            compilerVersion: "compiler-v1",
+            promptVersion: "prompt-v1",
+            artifacts: [
+              {
+                artifactKind: "claim",
+                artifactKey: "claim:1",
+                title: "Unsupported claim",
+                content: "No evidence.",
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "publishWikiArtifacts",
+          payload: {
+            scope: { kind: "source", id: "source-1" },
+            inputSignature: "sig-1",
+            compilerVersion: "compiler-v1",
+            promptVersion: "prompt-v1",
+            artifacts: [
+              {
+                artifactKind: "claim",
+                artifactKey: "claim:1",
+                title: "Claim",
+                content: "Content",
+                evidence: [
+                  {
+                    sourceId: "source-1",
+                    chunkId: "chunk-1",
+                    parserArtifactKind: "pdf_text_block",
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "publishWikiArtifacts",
+          payload: {
+            scope: { kind: "library", id: "default" },
+            inputSignature: "sig-1",
+            compilerVersion: "compiler-v1",
+            promptVersion: "prompt-v1",
+            artifacts: [
+              {
+                artifactKind: "index",
+                artifactKey: "root",
+                title: "Index",
+                content: "Content",
+              },
+            ],
+            links: [
+              {
+                from: { artifactKind: "index", artifactKey: "root" },
+                to: { artifactKind: "topic", artifactKey: "missing" },
+                kind: "contains",
+                createdBy: "compiler",
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listWikiArtifacts", filter: { limit: 501 } },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "appendWikiUserEdit",
+          payload: {
+            baseArtifactId: "wiki-artifact-1",
+            editKind: "patch",
+            payload: { operation: undefined },
+            mergeOutcome: "manual_merge",
+          },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listWikiUserEdits", artifactId: "", limit: 20 },
+      }),
+    ).toBe(false);
+  });
+
   it("accepts typed wiki compile job and graph requests", () => {
     expect(
       isEngineRequestMessage({

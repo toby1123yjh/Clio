@@ -27,6 +27,7 @@ import {
   type AppendSessionEvidencePayload,
   type AppendSourceContextCompressionLogsPayload,
   type AppendSourceContextMapArtifactsPayload,
+  type AppendWikiUserEditPayload,
   type BuildSourceContextPackPayload,
   type BuildSourceGraphPayload,
   type BuildSourceGraphResult,
@@ -59,6 +60,7 @@ import {
   type CreateWikiCompileJobPayload,
   type DeleteMemoryResult,
   type DeleteTopicPageResult,
+  type DeleteWikiArtifactResult,
   type EmbeddingReindexModelDescriptor,
   type EngineHealth,
   type EngineRequest,
@@ -95,6 +97,8 @@ import {
   type ListMemoriesResult,
   type ListSourceContextMapEventsResult,
   type ListSourceContextMapRunsResult,
+  type ListWikiArtifactsResult,
+  type ListWikiUserEditsResult,
   type MarkSourceContextMapReduceCompletedPayload,
   type MarkSourceContextMapReduceFailedPayload,
   type MarkSourceContextMapReduceStartedPayload,
@@ -109,6 +113,8 @@ import {
   type OrchestrationRunStatus,
   type OrchestrationRunSummary,
   type PdfRawFileResult,
+  type PublishWikiArtifactsPayload,
+  type PublishWikiArtifactsResult,
   type ReindexResult,
   type RepairAction,
   type RepairResult,
@@ -165,17 +171,35 @@ import {
   type UpdateChatMessagePayload,
   type UpdateTopicPagePayload,
   type UpsertChatMessagePayload,
+  WIKI_ARTIFACT_RPC_LIMITS,
   type WebSearchHistoryRecord,
+  type WikiArtifactBatchRef,
+  type WikiArtifactDetail,
+  type WikiArtifactEvidence,
+  type WikiArtifactFilter,
+  type WikiArtifactFreshness,
+  type WikiArtifactJsonObject,
+  type WikiArtifactKind,
+  type WikiArtifactLink,
+  type WikiArtifactLinkCreatedBy,
+  type WikiArtifactLinkKind,
+  type WikiArtifactMachineVersion,
+  type WikiArtifactScope,
+  type WikiArtifactScopeKind,
   type WikiCompileEventKind,
   type WikiCompileEventLevel,
   type WikiCompileJobEvent,
   type WikiCompileJobStatus,
   type WikiCompileJobSummary,
   type WikiCompileResultPayload,
+  type WikiUserEdit,
+  type WikiUserEditKind,
+  type WikiUserEditMergeOutcome,
   type WorkingSetLoadDepth,
   type WorkingSetStatusResult,
   createRequestId,
   engineErrorFromUnknown,
+  isBoundedWikiArtifactJsonObject,
   isWorkerChunkMetaSummaryResponseMessage,
   isWorkerEmbeddingResponseMessage,
   isWorkerGraphExtractionResponseMessage,
@@ -403,7 +427,7 @@ export interface LocalEngineOptions {
 
 const databasePath = "/clio-browser-phase1.sqlite3";
 const pdfRawFileDirectoryName = "clio-pdf-raw-files";
-const schemaVersion = 22;
+const schemaVersion = 23;
 const sourceNativeSchemaVersion = 12;
 const staleJobMs = 60_000;
 const defaultJobMaxAttempts = 3;
@@ -600,6 +624,63 @@ interface SourceGraphBuild {
     }
   >;
   evidenceChunkIds: string[];
+}
+
+interface NormalizedWikiArtifactDraft {
+  artifactKind: WikiArtifactKind;
+  artifactKey: string;
+  title: string;
+  content: string;
+  payload: WikiArtifactJsonObject;
+  coverage: WikiArtifactJsonObject;
+  evidence: Array<{
+    sourceId: string;
+    chunkId: string;
+    pageNo?: number;
+    bbox?: WikiArtifactJsonObject;
+    parserArtifactKind?: string;
+    parserArtifactId?: string;
+    anchor?: WikiArtifactJsonObject;
+  }>;
+}
+
+interface NormalizedWikiArtifactLink {
+  from: WikiArtifactBatchRef;
+  to: { artifactId: string } | WikiArtifactBatchRef;
+  kind: WikiArtifactLinkKind;
+  createdBy: WikiArtifactLinkCreatedBy;
+  creatorVersion?: string;
+}
+
+interface NormalizedWikiArtifactPublication {
+  scope: WikiArtifactScope;
+  inputSignature: string;
+  compilerVersion: string;
+  promptVersion: string;
+  modelId?: string;
+  freshness: Exclude<WikiArtifactFreshness, "stale">;
+  artifacts: NormalizedWikiArtifactDraft[];
+  links: NormalizedWikiArtifactLink[];
+}
+
+interface NormalizedWikiArtifactFilter {
+  scope?: WikiArtifactScope;
+  artifactKind?: WikiArtifactKind;
+  freshness?: WikiArtifactFreshness;
+  inputSignature?: string;
+  includeHistory: boolean;
+  limit: number;
+}
+
+interface NormalizedWikiUserEdit {
+  id: string;
+  baseArtifactId: string;
+  previousEditId?: string;
+  candidateArtifactId?: string;
+  editKind: WikiUserEditKind;
+  payload: WikiArtifactJsonObject;
+  mergeOutcome: WikiUserEditMergeOutcome;
+  createdAt: string;
 }
 
 interface SourceContextPackOptions {
@@ -942,6 +1023,18 @@ export class LocalEngine {
         return await this.updateTopicPage(request.id, request.payload);
       case "deleteTopicPage":
         return await this.deleteTopicPage(request.id);
+      case "publishWikiArtifacts":
+        return await this.publishWikiArtifacts(request.payload);
+      case "listWikiArtifacts":
+        return await this.listWikiArtifacts(request.filter);
+      case "getWikiArtifact":
+        return await this.getWikiArtifact(request.id);
+      case "appendWikiUserEdit":
+        return await this.appendWikiUserEdit(request.payload);
+      case "listWikiUserEdits":
+        return await this.listWikiUserEdits(request.artifactId, request.limit);
+      case "deleteWikiArtifact":
+        return await this.deleteWikiArtifact(request.id);
       case "enqueueWikiCompile":
         return await this.enqueueWikiCompile(request.payload);
       case "listWikiCompileJobs":
@@ -2613,6 +2706,7 @@ export class LocalEngine {
       );
       if (source === undefined) return;
       const deletedAt = new Date().toISOString();
+      staleWikiArtifactsForDeletedSource(db, id);
       db.exec({
         sql: `UPDATE sources
               SET superseded_by_source_id = NULL
@@ -2736,6 +2830,393 @@ export class LocalEngine {
       deleted: db.selectValue("SELECT changes()") !== 0,
       id,
     };
+  }
+
+  private async publishWikiArtifacts(
+    payload: PublishWikiArtifactsPayload,
+  ): Promise<PublishWikiArtifactsResult> {
+    const db = await this.ensureReady();
+    const publication = normalizeWikiArtifactPublication(payload);
+
+    return transaction(db, () => {
+      assertWikiArtifactScopeExists(db, publication.scope);
+      assertWikiArtifactEvidenceTargetsExist(db, publication.artifacts);
+      assertExistingWikiArtifactLinkTargetsExist(db, publication.links);
+
+      const signatureRows = db.selectObjects(
+        `SELECT *
+         FROM wiki_artifacts
+         WHERE scope_kind = ?
+           AND scope_id = ?
+           AND input_signature = ?
+         ORDER BY artifact_kind ASC, artifact_key ASC`,
+        [publication.scope.kind, publication.scope.id, publication.inputSignature],
+      );
+      if (signatureRows.length > 0) {
+        const signatureArtifacts = signatureRows.map(wikiArtifactMachineVersionFromRow);
+        const artifactsByRef = new Map(
+          signatureArtifacts.map((artifact) => [wikiArtifactBatchRefKey(artifact), artifact]),
+        );
+        if (signatureArtifacts.length !== publication.artifacts.length) {
+          throw new EngineRpcError(
+            "WIKI_ARTIFACT_PARTIAL_IDEMPOTENCY_CONFLICT",
+            "The input signature must reuse the complete original publication batch.",
+          );
+        }
+        const artifacts = publication.artifacts.map((artifact) => {
+          const existing = artifactsByRef.get(wikiArtifactBatchRefKey(artifact));
+          if (existing === undefined) {
+            throw new EngineRpcError(
+              "WIKI_ARTIFACT_PARTIAL_IDEMPOTENCY_CONFLICT",
+              "The input signature must reuse the complete original publication batch.",
+            );
+          }
+          return existing;
+        });
+        const versionGroupIds = new Set(artifacts.map((artifact) => artifact.versionGroupId));
+        if (versionGroupIds.size !== 1) {
+          throw new EngineRpcError(
+            "WIKI_ARTIFACT_VERSION_GROUP_CONFLICT",
+            "Idempotent artifact rows do not share one version group.",
+          );
+        }
+        return {
+          versionGroupId: artifacts[0]?.versionGroupId ?? "",
+          items: artifacts.map((artifact) => ({ artifact, disposition: "reused" as const })),
+          createdCount: 0,
+          reusedCount: artifacts.length,
+        };
+      }
+
+      const versionGroupId = createId("wiki_version_group");
+      const publishedAt = new Date().toISOString();
+      const prepared = publication.artifacts.map((artifact) => {
+        const latest = db.selectObject(
+          `SELECT *
+           FROM wiki_artifacts
+           WHERE scope_kind = ?
+             AND scope_id = ?
+             AND artifact_kind = ?
+             AND artifact_key = ?
+           ORDER BY version_no DESC
+           LIMIT 1`,
+          [
+            publication.scope.kind,
+            publication.scope.id,
+            artifact.artifactKind,
+            artifact.artifactKey,
+          ],
+        );
+        return {
+          artifact,
+          id: createId("wiki_artifact"),
+          versionNo: latest === undefined ? 1 : wikiArtifactVersionNoFromRow(latest) + 1,
+          supersedesArtifactId:
+            latest === undefined ? undefined : wikiArtifactRequiredRowString(latest, "id"),
+        };
+      });
+      const artifactIdsByRef = new Map(
+        prepared.map((item) => [wikiArtifactBatchRefKey(item.artifact), item.id]),
+      );
+
+      for (const item of prepared) {
+        db.exec({
+          sql: `INSERT INTO wiki_artifacts (
+            id,
+            scope_kind,
+            scope_id,
+            source_id,
+            artifact_kind,
+            artifact_key,
+            version_no,
+            version_group_id,
+            supersedes_artifact_id,
+            input_signature,
+            compiler_version,
+            prompt_version,
+            model_id,
+            title,
+            content,
+            payload_json,
+            coverage_json,
+            freshness,
+            created_at,
+            published_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          bind: [
+            item.id,
+            publication.scope.kind,
+            publication.scope.id,
+            publication.scope.kind === "source" ? publication.scope.id : null,
+            item.artifact.artifactKind,
+            item.artifact.artifactKey,
+            item.versionNo,
+            versionGroupId,
+            item.supersedesArtifactId ?? null,
+            publication.inputSignature,
+            publication.compilerVersion,
+            publication.promptVersion,
+            publication.modelId ?? null,
+            item.artifact.title,
+            item.artifact.content,
+            JSON.stringify(item.artifact.payload),
+            JSON.stringify(item.artifact.coverage),
+            publication.freshness,
+            publishedAt,
+            publishedAt,
+          ],
+        });
+
+        item.artifact.evidence.forEach((evidence, ordinal) => {
+          db.exec({
+            sql: `INSERT INTO wiki_artifact_evidence (
+              id,
+              artifact_id,
+              source_id,
+              chunk_id,
+              page_no,
+              bbox_json,
+              parser_artifact_kind,
+              parser_artifact_id,
+              anchor_json,
+              ordinal
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            bind: [
+              createId("wiki_evidence"),
+              item.id,
+              evidence.sourceId,
+              evidence.chunkId,
+              evidence.pageNo ?? null,
+              evidence.bbox === undefined ? null : JSON.stringify(evidence.bbox),
+              evidence.parserArtifactKind ?? null,
+              evidence.parserArtifactId ?? null,
+              evidence.anchor === undefined ? null : JSON.stringify(evidence.anchor),
+              ordinal,
+            ],
+          });
+        });
+      }
+
+      for (const link of publication.links) {
+        const fromArtifactId = artifactIdsByRef.get(wikiArtifactBatchRefKey(link.from));
+        const toArtifactId =
+          "artifactId" in link.to
+            ? link.to.artifactId
+            : artifactIdsByRef.get(wikiArtifactBatchRefKey(link.to));
+        if (fromArtifactId === undefined || toArtifactId === undefined) {
+          throw new EngineRpcError(
+            "WIKI_ARTIFACT_LINK_TARGET_NOT_FOUND",
+            "Wiki artifact link target was not resolved inside the publication batch.",
+          );
+        }
+        if (fromArtifactId === toArtifactId) {
+          throw new EngineRpcError(
+            "WIKI_ARTIFACT_LINK_SELF_REFERENCE",
+            "Wiki artifact links cannot reference the same machine version.",
+          );
+        }
+        db.exec({
+          sql: `INSERT INTO wiki_artifact_links (
+            id,
+            from_artifact_id,
+            to_artifact_id,
+            kind,
+            created_by,
+            creator_version,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          bind: [
+            createId("wiki_link"),
+            fromArtifactId,
+            toArtifactId,
+            link.kind,
+            link.createdBy,
+            link.creatorVersion ?? null,
+            publishedAt,
+          ],
+        });
+      }
+
+      for (const item of prepared) {
+        db.exec({
+          sql: `UPDATE wiki_artifacts
+                SET freshness = 'stale'
+                WHERE scope_kind = ?
+                  AND scope_id = ?
+                  AND artifact_kind = ?
+                  AND artifact_key = ?
+                  AND id <> ?
+                  AND freshness <> 'stale'`,
+          bind: [
+            publication.scope.kind,
+            publication.scope.id,
+            item.artifact.artifactKind,
+            item.artifact.artifactKey,
+            item.id,
+          ],
+        });
+      }
+
+      const artifacts = prepared.map((item) => {
+        const row = db.selectObject("SELECT * FROM wiki_artifacts WHERE id = ? LIMIT 1", [item.id]);
+        if (row === undefined) {
+          throw new EngineRpcError(
+            "WIKI_ARTIFACT_PUBLISH_FAILED",
+            "Published Wiki artifact could not be loaded.",
+          );
+        }
+        return wikiArtifactMachineVersionFromRow(row);
+      });
+      return {
+        versionGroupId,
+        items: artifacts.map((artifact) => ({ artifact, disposition: "created" as const })),
+        createdCount: artifacts.length,
+        reusedCount: 0,
+      };
+    });
+  }
+
+  private async listWikiArtifacts(filter?: WikiArtifactFilter): Promise<ListWikiArtifactsResult> {
+    const db = await this.ensureReady();
+    const normalized = normalizeWikiArtifactFilter(filter);
+    const clauses: string[] = [];
+    const bind: unknown[] = [];
+    if (normalized.scope !== undefined) {
+      clauses.push("scope_kind = ?", "scope_id = ?");
+      bind.push(normalized.scope.kind, normalized.scope.id);
+    }
+    if (normalized.artifactKind !== undefined) {
+      clauses.push("artifact_kind = ?");
+      bind.push(normalized.artifactKind);
+    }
+    if (normalized.freshness !== undefined) {
+      clauses.push("freshness = ?");
+      bind.push(normalized.freshness);
+    } else if (!normalized.includeHistory) {
+      clauses.push("freshness IN ('partial', 'fresh')");
+    }
+    if (normalized.inputSignature !== undefined) {
+      clauses.push("input_signature = ?");
+      bind.push(normalized.inputSignature);
+    }
+    bind.push(normalized.limit);
+    const rows = db.selectObjects(
+      `SELECT *
+       FROM wiki_artifacts
+       ${clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`}
+       ORDER BY published_at DESC, version_no DESC, id ASC
+       LIMIT ?`,
+      bind,
+    );
+    return { items: rows.map(wikiArtifactMachineVersionFromRow) };
+  }
+
+  private async getWikiArtifact(id: string): Promise<WikiArtifactDetail | null> {
+    const db = await this.ensureReady();
+    const artifactId = normalizeWikiArtifactId(id, "id");
+    const row = db.selectObject("SELECT * FROM wiki_artifacts WHERE id = ? LIMIT 1", [artifactId]);
+    return row === undefined ? null : wikiArtifactDetailFromDb(db, row);
+  }
+
+  private async appendWikiUserEdit(payload: AppendWikiUserEditPayload): Promise<WikiUserEdit> {
+    const db = await this.ensureReady();
+    const edit = normalizeWikiUserEditPayload(payload);
+    return transaction(db, () => {
+      const base = requireWikiArtifactRow(db, edit.baseArtifactId);
+      if (edit.candidateArtifactId !== undefined) {
+        const candidate = requireWikiArtifactRow(db, edit.candidateArtifactId);
+        assertSameWikiArtifactLogicalIdentity(base, candidate, "candidateArtifactId");
+      }
+
+      const latest = selectLatestWikiUserEditForLogicalArtifact(db, base);
+      if (latest === undefined && edit.previousEditId !== undefined) {
+        throw new EngineRpcError(
+          "WIKI_USER_EDIT_PREVIOUS_NOT_FOUND",
+          `Previous Wiki user edit not found: ${edit.previousEditId}`,
+        );
+      }
+      if (
+        latest !== undefined &&
+        wikiArtifactRequiredRowString(latest, "id") !== edit.previousEditId
+      ) {
+        throw new EngineRpcError(
+          "WIKI_USER_EDIT_CHAIN_CONFLICT",
+          "The previous edit is not the latest edit for this logical Wiki artifact.",
+        );
+      }
+      if (latest !== undefined) {
+        const latestBase = requireWikiArtifactRow(
+          db,
+          wikiArtifactRequiredRowString(latest, "base_artifact_id"),
+        );
+        assertSameWikiArtifactLogicalIdentity(base, latestBase, "previousEditId");
+      }
+
+      const versionNo = latest === undefined ? 1 : wikiUserEditVersionNoFromRow(latest) + 1;
+      db.exec({
+        sql: `INSERT INTO wiki_user_edits (
+          id,
+          base_artifact_id,
+          previous_edit_id,
+          candidate_artifact_id,
+          version_no,
+          edit_kind,
+          payload_json,
+          merge_outcome,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        bind: [
+          edit.id,
+          edit.baseArtifactId,
+          edit.previousEditId ?? null,
+          edit.candidateArtifactId ?? null,
+          versionNo,
+          edit.editKind,
+          JSON.stringify(edit.payload),
+          edit.mergeOutcome,
+          edit.createdAt,
+        ],
+      });
+      const row = db.selectObject("SELECT * FROM wiki_user_edits WHERE id = ? LIMIT 1", [edit.id]);
+      if (row === undefined) {
+        throw new EngineRpcError("WIKI_USER_EDIT_CREATE_FAILED", "Wiki user edit was not saved.");
+      }
+      return wikiUserEditFromRow(row);
+    });
+  }
+
+  private async listWikiUserEdits(
+    artifactId: string,
+    limit = 100,
+  ): Promise<ListWikiUserEditsResult> {
+    const db = await this.ensureReady();
+    const artifact = requireWikiArtifactRow(db, normalizeWikiArtifactId(artifactId, "artifactId"));
+    return {
+      items: selectWikiUserEditRowsForLogicalArtifact(
+        db,
+        artifact,
+        normalizeWikiListLimit(limit),
+      ).map(wikiUserEditFromRow),
+    };
+  }
+
+  private async deleteWikiArtifact(id: string): Promise<DeleteWikiArtifactResult> {
+    const db = await this.ensureReady();
+    const artifactId = normalizeWikiArtifactId(id, "id");
+    return transaction(db, () => {
+      const target = db.selectObject("SELECT id FROM wiki_artifacts WHERE id = ? LIMIT 1", [
+        artifactId,
+      ]);
+      if (target === undefined) {
+        return { deleted: false, id: artifactId, staleArtifactCount: 0 };
+      }
+      const dependentArtifactIds = findWikiDependentArtifactIds(db, [artifactId]).filter(
+        (dependentId) => dependentId !== artifactId,
+      );
+      const staleArtifactCount = markWikiArtifactsStale(db, dependentArtifactIds);
+      db.exec({ sql: "DELETE FROM wiki_artifacts WHERE id = ?", bind: [artifactId] });
+      return { deleted: true, id: artifactId, staleArtifactCount };
+    });
   }
 
   private async enqueueWikiCompile(
@@ -4166,6 +4647,10 @@ export class LocalEngine {
       db.exec("DELETE FROM source_metadata");
       db.exec("DELETE FROM keyword_index_sources");
       db.exec("DELETE FROM keyword_index");
+      db.exec("DELETE FROM wiki_user_edits");
+      db.exec("DELETE FROM wiki_artifact_links");
+      db.exec("DELETE FROM wiki_artifact_evidence");
+      db.exec("DELETE FROM wiki_artifacts");
       db.exec("DELETE FROM topic_graph_edges");
       db.exec("DELETE FROM wiki_compile_job_events");
       db.exec("DELETE FROM wiki_compile_jobs");
@@ -5037,6 +5522,96 @@ function migrate(db: SqliteDb) {
     )
   `);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS wiki_artifacts (
+      id TEXT PRIMARY KEY,
+      scope_kind TEXT NOT NULL CHECK (scope_kind IN ('source', 'topic', 'library')),
+      scope_id TEXT NOT NULL,
+      source_id TEXT REFERENCES sources(id),
+      artifact_kind TEXT NOT NULL CHECK (
+        artifact_kind IN ('source_digest', 'section', 'topic', 'claim', 'index')
+      ),
+      artifact_key TEXT NOT NULL,
+      version_no INTEGER NOT NULL CHECK (version_no > 0),
+      version_group_id TEXT NOT NULL,
+      supersedes_artifact_id TEXT REFERENCES wiki_artifacts(id) ON DELETE SET NULL,
+      input_signature TEXT NOT NULL,
+      compiler_version TEXT NOT NULL,
+      prompt_version TEXT NOT NULL,
+      model_id TEXT,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      coverage_json TEXT NOT NULL DEFAULT '{}',
+      freshness TEXT NOT NULL CHECK (freshness IN ('partial', 'fresh', 'stale')),
+      created_at TEXT NOT NULL,
+      published_at TEXT NOT NULL,
+      CHECK (
+        (scope_kind = 'source' AND source_id = scope_id)
+        OR (scope_kind <> 'source' AND source_id IS NULL)
+      ),
+      UNIQUE (scope_kind, scope_id, artifact_kind, artifact_key, version_no),
+      UNIQUE (scope_kind, scope_id, artifact_kind, artifact_key, input_signature)
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wiki_artifact_evidence (
+      id TEXT PRIMARY KEY,
+      artifact_id TEXT NOT NULL REFERENCES wiki_artifacts(id) ON DELETE CASCADE,
+      source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+      chunk_id TEXT NOT NULL REFERENCES source_chunks(id) ON DELETE CASCADE,
+      page_no INTEGER CHECK (page_no IS NULL OR page_no > 0),
+      bbox_json TEXT,
+      parser_artifact_kind TEXT,
+      parser_artifact_id TEXT,
+      anchor_json TEXT,
+      ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+      CHECK (
+        (parser_artifact_kind IS NULL AND parser_artifact_id IS NULL)
+        OR (parser_artifact_kind IS NOT NULL AND parser_artifact_id IS NOT NULL)
+      ),
+      UNIQUE (artifact_id, ordinal)
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wiki_artifact_links (
+      id TEXT PRIMARY KEY,
+      from_artifact_id TEXT NOT NULL REFERENCES wiki_artifacts(id) ON DELETE CASCADE,
+      to_artifact_id TEXT NOT NULL REFERENCES wiki_artifacts(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('derived_from', 'contains', 'related', 'contradicts')),
+      created_by TEXT NOT NULL CHECK (created_by IN ('compiler', 'projector', 'user')),
+      creator_version TEXT,
+      created_at TEXT NOT NULL,
+      CHECK (from_artifact_id <> to_artifact_id),
+      UNIQUE (from_artifact_id, to_artifact_id, kind, created_by)
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wiki_user_edits (
+      id TEXT PRIMARY KEY,
+      base_artifact_id TEXT NOT NULL REFERENCES wiki_artifacts(id) ON DELETE CASCADE,
+      previous_edit_id TEXT REFERENCES wiki_user_edits(id) ON DELETE SET NULL,
+      candidate_artifact_id TEXT REFERENCES wiki_artifacts(id) ON DELETE SET NULL,
+      version_no INTEGER NOT NULL CHECK (version_no > 0),
+      edit_kind TEXT NOT NULL CHECK (edit_kind IN ('patch', 'override')),
+      payload_json TEXT NOT NULL,
+      merge_outcome TEXT NOT NULL CHECK (
+        merge_outcome IN (
+          'authored',
+          'unchanged',
+          'auto_merged',
+          'conflict',
+          'keep_user',
+          'accept_machine',
+          'manual_merge'
+        )
+      ),
+      created_at TEXT NOT NULL,
+      CHECK (previous_edit_id IS NULL OR previous_edit_id <> id),
+      CHECK (candidate_artifact_id IS NULL OR candidate_artifact_id <> base_artifact_id),
+      UNIQUE (base_artifact_id, version_no)
+    )
+  `);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS topic_pages (
       id TEXT PRIMARY KEY,
       slug TEXT NOT NULL UNIQUE,
@@ -5269,6 +5844,38 @@ function migrate(db: SqliteDb) {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_image_generation_history_created ON image_generation_history(created_at DESC)",
   );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_artifacts_scope_current
+     ON wiki_artifacts(scope_kind, scope_id, artifact_kind, artifact_key, freshness, version_no DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_artifacts_input_signature
+     ON wiki_artifacts(input_signature, published_at DESC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_artifact_evidence_source
+     ON wiki_artifact_evidence(source_id, artifact_id)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_artifact_evidence_chunk
+     ON wiki_artifact_evidence(chunk_id, artifact_id)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_artifact_links_from
+     ON wiki_artifact_links(from_artifact_id, kind, to_artifact_id)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_artifact_links_to
+     ON wiki_artifact_links(to_artifact_id, kind, from_artifact_id)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_user_edits_base
+     ON wiki_user_edits(base_artifact_id, version_no ASC)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_wiki_user_edits_candidate
+     ON wiki_user_edits(candidate_artifact_id)`,
+  );
   db.exec("CREATE INDEX IF NOT EXISTS idx_topic_pages_updated ON topic_pages(updated_at DESC)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_topic_pages_slug ON topic_pages(slug)");
   db.exec(
@@ -5306,6 +5913,10 @@ function migrate(db: SqliteDb) {
 }
 
 function dropPreSourceNativeTables(db: SqliteDb) {
+  db.exec("DROP TABLE IF EXISTS wiki_user_edits");
+  db.exec("DROP TABLE IF EXISTS wiki_artifact_links");
+  db.exec("DROP TABLE IF EXISTS wiki_artifact_evidence");
+  db.exec("DROP TABLE IF EXISTS wiki_artifacts");
   db.exec("DROP TABLE IF EXISTS topic_graph_edges");
   db.exec("DROP TABLE IF EXISTS wiki_compile_job_events");
   db.exec("DROP TABLE IF EXISTS wiki_compile_jobs");
@@ -14041,6 +14652,300 @@ function memorySummaryFromRetrievalRow(row: SqlRow, fallbackExcerpt: string): Me
   };
 }
 
+function wikiArtifactMachineVersionFromRow(row: SqlRow): WikiArtifactMachineVersion {
+  const scopeKind = wikiArtifactScopeKindFromRow(row, "scope_kind");
+  const scopeId = wikiArtifactRequiredRowString(row, "scope_id");
+  const sourceId = wikiArtifactOptionalRowString(row, "source_id");
+  if (
+    (scopeKind === "source" && sourceId !== scopeId) ||
+    (scopeKind !== "source" && sourceId !== undefined)
+  ) {
+    throw new EngineRpcError(
+      "WIKI_ARTIFACT_CORRUPT",
+      "Wiki artifact scope and source reference are inconsistent.",
+    );
+  }
+  const supersedesArtifactId = wikiArtifactOptionalRowString(row, "supersedes_artifact_id");
+  const modelId = wikiArtifactOptionalRowString(row, "model_id");
+  return {
+    id: wikiArtifactRequiredRowString(row, "id"),
+    scope: { kind: scopeKind, id: scopeId },
+    ...(sourceId === undefined ? {} : { sourceId }),
+    artifactKind: wikiArtifactKindFromRow(row, "artifact_kind"),
+    artifactKey: wikiArtifactRequiredRowString(row, "artifact_key"),
+    versionNo: wikiArtifactVersionNoFromRow(row),
+    versionGroupId: wikiArtifactRequiredRowString(row, "version_group_id"),
+    ...(supersedesArtifactId === undefined ? {} : { supersedesArtifactId }),
+    inputSignature: wikiArtifactRequiredRowString(row, "input_signature"),
+    compilerVersion: wikiArtifactRequiredRowString(row, "compiler_version"),
+    promptVersion: wikiArtifactRequiredRowString(row, "prompt_version"),
+    ...(modelId === undefined ? {} : { modelId }),
+    title: wikiArtifactRequiredRowString(row, "title"),
+    content: wikiArtifactRequiredRowString(row, "content"),
+    payload: wikiArtifactJsonObjectFromRow(row, "payload_json"),
+    coverage: wikiArtifactJsonObjectFromRow(row, "coverage_json"),
+    freshness: wikiArtifactFreshnessFromRow(row, "freshness"),
+    createdAt: wikiArtifactRequiredRowString(row, "created_at"),
+    publishedAt: wikiArtifactRequiredRowString(row, "published_at"),
+  };
+}
+
+function wikiArtifactEvidenceFromRow(row: SqlRow): WikiArtifactEvidence {
+  const pageNo = wikiArtifactOptionalPositiveIntegerFromRow(row, "page_no");
+  const bbox = wikiArtifactOptionalJsonObjectFromRow(row, "bbox_json");
+  const parserArtifactKind = wikiArtifactOptionalRowString(row, "parser_artifact_kind");
+  const parserArtifactId = wikiArtifactOptionalRowString(row, "parser_artifact_id");
+  const anchor = wikiArtifactOptionalJsonObjectFromRow(row, "anchor_json");
+  if ((parserArtifactKind === undefined) !== (parserArtifactId === undefined)) {
+    throw new EngineRpcError(
+      "WIKI_ARTIFACT_CORRUPT",
+      "Wiki evidence parser artifact reference is incomplete.",
+    );
+  }
+  return {
+    id: wikiArtifactRequiredRowString(row, "id"),
+    artifactId: wikiArtifactRequiredRowString(row, "artifact_id"),
+    sourceId: wikiArtifactRequiredRowString(row, "source_id"),
+    chunkId: wikiArtifactRequiredRowString(row, "chunk_id"),
+    ...(pageNo === undefined ? {} : { pageNo }),
+    ...(bbox === undefined ? {} : { bbox }),
+    ...(parserArtifactKind === undefined ? {} : { parserArtifactKind, parserArtifactId }),
+    ...(anchor === undefined ? {} : { anchor }),
+    ordinal: wikiArtifactNonNegativeIntegerFromRow(row, "ordinal"),
+  };
+}
+
+function wikiArtifactLinkFromRow(row: SqlRow): WikiArtifactLink {
+  const creatorVersion = wikiArtifactOptionalRowString(row, "creator_version");
+  return {
+    id: wikiArtifactRequiredRowString(row, "id"),
+    fromArtifactId: wikiArtifactRequiredRowString(row, "from_artifact_id"),
+    toArtifactId: wikiArtifactRequiredRowString(row, "to_artifact_id"),
+    kind: wikiArtifactLinkKindFromRow(row, "kind"),
+    createdBy: wikiArtifactLinkCreatedByFromRow(row, "created_by"),
+    ...(creatorVersion === undefined ? {} : { creatorVersion }),
+    createdAt: wikiArtifactRequiredRowString(row, "created_at"),
+  };
+}
+
+function wikiUserEditFromRow(row: SqlRow): WikiUserEdit {
+  const previousEditId = wikiArtifactOptionalRowString(row, "previous_edit_id");
+  const candidateArtifactId = wikiArtifactOptionalRowString(row, "candidate_artifact_id");
+  return {
+    id: wikiArtifactRequiredRowString(row, "id"),
+    baseArtifactId: wikiArtifactRequiredRowString(row, "base_artifact_id"),
+    ...(previousEditId === undefined ? {} : { previousEditId }),
+    ...(candidateArtifactId === undefined ? {} : { candidateArtifactId }),
+    versionNo: wikiUserEditVersionNoFromRow(row),
+    editKind: wikiUserEditKindFromRow(row, "edit_kind"),
+    payload: wikiArtifactJsonObjectFromRow(row, "payload_json"),
+    mergeOutcome: wikiUserEditMergeOutcomeFromRow(row, "merge_outcome"),
+    createdAt: wikiArtifactRequiredRowString(row, "created_at"),
+  };
+}
+
+function wikiArtifactDetailFromDb(db: SqliteDb, artifactRow: SqlRow): WikiArtifactDetail {
+  const artifact = wikiArtifactMachineVersionFromRow(artifactRow);
+  return {
+    artifact,
+    evidence: db
+      .selectObjects(
+        `SELECT *
+         FROM wiki_artifact_evidence
+         WHERE artifact_id = ?
+         ORDER BY ordinal ASC, id ASC`,
+        [artifact.id],
+      )
+      .map(wikiArtifactEvidenceFromRow),
+    outgoingLinks: db
+      .selectObjects(
+        `SELECT *
+         FROM wiki_artifact_links
+         WHERE from_artifact_id = ?
+         ORDER BY created_at ASC, id ASC`,
+        [artifact.id],
+      )
+      .map(wikiArtifactLinkFromRow),
+    incomingLinks: db
+      .selectObjects(
+        `SELECT *
+         FROM wiki_artifact_links
+         WHERE to_artifact_id = ?
+         ORDER BY created_at ASC, id ASC`,
+        [artifact.id],
+      )
+      .map(wikiArtifactLinkFromRow),
+    userEdits: selectWikiUserEditRowsForLogicalArtifact(
+      db,
+      artifactRow,
+      WIKI_ARTIFACT_RPC_LIMITS.listItems,
+    ).map(wikiUserEditFromRow),
+  };
+}
+
+function wikiArtifactRequiredRowString(row: SqlRow, key: string): string {
+  const value = row[key];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new EngineRpcError(
+      "WIKI_ARTIFACT_CORRUPT",
+      `Wiki artifact row has an invalid ${key} field.`,
+    );
+  }
+  return value;
+}
+
+function wikiArtifactOptionalRowString(row: SqlRow, key: string): string | undefined {
+  const value = row[key];
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== "string" || value.length === 0) {
+    throw new EngineRpcError(
+      "WIKI_ARTIFACT_CORRUPT",
+      `Wiki artifact row has an invalid optional ${key} field.`,
+    );
+  }
+  return value;
+}
+
+function wikiArtifactVersionNoFromRow(row: SqlRow): number {
+  const value = wikiArtifactIntegerFromRow(row, "version_no");
+  if (value <= 0) {
+    throw new EngineRpcError("WIKI_ARTIFACT_CORRUPT", "Wiki artifact version must be positive.");
+  }
+  return value;
+}
+
+function wikiUserEditVersionNoFromRow(row: SqlRow): number {
+  const value = wikiArtifactIntegerFromRow(row, "version_no");
+  if (value <= 0) {
+    throw new EngineRpcError("WIKI_ARTIFACT_CORRUPT", "Wiki user edit version must be positive.");
+  }
+  return value;
+}
+
+function wikiArtifactNonNegativeIntegerFromRow(row: SqlRow, key: string): number {
+  const value = wikiArtifactIntegerFromRow(row, key);
+  if (value < 0) {
+    throw new EngineRpcError(
+      "WIKI_ARTIFACT_CORRUPT",
+      `Wiki artifact row has a negative ${key} field.`,
+    );
+  }
+  return value;
+}
+
+function wikiArtifactOptionalPositiveIntegerFromRow(row: SqlRow, key: string): number | undefined {
+  if (row[key] === null || row[key] === undefined) return undefined;
+  const value = wikiArtifactIntegerFromRow(row, key);
+  if (value <= 0) {
+    throw new EngineRpcError(
+      "WIKI_ARTIFACT_CORRUPT",
+      `Wiki artifact row has a non-positive ${key} field.`,
+    );
+  }
+  return value;
+}
+
+function wikiArtifactIntegerFromRow(row: SqlRow, key: string): number {
+  const raw = row[key];
+  const value = typeof raw === "bigint" ? Number(raw) : raw;
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new EngineRpcError(
+      "WIKI_ARTIFACT_CORRUPT",
+      `Wiki artifact row has an invalid integer ${key} field.`,
+    );
+  }
+  return value;
+}
+
+function wikiArtifactJsonObjectFromRow(row: SqlRow, key: string): WikiArtifactJsonObject {
+  const raw = wikiArtifactRequiredRowString(row, key);
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (isBoundedWikiArtifactJsonObject(parsed)) return parsed;
+  } catch {
+    // The stable corruption error below owns all invalid persisted JSON cases.
+  }
+  throw new EngineRpcError(
+    "WIKI_ARTIFACT_CORRUPT",
+    `Wiki artifact row has invalid JSON in ${key}.`,
+  );
+}
+
+function wikiArtifactOptionalJsonObjectFromRow(
+  row: SqlRow,
+  key: string,
+): WikiArtifactJsonObject | undefined {
+  if (row[key] === null || row[key] === undefined) return undefined;
+  return wikiArtifactJsonObjectFromRow(row, key);
+}
+
+function wikiArtifactScopeKindFromRow(row: SqlRow, key: string): WikiArtifactScopeKind {
+  const value = wikiArtifactRequiredRowString(row, key);
+  if (value === "source" || value === "topic" || value === "library") return value;
+  throw new EngineRpcError("WIKI_ARTIFACT_CORRUPT", `Invalid Wiki artifact scope kind: ${value}`);
+}
+
+function wikiArtifactKindFromRow(row: SqlRow, key: string): WikiArtifactKind {
+  const value = wikiArtifactRequiredRowString(row, key);
+  if (
+    value === "source_digest" ||
+    value === "section" ||
+    value === "topic" ||
+    value === "claim" ||
+    value === "index"
+  ) {
+    return value;
+  }
+  throw new EngineRpcError("WIKI_ARTIFACT_CORRUPT", `Invalid Wiki artifact kind: ${value}`);
+}
+
+function wikiArtifactFreshnessFromRow(row: SqlRow, key: string): WikiArtifactFreshness {
+  const value = wikiArtifactRequiredRowString(row, key);
+  if (value === "partial" || value === "fresh" || value === "stale") return value;
+  throw new EngineRpcError("WIKI_ARTIFACT_CORRUPT", `Invalid Wiki artifact freshness: ${value}`);
+}
+
+function wikiArtifactLinkKindFromRow(row: SqlRow, key: string): WikiArtifactLinkKind {
+  const value = wikiArtifactRequiredRowString(row, key);
+  if (
+    value === "derived_from" ||
+    value === "contains" ||
+    value === "related" ||
+    value === "contradicts"
+  ) {
+    return value;
+  }
+  throw new EngineRpcError("WIKI_ARTIFACT_CORRUPT", `Invalid Wiki artifact link kind: ${value}`);
+}
+
+function wikiArtifactLinkCreatedByFromRow(row: SqlRow, key: string): WikiArtifactLinkCreatedBy {
+  const value = wikiArtifactRequiredRowString(row, key);
+  if (value === "compiler" || value === "projector" || value === "user") return value;
+  throw new EngineRpcError("WIKI_ARTIFACT_CORRUPT", `Invalid Wiki artifact link owner: ${value}`);
+}
+
+function wikiUserEditKindFromRow(row: SqlRow, key: string): WikiUserEditKind {
+  const value = wikiArtifactRequiredRowString(row, key);
+  if (value === "patch" || value === "override") return value;
+  throw new EngineRpcError("WIKI_ARTIFACT_CORRUPT", `Invalid Wiki user edit kind: ${value}`);
+}
+
+function wikiUserEditMergeOutcomeFromRow(row: SqlRow, key: string): WikiUserEditMergeOutcome {
+  const value = wikiArtifactRequiredRowString(row, key);
+  if (
+    value === "authored" ||
+    value === "unchanged" ||
+    value === "auto_merged" ||
+    value === "conflict" ||
+    value === "keep_user" ||
+    value === "accept_machine" ||
+    value === "manual_merge"
+  ) {
+    return value;
+  }
+  throw new EngineRpcError("WIKI_ARTIFACT_CORRUPT", `Invalid Wiki merge outcome: ${value}`);
+}
+
 function topicPageSummaryFromRow(row: SqlRow): Omit<TopicPageDetail, "content" | "sourceRefs"> {
   const sourceRefs = parseTopicSourceRefs(stringField(row, "source_refs_json"));
   return {
@@ -17903,6 +18808,698 @@ function normalizeTopicTitle(value: string) {
 
 function normalizeTopicText(value: string, maxLength: number) {
   return normalizeText(value).slice(0, maxLength);
+}
+
+function normalizeWikiArtifactPublication(
+  payload: PublishWikiArtifactsPayload,
+): NormalizedWikiArtifactPublication {
+  if (!isRecord(payload)) {
+    throw new EngineRpcError("INVALID_WIKI_ARTIFACT_PUBLICATION", "Wiki publication is required.");
+  }
+  const scope = normalizeWikiArtifactScope(payload.scope);
+  const inputSignature = normalizeWikiRequiredString(
+    payload.inputSignature,
+    "inputSignature",
+    WIKI_ARTIFACT_RPC_LIMITS.versionLength,
+  );
+  const compilerVersion = normalizeWikiRequiredString(
+    payload.compilerVersion,
+    "compilerVersion",
+    WIKI_ARTIFACT_RPC_LIMITS.versionLength,
+  );
+  const promptVersion = normalizeWikiRequiredString(
+    payload.promptVersion,
+    "promptVersion",
+    WIKI_ARTIFACT_RPC_LIMITS.versionLength,
+  );
+  const modelId = normalizeWikiOptionalString(
+    payload.modelId,
+    "modelId",
+    WIKI_ARTIFACT_RPC_LIMITS.versionLength,
+  );
+  const freshness = normalizeWikiPublicationFreshness(payload.freshness);
+  if (
+    !Array.isArray(payload.artifacts) ||
+    payload.artifacts.length === 0 ||
+    payload.artifacts.length > WIKI_ARTIFACT_RPC_LIMITS.batchItems
+  ) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_BATCH",
+      `Wiki publication must contain 1-${WIKI_ARTIFACT_RPC_LIMITS.batchItems} artifacts.`,
+    );
+  }
+  const artifacts = payload.artifacts.map(normalizeWikiArtifactDraft);
+  const refs = new Set<string>();
+  for (const artifact of artifacts) {
+    const ref = wikiArtifactBatchRefKey(artifact);
+    if (refs.has(ref)) {
+      throw new EngineRpcError(
+        "DUPLICATE_WIKI_ARTIFACT_KEY",
+        `Duplicate Wiki artifact key in publication: ${artifact.artifactKey}`,
+      );
+    }
+    refs.add(ref);
+  }
+
+  if (
+    payload.links !== undefined &&
+    (!Array.isArray(payload.links) || payload.links.length > WIKI_ARTIFACT_RPC_LIMITS.linkItems)
+  ) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_LINKS",
+      `Wiki publication supports at most ${WIKI_ARTIFACT_RPC_LIMITS.linkItems} links.`,
+    );
+  }
+  const links = (payload.links ?? []).map(normalizeWikiArtifactLink);
+  const linkKeys = new Set<string>();
+  for (const link of links) {
+    const fromRef = wikiArtifactBatchRefKey(link.from);
+    if (!refs.has(fromRef)) {
+      throw new EngineRpcError(
+        "WIKI_ARTIFACT_LINK_SOURCE_NOT_FOUND",
+        "Wiki artifact links must originate from an artifact in the publication batch.",
+      );
+    }
+    let targetKey: string;
+    if ("artifactId" in link.to) {
+      targetKey = `id:${link.to.artifactId}`;
+    } else {
+      targetKey = `batch:${wikiArtifactBatchRefKey(link.to)}`;
+      if (!refs.has(wikiArtifactBatchRefKey(link.to))) {
+        throw new EngineRpcError(
+          "WIKI_ARTIFACT_LINK_TARGET_NOT_FOUND",
+          "Wiki artifact batch link target does not exist.",
+        );
+      }
+      if (wikiArtifactBatchRefKey(link.to) === fromRef) {
+        throw new EngineRpcError(
+          "WIKI_ARTIFACT_LINK_SELF_REFERENCE",
+          "Wiki artifact links cannot reference themselves.",
+        );
+      }
+    }
+    const linkKey = `${fromRef}\u0000${targetKey}\u0000${link.kind}\u0000${link.createdBy}`;
+    if (linkKeys.has(linkKey)) {
+      throw new EngineRpcError(
+        "DUPLICATE_WIKI_ARTIFACT_LINK",
+        "Wiki publication contains a duplicate artifact link.",
+      );
+    }
+    linkKeys.add(linkKey);
+  }
+
+  return {
+    scope,
+    inputSignature,
+    compilerVersion,
+    promptVersion,
+    ...(modelId === undefined ? {} : { modelId }),
+    freshness,
+    artifacts,
+    links,
+  };
+}
+
+function normalizeWikiArtifactDraft(value: unknown): NormalizedWikiArtifactDraft {
+  if (!isRecord(value)) {
+    throw new EngineRpcError("INVALID_WIKI_ARTIFACT", "Wiki artifact draft must be an object.");
+  }
+  const artifactKind = normalizeWikiArtifactKind(value.artifactKind);
+  const artifactKey = normalizeWikiRequiredString(
+    value.artifactKey,
+    "artifactKey",
+    WIKI_ARTIFACT_RPC_LIMITS.artifactKeyLength,
+  );
+  const title = normalizeWikiRequiredString(
+    value.title,
+    "title",
+    WIKI_ARTIFACT_RPC_LIMITS.titleLength,
+  );
+  const content = normalizeWikiRequiredString(
+    value.content,
+    "content",
+    WIKI_ARTIFACT_RPC_LIMITS.contentLength,
+    true,
+  );
+  const payload = normalizeWikiJsonObject(value.payload ?? {}, "payload");
+  const coverage = normalizeWikiJsonObject(value.coverage ?? {}, "coverage");
+  if (
+    value.evidence !== undefined &&
+    (!Array.isArray(value.evidence) ||
+      value.evidence.length > WIKI_ARTIFACT_RPC_LIMITS.evidenceItems)
+  ) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_EVIDENCE",
+      `Wiki artifact supports at most ${WIKI_ARTIFACT_RPC_LIMITS.evidenceItems} evidence rows.`,
+    );
+  }
+  const evidence = (value.evidence ?? []).map(normalizeWikiArtifactEvidence);
+  if (artifactKind === "claim" && evidence.length === 0) {
+    throw new EngineRpcError(
+      "WIKI_CLAIM_EVIDENCE_REQUIRED",
+      "Claim artifacts require at least one Source/Chunk evidence reference.",
+    );
+  }
+  return { artifactKind, artifactKey, title, content, payload, coverage, evidence };
+}
+
+function normalizeWikiArtifactEvidence(
+  value: unknown,
+): NormalizedWikiArtifactDraft["evidence"][number] {
+  if (!isRecord(value)) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_EVIDENCE",
+      "Wiki artifact evidence must be an object.",
+    );
+  }
+  const sourceId = normalizeWikiArtifactId(value.sourceId, "sourceId");
+  const chunkId = normalizeWikiArtifactId(value.chunkId, "chunkId");
+  let pageNo: number | undefined;
+  if (value.pageNo !== undefined) {
+    if (
+      !Number.isInteger(value.pageNo) ||
+      Number(value.pageNo) <= 0 ||
+      Number(value.pageNo) > 1_000_000
+    ) {
+      throw new EngineRpcError(
+        "INVALID_WIKI_ARTIFACT_EVIDENCE",
+        "Wiki evidence pageNo must be a positive integer.",
+      );
+    }
+    pageNo = Number(value.pageNo);
+  }
+  const bbox =
+    value.bbox === undefined ? undefined : normalizeWikiJsonObject(value.bbox, "evidence.bbox");
+  const anchor =
+    value.anchor === undefined
+      ? undefined
+      : normalizeWikiJsonObject(value.anchor, "evidence.anchor");
+  const parserArtifactKind = normalizeWikiOptionalString(
+    value.parserArtifactKind,
+    "parserArtifactKind",
+    WIKI_ARTIFACT_RPC_LIMITS.artifactKeyLength,
+  );
+  const parserArtifactId = normalizeWikiOptionalString(
+    value.parserArtifactId,
+    "parserArtifactId",
+    WIKI_ARTIFACT_RPC_LIMITS.idLength,
+  );
+  if ((parserArtifactKind === undefined) !== (parserArtifactId === undefined)) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_EVIDENCE",
+      "Wiki evidence parser artifact kind and id must be provided together.",
+    );
+  }
+  return {
+    sourceId,
+    chunkId,
+    ...(pageNo === undefined ? {} : { pageNo }),
+    ...(bbox === undefined ? {} : { bbox }),
+    ...(parserArtifactKind === undefined ? {} : { parserArtifactKind, parserArtifactId }),
+    ...(anchor === undefined ? {} : { anchor }),
+  };
+}
+
+function normalizeWikiArtifactLink(value: unknown): NormalizedWikiArtifactLink {
+  if (!isRecord(value)) {
+    throw new EngineRpcError("INVALID_WIKI_ARTIFACT_LINK", "Wiki artifact link must be an object.");
+  }
+  const from = normalizeWikiArtifactBatchRef(value.from);
+  let to: NormalizedWikiArtifactLink["to"];
+  if (!isRecord(value.to)) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_LINK",
+      "Wiki artifact link target must be an object.",
+    );
+  }
+  if (value.to.artifactId !== undefined) {
+    if (value.to.artifactKind !== undefined || value.to.artifactKey !== undefined) {
+      throw new EngineRpcError(
+        "INVALID_WIKI_ARTIFACT_LINK",
+        "Wiki artifact link target must use either artifactId or a batch reference.",
+      );
+    }
+    to = { artifactId: normalizeWikiArtifactId(value.to.artifactId, "to.artifactId") };
+  } else {
+    to = normalizeWikiArtifactBatchRef(value.to);
+  }
+  const creatorVersion = normalizeWikiOptionalString(
+    value.creatorVersion,
+    "creatorVersion",
+    WIKI_ARTIFACT_RPC_LIMITS.versionLength,
+  );
+  return {
+    from,
+    to,
+    kind: normalizeWikiArtifactLinkKind(value.kind),
+    createdBy: normalizeWikiArtifactLinkCreatedBy(value.createdBy),
+    ...(creatorVersion === undefined ? {} : { creatorVersion }),
+  };
+}
+
+function normalizeWikiArtifactBatchRef(value: unknown): WikiArtifactBatchRef {
+  if (!isRecord(value)) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_REFERENCE",
+      "Wiki artifact batch reference must be an object.",
+    );
+  }
+  return {
+    artifactKind: normalizeWikiArtifactKind(value.artifactKind),
+    artifactKey: normalizeWikiRequiredString(
+      value.artifactKey,
+      "artifactKey",
+      WIKI_ARTIFACT_RPC_LIMITS.artifactKeyLength,
+    ),
+  };
+}
+
+function normalizeWikiArtifactFilter(filter?: WikiArtifactFilter): NormalizedWikiArtifactFilter {
+  if (filter === undefined) {
+    return { includeHistory: false, limit: 100 };
+  }
+  if (!isRecord(filter)) {
+    throw new EngineRpcError("INVALID_WIKI_ARTIFACT_FILTER", "Wiki artifact filter is invalid.");
+  }
+  const scope = filter.scope === undefined ? undefined : normalizeWikiArtifactScope(filter.scope);
+  const artifactKind =
+    filter.artifactKind === undefined ? undefined : normalizeWikiArtifactKind(filter.artifactKind);
+  const freshness =
+    filter.freshness === undefined ? undefined : normalizeWikiArtifactFreshness(filter.freshness);
+  const inputSignature = normalizeWikiOptionalString(
+    filter.inputSignature,
+    "inputSignature",
+    WIKI_ARTIFACT_RPC_LIMITS.versionLength,
+  );
+  if (filter.includeHistory !== undefined && typeof filter.includeHistory !== "boolean") {
+    throw new EngineRpcError("INVALID_WIKI_ARTIFACT_FILTER", "includeHistory must be a boolean.");
+  }
+  return {
+    ...(scope === undefined ? {} : { scope }),
+    ...(artifactKind === undefined ? {} : { artifactKind }),
+    ...(freshness === undefined ? {} : { freshness }),
+    ...(inputSignature === undefined ? {} : { inputSignature }),
+    includeHistory: filter.includeHistory ?? false,
+    limit: normalizeWikiListLimit(filter.limit ?? 100),
+  };
+}
+
+function normalizeWikiUserEditPayload(payload: AppendWikiUserEditPayload): NormalizedWikiUserEdit {
+  if (!isRecord(payload)) {
+    throw new EngineRpcError("INVALID_WIKI_USER_EDIT", "Wiki user edit is required.");
+  }
+  const id =
+    payload.id === undefined ? createId("wiki_edit") : normalizeWikiArtifactId(payload.id, "id");
+  const baseArtifactId = normalizeWikiArtifactId(payload.baseArtifactId, "baseArtifactId");
+  const previousEditId =
+    payload.previousEditId === undefined
+      ? undefined
+      : normalizeWikiArtifactId(payload.previousEditId, "previousEditId");
+  const candidateArtifactId =
+    payload.candidateArtifactId === undefined
+      ? undefined
+      : normalizeWikiArtifactId(payload.candidateArtifactId, "candidateArtifactId");
+  if (candidateArtifactId === baseArtifactId) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_USER_EDIT",
+      "candidateArtifactId must reference a different machine version.",
+    );
+  }
+  if (previousEditId === id) {
+    throw new EngineRpcError("INVALID_WIKI_USER_EDIT", "A Wiki user edit cannot reference itself.");
+  }
+  const createdAt =
+    normalizeWikiOptionalString(
+      payload.createdAt,
+      "createdAt",
+      WIKI_ARTIFACT_RPC_LIMITS.versionLength,
+    ) ?? new Date().toISOString();
+  return {
+    id,
+    baseArtifactId,
+    ...(previousEditId === undefined ? {} : { previousEditId }),
+    ...(candidateArtifactId === undefined ? {} : { candidateArtifactId }),
+    editKind: normalizeWikiUserEditKind(payload.editKind),
+    payload: normalizeWikiJsonObject(payload.payload, "payload"),
+    mergeOutcome: normalizeWikiUserEditMergeOutcome(payload.mergeOutcome),
+    createdAt,
+  };
+}
+
+function normalizeWikiArtifactScope(value: unknown): WikiArtifactScope {
+  if (!isRecord(value)) {
+    throw new EngineRpcError("INVALID_WIKI_ARTIFACT_SCOPE", "Wiki artifact scope is required.");
+  }
+  return {
+    kind: normalizeWikiArtifactScopeKind(value.kind),
+    id: normalizeWikiArtifactId(value.id, "scope.id"),
+  };
+}
+
+function normalizeWikiArtifactId(value: unknown, field: string): string {
+  return normalizeWikiRequiredString(value, field, WIKI_ARTIFACT_RPC_LIMITS.idLength);
+}
+
+function normalizeWikiRequiredString(
+  value: unknown,
+  field: string,
+  maxLength: number,
+  preserveWhitespace = false,
+): string {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > maxLength) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_FIELD",
+      `${field} must be a non-empty string no longer than ${maxLength} characters.`,
+    );
+  }
+  return preserveWhitespace ? value : value.trim();
+}
+
+function normalizeWikiOptionalString(
+  value: unknown,
+  field: string,
+  maxLength: number,
+): string | undefined {
+  if (value === undefined) return undefined;
+  return normalizeWikiRequiredString(value, field, maxLength);
+}
+
+function normalizeWikiJsonObject(value: unknown, field: string): WikiArtifactJsonObject {
+  if (!isBoundedWikiArtifactJsonObject(value)) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_JSON",
+      `${field} must be a bounded JSON object.`,
+    );
+  }
+  const cloned = JSON.parse(JSON.stringify(value)) as unknown;
+  if (!isBoundedWikiArtifactJsonObject(cloned)) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_JSON",
+      `${field} could not be normalized as bounded JSON.`,
+    );
+  }
+  return cloned;
+}
+
+function normalizeWikiListLimit(value: unknown): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value <= 0 ||
+    value > WIKI_ARTIFACT_RPC_LIMITS.listItems
+  ) {
+    throw new EngineRpcError(
+      "INVALID_WIKI_ARTIFACT_LIMIT",
+      `Wiki artifact limit must be an integer from 1 to ${WIKI_ARTIFACT_RPC_LIMITS.listItems}.`,
+    );
+  }
+  return value;
+}
+
+function normalizeWikiPublicationFreshness(
+  value: PublishWikiArtifactsPayload["freshness"],
+): Exclude<WikiArtifactFreshness, "stale"> {
+  if (value === undefined || value === "fresh") return "fresh";
+  if (value === "partial") return value;
+  throw new EngineRpcError(
+    "INVALID_WIKI_ARTIFACT_FRESHNESS",
+    "New Wiki artifacts may only be published as partial or fresh.",
+  );
+}
+
+function normalizeWikiArtifactScopeKind(value: unknown): WikiArtifactScopeKind {
+  if (value === "source" || value === "topic" || value === "library") return value;
+  throw new EngineRpcError(
+    "INVALID_WIKI_ARTIFACT_SCOPE",
+    `Invalid Wiki scope kind: ${String(value)}`,
+  );
+}
+
+function normalizeWikiArtifactKind(value: unknown): WikiArtifactKind {
+  if (
+    value === "source_digest" ||
+    value === "section" ||
+    value === "topic" ||
+    value === "claim" ||
+    value === "index"
+  ) {
+    return value;
+  }
+  throw new EngineRpcError(
+    "INVALID_WIKI_ARTIFACT_KIND",
+    `Invalid Wiki artifact kind: ${String(value)}`,
+  );
+}
+
+function normalizeWikiArtifactFreshness(value: unknown): WikiArtifactFreshness {
+  if (value === "partial" || value === "fresh" || value === "stale") return value;
+  throw new EngineRpcError(
+    "INVALID_WIKI_ARTIFACT_FRESHNESS",
+    `Invalid Wiki artifact freshness: ${String(value)}`,
+  );
+}
+
+function normalizeWikiArtifactLinkKind(value: unknown): WikiArtifactLinkKind {
+  if (
+    value === "derived_from" ||
+    value === "contains" ||
+    value === "related" ||
+    value === "contradicts"
+  ) {
+    return value;
+  }
+  throw new EngineRpcError(
+    "INVALID_WIKI_ARTIFACT_LINK",
+    `Invalid Wiki artifact link kind: ${String(value)}`,
+  );
+}
+
+function normalizeWikiArtifactLinkCreatedBy(value: unknown): WikiArtifactLinkCreatedBy {
+  if (value === "compiler" || value === "projector" || value === "user") return value;
+  throw new EngineRpcError(
+    "INVALID_WIKI_ARTIFACT_LINK",
+    `Invalid Wiki artifact link owner: ${String(value)}`,
+  );
+}
+
+function normalizeWikiUserEditKind(value: unknown): WikiUserEditKind {
+  if (value === "patch" || value === "override") return value;
+  throw new EngineRpcError(
+    "INVALID_WIKI_USER_EDIT",
+    `Invalid Wiki user edit kind: ${String(value)}`,
+  );
+}
+
+function normalizeWikiUserEditMergeOutcome(value: unknown): WikiUserEditMergeOutcome {
+  if (
+    value === "authored" ||
+    value === "unchanged" ||
+    value === "auto_merged" ||
+    value === "conflict" ||
+    value === "keep_user" ||
+    value === "accept_machine" ||
+    value === "manual_merge"
+  ) {
+    return value;
+  }
+  throw new EngineRpcError(
+    "INVALID_WIKI_USER_EDIT",
+    `Invalid Wiki user edit merge outcome: ${String(value)}`,
+  );
+}
+
+function wikiArtifactBatchRefKey(value: WikiArtifactBatchRef): string {
+  return `${value.artifactKind}\u0000${value.artifactKey}`;
+}
+
+function assertWikiArtifactScopeExists(db: SqliteDb, scope: WikiArtifactScope) {
+  if (scope.kind !== "source") return;
+  const source = db.selectObject(
+    "SELECT id FROM sources WHERE id = ? AND lifecycle_status <> 'deleted' LIMIT 1",
+    [scope.id],
+  );
+  if (source === undefined) {
+    throw new EngineRpcError("WIKI_ARTIFACT_SOURCE_NOT_FOUND", `Source not found: ${scope.id}`);
+  }
+}
+
+function assertWikiArtifactEvidenceTargetsExist(
+  db: SqliteDb,
+  artifacts: NormalizedWikiArtifactDraft[],
+) {
+  for (const artifact of artifacts) {
+    for (const evidence of artifact.evidence) {
+      const row = db.selectObject(
+        `SELECT c.id
+         FROM source_chunks c
+         JOIN sources s ON s.id = c.source_id
+         WHERE c.id = ?
+           AND c.source_id = ?
+           AND s.lifecycle_status <> 'deleted'
+         LIMIT 1`,
+        [evidence.chunkId, evidence.sourceId],
+      );
+      if (row === undefined) {
+        throw new EngineRpcError(
+          "WIKI_ARTIFACT_EVIDENCE_NOT_FOUND",
+          `Chunk ${evidence.chunkId} does not belong to Source ${evidence.sourceId}.`,
+        );
+      }
+    }
+  }
+}
+
+function assertExistingWikiArtifactLinkTargetsExist(
+  db: SqliteDb,
+  links: NormalizedWikiArtifactLink[],
+) {
+  for (const link of links) {
+    if (!("artifactId" in link.to)) continue;
+    const target = db.selectObject("SELECT id FROM wiki_artifacts WHERE id = ? LIMIT 1", [
+      link.to.artifactId,
+    ]);
+    if (target === undefined) {
+      throw new EngineRpcError(
+        "WIKI_ARTIFACT_LINK_TARGET_NOT_FOUND",
+        `Wiki artifact link target not found: ${link.to.artifactId}`,
+      );
+    }
+  }
+}
+
+function requireWikiArtifactRow(db: SqliteDb, id: string): SqlRow {
+  const row = db.selectObject("SELECT * FROM wiki_artifacts WHERE id = ? LIMIT 1", [id]);
+  if (row === undefined) {
+    throw new EngineRpcError("WIKI_ARTIFACT_NOT_FOUND", `Wiki artifact not found: ${id}`);
+  }
+  wikiArtifactMachineVersionFromRow(row);
+  return row;
+}
+
+function assertSameWikiArtifactLogicalIdentity(left: SqlRow, right: SqlRow, field: string) {
+  const keys = ["scope_kind", "scope_id", "artifact_kind", "artifact_key"] as const;
+  if (
+    keys.every(
+      (key) =>
+        wikiArtifactRequiredRowString(left, key) === wikiArtifactRequiredRowString(right, key),
+    )
+  ) {
+    return;
+  }
+  throw new EngineRpcError(
+    "WIKI_ARTIFACT_LOGICAL_IDENTITY_MISMATCH",
+    `${field} must reference the same logical Wiki artifact.`,
+  );
+}
+
+function selectLatestWikiUserEditForLogicalArtifact(db: SqliteDb, artifact: SqlRow) {
+  return db.selectObject(
+    `SELECT e.*
+     FROM wiki_user_edits e
+     JOIN wiki_artifacts a ON a.id = e.base_artifact_id
+     WHERE a.scope_kind = ?
+       AND a.scope_id = ?
+       AND a.artifact_kind = ?
+       AND a.artifact_key = ?
+     ORDER BY e.version_no DESC, e.created_at DESC, e.id DESC
+     LIMIT 1`,
+    wikiArtifactLogicalIdentityBind(artifact),
+  );
+}
+
+function selectWikiUserEditRowsForLogicalArtifact(db: SqliteDb, artifact: SqlRow, limit: number) {
+  return db.selectObjects(
+    `SELECT e.*
+     FROM wiki_user_edits e
+     JOIN wiki_artifacts a ON a.id = e.base_artifact_id
+     WHERE a.scope_kind = ?
+       AND a.scope_id = ?
+       AND a.artifact_kind = ?
+       AND a.artifact_key = ?
+     ORDER BY e.version_no ASC, e.created_at ASC, e.id ASC
+     LIMIT ?`,
+    [...wikiArtifactLogicalIdentityBind(artifact), limit],
+  );
+}
+
+function wikiArtifactLogicalIdentityBind(artifact: SqlRow) {
+  return [
+    wikiArtifactRequiredRowString(artifact, "scope_kind"),
+    wikiArtifactRequiredRowString(artifact, "scope_id"),
+    wikiArtifactRequiredRowString(artifact, "artifact_kind"),
+    wikiArtifactRequiredRowString(artifact, "artifact_key"),
+  ];
+}
+
+function findWikiDependentArtifactIds(db: SqliteDb, rootArtifactIds: string[]) {
+  if (rootArtifactIds.length === 0) return [];
+  const rows = db.selectObjects(
+    `WITH RECURSIVE affected(id) AS (
+       SELECT id
+       FROM wiki_artifacts
+       WHERE id IN (${rootArtifactIds.map(() => "?").join(", ")})
+       UNION
+       SELECT links.from_artifact_id
+       FROM wiki_artifact_links links
+       JOIN affected ON affected.id = links.to_artifact_id
+       WHERE links.kind IN ('derived_from', 'contains')
+     )
+     SELECT id FROM affected ORDER BY id ASC`,
+    rootArtifactIds,
+  );
+  return rows.map((row) => wikiArtifactRequiredRowString(row, "id"));
+}
+
+function markWikiArtifactsStale(db: SqliteDb, artifactIds: string[]) {
+  let changed = 0;
+  for (let offset = 0; offset < artifactIds.length; offset += 400) {
+    const batch = artifactIds.slice(offset, offset + 400);
+    if (batch.length === 0) continue;
+    const placeholders = batch.map(() => "?").join(", ");
+    const activeCount = Number(
+      db.selectValue(
+        `SELECT count(*)
+         FROM wiki_artifacts
+         WHERE id IN (${placeholders})
+           AND freshness IN ('partial', 'fresh')`,
+        batch,
+      ) ?? 0,
+    );
+    db.exec({
+      sql: `UPDATE wiki_artifacts
+            SET freshness = 'stale'
+            WHERE id IN (${placeholders})
+              AND freshness IN ('partial', 'fresh')`,
+      bind: batch,
+    });
+    changed += activeCount;
+  }
+  return changed;
+}
+
+function staleWikiArtifactsForDeletedSource(db: SqliteDb, sourceId: string) {
+  const affectedRows = db.selectObjects(
+    `WITH RECURSIVE affected(id) AS (
+       SELECT id FROM wiki_artifacts WHERE source_id = ?
+       UNION
+       SELECT artifact_id FROM wiki_artifact_evidence WHERE source_id = ?
+       UNION
+       SELECT links.from_artifact_id
+       FROM wiki_artifact_links links
+       JOIN affected ON affected.id = links.to_artifact_id
+       WHERE links.kind IN ('derived_from', 'contains')
+     )
+     SELECT id FROM affected ORDER BY id ASC`,
+    [sourceId, sourceId],
+  );
+  markWikiArtifactsStale(
+    db,
+    affectedRows.map((row) => wikiArtifactRequiredRowString(row, "id")),
+  );
+  db.exec({
+    sql: "DELETE FROM wiki_artifact_evidence WHERE source_id = ?",
+    bind: [sourceId],
+  });
 }
 
 function createTopicPageRow(db: SqliteDb, payload: CreateTopicPagePayload): SqlRow {

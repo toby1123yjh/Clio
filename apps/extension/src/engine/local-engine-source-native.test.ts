@@ -18,7 +18,7 @@ function sourceSection(start: string, end: string) {
 
 describe("local engine source-native storage foundation", () => {
   it("defines source-native storage and drops the legacy memory substrate", () => {
-    expect(workerSource).toContain("const schemaVersion = 22");
+    expect(workerSource).toContain("const schemaVersion = 23");
     expect(workerSource).toContain("const sourceNativeSchemaVersion = 12");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS sources");
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_metadata");
@@ -59,6 +59,50 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).not.toContain("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts");
     expect(workerSource).not.toContain('ensureColumn(db, "memories"');
     expect(workerSource).not.toContain('ensureColumn(db, "chunks"');
+  });
+
+  it("defines the isolated Wiki Artifact Core schema and RPC surface", () => {
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS wiki_artifacts");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS wiki_artifact_evidence");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS wiki_artifact_links");
+    expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS wiki_user_edits");
+    expect(workerSource).toContain(
+      "UNIQUE (scope_kind, scope_id, artifact_kind, artifact_key, version_no)",
+    );
+    expect(workerSource).toContain(
+      "UNIQUE (scope_kind, scope_id, artifact_kind, artifact_key, input_signature)",
+    );
+    expect(workerSource).toContain("idx_wiki_artifacts_scope_current");
+    expect(workerSource).toContain("idx_wiki_artifacts_input_signature");
+    expect(workerSource).toContain("idx_wiki_artifact_evidence_source");
+    expect(workerSource).toContain("idx_wiki_artifact_evidence_chunk");
+    expect(workerSource).toContain("idx_wiki_artifact_links_from");
+    expect(workerSource).toContain("idx_wiki_artifact_links_to");
+    expect(workerSource).toContain("idx_wiki_user_edits_base");
+    expect(workerSource).toContain("idx_wiki_user_edits_candidate");
+
+    const handleSection = sourceSection("async handle", "private async health");
+    expect(handleSection).toContain('case "publishWikiArtifacts"');
+    expect(handleSection).toContain('case "listWikiArtifacts"');
+    expect(handleSection).toContain('case "getWikiArtifact"');
+    expect(handleSection).toContain('case "appendWikiUserEdit"');
+    expect(handleSection).toContain('case "listWikiUserEdits"');
+    expect(handleSection).toContain('case "deleteWikiArtifact"');
+
+    const resetSection = sourceSection("private async resetLibrary", "private async ensureReady");
+    expect(resetSection).toContain('db.exec("DELETE FROM wiki_user_edits")');
+    expect(resetSection).toContain('db.exec("DELETE FROM wiki_artifact_links")');
+    expect(resetSection).toContain('db.exec("DELETE FROM wiki_artifact_evidence")');
+    expect(resetSection).toContain('db.exec("DELETE FROM wiki_artifacts")');
+
+    const retrievalSection = sourceSection(
+      "private async retrieveSources",
+      "private async searchKnowledgeBase",
+    );
+    expect(retrievalSection).not.toContain("wiki_artifacts");
+    expect(retrievalSection).not.toContain("wiki_artifact_evidence");
+    expect(retrievalSection).not.toContain("wiki_artifact_links");
+    expect(retrievalSection).not.toContain("wiki_user_edits");
   });
 
   it("defines the explicit source graph substrate without reusing wiki graph rows", () => {

@@ -11,6 +11,7 @@ import type {
   EngineRequest,
   EngineResultFor,
   JobSummary,
+  PublishWikiArtifactsPayload,
   RetrieveSourcesResult,
   SourceContextMapRunDetail,
 } from "@/src/shared/rpc";
@@ -5272,6 +5273,338 @@ describe("local engine behavior harness", () => {
     expect(harness.count("sources", "source_type = 'pdf'")).toBe(0);
     expect(harness.count("source_chunks")).toBe(0);
   });
+
+  it("publishes and hydrates atomic Wiki artifact batches with version idempotency", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceTitle: "Wiki Artifact Source",
+        normalizedText: ragText("wiki artifact evidence", 12),
+      }),
+    });
+    const sourceId = capture.memory.id;
+    const chunkId = firstChunkId(harness, sourceId);
+    const firstPayload = wikiSourcePublication(sourceId, chunkId, "wiki-input-v1");
+
+    const first = await harness.request({ kind: "publishWikiArtifacts", payload: firstPayload });
+    expect(first.createdCount).toBe(2);
+    expect(first.reusedCount).toBe(0);
+    expect(new Set(first.items.map((item) => item.artifact.versionGroupId))).toEqual(
+      new Set([first.versionGroupId]),
+    );
+    expect(first.items.every((item) => item.disposition === "created")).toBe(true);
+
+    const firstDigest = first.items.find(
+      (item) => item.artifact.artifactKind === "source_digest",
+    )?.artifact;
+    const firstClaim = first.items.find((item) => item.artifact.artifactKind === "claim")?.artifact;
+    expect(firstDigest).toBeDefined();
+    expect(firstClaim).toBeDefined();
+
+    const detail = await harness.request({
+      kind: "getWikiArtifact",
+      id: firstClaim?.id ?? "",
+    });
+    expect(detail?.artifact.payload).toEqual({ signature: "wiki-input-v1" });
+    expect(detail?.artifact.coverage).toEqual({ sourceCount: 1 });
+    expect(detail?.evidence).toEqual([
+      expect.objectContaining({
+        artifactId: firstClaim?.id,
+        sourceId,
+        chunkId,
+        pageNo: 1,
+        ordinal: 0,
+        bbox: { x: 0.1, y: 0.2 },
+        parserArtifactKind: "paragraph",
+        parserArtifactId: "paragraph-1",
+        anchor: { quote: "wiki artifact evidence" },
+      }),
+    ]);
+    expect(detail?.outgoingLinks).toEqual([
+      expect.objectContaining({
+        fromArtifactId: firstClaim?.id,
+        toArtifactId: firstDigest?.id,
+        kind: "derived_from",
+        createdBy: "compiler",
+        creatorVersion: "compiler-v1",
+      }),
+    ]);
+
+    const reused = await harness.request({ kind: "publishWikiArtifacts", payload: firstPayload });
+    expect(reused.versionGroupId).toBe(first.versionGroupId);
+    expect(reused.createdCount).toBe(0);
+    expect(reused.reusedCount).toBe(2);
+    expect(reused.items.map((item) => item.artifact.id)).toEqual(
+      first.items.map((item) => item.artifact.id),
+    );
+    expect(reused.items.every((item) => item.disposition === "reused")).toBe(true);
+
+    const incompleteRetry: PublishWikiArtifactsPayload = {
+      ...firstPayload,
+      artifacts: firstPayload.artifacts.slice(0, 1),
+      links: [],
+    };
+    await expect(
+      harness.request({ kind: "publishWikiArtifacts", payload: incompleteRetry }),
+    ).rejects.toMatchObject({ code: "WIKI_ARTIFACT_PARTIAL_IDEMPOTENCY_CONFLICT" });
+    expect(harness.count("wiki_artifacts", "input_signature = 'wiki-input-v1'")).toBe(2);
+
+    const second = await harness.request({
+      kind: "publishWikiArtifacts",
+      payload: wikiSourcePublication(sourceId, chunkId, "wiki-input-v2"),
+    });
+    expect(second.items.map((item) => item.artifact.versionNo)).toEqual([2, 2]);
+    for (const item of second.items) {
+      const replaced = first.items.find(
+        (candidate) =>
+          candidate.artifact.artifactKind === item.artifact.artifactKind &&
+          candidate.artifact.artifactKey === item.artifact.artifactKey,
+      );
+      expect(item.artifact.supersedesArtifactId).toBe(replaced?.artifact.id);
+    }
+
+    const current = await harness.request({
+      kind: "listWikiArtifacts",
+      filter: { scope: { kind: "source", id: sourceId } },
+    });
+    expect(current.items).toHaveLength(2);
+    expect(current.items.every((artifact) => artifact.inputSignature === "wiki-input-v2")).toBe(
+      true,
+    );
+    const history = await harness.request({
+      kind: "listWikiArtifacts",
+      filter: { scope: { kind: "source", id: sourceId }, includeHistory: true },
+    });
+    expect(history.items).toHaveLength(4);
+    expect(history.items.filter((artifact) => artifact.inputSignature === "wiki-input-v1")).toEqual(
+      [
+        expect.objectContaining({ freshness: "stale", versionNo: 1 }),
+        expect.objectContaining({ freshness: "stale", versionNo: 1 }),
+      ],
+    );
+  });
+
+  it("rejects invalid Wiki evidence and links without leaving a partial publication", async () => {
+    const harness = createHarness();
+    const firstCapture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/wiki-first",
+        normalizedText: ragText("first wiki evidence", 8),
+      }),
+    });
+    const secondCapture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({
+        sourceUrl: "https://example.test/wiki-second",
+        normalizedText: ragText("second wiki evidence", 8),
+      }),
+    });
+    const firstSourceId = firstCapture.memory.id;
+    const firstChunkIdValue = firstChunkId(harness, firstSourceId);
+    const secondSourceId = secondCapture.memory.id;
+
+    const claimWithoutEvidence: PublishWikiArtifactsPayload = {
+      scope: { kind: "source", id: firstSourceId },
+      inputSignature: "missing-claim-evidence",
+      compilerVersion: "compiler-v1",
+      promptVersion: "prompt-v1",
+      artifacts: [
+        {
+          artifactKind: "claim",
+          artifactKey: "claim:missing-evidence",
+          title: "Unsupported claim",
+          content: "This claim must not be persisted.",
+        },
+      ],
+    };
+    await expect(
+      harness.request({ kind: "publishWikiArtifacts", payload: claimWithoutEvidence }),
+    ).rejects.toMatchObject({ code: "WIKI_CLAIM_EVIDENCE_REQUIRED" });
+
+    const missingChunk = wikiSourcePublication(
+      firstSourceId,
+      "missing-wiki-chunk",
+      "missing-chunk",
+    );
+    await expect(
+      harness.request({ kind: "publishWikiArtifacts", payload: missingChunk }),
+    ).rejects.toMatchObject({ code: "WIKI_ARTIFACT_EVIDENCE_NOT_FOUND" });
+
+    const mismatchedChunk = wikiSourcePublication(
+      secondSourceId,
+      firstChunkIdValue,
+      "mismatched-chunk",
+    );
+    await expect(
+      harness.request({ kind: "publishWikiArtifacts", payload: mismatchedChunk }),
+    ).rejects.toMatchObject({ code: "WIKI_ARTIFACT_EVIDENCE_NOT_FOUND" });
+
+    const missingLinkTarget: PublishWikiArtifactsPayload = {
+      scope: { kind: "source", id: firstSourceId },
+      inputSignature: "missing-link-target",
+      compilerVersion: "compiler-v1",
+      promptVersion: "prompt-v1",
+      artifacts: [
+        {
+          artifactKind: "source_digest",
+          artifactKey: "digest:rollback",
+          title: "Rollback digest",
+          content: "This entire batch must roll back.",
+        },
+      ],
+      links: [
+        {
+          from: { artifactKind: "source_digest", artifactKey: "digest:rollback" },
+          to: { artifactId: "missing-artifact" },
+          kind: "derived_from",
+          createdBy: "compiler",
+        },
+      ],
+    };
+    await expect(
+      harness.request({ kind: "publishWikiArtifacts", payload: missingLinkTarget }),
+    ).rejects.toMatchObject({ code: "WIKI_ARTIFACT_LINK_TARGET_NOT_FOUND" });
+
+    expect(harness.count("wiki_artifacts")).toBe(0);
+    expect(harness.count("wiki_artifact_evidence")).toBe(0);
+    expect(harness.count("wiki_artifact_links")).toBe(0);
+  });
+
+  it("keeps Wiki user edits append-only across machine versions", async () => {
+    const harness = createHarness();
+    const first = await harness.request({
+      kind: "publishWikiArtifacts",
+      payload: wikiLibraryPublication("edit-input-v1", "topic:editable"),
+    });
+    const firstArtifact = first.items[0]?.artifact;
+    const second = await harness.request({
+      kind: "publishWikiArtifacts",
+      payload: wikiLibraryPublication("edit-input-v2", "topic:editable"),
+    });
+    const secondArtifact = second.items[0]?.artifact;
+    const unrelated = await harness.request({
+      kind: "publishWikiArtifacts",
+      payload: wikiLibraryPublication("edit-input-other", "topic:unrelated"),
+    });
+
+    const edit1 = await harness.request({
+      kind: "appendWikiUserEdit",
+      payload: {
+        id: "wiki-edit-1",
+        baseArtifactId: firstArtifact?.id ?? "",
+        candidateArtifactId: secondArtifact?.id,
+        editKind: "patch",
+        payload: { operations: [{ op: "replace", path: "/title", value: "User title" }] },
+        mergeOutcome: "authored",
+        createdAt: "2026-08-11T01:00:00.000Z",
+      },
+    });
+    const edit2 = await harness.request({
+      kind: "appendWikiUserEdit",
+      payload: {
+        id: "wiki-edit-2",
+        baseArtifactId: secondArtifact?.id ?? "",
+        previousEditId: edit1.id,
+        candidateArtifactId: firstArtifact?.id,
+        editKind: "override",
+        payload: { content: "User-owned content" },
+        mergeOutcome: "manual_merge",
+        createdAt: "2026-08-11T01:01:00.000Z",
+      },
+    });
+
+    expect(edit1.versionNo).toBe(1);
+    expect(edit2).toMatchObject({ previousEditId: edit1.id, versionNo: 2 });
+    const history = await harness.request({
+      kind: "listWikiUserEdits",
+      artifactId: secondArtifact?.id ?? "",
+    });
+    expect(history.items.map((edit) => edit.id)).toEqual(["wiki-edit-1", "wiki-edit-2"]);
+    const detail = await harness.request({
+      kind: "getWikiArtifact",
+      id: firstArtifact?.id ?? "",
+    });
+    expect(detail?.artifact.content).toContain("edit-input-v1");
+    expect(detail?.userEdits.map((edit) => edit.id)).toEqual(["wiki-edit-1", "wiki-edit-2"]);
+
+    await expect(
+      harness.request({
+        kind: "appendWikiUserEdit",
+        payload: {
+          baseArtifactId: secondArtifact?.id ?? "",
+          previousEditId: edit2.id,
+          candidateArtifactId: unrelated.items[0]?.artifact.id,
+          editKind: "patch",
+          payload: { rejected: true },
+          mergeOutcome: "conflict",
+        },
+      }),
+    ).rejects.toMatchObject({ code: "WIKI_ARTIFACT_LOGICAL_IDENTITY_MISMATCH" });
+    expect(harness.count("wiki_user_edits")).toBe(2);
+  });
+
+  it("deletes only the selected Wiki artifact and stales recursive dependents", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({ normalizedText: ragText("artifact delete evidence", 8) }),
+    });
+    const sourceId = capture.memory.id;
+    const chain = await createWikiDependencyChain(
+      harness,
+      sourceId,
+      firstChunkId(harness, sourceId),
+    );
+    const sourceCount = harness.count("sources", "id = ?", [sourceId]);
+    const chunkCount = harness.count("source_chunks", "source_id = ?", [sourceId]);
+
+    const deleted = await harness.request({ kind: "deleteWikiArtifact", id: chain.digestId });
+    expect(deleted).toEqual({ deleted: true, id: chain.digestId, staleArtifactCount: 2 });
+    expect(await harness.request({ kind: "getWikiArtifact", id: chain.digestId })).toBeNull();
+    expect(harness.count("wiki_artifacts", "freshness = 'stale'")).toBe(2);
+    expect(harness.count("sources", "id = ?", [sourceId])).toBe(sourceCount);
+    expect(harness.count("source_chunks", "source_id = ?", [sourceId])).toBe(chunkCount);
+  });
+
+  it("propagates Source deletion through Wiki evidence and clears Wiki Core on reset", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({ normalizedText: ragText("source delete evidence", 8) }),
+    });
+    const sourceId = capture.memory.id;
+    const chain = await createWikiDependencyChain(
+      harness,
+      sourceId,
+      firstChunkId(harness, sourceId),
+    );
+    await harness.request({
+      kind: "appendWikiUserEdit",
+      payload: {
+        baseArtifactId: chain.indexId,
+        editKind: "patch",
+        payload: { title: "Edited index" },
+        mergeOutcome: "authored",
+      },
+    });
+    expect(harness.count("wiki_artifact_evidence", "source_id = ?", [sourceId])).toBe(1);
+
+    expect(await harness.request({ kind: "deleteMemory", id: sourceId })).toEqual({
+      deleted: true,
+      id: sourceId,
+    });
+    expect(harness.count("wiki_artifact_evidence", "source_id = ?", [sourceId])).toBe(0);
+    expect(harness.count("wiki_artifacts", "freshness = 'stale'")).toBe(3);
+    expect(harness.count("sources", "id = ? AND lifecycle_status = 'deleted'", [sourceId])).toBe(1);
+
+    await harness.request({ kind: "repair", action: "reset_library" });
+    expect(harness.count("wiki_user_edits")).toBe(0);
+    expect(harness.count("wiki_artifact_links")).toBe(0);
+    expect(harness.count("wiki_artifact_evidence")).toBe(0);
+    expect(harness.count("wiki_artifacts")).toBe(0);
+  });
 });
 
 type BehaviorHarnessOptions = Omit<LocalEngineOptions, "openDatabase"> & {
@@ -5340,6 +5673,174 @@ function createHarness(options: BehaviorHarnessOptions = {}) {
       if (db === undefined) throw new Error("Test database is not open.");
       return db.selectObjects(sql, bind);
     },
+  };
+}
+
+function firstChunkId(harness: ReturnType<typeof createHarness>, sourceId: string) {
+  const row = harness.selectObject(
+    "SELECT id FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
+    [sourceId],
+  );
+  const id = row?.id;
+  if (typeof id !== "string" || id.length === 0) {
+    throw new Error(`Source ${sourceId} has no test chunk.`);
+  }
+  return id;
+}
+
+function wikiSourcePublication(
+  sourceId: string,
+  chunkId: string,
+  inputSignature: string,
+): PublishWikiArtifactsPayload {
+  return {
+    scope: { kind: "source", id: sourceId },
+    inputSignature,
+    compilerVersion: "compiler-v1",
+    promptVersion: "prompt-v1",
+    modelId: "main-model",
+    freshness: "fresh",
+    artifacts: [
+      {
+        artifactKind: "source_digest",
+        artifactKey: "digest:root",
+        title: "Source digest",
+        content: `Digest compiled from ${inputSignature}.`,
+        payload: { signature: inputSignature },
+        coverage: { sourceCount: 1 },
+      },
+      {
+        artifactKind: "claim",
+        artifactKey: "claim:root",
+        title: "Supported claim",
+        content: `Claim compiled from ${inputSignature}.`,
+        payload: { signature: inputSignature },
+        coverage: { sourceCount: 1 },
+        evidence: [
+          {
+            sourceId,
+            chunkId,
+            pageNo: 1,
+            bbox: { x: 0.1, y: 0.2 },
+            parserArtifactKind: "paragraph",
+            parserArtifactId: "paragraph-1",
+            anchor: { quote: "wiki artifact evidence" },
+          },
+        ],
+      },
+    ],
+    links: [
+      {
+        from: { artifactKind: "claim", artifactKey: "claim:root" },
+        to: { artifactKind: "source_digest", artifactKey: "digest:root" },
+        kind: "derived_from",
+        createdBy: "compiler",
+        creatorVersion: "compiler-v1",
+      },
+    ],
+  };
+}
+
+function wikiLibraryPublication(
+  inputSignature: string,
+  artifactKey: string,
+): PublishWikiArtifactsPayload {
+  return {
+    scope: { kind: "library", id: "default-library" },
+    inputSignature,
+    compilerVersion: "compiler-v1",
+    promptVersion: "prompt-v1",
+    artifacts: [
+      {
+        artifactKind: "topic",
+        artifactKey,
+        title: "Editable topic",
+        content: `Machine content for ${inputSignature}.`,
+        payload: { signature: inputSignature },
+      },
+    ],
+  };
+}
+
+async function createWikiDependencyChain(
+  harness: ReturnType<typeof createHarness>,
+  sourceId: string,
+  chunkId: string,
+) {
+  const digest = await harness.request({
+    kind: "publishWikiArtifacts",
+    payload: {
+      scope: { kind: "source", id: sourceId },
+      inputSignature: "dependency-digest-v1",
+      compilerVersion: "compiler-v1",
+      promptVersion: "prompt-v1",
+      artifacts: [
+        {
+          artifactKind: "source_digest",
+          artifactKey: "digest:dependency-root",
+          title: "Dependency digest",
+          content: "Root artifact for dependency propagation.",
+        },
+      ],
+    },
+  });
+  const digestId = digest.items[0]?.artifact.id ?? "";
+  const claim = await harness.request({
+    kind: "publishWikiArtifacts",
+    payload: {
+      scope: { kind: "library", id: "default-library" },
+      inputSignature: "dependency-claim-v1",
+      compilerVersion: "compiler-v1",
+      promptVersion: "prompt-v1",
+      artifacts: [
+        {
+          artifactKind: "claim",
+          artifactKey: "claim:dependency-middle",
+          title: "Dependency claim",
+          content: "Claim backed by the source.",
+          evidence: [{ sourceId, chunkId }],
+        },
+      ],
+      links: [
+        {
+          from: { artifactKind: "claim", artifactKey: "claim:dependency-middle" },
+          to: { artifactId: digestId },
+          kind: "derived_from",
+          createdBy: "compiler",
+        },
+      ],
+    },
+  });
+  const claimId = claim.items[0]?.artifact.id ?? "";
+  const index = await harness.request({
+    kind: "publishWikiArtifacts",
+    payload: {
+      scope: { kind: "library", id: "default-library" },
+      inputSignature: "dependency-index-v1",
+      compilerVersion: "compiler-v1",
+      promptVersion: "prompt-v1",
+      artifacts: [
+        {
+          artifactKind: "index",
+          artifactKey: "index:dependency-leaf",
+          title: "Dependency index",
+          content: "Index derived from the claim.",
+        },
+      ],
+      links: [
+        {
+          from: { artifactKind: "index", artifactKey: "index:dependency-leaf" },
+          to: { artifactId: claimId },
+          kind: "contains",
+          createdBy: "compiler",
+        },
+      ],
+    },
+  });
+  return {
+    digestId,
+    claimId,
+    indexId: index.items[0]?.artifact.id ?? "",
   };
 }
 
