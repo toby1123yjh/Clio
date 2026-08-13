@@ -208,16 +208,6 @@ export type SourceContextMapEventKind =
   | "cancel_requested"
   | "cancelled"
   | "retry_created";
-export type WikiCompileJobStatus = "queued" | "running" | "done" | "failed";
-export type WikiCompileEventLevel = "info" | "warning" | "error";
-export type WikiCompileEventKind =
-  | "queued"
-  | "claimed"
-  | "sources_selected"
-  | "provider_started"
-  | "provider_delta"
-  | "completed"
-  | "failed";
 export type WikiArtifactScopeKind = "source" | "topic" | "library";
 export type WikiArtifactKind = "source_digest" | "section" | "topic" | "claim" | "index";
 export type WikiArtifactFreshness = "partial" | "fresh" | "stale";
@@ -233,7 +223,6 @@ export type WikiUserEditMergeOutcome =
   | "accept_machine"
   | "manual_merge";
 export type WikiArtifactPublicationDisposition = "created" | "reused";
-export type TopicGraphEdgeKind = "source" | "related" | "mentions";
 export type GraphNodeKind =
   | "source"
   | "person"
@@ -968,57 +957,6 @@ export interface SearchMemoryItem extends MemorySummary {
   snippet: string;
 }
 
-export interface TopicPageSourceRef {
-  memoryId: string;
-  chunkId?: string;
-  quote?: string;
-}
-
-export interface TopicPageSummary {
-  id: string;
-  slug: string;
-  title: string;
-  summary: string;
-  createdAt: string;
-  updatedAt: string;
-  sourceCount: number;
-}
-
-export interface TopicPageDetail extends TopicPageSummary {
-  content: string;
-  sourceRefs: TopicPageSourceRef[];
-}
-
-export interface CreateTopicPagePayload {
-  id?: string;
-  slug?: string;
-  title: string;
-  summary?: string;
-  content?: string;
-  sourceRefs?: TopicPageSourceRef[];
-  createdAt?: string;
-  updatedAt?: string;
-}
-
-export interface UpdateTopicPagePayload {
-  slug?: string;
-  title?: string;
-  summary?: string;
-  content?: string;
-  sourceRefs?: TopicPageSourceRef[];
-  updatedAt?: string;
-}
-
-export interface ListTopicPagesResult {
-  items: TopicPageSummary[];
-  query?: string;
-}
-
-export interface DeleteTopicPageResult {
-  deleted: boolean;
-  id: string;
-}
-
 export type WikiArtifactJsonValue =
   | string
   | number
@@ -1155,6 +1093,14 @@ export interface ListWikiArtifactsResult {
   items: WikiArtifactMachineVersion[];
 }
 
+export interface ListWikiArtifactsForSourceRequest {
+  kind: "listWikiArtifactsForSource";
+  sourceId: string;
+  chunkId?: string;
+  includeHistory?: boolean;
+  limit?: number;
+}
+
 export interface WikiArtifactDetail {
   artifact: WikiArtifactMachineVersion;
   evidence: WikiArtifactEvidence[];
@@ -1182,96 +1128,6 @@ export interface DeleteWikiArtifactResult {
   deleted: boolean;
   id: string;
   staleArtifactCount: number;
-}
-
-export interface CreateWikiCompileJobPayload {
-  id?: string;
-  topicId?: string;
-  query: string;
-  instructions?: string;
-  sourceMemoryIds?: string[];
-  maxAttempts?: number;
-  runAfter?: string;
-  createdAt?: string;
-}
-
-export interface WikiCompileJobSummary {
-  id: string;
-  status: WikiCompileJobStatus;
-  topicId?: string;
-  query: string;
-  instructions: string;
-  sourceMemoryIds: string[];
-  attempts: number;
-  maxAttempts: number;
-  createdAt: string;
-  updatedAt: string;
-  runAfter?: string;
-  claimedAt?: string;
-  finishedAt?: string;
-  lastError?: string;
-  resultTopicId?: string;
-}
-
-export interface ListWikiCompileJobsResult {
-  jobs: WikiCompileJobSummary[];
-}
-
-export interface CreateWikiCompileJobEventPayload {
-  id?: string;
-  jobId: string;
-  kind: WikiCompileEventKind;
-  level?: WikiCompileEventLevel;
-  message?: string;
-  detail?: Record<string, unknown>;
-  createdAt?: string;
-}
-
-export interface WikiCompileJobEvent {
-  id: string;
-  jobId: string;
-  kind: WikiCompileEventKind;
-  level: WikiCompileEventLevel;
-  message: string;
-  detail: Record<string, unknown>;
-  createdAt: string;
-}
-
-export interface ListWikiCompileJobEventsResult {
-  events: WikiCompileJobEvent[];
-}
-
-export interface WikiCompileResultPayload {
-  topic?: CreateTopicPagePayload | UpdateTopicPagePayload;
-  sourceRefs?: TopicPageSourceRef[];
-  edges?: TopicGraphEdgeInput[];
-  completedAt?: string;
-}
-
-export interface TopicGraphEdgeInput {
-  id?: string;
-  fromTopicId?: string;
-  toTopicId?: string;
-  memoryId?: string;
-  chunkId?: string;
-  kind: TopicGraphEdgeKind;
-  weight?: number;
-  label?: string;
-  createdAt?: string;
-}
-
-export interface TopicGraphEdge extends Required<Pick<TopicGraphEdgeInput, "id" | "kind">> {
-  fromTopicId: string;
-  toTopicId?: string;
-  memoryId?: string;
-  chunkId?: string;
-  weight: number;
-  label: string;
-  createdAt: string;
-}
-
-export interface ListTopicGraphEdgesResult {
-  edges: TopicGraphEdge[];
 }
 
 export interface GraphNode {
@@ -1894,13 +1750,9 @@ export type EngineRequest =
     }
   | { kind: "markSourceContextMapReduceFailed"; payload: MarkSourceContextMapReduceFailedPayload }
   | { kind: "deleteMemory"; id: string }
-  | { kind: "listTopicPages"; query?: string; limit?: number }
-  | { kind: "getTopicPage"; id: string }
-  | { kind: "createTopicPage"; payload: CreateTopicPagePayload }
-  | { kind: "updateTopicPage"; id: string; payload: UpdateTopicPagePayload }
-  | { kind: "deleteTopicPage"; id: string }
   | { kind: "publishWikiArtifacts"; payload: PublishWikiArtifactsPayload }
   | { kind: "listWikiArtifacts"; filter?: WikiArtifactFilter }
+  | ListWikiArtifactsForSourceRequest
   | { kind: "getWikiArtifact"; id: string }
   | { kind: "appendWikiUserEdit"; payload: AppendWikiUserEditPayload }
   | { kind: "listWikiUserEdits"; artifactId: string; limit?: number }
@@ -1923,15 +1775,6 @@ export type EngineRequest =
   | { kind: "getWikiCompileReduceInput"; runId: string; leaseOwner: string }
   | { kind: "completeWikiCompileReduce"; payload: CompleteWikiCompileReducePayload }
   | { kind: "failWikiCompileReduce"; payload: FailWikiCompileStagePayload }
-  | { kind: "enqueueWikiCompile"; payload: CreateWikiCompileJobPayload }
-  | { kind: "listWikiCompileJobs"; status?: WikiCompileJobStatus; limit?: number }
-  | { kind: "getWikiCompileJob"; id: string }
-  | { kind: "appendWikiCompileJobEvent"; payload: CreateWikiCompileJobEventPayload }
-  | { kind: "listWikiCompileJobEvents"; jobId: string; limit?: number }
-  | { kind: "claimNextWikiCompileJob"; id?: string; now?: string }
-  | { kind: "completeWikiCompileJob"; id: string; result: WikiCompileResultPayload }
-  | { kind: "failWikiCompileJob"; id: string; error: string; retryAfter?: string; now?: string }
-  | { kind: "listTopicGraphEdges"; topicId: string; edgeKind?: TopicGraphEdgeKind }
   | { kind: "buildSourceGraph"; payload: BuildSourceGraphPayload }
   | { kind: "enqueueSourceGraphJob"; payload: EnqueueSourceGraphJobPayload }
   | { kind: "queryGraphNeighbors"; payload: GraphNeighborsPayload }
@@ -2085,289 +1928,246 @@ export type EngineResultFor<T extends EngineRequest> = T extends { kind: "health
                                             ? SourceContextMapStepRecord
                                             : T extends { kind: "deleteMemory" }
                                               ? DeleteMemoryResult
-                                              : T extends { kind: "listTopicPages" }
-                                                ? ListTopicPagesResult
+                                              : T extends { kind: "publishWikiArtifacts" }
+                                                ? PublishWikiArtifactsResult
                                                 : T extends {
-                                                      kind: "getTopicPage" | "updateTopicPage";
+                                                      kind:
+                                                        | "listWikiArtifacts"
+                                                        | "listWikiArtifactsForSource";
                                                     }
-                                                  ? TopicPageDetail | null
-                                                  : T extends { kind: "createTopicPage" }
-                                                    ? TopicPageDetail
-                                                    : T extends { kind: "deleteTopicPage" }
-                                                      ? DeleteTopicPageResult
-                                                      : T extends { kind: "publishWikiArtifacts" }
-                                                        ? PublishWikiArtifactsResult
-                                                        : T extends { kind: "listWikiArtifacts" }
-                                                          ? ListWikiArtifactsResult
-                                                          : T extends { kind: "getWikiArtifact" }
-                                                            ? WikiArtifactDetail | null
+                                                  ? ListWikiArtifactsResult
+                                                  : T extends { kind: "getWikiArtifact" }
+                                                    ? WikiArtifactDetail | null
+                                                    : T extends {
+                                                          kind: "appendWikiUserEdit";
+                                                        }
+                                                      ? WikiUserEdit
+                                                      : T extends {
+                                                            kind: "listWikiUserEdits";
+                                                          }
+                                                        ? ListWikiUserEditsResult
+                                                        : T extends {
+                                                              kind: "deleteWikiArtifact";
+                                                            }
+                                                          ? DeleteWikiArtifactResult
+                                                          : T extends {
+                                                                kind:
+                                                                  | "enqueueWikiCompileRun"
+                                                                  | "createWikiCompileRun";
+                                                              }
+                                                            ? WikiCompileCreateResult
                                                             : T extends {
-                                                                  kind: "appendWikiUserEdit";
+                                                                  kind: "listWikiCompileRuns";
                                                                 }
-                                                              ? WikiUserEdit
+                                                              ? ListWikiCompileRunsResult
                                                               : T extends {
-                                                                    kind: "listWikiUserEdits";
+                                                                    kind: "getWikiCompileRun";
                                                                   }
-                                                                ? ListWikiUserEditsResult
+                                                                ? WikiCompileRunDetail | null
                                                                 : T extends {
-                                                                      kind: "deleteWikiArtifact";
+                                                                      kind:
+                                                                        | "cancelWikiCompileRun"
+                                                                        | "retryWikiCompileRun"
+                                                                        | "resumeWikiCompileRun"
+                                                                        | "pauseWikiCompileRun"
+                                                                        | "failWikiCompileStep"
+                                                                        | "failWikiCompileReduce";
                                                                     }
-                                                                  ? DeleteWikiArtifactResult
+                                                                  ? WikiCompileRunSummary
                                                                   : T extends {
-                                                                        kind: "enqueueWikiCompile";
+                                                                        kind: "listWikiCompileEvents";
                                                                       }
-                                                                    ? WikiCompileJobSummary
+                                                                    ? ListWikiCompileEventsResult
                                                                     : T extends {
-                                                                          kind:
-                                                                            | "enqueueWikiCompileRun"
-                                                                            | "createWikiCompileRun";
+                                                                          kind: "recoverWikiCompileRuns";
                                                                         }
-                                                                      ? WikiCompileCreateResult
+                                                                      ? RecoverWikiCompileRunsResult
                                                                       : T extends {
-                                                                            kind: "listWikiCompileRuns";
+                                                                            kind: "claimNextWikiCompileStep";
                                                                           }
-                                                                        ? ListWikiCompileRunsResult
+                                                                        ? WikiCompileClaimStepResult
                                                                         : T extends {
-                                                                              kind: "getWikiCompileRun";
+                                                                              kind: "getWikiCompileStepInput";
                                                                             }
-                                                                          ? WikiCompileRunDetail | null
+                                                                          ? WikiCompileMapInput
                                                                           : T extends {
-                                                                                kind:
-                                                                                  | "cancelWikiCompileRun"
-                                                                                  | "retryWikiCompileRun"
-                                                                                  | "resumeWikiCompileRun"
-                                                                                  | "pauseWikiCompileRun"
-                                                                                  | "failWikiCompileStep"
-                                                                                  | "failWikiCompileReduce";
+                                                                                kind: "completeWikiCompileStep";
                                                                               }
-                                                                            ? WikiCompileRunSummary
+                                                                            ? WikiCompileStepRecord
                                                                             : T extends {
-                                                                                  kind: "listWikiCompileEvents";
+                                                                                  kind: "claimWikiCompileReduce";
                                                                                 }
-                                                                              ? ListWikiCompileEventsResult
+                                                                              ? WikiCompileClaimReduceResult
                                                                               : T extends {
-                                                                                    kind: "recoverWikiCompileRuns";
+                                                                                    kind: "getWikiCompileReduceInput";
                                                                                   }
-                                                                                ? RecoverWikiCompileRunsResult
+                                                                                ? WikiCompileReduceInput
                                                                                 : T extends {
-                                                                                      kind: "claimNextWikiCompileStep";
+                                                                                      kind: "completeWikiCompileReduce";
                                                                                     }
-                                                                                  ? WikiCompileClaimStepResult
+                                                                                  ? WikiCompileRunSummary
                                                                                   : T extends {
-                                                                                        kind: "getWikiCompileStepInput";
+                                                                                        kind: "buildSourceGraph";
                                                                                       }
-                                                                                    ? WikiCompileMapInput
+                                                                                    ? BuildSourceGraphResult
                                                                                     : T extends {
-                                                                                          kind: "completeWikiCompileStep";
+                                                                                          kind:
+                                                                                            | "queryGraphNeighbors"
+                                                                                            | "queryGraphSubgraph"
+                                                                                            | "queryGraphPath"
+                                                                                            | "queryGraphTimeline";
                                                                                         }
-                                                                                      ? WikiCompileStepRecord
+                                                                                      ? GraphQueryResult
                                                                                       : T extends {
-                                                                                            kind: "claimWikiCompileReduce";
+                                                                                            kind: "repair";
                                                                                           }
-                                                                                        ? WikiCompileClaimReduceResult
+                                                                                        ? RepairResult
                                                                                         : T extends {
-                                                                                              kind: "getWikiCompileReduceInput";
+                                                                                              kind: "getActiveEmbeddingModel";
                                                                                             }
-                                                                                          ? WikiCompileReduceInput
+                                                                                          ? ActiveEmbeddingModelSummary | null
                                                                                           : T extends {
-                                                                                                kind: "completeWikiCompileReduce";
+                                                                                                kind: "getJobStatus";
                                                                                               }
-                                                                                            ? WikiCompileRunSummary
+                                                                                            ? GetJobStatusResult
                                                                                             : T extends {
-                                                                                                  kind: "listWikiCompileJobs";
+                                                                                                  kind: "listOrchestrationRuns";
                                                                                                 }
-                                                                                              ? ListWikiCompileJobsResult
+                                                                                              ? ListOrchestrationRunsResult
                                                                                               : T extends {
-                                                                                                    kind: "appendWikiCompileJobEvent";
+                                                                                                    kind: "listOrchestrationEvents";
                                                                                                   }
-                                                                                                ? WikiCompileJobEvent
+                                                                                                ? ListOrchestrationEventsResult
                                                                                                 : T extends {
-                                                                                                      kind: "listWikiCompileJobEvents";
+                                                                                                      kind:
+                                                                                                        | "createOrchestrationRun"
+                                                                                                        | "runOrchestration"
+                                                                                                        | "cancelOrchestrationRun"
+                                                                                                        | "retryOrchestrationRun";
                                                                                                     }
-                                                                                                  ? ListWikiCompileJobEventsResult
+                                                                                                  ? OrchestrationRunSummary
                                                                                                   : T extends {
                                                                                                         kind:
-                                                                                                          | "getWikiCompileJob"
-                                                                                                          | "claimNextWikiCompileJob";
+                                                                                                          | "runJob"
+                                                                                                          | "cancelJob"
+                                                                                                          | "enqueueChunkMetaTier2Job"
+                                                                                                          | "enqueueSourceGraphJob";
                                                                                                       }
-                                                                                                    ? WikiCompileJobSummary | null
+                                                                                                    ? JobSummary
                                                                                                     : T extends {
-                                                                                                          kind: "completeWikiCompileJob";
+                                                                                                          kind: "listChunkMetaTier2Audit";
                                                                                                         }
                                                                                                       ? {
-                                                                                                          job: WikiCompileJobSummary;
-                                                                                                          topic: TopicPageDetail;
+                                                                                                          items: ChunkMetaTier2AuditRecord[];
                                                                                                         }
                                                                                                       : T extends {
-                                                                                                            kind: "failWikiCompileJob";
+                                                                                                            kind: "clearChunkMetaTier2Audit";
                                                                                                           }
-                                                                                                        ? WikiCompileJobSummary | null
+                                                                                                        ? {
+                                                                                                            cleared: number;
+                                                                                                          }
                                                                                                         : T extends {
-                                                                                                              kind: "listTopicGraphEdges";
+                                                                                                              kind:
+                                                                                                                | "reindex"
+                                                                                                                | "enqueueEmbeddingReindex";
                                                                                                             }
-                                                                                                          ? ListTopicGraphEdgesResult
+                                                                                                          ? ReindexResult
                                                                                                           : T extends {
-                                                                                                                kind: "buildSourceGraph";
+                                                                                                                kind: "resolveAnchor";
                                                                                                               }
-                                                                                                            ? BuildSourceGraphResult
+                                                                                                            ? AnchorResolveResult
                                                                                                             : T extends {
-                                                                                                                  kind:
-                                                                                                                    | "queryGraphNeighbors"
-                                                                                                                    | "queryGraphSubgraph"
-                                                                                                                    | "queryGraphPath"
-                                                                                                                    | "queryGraphTimeline";
+                                                                                                                  kind: "createChatSession";
                                                                                                                 }
-                                                                                                              ? GraphQueryResult
+                                                                                                              ? ChatSessionSummary
                                                                                                               : T extends {
-                                                                                                                    kind: "repair";
+                                                                                                                    kind: "listChatSessions";
                                                                                                                   }
-                                                                                                                ? RepairResult
+                                                                                                                ? ListChatSessionsResult
                                                                                                                 : T extends {
-                                                                                                                      kind: "getActiveEmbeddingModel";
+                                                                                                                      kind:
+                                                                                                                        | "loadChatSession"
+                                                                                                                        | "recoverInterruptedChatSession";
                                                                                                                     }
-                                                                                                                  ? ActiveEmbeddingModelSummary | null
+                                                                                                                  ? ChatSessionDetail | null
                                                                                                                   : T extends {
-                                                                                                                        kind: "getJobStatus";
+                                                                                                                        kind:
+                                                                                                                          | "claimChatSession"
+                                                                                                                          | "heartbeatChatSession"
+                                                                                                                          | "releaseChatSession";
                                                                                                                       }
-                                                                                                                    ? GetJobStatusResult
+                                                                                                                    ? SessionLeaseResult
                                                                                                                     : T extends {
-                                                                                                                          kind: "listOrchestrationRuns";
+                                                                                                                          kind: "appendSessionEvidence";
                                                                                                                         }
-                                                                                                                      ? ListOrchestrationRunsResult
+                                                                                                                      ? SessionEvidenceRecord
                                                                                                                       : T extends {
-                                                                                                                            kind: "listOrchestrationEvents";
+                                                                                                                            kind: "appendCompaction";
                                                                                                                           }
-                                                                                                                        ? ListOrchestrationEventsResult
+                                                                                                                        ? CompactionRecord
                                                                                                                         : T extends {
-                                                                                                                              kind:
-                                                                                                                                | "createOrchestrationRun"
-                                                                                                                                | "runOrchestration"
-                                                                                                                                | "cancelOrchestrationRun"
-                                                                                                                                | "retryOrchestrationRun";
+                                                                                                                              kind: "listCompactions";
                                                                                                                             }
-                                                                                                                          ? OrchestrationRunSummary
+                                                                                                                          ? {
+                                                                                                                              items: CompactionRecord[];
+                                                                                                                            }
                                                                                                                           : T extends {
-                                                                                                                                kind:
-                                                                                                                                  | "runJob"
-                                                                                                                                  | "cancelJob"
-                                                                                                                                  | "enqueueChunkMetaTier2Job"
-                                                                                                                                  | "enqueueSourceGraphJob";
+                                                                                                                                kind: "getLatestCompaction";
                                                                                                                               }
-                                                                                                                            ? JobSummary
+                                                                                                                            ? CompactionRecord | null
                                                                                                                             : T extends {
-                                                                                                                                  kind: "listChunkMetaTier2Audit";
+                                                                                                                                  kind:
+                                                                                                                                    | "upsertChatMessage"
+                                                                                                                                    | "updateChatMessage";
                                                                                                                                 }
-                                                                                                                              ? {
-                                                                                                                                  items: ChunkMetaTier2AuditRecord[];
-                                                                                                                                }
+                                                                                                                              ? ChatMessageRecord
                                                                                                                               : T extends {
-                                                                                                                                    kind: "clearChunkMetaTier2Audit";
+                                                                                                                                    kind: "deleteChatMessage";
                                                                                                                                   }
                                                                                                                                 ? {
-                                                                                                                                    cleared: number;
+                                                                                                                                    deleted: boolean;
                                                                                                                                   }
                                                                                                                                 : T extends {
-                                                                                                                                      kind:
-                                                                                                                                        | "reindex"
-                                                                                                                                        | "enqueueEmbeddingReindex";
+                                                                                                                                      kind: "clearQueuedChatMessages";
                                                                                                                                     }
-                                                                                                                                  ? ReindexResult
+                                                                                                                                  ? {
+                                                                                                                                      cleared: number;
+                                                                                                                                    }
                                                                                                                                   : T extends {
-                                                                                                                                        kind: "resolveAnchor";
+                                                                                                                                        kind: "listWebSearchHistory";
                                                                                                                                       }
-                                                                                                                                    ? AnchorResolveResult
+                                                                                                                                    ? ListWebSearchHistoryResult
                                                                                                                                     : T extends {
-                                                                                                                                          kind: "createChatSession";
+                                                                                                                                          kind: "appendWebSearchHistory";
                                                                                                                                         }
-                                                                                                                                      ? ChatSessionSummary
+                                                                                                                                      ? WebSearchHistoryRecord
                                                                                                                                       : T extends {
-                                                                                                                                            kind: "listChatSessions";
+                                                                                                                                            kind: "deleteWebSearchHistory";
                                                                                                                                           }
-                                                                                                                                        ? ListChatSessionsResult
+                                                                                                                                        ? {
+                                                                                                                                            deleted: boolean;
+                                                                                                                                          }
                                                                                                                                         : T extends {
-                                                                                                                                              kind:
-                                                                                                                                                | "loadChatSession"
-                                                                                                                                                | "recoverInterruptedChatSession";
+                                                                                                                                              kind: "clearWebSearchHistory";
                                                                                                                                             }
-                                                                                                                                          ? ChatSessionDetail | null
+                                                                                                                                          ? {
+                                                                                                                                              cleared: number;
+                                                                                                                                            }
                                                                                                                                           : T extends {
-                                                                                                                                                kind:
-                                                                                                                                                  | "claimChatSession"
-                                                                                                                                                  | "heartbeatChatSession"
-                                                                                                                                                  | "releaseChatSession";
+                                                                                                                                                kind: "listImageGenerationHistory";
                                                                                                                                               }
-                                                                                                                                            ? SessionLeaseResult
+                                                                                                                                            ? ListImageGenerationHistoryResult
                                                                                                                                             : T extends {
-                                                                                                                                                  kind: "appendSessionEvidence";
+                                                                                                                                                  kind: "appendImageGenerationHistory";
                                                                                                                                                 }
-                                                                                                                                              ? SessionEvidenceRecord
+                                                                                                                                              ? ImageGenerationHistoryRecord
                                                                                                                                               : T extends {
-                                                                                                                                                    kind: "appendCompaction";
+                                                                                                                                                    kind: "deleteImageGenerationHistory";
                                                                                                                                                   }
-                                                                                                                                                ? CompactionRecord
-                                                                                                                                                : T extends {
-                                                                                                                                                      kind: "listCompactions";
-                                                                                                                                                    }
-                                                                                                                                                  ? {
-                                                                                                                                                      items: CompactionRecord[];
-                                                                                                                                                    }
-                                                                                                                                                  : T extends {
-                                                                                                                                                        kind: "getLatestCompaction";
-                                                                                                                                                      }
-                                                                                                                                                    ? CompactionRecord | null
-                                                                                                                                                    : T extends {
-                                                                                                                                                          kind:
-                                                                                                                                                            | "upsertChatMessage"
-                                                                                                                                                            | "updateChatMessage";
-                                                                                                                                                        }
-                                                                                                                                                      ? ChatMessageRecord
-                                                                                                                                                      : T extends {
-                                                                                                                                                            kind: "deleteChatMessage";
-                                                                                                                                                          }
-                                                                                                                                                        ? {
-                                                                                                                                                            deleted: boolean;
-                                                                                                                                                          }
-                                                                                                                                                        : T extends {
-                                                                                                                                                              kind: "clearQueuedChatMessages";
-                                                                                                                                                            }
-                                                                                                                                                          ? {
-                                                                                                                                                              cleared: number;
-                                                                                                                                                            }
-                                                                                                                                                          : T extends {
-                                                                                                                                                                kind: "listWebSearchHistory";
-                                                                                                                                                              }
-                                                                                                                                                            ? ListWebSearchHistoryResult
-                                                                                                                                                            : T extends {
-                                                                                                                                                                  kind: "appendWebSearchHistory";
-                                                                                                                                                                }
-                                                                                                                                                              ? WebSearchHistoryRecord
-                                                                                                                                                              : T extends {
-                                                                                                                                                                    kind: "deleteWebSearchHistory";
-                                                                                                                                                                  }
-                                                                                                                                                                ? {
-                                                                                                                                                                    deleted: boolean;
-                                                                                                                                                                  }
-                                                                                                                                                                : T extends {
-                                                                                                                                                                      kind: "clearWebSearchHistory";
-                                                                                                                                                                    }
-                                                                                                                                                                  ? {
-                                                                                                                                                                      cleared: number;
-                                                                                                                                                                    }
-                                                                                                                                                                  : T extends {
-                                                                                                                                                                        kind: "listImageGenerationHistory";
-                                                                                                                                                                      }
-                                                                                                                                                                    ? ListImageGenerationHistoryResult
-                                                                                                                                                                    : T extends {
-                                                                                                                                                                          kind: "appendImageGenerationHistory";
-                                                                                                                                                                        }
-                                                                                                                                                                      ? ImageGenerationHistoryRecord
-                                                                                                                                                                      : T extends {
-                                                                                                                                                                            kind: "deleteImageGenerationHistory";
-                                                                                                                                                                          }
-                                                                                                                                                                        ? {
-                                                                                                                                                                            deleted: boolean;
-                                                                                                                                                                          }
-                                                                                                                                                                        : never;
+                                                                                                                                                ? {
+                                                                                                                                                    deleted: boolean;
+                                                                                                                                                  }
+                                                                                                                                                : never;
 
 export type EngineResponse<T = unknown> =
   | { ok: true; value: T }
@@ -3251,22 +3051,18 @@ function isEngineRequest(value: unknown): value is EngineRequest {
       return isMarkSourceContextMapReduceFailedPayload(value.payload);
     case "deleteMemory":
       return typeof value.id === "string";
-    case "listTopicPages":
-      return (
-        (value.query === undefined || typeof value.query === "string") &&
-        (value.limit === undefined || typeof value.limit === "number")
-      );
-    case "getTopicPage":
-    case "deleteTopicPage":
-      return typeof value.id === "string";
-    case "createTopicPage":
-      return isCreateTopicPagePayload(value.payload);
-    case "updateTopicPage":
-      return typeof value.id === "string" && isUpdateTopicPagePayload(value.payload);
     case "publishWikiArtifacts":
       return isPublishWikiArtifactsPayload(value.payload);
     case "listWikiArtifacts":
       return value.filter === undefined || isWikiArtifactFilter(value.filter);
+    case "listWikiArtifactsForSource":
+      return (
+        isBoundedWikiString(value.sourceId, WIKI_ARTIFACT_ID_MAX_LENGTH) &&
+        (value.chunkId === undefined ||
+          isBoundedWikiString(value.chunkId, WIKI_ARTIFACT_ID_MAX_LENGTH)) &&
+        (value.includeHistory === undefined || typeof value.includeHistory === "boolean") &&
+        (value.limit === undefined || isWikiArtifactListLimit(value.limit))
+      );
     case "getWikiArtifact":
     case "deleteWikiArtifact":
       return isBoundedWikiString(value.id, WIKI_ARTIFACT_ID_MAX_LENGTH);
@@ -3321,40 +3117,6 @@ function isEngineRequest(value: unknown): value is EngineRequest {
       return typeof value.runId === "string" && typeof value.leaseOwner === "string";
     case "completeWikiCompileReduce":
       return isCompleteWikiCompileReducePayload(value.payload);
-    case "enqueueWikiCompile":
-      return isCreateWikiCompileJobPayload(value.payload);
-    case "listWikiCompileJobs":
-      return (
-        (value.status === undefined || isWikiCompileJobStatus(value.status)) &&
-        (value.limit === undefined || typeof value.limit === "number")
-      );
-    case "appendWikiCompileJobEvent":
-      return isCreateWikiCompileJobEventPayload(value.payload);
-    case "listWikiCompileJobEvents":
-      return (
-        typeof value.jobId === "string" &&
-        (value.limit === undefined || typeof value.limit === "number")
-      );
-    case "getWikiCompileJob":
-    case "claimNextWikiCompileJob":
-      return value.kind === "claimNextWikiCompileJob"
-        ? (value.id === undefined || typeof value.id === "string") &&
-            (value.now === undefined || typeof value.now === "string")
-        : typeof value.id === "string";
-    case "completeWikiCompileJob":
-      return typeof value.id === "string" && isWikiCompileResultPayload(value.result);
-    case "failWikiCompileJob":
-      return (
-        typeof value.id === "string" &&
-        typeof value.error === "string" &&
-        (value.retryAfter === undefined || typeof value.retryAfter === "string") &&
-        (value.now === undefined || typeof value.now === "string")
-      );
-    case "listTopicGraphEdges":
-      return (
-        typeof value.topicId === "string" &&
-        (value.edgeKind === undefined || isTopicGraphEdgeKind(value.edgeKind))
-      );
     case "buildSourceGraph":
       return isBuildSourceGraphPayload(value.payload);
     case "enqueueSourceGraphJob":
@@ -4070,43 +3832,6 @@ function isRepairAction(value: unknown): value is RepairAction {
   return value === "retry_init" || value === "rebuild_fts" || value === "reset_library";
 }
 
-function isTopicPageSourceRef(value: unknown): value is TopicPageSourceRef {
-  return (
-    isRecord(value) &&
-    typeof value.memoryId === "string" &&
-    (value.chunkId === undefined || typeof value.chunkId === "string") &&
-    (value.quote === undefined || typeof value.quote === "string")
-  );
-}
-
-function isCreateTopicPagePayload(value: unknown): value is CreateTopicPagePayload {
-  return (
-    isRecord(value) &&
-    (value.id === undefined || typeof value.id === "string") &&
-    (value.slug === undefined || typeof value.slug === "string") &&
-    typeof value.title === "string" &&
-    (value.summary === undefined || typeof value.summary === "string") &&
-    (value.content === undefined || typeof value.content === "string") &&
-    (value.sourceRefs === undefined ||
-      (Array.isArray(value.sourceRefs) && value.sourceRefs.every(isTopicPageSourceRef))) &&
-    (value.createdAt === undefined || typeof value.createdAt === "string") &&
-    (value.updatedAt === undefined || typeof value.updatedAt === "string")
-  );
-}
-
-function isUpdateTopicPagePayload(value: unknown): value is UpdateTopicPagePayload {
-  return (
-    isRecord(value) &&
-    (value.slug === undefined || typeof value.slug === "string") &&
-    (value.title === undefined || typeof value.title === "string") &&
-    (value.summary === undefined || typeof value.summary === "string") &&
-    (value.content === undefined || typeof value.content === "string") &&
-    (value.sourceRefs === undefined ||
-      (Array.isArray(value.sourceRefs) && value.sourceRefs.every(isTopicPageSourceRef))) &&
-    (value.updatedAt === undefined || typeof value.updatedAt === "string")
-  );
-}
-
 export const WIKI_ARTIFACT_RPC_LIMITS = Object.freeze({
   idLength: 512,
   artifactKeyLength: 512,
@@ -4405,66 +4130,6 @@ function isWikiUserEditMergeOutcome(value: unknown): value is WikiUserEditMergeO
   );
 }
 
-function isCreateWikiCompileJobPayload(value: unknown): value is CreateWikiCompileJobPayload {
-  return (
-    isRecord(value) &&
-    (value.id === undefined || typeof value.id === "string") &&
-    (value.topicId === undefined || typeof value.topicId === "string") &&
-    typeof value.query === "string" &&
-    (value.instructions === undefined || typeof value.instructions === "string") &&
-    (value.sourceMemoryIds === undefined ||
-      (Array.isArray(value.sourceMemoryIds) &&
-        value.sourceMemoryIds.every((item) => typeof item === "string"))) &&
-    (value.maxAttempts === undefined || typeof value.maxAttempts === "number") &&
-    (value.runAfter === undefined || typeof value.runAfter === "string") &&
-    (value.createdAt === undefined || typeof value.createdAt === "string")
-  );
-}
-
-function isWikiCompileResultPayload(value: unknown): value is WikiCompileResultPayload {
-  return (
-    isRecord(value) &&
-    (value.topic === undefined ||
-      isCreateTopicPagePayload(value.topic) ||
-      isUpdateTopicPagePayload(value.topic)) &&
-    (value.sourceRefs === undefined ||
-      (Array.isArray(value.sourceRefs) && value.sourceRefs.every(isTopicPageSourceRef))) &&
-    (value.edges === undefined ||
-      (Array.isArray(value.edges) && value.edges.every(isTopicGraphEdgeInput))) &&
-    (value.completedAt === undefined || typeof value.completedAt === "string")
-  );
-}
-
-function isCreateWikiCompileJobEventPayload(
-  value: unknown,
-): value is CreateWikiCompileJobEventPayload {
-  return (
-    isRecord(value) &&
-    (value.id === undefined || typeof value.id === "string") &&
-    typeof value.jobId === "string" &&
-    isWikiCompileEventKind(value.kind) &&
-    (value.level === undefined || isWikiCompileEventLevel(value.level)) &&
-    (value.message === undefined || typeof value.message === "string") &&
-    (value.detail === undefined || isRecord(value.detail)) &&
-    (value.createdAt === undefined || typeof value.createdAt === "string")
-  );
-}
-
-function isTopicGraphEdgeInput(value: unknown): value is TopicGraphEdgeInput {
-  return (
-    isRecord(value) &&
-    (value.id === undefined || typeof value.id === "string") &&
-    (value.fromTopicId === undefined || typeof value.fromTopicId === "string") &&
-    (value.toTopicId === undefined || typeof value.toTopicId === "string") &&
-    (value.memoryId === undefined || typeof value.memoryId === "string") &&
-    (value.chunkId === undefined || typeof value.chunkId === "string") &&
-    isTopicGraphEdgeKind(value.kind) &&
-    (value.weight === undefined || typeof value.weight === "number") &&
-    (value.label === undefined || typeof value.label === "string") &&
-    (value.createdAt === undefined || typeof value.createdAt === "string")
-  );
-}
-
 function isBuildSourceGraphPayload(value: unknown): value is BuildSourceGraphPayload {
   return (
     isRecord(value) &&
@@ -4600,30 +4265,6 @@ function isOrchestrationRunFilter(value: unknown): value is OrchestrationRunFilt
     (value.targetJobId === undefined || typeof value.targetJobId === "string") &&
     (value.limit === undefined || typeof value.limit === "number")
   );
-}
-
-function isWikiCompileJobStatus(value: unknown): value is WikiCompileJobStatus {
-  return value === "queued" || value === "running" || value === "done" || value === "failed";
-}
-
-function isWikiCompileEventLevel(value: unknown): value is WikiCompileEventLevel {
-  return value === "info" || value === "warning" || value === "error";
-}
-
-function isWikiCompileEventKind(value: unknown): value is WikiCompileEventKind {
-  return (
-    value === "queued" ||
-    value === "claimed" ||
-    value === "sources_selected" ||
-    value === "provider_started" ||
-    value === "provider_delta" ||
-    value === "completed" ||
-    value === "failed"
-  );
-}
-
-function isTopicGraphEdgeKind(value: unknown): value is TopicGraphEdgeKind {
-  return value === "source" || value === "related" || value === "mentions";
 }
 
 function isCreateChatSessionPayload(value: unknown): value is CreateChatSessionPayload {

@@ -59,7 +59,7 @@ describe("content local RAG flow", () => {
     );
     const contentStateSection = contentSource.slice(
       contentSource.indexOf("function ClioContentApp()"),
-      contentSource.indexOf("React.useEffect(() => {"),
+      contentSource.indexOf("const requestKnowledgeBaseResults = React.useCallback"),
     );
     const knowledgeBaseResultsSection = contentSource.slice(
       contentSource.indexOf("const requestKnowledgeBaseResults = React.useCallback"),
@@ -96,7 +96,7 @@ describe("content local RAG flow", () => {
   it("exposes Knowledge Base advanced source filters without bypassing searchKnowledgeBase", () => {
     const contentStateSection = contentSource.slice(
       contentSource.indexOf("function ClioContentApp()"),
-      contentSource.indexOf("React.useEffect(() => {"),
+      contentSource.indexOf("const requestKnowledgeBaseResults = React.useCallback"),
     );
     const railPropsSection = contentSource.slice(
       contentSource.indexOf("<RailShell"),
@@ -192,7 +192,7 @@ describe("content local RAG flow", () => {
     expect(knowledgePanelSection).toContain('data-clio-knowledge-toolbar="true"');
     expect(knowledgePanelSection).toContain('data-clio-knowledge-scroll="true"');
     expect(knowledgePanelSection).toContain('aria-label="Open Research planner"');
-    expect(knowledgePanelSection).toContain("<MemoryList");
+    expect(knowledgePanelSection).toContain("<KnowledgeBaseResultGroups");
     expect(knowledgePanelSection).not.toContain("<KnowledgeBaseWorkingSetPanel");
     expect(knowledgePanelSection).not.toContain("<SourceContextPlannerPanel");
     expect(knowledgePanelSection).not.toContain("<SourceContextCompressionLogPanel");
@@ -230,7 +230,7 @@ describe("content local RAG flow", () => {
     );
 
     expect(knowledgePanelSection.indexOf("<KnowledgeBaseFilterControls")).toBeLessThan(
-      knowledgePanelSection.indexOf("<MemoryList"),
+      knowledgePanelSection.indexOf("<KnowledgeBaseResultGroups"),
     );
     expect(knowledgePanelSection).not.toContain("<KnowledgeBaseClusteringControls");
     expect(knowledgePanelSection).not.toContain("<SourceContextPlannerPanel");
@@ -264,7 +264,8 @@ describe("content local RAG flow", () => {
       railShellSource.indexOf("function MemoryListItem"),
     );
 
-    expect(interactiveSearchSection).toContain("requestKnowledgeBaseResults(nextQuery)");
+    expect(interactiveSearchSection).toContain("requestKnowledgeBaseResults(");
+    expect(interactiveSearchSection).toContain("nextQuery,");
     expect(contentStateSection).toContain('React.useState<KnowledgeBaseSearchMode>("exact")');
     expect(contentStateSection).toContain("mode: knowledgeBaseSearchMode");
     expect(interactiveSearchSection).not.toContain('kind: "listTopicPages"');
@@ -325,7 +326,7 @@ describe("content local RAG flow", () => {
     );
     const workingSetPanelSection = railShellSource.slice(
       railShellSource.indexOf("function KnowledgeBaseWorkingSetPanel"),
-      railShellSource.indexOf("function TopicKnowledgePanel"),
+      railShellSource.indexOf("function SourceContextPlannerPanel"),
     );
     const memoryListSection = railShellSource.slice(
       railShellSource.indexOf("function MemoryList"),
@@ -453,7 +454,7 @@ describe("content local RAG flow", () => {
   it("exposes explicit Tier2 chunk summary scheduling through content-owned RPCs", () => {
     const contentStateSection = contentSource.slice(
       contentSource.indexOf("function ClioContentApp()"),
-      contentSource.indexOf("React.useEffect(() => {"),
+      contentSource.indexOf("const requestKnowledgeBaseResults = React.useCallback"),
     );
     const contentAuditLoadSection = contentSource.slice(
       contentSource.indexOf("const loadChunkMetaTier2Audit = React.useCallback"),
@@ -638,7 +639,7 @@ describe("content local RAG flow", () => {
     );
     const knowledgePanelSection = railShellSource.slice(
       railShellSource.indexOf("function KnowledgeBasePanel"),
-      railShellSource.indexOf("function TopicKnowledgePanel"),
+      railShellSource.indexOf("function ResearchPlannerPanel"),
     );
 
     expect(uploadSection).toContain('kind: "capturePdf"');
@@ -653,10 +654,115 @@ describe("content local RAG flow", () => {
     expect(knowledgePanelSection).toContain("props.onUploadKnowledgeFiles(files)");
   });
 
+  it("renders Sources and Wiki as the only Knowledge Base products", () => {
+    const knowledgePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+    );
+
+    expect(knowledgePanelSection).toContain('id="clio-knowledge-sources-tab"');
+    expect(knowledgePanelSection).toContain('id="clio-knowledge-wiki-tab"');
+    expect(knowledgePanelSection).toContain("<WikiKnowledgePanel");
+    expect(knowledgePanelSection).not.toContain("<TopicKnowledgePanel");
+    expect(knowledgePanelSection).not.toContain("New topic");
+    expect(knowledgePanelSection).not.toContain("Create topic");
+    expect(knowledgePanelSection).not.toContain("Compile topic");
+  });
+
+  it("loads Wiki artifacts and keeps source controls scoped to Sources", () => {
+    const wikiLoadSection = contentSource.slice(
+      contentSource.indexOf("const loadWikiArtifacts = React.useCallback"),
+      contentSource.indexOf("const loadWikiCompileActivity = React.useCallback"),
+    );
+    const knowledgePanelSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBasePanel"),
+      railShellSource.indexOf("function ResearchPlannerPanel"),
+    );
+
+    expect(wikiLoadSection).toContain('kind: "listWikiArtifacts"');
+    expect(wikiLoadSection).toContain('kind: "getWikiArtifact"');
+    expect(wikiLoadSection).toContain('kind: "listWikiArtifactsForSource"');
+    expect(knowledgePanelSection).toContain('{section === "memories" ? (');
+    expect(knowledgePanelSection).toContain('data-clio-knowledge-actions="true"');
+    expect(knowledgePanelSection).toContain('data-clio-knowledge-toolbar="true"');
+    expect(knowledgePanelSection.indexOf('{section === "memories" ? (')).toBeLessThan(
+      knowledgePanelSection.indexOf('data-clio-knowledge-actions="true"'),
+    );
+    expect(knowledgePanelSection).toContain('{section === "wiki" ? (');
+    expect(knowledgePanelSection).toContain('id="clio-knowledge-wiki-panel"');
+  });
+
+  it("loads and saves the single Knowledge Base Wiki setting", () => {
+    const loadSettingsSection = contentSource.slice(
+      contentSource.indexOf("const loadKnowledgeBaseAiSettings = React.useCallback"),
+      contentSource.indexOf("const loadActiveEmbeddingModel = React.useCallback"),
+    );
+    const saveSettingsSection = contentSource.slice(
+      contentSource.indexOf("const saveKnowledgeBaseAiSettings = React.useCallback"),
+      contentSource.indexOf("const runLocalEmbeddingAction = React.useCallback"),
+    );
+    const settingsCardSection = railShellSource.slice(
+      railShellSource.indexOf("function KnowledgeBaseWikiSettingsCard"),
+      railShellSource.indexOf("function TestWorkspaceSettingsCard"),
+    );
+
+    expect(loadSettingsSection).toContain('kind: "getKnowledgeBaseAiSettings"');
+    expect(saveSettingsSection).toContain('kind: "saveKnowledgeBaseAiSettings"');
+    expect(saveSettingsSection).toContain("settings: input");
+    expect(settingsCardSection).toContain("checked={enabled}");
+    expect(settingsCardSection).toContain("Existing artifacts remain readable when disabled.");
+    expect(settingsCardSection).not.toContain("Fine Rank");
+  });
+
+  it("opens Wiki evidence through its owning Source", () => {
+    const openEvidenceSection = contentSource.slice(
+      contentSource.indexOf("const openWikiEvidence = React.useCallback"),
+      contentSource.indexOf("const selectWikiCompileRun = React.useCallback"),
+    );
+    const wikiPanelSection = railShellSource.slice(
+      railShellSource.indexOf("function WikiKnowledgePanel"),
+      railShellSource.indexOf("function WikiArtifactMetadata"),
+    );
+
+    expect(openEvidenceSection).toContain("await openDetail(evidence.sourceId)");
+    expect(openEvidenceSection).toContain("setWikiEvidenceTarget(evidence)");
+    expect(wikiPanelSection).toContain("onOpenEvidence(evidence)");
+    expect(wikiPanelSection).toContain("Browsing remains available when generation is disabled.");
+  });
+
+  it("routes Wiki compile actions through the trusted public runtime contract", () => {
+    const contentActionsSection = contentSource.slice(
+      contentSource.indexOf("const enqueueSourceWikiCompile = React.useCallback"),
+      contentSource.indexOf("const deleteMemory = React.useCallback"),
+    );
+    const wikiActivitySection = railShellSource.slice(
+      railShellSource.indexOf("function WikiCompileActivity"),
+      railShellSource.indexOf("function WikiArtifactMetadata"),
+    );
+    const sourceWikiSection = railShellSource.slice(
+      railShellSource.indexOf("function SourceWikiCompile"),
+      railShellSource.indexOf("function WikiEvidenceTarget"),
+    );
+
+    expect(contentActionsSection).toContain('kind: "enqueueWikiCompileRun"');
+    expect(contentActionsSection).toContain('kind: "cancelWikiCompileRun"');
+    expect(contentActionsSection).toContain('kind: "retryWikiCompileRun"');
+    expect(contentActionsSection).toContain('kind: "resumeWikiCompileRun"');
+    expect(contentActionsSection).not.toContain('kind: "createWikiCompileRun"');
+    expect(contentActionsSection).not.toContain('kind: "claimNextWikiCompileStep"');
+    expect(wikiActivitySection).toContain('data-clio-wiki-compile-activity="true"');
+    expect(wikiActivitySection).toContain("wikiCompileRunCanCancel");
+    expect(wikiActivitySection).toContain("wikiCompileRunCanRetry");
+    expect(wikiActivitySection).toContain("wikiCompileRunCanResume");
+    expect(sourceWikiSection).toContain('data-clio-source-wiki-compile="true"');
+    expect(sourceWikiSection).toContain("disabled={!wikiEnabled || actionLoading}");
+    expect(sourceWikiSection).toContain("Enable Wiki in Settings before compiling");
+  });
+
   it("loads raw PDF in content and renders a document index in Rail", () => {
     const openDetailSection = contentSource.slice(
       contentSource.indexOf("const openDetail = React.useCallback"),
-      contentSource.indexOf("const openTopicDetail = React.useCallback"),
+      contentSource.indexOf("const openWikiArtifact = React.useCallback"),
     );
     const railPropsSection = contentSource.slice(
       contentSource.indexOf("<RailShell"),

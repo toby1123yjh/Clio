@@ -46,6 +46,7 @@ import {
   readVisionProviderSettings,
   saveVisionProviderSettings,
 } from "@/src/agent-runtime/vision-provider-settings";
+import { wikiAutoCompileSourceId } from "@/src/agent-runtime/wiki-auto-compile";
 import {
   type LocalEmbeddingModelResult,
   isLocalEmbeddingModelRequest,
@@ -609,10 +610,35 @@ function setupSessionStorageAccess() {
 
 async function routeEngineRequest(request: EngineTransportRequest) {
   await ensureOffscreen();
-  return (await chrome.runtime.sendMessage({
+  const response = (await chrome.runtime.sendMessage({
     type: CLIO_OFFSCREEN_REQUEST,
     request,
   })) as EngineResponse;
+  const sourceId = wikiAutoCompileSourceId(request, response);
+  if (sourceId !== undefined) void enqueueWikiForNewCapture(sourceId);
+  return response;
+}
+
+async function enqueueWikiForNewCapture(sourceId: string) {
+  try {
+    const settings = await readKnowledgeBaseAiSettings();
+    if (!settings.wiki.enabled) return;
+    await ensureOffscreen();
+    const response = (await chrome.runtime.sendMessage({
+      type: CLIO_OFFSCREEN_REQUEST,
+      request: { kind: "enqueueWikiCompileRun", payload: { sourceId } },
+    })) as EngineResponse | undefined;
+    if (response === undefined || !response.ok) {
+      const message =
+        response?.ok === false ? response.error.message : "Offscreen did not respond.";
+      console.debug("clio:bg automatic Wiki enqueue failed", message.slice(0, 500));
+    }
+  } catch (error) {
+    console.debug(
+      "clio:bg automatic Wiki enqueue failed",
+      engineErrorFromUnknown(error).message.slice(0, 500),
+    );
+  }
 }
 
 async function routeKnowledgeBaseClusterLabelRefinementRequest(

@@ -5383,6 +5383,35 @@ describe("local engine behavior harness", () => {
         expect.objectContaining({ freshness: "stale", versionNo: 1 }),
       ],
     );
+
+    const sourceArtifacts = await harness.request({
+      kind: "listWikiArtifactsForSource",
+      sourceId,
+    });
+    expect(sourceArtifacts.items).toEqual([
+      expect.objectContaining({
+        artifactKind: "claim",
+        inputSignature: "wiki-input-v2",
+        freshness: "fresh",
+      }),
+    ]);
+    const chunkArtifacts = await harness.request({
+      kind: "listWikiArtifactsForSource",
+      sourceId,
+      chunkId,
+      includeHistory: true,
+    });
+    expect(chunkArtifacts.items.map((artifact) => artifact.inputSignature)).toEqual([
+      "wiki-input-v2",
+      "wiki-input-v1",
+    ]);
+    expect(
+      await harness.request({
+        kind: "listWikiArtifactsForSource",
+        sourceId,
+        chunkId: "missing-chunk",
+      }),
+    ).toEqual({ items: [] });
   });
 
   it("rejects invalid Wiki evidence and links without leaving a partial publication", async () => {

@@ -6,6 +6,10 @@ import {
   defaultImageGenerationSize,
   imageGenerationSizes,
 } from "@/src/agent-runtime/image-generation-settings";
+import type {
+  KnowledgeBaseAiSettings,
+  SaveKnowledgeBaseAiSettingsInput,
+} from "@/src/agent-runtime/knowledge-base-ai-settings";
 import {
   defaultOpenAIBaseUrl,
   defaultOpenAICompatibleBaseUrl,
@@ -47,16 +51,16 @@ import {
 import type { ComposerContextAttachmentKind } from "@/src/rail/api/chat-session";
 import { formatDate } from "@/src/rail/api/local-memory";
 import {
-  type TopicFormMode,
-  type TopicPageFormState,
-  type WikiCompileFormState,
-  emptyTopicPageForm,
-  topicGraphEdgeLabel,
-  topicSummaryLabel,
-  wikiCompileEventDetail,
-  wikiCompileEventLabel,
-  wikiJobStatusLabel,
-} from "@/src/rail/api/local-topic";
+  wikiArtifactFreshnessLabel,
+  wikiArtifactJsonValueLabel,
+  wikiArtifactKindLabel,
+  wikiArtifactSourceLabel,
+  wikiCompileRunCanCancel,
+  wikiCompileRunCanResume,
+  wikiCompileRunCanRetry,
+  wikiCompileRunProgress,
+  wikiCompileRunStatusLabel,
+} from "@/src/rail/api/local-wiki";
 import {
   buildAgentActivitySnapshot,
   formatExplicitToolTraceMeta,
@@ -132,12 +136,13 @@ import type {
   SourceContextMapRunSummary,
   SourceContextPackResult,
   SourceContextPackSourceDepthOverride,
-  TopicGraphEdge,
-  TopicPageDetail,
-  TopicPageSummary,
   WebSearchHistoryRecord,
-  WikiCompileJobEvent,
-  WikiCompileJobSummary,
+  WikiArtifactDetail,
+  WikiArtifactEvidence,
+  WikiArtifactMachineVersion,
+  WikiCompileEvent,
+  WikiCompileRunDetail,
+  WikiCompileRunSummary,
   WorkingSetLoadDepth,
   WorkingSetStatusResult,
 } from "@/src/shared/rpc";
@@ -188,7 +193,6 @@ import {
   Network,
   PanelRightClose,
   Paperclip,
-  Pencil,
   Pin,
   Plus,
   RefreshCw,
@@ -244,7 +248,22 @@ export interface RailShellProps {
   sourceContextMapRuns: SourceContextMapRunSummary[];
   sourceContextMapEvents: SourceContextMapEvent[];
   sourceContextPlanner: SourceContextPlannerState;
-  topicPages: TopicPageSummary[];
+  wikiArtifacts: WikiArtifactMachineVersion[];
+  wikiArtifactDetail: WikiArtifactDetail | null;
+  wikiArtifactsLoading: boolean;
+  wikiArtifactsError: string | null;
+  wikiCompileRuns: WikiCompileRunSummary[];
+  wikiCompileRunDetail: WikiCompileRunDetail | null;
+  wikiCompileEvents: WikiCompileEvent[];
+  wikiCompileActivityLoading: boolean;
+  wikiCompileActivityError: string | null;
+  wikiCompileActionLoading: boolean;
+  sourceWikiArtifacts: WikiArtifactMachineVersion[];
+  sourceWikiArtifactsLoading: boolean;
+  sourceWikiArtifactsError: string | null;
+  wikiEvidenceTarget: WikiArtifactEvidence | null;
+  sourceWikiCompileRun: WikiCompileRunSummary | null;
+  sourceWikiCompileRunLoading: boolean;
   relatedItems: SearchMemoryItem[];
   chatSessions: ChatSessionSummary[];
   railCommands: RailCommand[];
@@ -252,11 +271,6 @@ export interface RailShellProps {
   slashContext: SlashCommandContext;
   detail: MemoryDetail | null;
   pdfPreview: PdfReaderPreviewState | null;
-  topicDetail: TopicPageDetail | null;
-  topicForm: TopicPageFormState;
-  topicFormOpen: boolean;
-  topicGraphEdges: TopicGraphEdge[];
-  wikiCompileJobEvents: WikiCompileJobEvent[];
   railWidth: number;
   collapsedDragPoint: CollapsedLauncherDragPoint | null;
   collapsedSide: CollapsedLauncherSide;
@@ -274,13 +288,14 @@ export interface RailShellProps {
   testWorkspaceMessageTone: ProviderMessageTone;
   imageGenerationSettings: ImageGenerationSettings | null;
   visionProviderSettings: VisionProviderSettings | null;
+  knowledgeBaseAiSettings: KnowledgeBaseAiSettings | null;
+  knowledgeBaseAiSettingsLoading: boolean;
+  knowledgeBaseAiSettingsMessage: string | null;
+  knowledgeBaseAiSettingsMessageTone: ProviderMessageTone;
   imageGenerationHistory: ImageGenerationHistoryRecord[];
   imageGenerationState: ImageGenerationDisplayState;
   webSearchHistory: WebSearchHistoryRecord[];
   webSearchState: WebSearchDisplayState;
-  wikiCompileForm: WikiCompileFormState;
-  wikiCompileJobs: WikiCompileJobSummary[];
-  wikiCompileRunning: boolean;
   providerLoading: boolean;
   providerMessage: string | null;
   providerMessageTone: ProviderMessageTone;
@@ -302,7 +317,6 @@ export interface RailShellProps {
   onClearDialogue: () => void;
   onDelete: (id: string) => void;
   onDeleteLocalEmbeddingModel: () => Promise<boolean>;
-  onDeleteTopicPage: (id: string) => void;
   onExecuteCommand: (command: RailCommand) => void;
   onKeepPreviousPage: () => void;
   onOpenChatHistory: () => void;
@@ -310,15 +324,16 @@ export interface RailShellProps {
   onOpenDetail: (id: string) => void;
   onOpenKnowledgeBase: () => void;
   onOpenResearchPlanner: () => void;
-  onOpenTopicPage: (id: string) => void;
-  onCreateTopicPage: () => void;
-  onCancelTopicForm: () => void;
-  onEditTopicPage: (page: TopicPageDetail) => void;
-  onSaveTopicPage: (form: TopicPageFormState, id?: string) => void;
-  onTopicFormChange: (form: TopicPageFormState) => void;
-  onWikiCompileFormChange: (form: WikiCompileFormState) => void;
-  onCompileTopicWithAI: (form: WikiCompileFormState, topicId?: string) => void;
-  onOpenTopicSource: (memoryId: string) => void;
+  onOpenWikiArtifact: (id: string) => void;
+  onCloseWikiArtifact: () => void;
+  onOpenWikiEvidence: (evidence: WikiArtifactEvidence) => void;
+  onRefreshWikiArtifacts: () => void;
+  onRefreshWikiCompileActivity: () => void;
+  onSelectWikiCompileRun: (id: string) => void;
+  onEnqueueSourceWikiCompile: (sourceId: string) => void;
+  onCancelWikiCompileRun: (id: string) => void;
+  onRetryWikiCompileRun: (id: string) => void;
+  onResumeWikiCompileRun: (id: string) => void;
   onOpenMarkdownPreview: (messageId: string) => void;
   onReplySuggestion: (suggestion: ReplyActionSuggestion) => void;
   onToggleCitationExcerpt: (messageId: string, citationId: string) => void;
@@ -394,6 +409,7 @@ export interface RailShellProps {
   onSaveSearchProvider: (input: SaveSearchProviderInput) => Promise<boolean>;
   onSaveImageGenerationSettings: (input: SaveImageGenerationSettingsInput) => Promise<boolean>;
   onSaveVisionProviderSettings: (input: SaveVisionProviderSettingsInput) => Promise<boolean>;
+  onSaveKnowledgeBaseAiSettings: (input: SaveKnowledgeBaseAiSettingsInput) => Promise<boolean>;
   onInstallLocalEmbeddingModel: () => Promise<boolean>;
   onInitializeTestWorkspace: () => Promise<void>;
   onRemoveTestWorkspace: () => Promise<void>;
@@ -1322,8 +1338,21 @@ function renderMode(props: RailShellProps) {
             : props.onBackToKnowledgeBase
         }
         onDelete={props.onDelete}
+        onOpenWikiArtifact={props.onOpenWikiArtifact}
         onOpenSource={props.onOpenSource}
+        onCancelWikiCompileRun={props.onCancelWikiCompileRun}
+        onEnqueueSourceWikiCompile={props.onEnqueueSourceWikiCompile}
+        onResumeWikiCompileRun={props.onResumeWikiCompileRun}
+        onRetryWikiCompileRun={props.onRetryWikiCompileRun}
         pdfPreview={props.pdfPreview}
+        sourceWikiCompileRun={props.sourceWikiCompileRun}
+        sourceWikiCompileRunLoading={props.sourceWikiCompileRunLoading}
+        sourceWikiArtifacts={props.sourceWikiArtifacts}
+        sourceWikiArtifactsError={props.sourceWikiArtifactsError}
+        sourceWikiArtifactsLoading={props.sourceWikiArtifactsLoading}
+        wikiEvidenceTarget={props.wikiEvidenceTarget}
+        wikiActionLoading={props.wikiCompileActionLoading}
+        wikiEnabled={props.knowledgeBaseAiSettings?.wiki.enabled === true}
       />
     );
   }
@@ -3403,6 +3432,7 @@ function isSearchConfigurationError(code: string) {
 type SettingsSectionId =
   | "appearance"
   | "test-workspace"
+  | "knowledge-base"
   | "search"
   | "embeddings"
   | "vision"
@@ -3452,6 +3482,7 @@ function SettingsPanel(props: RailShellProps) {
   const [imageGenerationSize, setImageGenerationSize] = React.useState<
     ImageGenerationSettings["size"]
   >(defaultImageGenerationSize);
+  const [wikiEnabled, setWikiEnabled] = React.useState(false);
 
   React.useEffect(() => {
     if (props.providerSettings === null) return;
@@ -3501,6 +3532,11 @@ function SettingsPanel(props: RailShellProps) {
     setImageGenerationBaseUrl(props.imageGenerationSettings.baseUrl ?? "");
     setImageGenerationSize(props.imageGenerationSettings.size);
   }, [props.imageGenerationSettings]);
+
+  React.useEffect(() => {
+    if (props.knowledgeBaseAiSettings === null) return;
+    setWikiEnabled(props.knowledgeBaseAiSettings.wiki.enabled);
+  }, [props.knowledgeBaseAiSettings]);
 
   const activeProvider = props.providerSettings?.activeProvider ?? defaultActiveProvider;
   const providerSelectDisabled = props.providerLoading || props.providerSettings === null;
@@ -3568,6 +3604,16 @@ function SettingsPanel(props: RailShellProps) {
             progress={props.testWorkspaceProgress}
           />
         )}
+
+        <KnowledgeBaseWikiSettingsCard
+          enabled={wikiEnabled}
+          loading={props.knowledgeBaseAiSettingsLoading}
+          message={props.knowledgeBaseAiSettingsMessage}
+          messageTone={props.knowledgeBaseAiSettingsMessageTone}
+          onEnabledChange={setWikiEnabled}
+          onSave={() => props.onSaveKnowledgeBaseAiSettings({ wiki: { enabled: wikiEnabled } })}
+          settings={props.knowledgeBaseAiSettings}
+        />
 
         <VisionProviderSettingsCard
           compatibleApiKey={visionOpenAICompatibleApiKey}
@@ -3875,6 +3921,23 @@ function SettingsSectionMenu(props: {
         </button>
       ) : null}
       <button
+        aria-current={props.activeSection === "knowledge-base" ? "location" : undefined}
+        aria-label="Knowledge Base settings"
+        className={buttonClass("knowledge-base")}
+        onClick={() => props.onSelectSection("knowledge-base")}
+        type="button"
+      >
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface text-primary">
+          <BookOpen size={16} />
+        </span>
+        <span className="min-w-0 leading-tight">
+          <span className="block truncate text-sm font-semibold text-foreground">
+            Knowledge Base
+          </span>
+          <span className="block truncate text-[11px] text-muted-foreground">Wiki generation</span>
+        </span>
+      </button>
+      <button
         aria-current={props.activeSection === "search" ? "location" : undefined}
         aria-label="Search provider settings"
         className={buttonClass("search")}
@@ -3971,6 +4034,83 @@ interface TestWorkspaceSettingsCardProps {
   messageTone: ProviderMessageTone;
   onInitialize: () => Promise<void>;
   onRemove: () => Promise<void>;
+}
+
+function KnowledgeBaseWikiSettingsCard({
+  enabled,
+  loading,
+  message,
+  messageTone,
+  onEnabledChange,
+  onSave,
+  settings,
+}: {
+  enabled: boolean;
+  loading: boolean;
+  message: string | null;
+  messageTone: ProviderMessageTone;
+  onEnabledChange: (enabled: boolean) => void;
+  onSave: () => Promise<boolean>;
+  settings: KnowledgeBaseAiSettings | null;
+}) {
+  const messageClass =
+    messageTone === "success"
+      ? "border-success-border bg-success-background text-success-foreground"
+      : messageTone === "error"
+        ? "border-danger bg-danger/10 text-danger"
+        : "border-border bg-background text-muted-foreground";
+  return (
+    <section
+      className="rounded-xl border border-border bg-surface p-4"
+      data-clio-settings-section="knowledge-base"
+    >
+      <div className="flex min-w-0 items-start gap-2.5">
+        <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted text-primary">
+          <BookOpen size={16} />
+        </span>
+        <div className="min-w-0">
+          <h4 className="text-sm font-semibold">Knowledge Base Wiki</h4>
+          <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+            Compile durable summaries, sections, and evidence-backed claims for new Sources.
+          </p>
+        </div>
+      </div>
+      <label className="mt-4 flex min-h-11 cursor-pointer items-center justify-between gap-4 rounded-md border border-border bg-background px-3">
+        <span className="min-w-0">
+          <span className="block text-xs font-medium text-foreground">Generate Wiki</span>
+          <span className="block text-[10.5px] leading-4 text-muted-foreground">
+            Existing artifacts remain readable when disabled.
+          </span>
+        </span>
+        <input
+          checked={enabled}
+          className="h-4 w-4 shrink-0 accent-primary"
+          disabled={loading || settings === null}
+          onChange={(event) => onEnabledChange(event.target.checked)}
+          type="checkbox"
+        />
+      </label>
+      <Button
+        className="mt-3 w-full"
+        disabled={loading || settings === null}
+        onClick={() => void onSave()}
+        variant="default"
+      >
+        {loading ? <Loader2 className="animate-spin" size={15} /> : <Save size={15} />}
+        Save Wiki setting
+      </Button>
+      {message === null ? null : (
+        <div
+          aria-live="polite"
+          className={`mt-3 rounded-md border px-3 py-2 text-xs leading-5 ${messageClass}`}
+          data-clio-knowledge-base-settings-message="true"
+          data-clio-knowledge-base-settings-message-tone={messageTone}
+        >
+          {message}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function TestWorkspaceSettingsCard(props: TestWorkspaceSettingsCardProps) {
@@ -5244,7 +5384,12 @@ function visionProviderLabel(provider: VisionProviderId) {
 }
 
 function KnowledgeBasePanel(props: RailShellProps) {
-  const [section, setSection] = React.useState<"memories" | "topics">("memories");
+  const [section, setSection] = React.useState<"memories" | "wiki">(
+    props.wikiArtifactDetail === null ? "memories" : "wiki",
+  );
+  React.useEffect(() => {
+    if (props.wikiArtifactDetail !== null) setSection("wiki");
+  }, [props.wikiArtifactDetail]);
   const uploadInputRef = React.useRef<HTMLInputElement | null>(null);
   const workingSetSourceIds = React.useMemo(
     () => new Set(props.workingSetStatus?.entries.map((entry) => entry.source.id) ?? []),
@@ -5267,8 +5412,10 @@ function KnowledgeBasePanel(props: RailShellProps) {
     },
     [props.knowledgeBaseFilter, props.onKnowledgeBaseFilterChange],
   );
-  const topicCountLabel =
-    props.topicPages.length === 0 ? "No topic pages" : `${props.topicPages.length} topic pages`;
+  const wikiCountLabel =
+    props.wikiArtifacts.length === 0
+      ? "No Wiki artifacts"
+      : `${props.wikiArtifacts.length} Wiki artifacts`;
   const memoryCountLabel =
     props.items.length === 0
       ? hasActiveListCriteria
@@ -5301,7 +5448,7 @@ function KnowledgeBasePanel(props: RailShellProps) {
               Knowledge Base
             </h3>
             <p className="line-clamp-2 text-[11px] leading-4 text-muted-foreground">
-              {section === "topics" ? topicCountLabel : memoryCountLabel}
+              {section === "wiki" ? wikiCountLabel : memoryCountLabel}
             </p>
           </div>
         </div>
@@ -5366,153 +5513,142 @@ function KnowledgeBasePanel(props: RailShellProps) {
             Sources
           </button>
           <button
-            aria-controls="clio-knowledge-topics-panel"
-            aria-selected={section === "topics"}
+            aria-controls="clio-knowledge-wiki-panel"
+            aria-selected={section === "wiki"}
             className={[
               "relative flex min-h-9 items-center gap-1.5 border-b-2 px-1 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary",
-              section === "topics"
+              section === "wiki"
                 ? "border-primary text-foreground"
                 : "text-muted-foreground hover:bg-muted hover:text-foreground",
             ].join(" ")}
-            id="clio-knowledge-topics-tab"
-            onClick={() => setSection("topics")}
+            id="clio-knowledge-wiki-tab"
+            onClick={() => setSection("wiki")}
             role="tab"
             tabIndex={0}
             type="button"
           >
             <BookOpen size={14} />
-            Topics
+            Wiki
           </button>
         </div>
-        <input
-          ref={uploadInputRef}
-          accept="application/pdf,text/markdown,.pdf,.md,.markdown"
-          className="hidden"
-          multiple
-          onChange={handleUploadFiles}
-          type="file"
-        />
-        <div
-          className="grid grid-cols-3 gap-2"
-          data-clio-knowledge-actions="true"
-          data-clio-knowledge-command-bar="true"
-        >
-          <Button
-            className="border border-border bg-surface text-foreground hover:bg-muted"
-            data-clio-knowledge-upload-action="true"
-            disabled={props.state.loading}
-            onClick={props.onSavePage}
-            variant="subtle"
-          >
-            <BookOpen size={15} />
-            Save page
-          </Button>
-          <Button
-            className="border border-border bg-surface text-foreground hover:bg-muted"
-            disabled={props.state.loading}
-            onClick={props.onSaveSelection}
-            variant="subtle"
-          >
-            <BookmarkPlus size={15} />
-            Save selection
-          </Button>
-          <Button
-            className="border border-border bg-surface text-foreground hover:bg-muted"
-            disabled={props.state.loading}
-            onClick={() => uploadInputRef.current?.click()}
-            variant="subtle"
-          >
-            <Upload size={15} />
-            Upload
-          </Button>
-        </div>
-        {section === "topics" ? (
-          <Button
-            className="border border-border bg-surface text-foreground hover:bg-muted"
-            disabled={props.state.loading}
-            onClick={props.onCreateTopicPage}
-            variant="subtle"
-          >
-            <Plus size={15} />
-            New topic
-          </Button>
+        {section === "memories" ? (
+          <input
+            ref={uploadInputRef}
+            accept="application/pdf,text/markdown,.pdf,.md,.markdown"
+            className="hidden"
+            multiple
+            onChange={handleUploadFiles}
+            type="file"
+          />
         ) : null}
-        <div className="grid gap-2" data-clio-knowledge-toolbar="true">
-          <div className="relative">
-            <Search
-              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
-              size={15}
-            />
-            <Input
-              aria-label="Search knowledge sources"
-              aria-busy={props.knowledgeBaseSearchLoading}
-              className="h-10 rounded-md border-border bg-background pl-9 pr-9 text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-              onChange={(event) => props.onQueryChange(event.target.value)}
-              placeholder="Search sources"
-              value={props.state.query}
-            />
-            {props.knowledgeBaseSearchLoading ? (
-              <Loader2
-                className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-muted-foreground"
-                data-clio-knowledge-search-loading="true"
-                size={14}
-              />
-            ) : null}
+        {section === "memories" ? (
+          <div
+            className="grid grid-cols-3 gap-2"
+            data-clio-knowledge-actions="true"
+            data-clio-knowledge-command-bar="true"
+          >
+            <Button
+              className="border border-border bg-surface text-foreground hover:bg-muted"
+              data-clio-knowledge-upload-action="true"
+              disabled={props.state.loading}
+              onClick={props.onSavePage}
+              variant="subtle"
+            >
+              <BookOpen size={15} />
+              Save page
+            </Button>
+            <Button
+              className="border border-border bg-surface text-foreground hover:bg-muted"
+              disabled={props.state.loading}
+              onClick={props.onSaveSelection}
+              variant="subtle"
+            >
+              <BookmarkPlus size={15} />
+              Save selection
+            </Button>
+            <Button
+              className="border border-border bg-surface text-foreground hover:bg-muted"
+              disabled={props.state.loading}
+              onClick={() => uploadInputRef.current?.click()}
+              variant="subtle"
+            >
+              <Upload size={15} />
+              Upload
+            </Button>
           </div>
-          {section === "memories" ? (
-            <>
-              <KnowledgeBaseSearchModeControl
-                disabled={props.state.loading}
-                mode={props.knowledgeBaseSearchMode}
-                semanticAvailable={props.activeEmbeddingModel !== null}
-                onModeChange={props.onKnowledgeBaseSearchModeChange}
+        ) : null}
+        {section === "memories" ? (
+          <div className="grid gap-2" data-clio-knowledge-toolbar="true">
+            <div className="relative">
+              <Search
+                className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+                size={15}
               />
-              <KnowledgeBaseStrengthControl
-                disabled={props.state.loading}
-                strength={props.knowledgeBaseStrength}
-                onStrengthChange={props.onKnowledgeBaseStrengthChange}
+              <Input
+                aria-label="Search knowledge sources"
+                aria-busy={props.knowledgeBaseSearchLoading}
+                className="h-10 rounded-md border-border bg-background pl-9 pr-9 text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
+                onChange={(event) => props.onQueryChange(event.target.value)}
+                placeholder="Search sources"
+                value={props.state.query}
               />
-            </>
-          ) : null}
-          <div className="grid gap-2" data-clio-knowledge-toolbar-controls="true">
-            {section === "memories" ? (
+              {props.knowledgeBaseSearchLoading ? (
+                <Loader2
+                  className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-muted-foreground"
+                  data-clio-knowledge-search-loading="true"
+                  size={14}
+                />
+              ) : null}
+            </div>
+            <KnowledgeBaseSearchModeControl
+              disabled={props.state.loading}
+              mode={props.knowledgeBaseSearchMode}
+              semanticAvailable={props.activeEmbeddingModel !== null}
+              onModeChange={props.onKnowledgeBaseSearchModeChange}
+            />
+            <KnowledgeBaseStrengthControl
+              disabled={props.state.loading}
+              strength={props.knowledgeBaseStrength}
+              onStrengthChange={props.onKnowledgeBaseStrengthChange}
+            />
+            <div className="grid gap-2" data-clio-knowledge-toolbar-controls="true">
               <KnowledgeBaseFilterControls
                 disabled={props.state.loading}
                 filter={props.knowledgeBaseFilter}
                 normalizedFilter={props.knowledgeBaseRetrieveFilter}
                 onFilterChange={patchKnowledgeBaseFilter}
               />
-            ) : null}
+            </div>
           </div>
-        </div>
-        {section === "topics" ? (
+        ) : null}
+        {section === "wiki" ? (
           <div
-            aria-labelledby="clio-knowledge-topics-tab"
+            aria-labelledby="clio-knowledge-wiki-tab"
             className="grid gap-3"
-            id="clio-knowledge-topics-panel"
+            id="clio-knowledge-wiki-panel"
             role="tabpanel"
           >
-            <TopicKnowledgePanel
-              detail={props.topicDetail}
-              form={props.topicForm}
-              formOpen={props.topicFormOpen}
-              graphEdges={props.topicGraphEdges}
-              items={props.topicPages}
-              loading={props.state.loading}
-              wikiCompileForm={props.wikiCompileForm}
-              wikiCompileJobEvents={props.wikiCompileJobEvents}
-              wikiCompileJobs={props.wikiCompileJobs}
-              wikiCompileRunning={props.wikiCompileRunning}
-              onCancelForm={props.onCancelTopicForm}
-              onChangeForm={props.onTopicFormChange}
-              onChangeWikiCompileForm={props.onWikiCompileFormChange}
-              onCompileWithAI={props.onCompileTopicWithAI}
-              onCreate={props.onCreateTopicPage}
-              onDelete={props.onDeleteTopicPage}
-              onEdit={props.onEditTopicPage}
-              onOpen={props.onOpenTopicPage}
-              onOpenSource={props.onOpenTopicSource}
-              onSave={props.onSaveTopicPage}
+            <WikiKnowledgePanel
+              actionLoading={props.wikiCompileActionLoading}
+              detail={props.wikiArtifactDetail}
+              error={props.wikiArtifactsError}
+              events={props.wikiCompileEvents}
+              items={props.wikiArtifacts}
+              loading={props.wikiArtifactsLoading}
+              runDetail={props.wikiCompileRunDetail}
+              runError={props.wikiCompileActivityError}
+              runLoading={props.wikiCompileActivityLoading}
+              runs={props.wikiCompileRuns}
+              wikiEnabled={props.knowledgeBaseAiSettings?.wiki.enabled === true}
+              onBack={props.onCloseWikiArtifact}
+              onCancelRun={props.onCancelWikiCompileRun}
+              onOpen={props.onOpenWikiArtifact}
+              onOpenEvidence={props.onOpenWikiEvidence}
+              onRefresh={props.onRefreshWikiArtifacts}
+              onRefreshRuns={props.onRefreshWikiCompileActivity}
+              onResumeRun={props.onResumeWikiCompileRun}
+              onRetryRun={props.onRetryWikiCompileRun}
+              onSelectRun={props.onSelectWikiCompileRun}
             />
           </div>
         ) : (
@@ -7193,591 +7329,460 @@ function sourceContextLostInfoTypeLabel(
   return "groups";
 }
 
-function TopicKnowledgePanel({
+function WikiKnowledgePanel({
+  actionLoading,
   detail,
-  form,
-  formOpen,
-  graphEdges,
-  items,
-  loading,
-  wikiCompileForm,
-  wikiCompileJobEvents,
-  wikiCompileJobs,
-  wikiCompileRunning,
-  onCancelForm,
-  onChangeForm,
-  onChangeWikiCompileForm,
-  onCompileWithAI,
-  onCreate,
-  onDelete,
-  onEdit,
-  onOpen,
-  onOpenSource,
-  onSave,
-}: {
-  detail: TopicPageDetail | null;
-  form: TopicPageFormState;
-  formOpen: boolean;
-  graphEdges: TopicGraphEdge[];
-  items: TopicPageSummary[];
-  loading: boolean;
-  wikiCompileForm: WikiCompileFormState;
-  wikiCompileJobEvents: WikiCompileJobEvent[];
-  wikiCompileJobs: WikiCompileJobSummary[];
-  wikiCompileRunning: boolean;
-  onCancelForm: () => void;
-  onChangeForm: (form: TopicPageFormState) => void;
-  onChangeWikiCompileForm: (form: WikiCompileFormState) => void;
-  onCompileWithAI: (form: WikiCompileFormState, topicId?: string) => void;
-  onCreate: () => void;
-  onDelete: (id: string) => void;
-  onEdit: (page: TopicPageDetail) => void;
-  onOpen: (id: string) => void;
-  onOpenSource: (memoryId: string) => void;
-  onSave: (form: TopicPageFormState, id?: string) => void;
-}) {
-  if (formOpen) {
-    return (
-      <TopicPageForm
-        form={form}
-        loading={loading}
-        mode={detail === null ? "create" : "edit"}
-        onCancel={onCancelForm}
-        onChange={onChangeForm}
-        onSave={() => onSave(form, detail?.id)}
-      />
-    );
-  }
-
-  return (
-    <div className="grid gap-3">
-      {detail === null ? null : (
-        <TopicPageDetailCard
-          detail={detail}
-          graphEdges={graphEdges}
-          loading={loading}
-          onDelete={onDelete}
-          onEdit={onEdit}
-          onOpenSource={onOpenSource}
-        />
-      )}
-      <WikiCompileCard
-        detail={detail}
-        form={wikiCompileForm}
-        events={wikiCompileJobEvents}
-        jobs={wikiCompileJobs}
-        loading={loading || wikiCompileRunning}
-        onChange={onChangeWikiCompileForm}
-        onCompile={onCompileWithAI}
-      />
-      <TopicPageList
-        activeId={detail?.id}
-        items={items}
-        loading={loading}
-        onCreate={onCreate}
-        onOpen={onOpen}
-      />
-    </div>
-  );
-}
-
-function TopicPageList({
-  activeId,
-  items,
-  loading,
-  onCreate,
-  onOpen,
-}: {
-  activeId?: string;
-  items: TopicPageSummary[];
-  loading: boolean;
-  onCreate: () => void;
-  onOpen: (id: string) => void;
-}) {
-  if (loading) {
-    return (
-      <div className="flex h-28 items-center justify-center rounded-lg border border-border bg-surface text-sm text-muted-foreground">
-        <Loader2 className="mr-2 animate-spin" size={16} />
-        Loading topics
-      </div>
-    );
-  }
-  if (items.length === 0) {
-    return (
-      <div className="rounded-lg border border-border bg-surface px-4 py-8 text-center">
-        <p className="text-sm text-muted-foreground">No topic pages yet.</p>
-        <Button className="mt-3" onClick={onCreate} size="sm" variant="subtle">
-          <Plus size={14} />
-          New topic
-        </Button>
-      </div>
-    );
-  }
-  return (
-    <ul className="flex flex-col gap-2">
-      {items.map((item) => (
-        <li key={item.id}>
-          <button
-            className={[
-              "relative flex w-full flex-col gap-2 rounded-lg border bg-surface p-3.5 text-left outline-none transition-colors hover:border-border-strong hover:bg-surface-subtle focus-visible:ring-2 focus-visible:ring-primary",
-              activeId === item.id ? "border-primary/70" : "border-border",
-            ].join(" ")}
-            onClick={() => onOpen(item.id)}
-            type="button"
-          >
-            {activeId === item.id ? (
-              <span className="absolute bottom-3 left-0 top-3 w-[2px] rounded-r bg-primary" />
-            ) : null}
-            <div className="flex items-start gap-2.5">
-              <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-surface-subtle text-primary">
-                <BookOpen size={15} />
-              </span>
-              <div className="min-w-0 flex-1">
-                <h3 className="line-clamp-2 text-sm font-semibold leading-5">{item.title}</h3>
-                <p className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-                  <span>{topicSummaryLabel(item)}</span>
-                  <span>{formatDate(item.updatedAt)}</span>
-                </p>
-              </div>
-              <Badge className="border-border bg-surface-subtle text-muted-foreground">topic</Badge>
-            </div>
-            <p className="line-clamp-3 pl-9 text-[12.5px] leading-5 text-muted-foreground">
-              {item.summary || "Derived page over local memories."}
-            </p>
-          </button>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function WikiCompileCard({
-  detail,
+  error,
   events,
-  form,
-  jobs,
+  items,
   loading,
-  onChange,
-  onCompile,
+  runDetail,
+  runError,
+  runLoading,
+  runs,
+  wikiEnabled,
+  onBack,
+  onCancelRun,
+  onOpen,
+  onOpenEvidence,
+  onRefresh,
+  onRefreshRuns,
+  onResumeRun,
+  onRetryRun,
+  onSelectRun,
 }: {
-  detail: TopicPageDetail | null;
-  events: WikiCompileJobEvent[];
-  form: WikiCompileFormState;
-  jobs: WikiCompileJobSummary[];
+  actionLoading: boolean;
+  detail: WikiArtifactDetail | null;
+  error: string | null;
+  events: WikiCompileEvent[];
+  items: WikiArtifactMachineVersion[];
   loading: boolean;
-  onChange: (form: WikiCompileFormState) => void;
-  onCompile: (form: WikiCompileFormState, topicId?: string) => void;
+  runDetail: WikiCompileRunDetail | null;
+  runError: string | null;
+  runLoading: boolean;
+  runs: WikiCompileRunSummary[];
+  wikiEnabled: boolean;
+  onBack: () => void;
+  onCancelRun: (id: string) => void;
+  onOpen: (id: string) => void;
+  onOpenEvidence: (evidence: WikiArtifactEvidence) => void;
+  onRefresh: () => void;
+  onRefreshRuns: () => void;
+  onResumeRun: (id: string) => void;
+  onRetryRun: (id: string) => void;
+  onSelectRun: (id: string) => void;
 }) {
-  const query = form.query.trim();
-  const recentEvents = events.slice(-5).reverse();
+  if (detail !== null) {
+    const artifact = detail.artifact;
+    return (
+      <article className="min-w-0" data-clio-wiki-detail="true">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <Button onClick={onBack} size="sm" variant="ghost">
+            <ArrowLeft size={14} />
+            Wiki
+          </Button>
+          <Badge className="border-border bg-surface text-muted-foreground">
+            {wikiArtifactFreshnessLabel(artifact.freshness)}
+          </Badge>
+        </div>
+        <div className="min-w-0 border-b border-border pb-4">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <Badge className="border-border bg-muted text-foreground-soft">
+              {wikiArtifactKindLabel(artifact.artifactKind)}
+            </Badge>
+            <span className="text-[11px] text-muted-foreground">
+              v{artifact.versionNo} / {formatDate(artifact.publishedAt)}
+            </span>
+          </div>
+          <h4 className="break-words text-base font-semibold leading-6">{artifact.title}</h4>
+          <p className="mt-1 break-all text-[11px] text-muted-foreground">
+            {wikiArtifactSourceLabel(artifact)}
+          </p>
+        </div>
+        <section className="border-b border-border py-4">
+          <h5 className="mb-2 text-xs font-semibold text-foreground">Content</h5>
+          <MarkdownRenderer
+            markdown={artifact.content}
+            onSourceActivate={() => undefined}
+            sources={[]}
+            variant="preview"
+          />
+        </section>
+        <WikiArtifactMetadata title="Coverage" value={artifact.coverage} />
+        <section className="border-b border-border py-4">
+          <h5 className="text-xs font-semibold text-foreground">Evidence</h5>
+          {detail.evidence.length === 0 ? (
+            <p className="mt-2 text-xs text-muted-foreground">No evidence references.</p>
+          ) : (
+            <ul className="mt-2 grid gap-1.5">
+              {detail.evidence.map((evidence) => (
+                <li key={evidence.id}>
+                  <button
+                    className="flex min-h-11 w-full min-w-0 items-center justify-between gap-3 rounded-md px-2.5 text-left outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
+                    onClick={() => onOpenEvidence(evidence)}
+                    type="button"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-xs font-medium text-foreground">
+                        Chunk {evidence.chunkId}
+                      </span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        {evidence.pageNo === undefined
+                          ? "Source evidence"
+                          : `PDF page ${evidence.pageNo}`}
+                      </span>
+                    </span>
+                    <ChevronRight className="shrink-0 text-muted-foreground" size={14} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+        <WikiArtifactRelations detail={detail} />
+      </article>
+    );
+  }
+
   return (
-    <section className="rounded-lg border border-border bg-surface p-4">
-      <div className="mb-3 flex items-start justify-between gap-2">
+    <section className="min-w-0" data-clio-wiki-list="true">
+      <div className="mb-2 flex items-center justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="text-sm font-semibold">AI compile</h3>
-          <p className="mt-1 text-[11px] text-muted-foreground">
-            Compile a derived topic from saved memories.
+          <h4 className="text-sm font-semibold">Compiled Wiki</h4>
+          <p className="text-[11px] leading-4 text-muted-foreground">
+            Browsing remains available when generation is disabled.
           </p>
         </div>
         <Button
-          disabled={loading || query.length === 0}
-          onClick={() => onCompile(form, detail?.id)}
-          size="sm"
-          variant="subtle"
+          aria-label="Refresh Wiki artifacts"
+          disabled={loading}
+          onClick={onRefresh}
+          size="icon"
+          title="Refresh Wiki artifacts"
+          variant="ghost"
         >
-          {loading ? <Loader2 className="animate-spin" size={14} /> : <Sparkles size={14} />}
-          Compile
+          <RefreshCw className={loading ? "animate-spin" : ""} size={15} />
         </Button>
       </div>
-      <div className="grid gap-2.5">
-        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-wiki-compile-query">
-          <span className="font-medium text-foreground">Topic query</span>
-          <Input
-            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-            id="clio-wiki-compile-query"
-            onChange={(event) => onChange({ ...form, query: event.target.value })}
-            placeholder="Customer onboarding"
-            value={form.query}
-          />
-        </label>
-        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-wiki-compile-instructions">
-          <span className="font-medium text-foreground">Instructions</span>
-          <textarea
-            className="min-h-[68px] resize-y rounded-lg border border-border bg-background px-3 py-2.5 text-[12px] leading-5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-primary"
-            id="clio-wiki-compile-instructions"
-            onChange={(event) => onChange({ ...form, instructions: event.target.value })}
-            placeholder="Optional focus, scope, or tone"
-            value={form.instructions}
-          />
-        </label>
-      </div>
-      {jobs.length === 0 ? null : (
-        <div className="mt-3 grid gap-1.5">
-          {jobs.slice(0, 3).map((job) => (
-            <div
-              className="flex items-center justify-between gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-[11px]"
-              key={job.id}
-            >
-              <span className="min-w-0 truncate text-muted-foreground">{job.query}</span>
-              <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
-                {wikiJobStatusLabel(job)}
-              </Badge>
-            </div>
-          ))}
+      {error === null ? null : (
+        <div
+          className="mb-2 rounded-md border border-danger bg-danger/10 px-3 py-2 text-xs leading-5 text-danger"
+          role="alert"
+        >
+          {error}
         </div>
       )}
-      {recentEvents.length === 0 ? null : (
-        <div className="mt-3 grid gap-1.5 border-t border-border pt-3">
-          <div className="flex items-center justify-between gap-2">
-            <h4 className="text-[12px] font-semibold text-foreground">Compile log</h4>
-            <Badge className="border-border bg-surface-subtle text-muted-foreground">
-              {recentEvents.length}
-            </Badge>
-          </div>
-          <div className="grid gap-1.5">
-            {recentEvents.map((event) => {
-              const detailText = wikiCompileEventDetail(event);
-              return (
-                <div
-                  className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-[11px]"
-                  key={event.id}
-                >
-                  <span
-                    className={[
-                      "h-2 w-2 rounded-full",
-                      event.level === "error"
-                        ? "bg-destructive"
-                        : event.level === "warning"
-                          ? "bg-amber-500"
-                          : "bg-primary",
-                    ].join(" ")}
-                  />
-                  <span className="min-w-0 truncate text-foreground">
-                    {event.message || wikiCompileEventLabel(event)}
+      {loading && items.length === 0 ? (
+        <div className="flex min-h-24 items-center justify-center text-xs text-muted-foreground">
+          <Loader2 className="mr-2 animate-spin" size={15} />
+          Loading Wiki
+        </div>
+      ) : items.length === 0 ? (
+        <div className="min-h-24 border-y border-border py-5 text-center">
+          <BookOpen className="mx-auto mb-2 text-muted-foreground" size={20} />
+          <p className="text-xs font-medium">No compiled Wiki yet</p>
+          <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+            Enable Wiki in Settings, then compile a saved Source.
+          </p>
+        </div>
+      ) : (
+        <ul className="divide-y divide-border border-y border-border">
+          {items.map((artifact) => (
+            <li key={artifact.id}>
+              <button
+                className="flex min-h-16 w-full min-w-0 items-start gap-3 px-1 py-3 text-left outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
+                onClick={() => onOpen(artifact.id)}
+                type="button"
+              >
+                <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted text-primary">
+                  {artifact.artifactKind === "claim" ? (
+                    <ShieldCheck size={15} />
+                  ) : (
+                    <FileText size={15} />
+                  )}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="line-clamp-2 break-words text-xs font-semibold leading-4">
+                    {artifact.title}
                   </span>
-                  <span className="shrink-0 text-muted-foreground">
-                    {detailText || wikiCompileEventLabel(event)}
+                  <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
+                    <span>{wikiArtifactKindLabel(artifact.artifactKind)}</span>
+                    <span>v{artifact.versionNo}</span>
+                    <span>{formatDate(artifact.publishedAt)}</span>
                   </span>
-                </div>
-              );
-            })}
+                </span>
+                <ChevronRight className="mt-2 shrink-0 text-muted-foreground" size={14} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <WikiCompileActivity
+        actionLoading={actionLoading}
+        error={runError}
+        events={events}
+        loading={runLoading}
+        runDetail={runDetail}
+        runs={runs}
+        wikiEnabled={wikiEnabled}
+        onCancel={onCancelRun}
+        onRefresh={onRefreshRuns}
+        onResume={onResumeRun}
+        onRetry={onRetryRun}
+        onSelect={onSelectRun}
+      />
+    </section>
+  );
+}
+
+function WikiCompileActivity({
+  actionLoading,
+  error,
+  events,
+  loading,
+  runDetail,
+  runs,
+  wikiEnabled,
+  onCancel,
+  onRefresh,
+  onResume,
+  onRetry,
+  onSelect,
+}: {
+  actionLoading: boolean;
+  error: string | null;
+  events: WikiCompileEvent[];
+  loading: boolean;
+  runDetail: WikiCompileRunDetail | null;
+  runs: WikiCompileRunSummary[];
+  wikiEnabled: boolean;
+  onCancel: (id: string) => void;
+  onRefresh: () => void;
+  onResume: (id: string) => void;
+  onRetry: (id: string) => void;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <section className="mt-5 border-t border-border pt-4" data-clio-wiki-compile-activity="true">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h4 className="text-sm font-semibold">Compile activity</h4>
+          <p className="text-[11px] leading-4 text-muted-foreground">
+            {wikiEnabled
+              ? "Durable background runs"
+              : "Generation is disabled; history remains readable"}
+          </p>
+        </div>
+        <Button
+          aria-label="Refresh Wiki compile activity"
+          disabled={loading}
+          onClick={onRefresh}
+          size="icon"
+          title="Refresh Wiki compile activity"
+          variant="ghost"
+        >
+          <RefreshCw className={loading ? "animate-spin" : ""} size={15} />
+        </Button>
+      </div>
+      {error === null ? null : (
+        <p className="mt-2 break-words text-xs leading-5 text-danger" role="alert">
+          {error}
+        </p>
+      )}
+      {runs.length === 0 ? (
+        <p className="mt-3 text-xs text-muted-foreground">No Wiki compile runs yet.</p>
+      ) : (
+        <div className="mt-3 grid gap-3">
+          <div className="flex min-w-0 gap-2 overflow-x-auto pb-1">
+            {runs.map((run) => (
+              <button
+                aria-pressed={runDetail?.id === run.id}
+                className="min-w-32 shrink-0 rounded-md border border-border px-2.5 py-2 text-left outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
+                key={run.id}
+                onClick={() => onSelect(run.id)}
+                type="button"
+              >
+                <span className="block truncate text-xs font-medium">
+                  {wikiCompileRunStatusLabel(run.status)}
+                </span>
+                <span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">
+                  {wikiCompileRunProgress(run)}% / {formatDate(run.createdAt)}
+                </span>
+              </button>
+            ))}
           </div>
+          {runDetail === null ? null : (
+            <WikiCompileRunDetailPanel
+              actionLoading={actionLoading}
+              events={events}
+              run={runDetail}
+              wikiEnabled={wikiEnabled}
+              onCancel={onCancel}
+              onResume={onResume}
+              onRetry={onRetry}
+            />
+          )}
         </div>
       )}
     </section>
   );
 }
 
-function TopicPageDetailCard({
-  detail,
-  graphEdges,
-  loading,
-  onDelete,
-  onEdit,
-  onOpenSource,
-}: {
-  detail: TopicPageDetail;
-  graphEdges: TopicGraphEdge[];
-  loading: boolean;
-  onDelete: (id: string) => void;
-  onEdit: (page: TopicPageDetail) => void;
-  onOpenSource: (memoryId: string) => void;
-}) {
-  return (
-    <article className="rounded-lg border border-border bg-surface p-4">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <div className="min-w-0">
-          <div className="mb-1 flex flex-wrap items-center gap-1.5">
-            <Badge className="border-border bg-surface-subtle text-muted-foreground">topic</Badge>
-            <span className="text-[11px] text-muted-foreground">
-              {formatDate(detail.updatedAt)}
-            </span>
-          </div>
-          <h3 className="line-clamp-2 text-base font-semibold leading-6">{detail.title}</h3>
-        </div>
-        <div className="flex shrink-0 gap-1.5">
-          <Button disabled={loading} onClick={() => onEdit(detail)} size="sm" variant="ghost">
-            <Pencil size={14} />
-            Edit
-          </Button>
-          <Button disabled={loading} onClick={() => onDelete(detail.id)} size="sm" variant="ghost">
-            <Trash2 size={14} />
-            Delete
-          </Button>
-        </div>
-      </div>
-      {detail.summary.length > 0 ? (
-        <p className="mb-3 text-[12.5px] leading-5 text-muted-foreground">{detail.summary}</p>
-      ) : null}
-      {detail.content.length > 0 ? (
-        <div className="mb-4 whitespace-pre-wrap rounded-lg border border-border bg-background p-3 text-sm leading-6 text-foreground">
-          {detail.content}
-        </div>
-      ) : (
-        <div className="mb-4 rounded-lg border border-dashed border-border bg-background px-3 py-6 text-center text-sm text-muted-foreground">
-          Empty topic page.
-        </div>
-      )}
-      <div className="grid gap-2">
-        <h4 className="text-[12px] font-semibold text-foreground">Sources</h4>
-        {detail.sourceRefs.length === 0 ? (
-          <p className="rounded-lg border border-border bg-background px-3 py-3 text-[12px] text-muted-foreground">
-            No source memories linked.
-          </p>
-        ) : (
-          detail.sourceRefs.map((ref) => (
-            <button
-              className="flex w-full flex-col gap-1 rounded-lg border border-border bg-background px-3 py-2.5 text-left text-[12px] outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
-              key={`${ref.memoryId}:${ref.chunkId ?? ""}`}
-              onClick={() => onOpenSource(ref.memoryId)}
-              type="button"
-            >
-              <span className="flex items-center gap-1.5 font-medium text-foreground">
-                <ExternalLink size={13} />
-                {ref.memoryId}
-              </span>
-              {ref.quote === undefined ? null : (
-                <span className="line-clamp-2 text-muted-foreground">{ref.quote}</span>
-              )}
-            </button>
-          ))
-        )}
-      </div>
-      <TopicGraphMap detail={detail} edges={graphEdges} onOpenSource={onOpenSource} />
-      <TopicGraphEdgesList edges={graphEdges} onOpenSource={onOpenSource} />
-    </article>
-  );
-}
-
-function TopicGraphMap({
-  detail,
-  edges,
-  onOpenSource,
-}: {
-  detail: TopicPageDetail;
-  edges: TopicGraphEdge[];
-  onOpenSource: (memoryId: string) => void;
-}) {
-  if (edges.length === 0) return null;
-  const sourceEdges = edges.filter((edge) => edge.memoryId !== undefined).slice(0, 4);
-  const topicEdges = edges.filter((edge) => edge.toTopicId !== undefined).slice(0, 4);
-  const sourceNodes = sourceEdges.map((edge, index) => ({
-    edge,
-    x: 18,
-    y: graphNodeY(index, sourceEdges.length),
-    label: edge.label || edge.memoryId || "Source",
-  }));
-  const topicNodes = topicEdges.map((edge, index) => ({
-    edge,
-    x: 82,
-    y: graphNodeY(index, topicEdges.length),
-    label: edge.label || edge.toTopicId || "Topic",
-  }));
-  const center = { x: 50, y: 50 };
-  return (
-    <div className="mt-4 grid gap-2 border-t border-border pt-3">
-      <h4 className="text-[12px] font-semibold text-foreground">Graph</h4>
-      <div className="relative h-56 overflow-hidden rounded-lg border border-border bg-background">
-        <svg
-          aria-hidden="true"
-          className="absolute inset-0 h-full w-full"
-          preserveAspectRatio="none"
-          viewBox="0 0 100 100"
-        >
-          <title>Topic graph</title>
-          {sourceNodes.map((node) => (
-            <line
-              className="stroke-primary/45"
-              key={`source-line-${node.edge.id}`}
-              strokeWidth="0.55"
-              x1={node.x + 8}
-              x2={center.x - 8}
-              y1={node.y}
-              y2={center.y}
-            />
-          ))}
-          {topicNodes.map((node) => (
-            <line
-              className="stroke-muted-foreground/40"
-              key={`topic-line-${node.edge.id}`}
-              strokeDasharray={node.edge.kind === "mentions" ? "2 2" : undefined}
-              strokeWidth="0.55"
-              x1={center.x + 8}
-              x2={node.x - 8}
-              y1={center.y}
-              y2={node.y}
-            />
-          ))}
-        </svg>
-        <div
-          className="absolute left-1/2 top-1/2 flex h-14 w-28 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-lg border border-primary/50 bg-surface px-2 text-center text-[11px] font-semibold leading-4 text-foreground shadow-sm"
-          title={detail.title}
-        >
-          <span className="line-clamp-2">{detail.title}</span>
-        </div>
-        {sourceNodes.map((node) => (
-          <button
-            className="absolute flex h-10 w-24 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-md border border-border bg-surface-subtle px-2 text-center text-[10px] leading-3 text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
-            key={`source-node-${node.edge.id}`}
-            onClick={() => {
-              if (node.edge.memoryId !== undefined) onOpenSource(node.edge.memoryId);
-            }}
-            style={{ left: `${node.x}%`, top: `${node.y}%` }}
-            title={node.label}
-            type="button"
-          >
-            <span className="line-clamp-2">{node.label}</span>
-          </button>
-        ))}
-        {topicNodes.map((node) => (
-          <div
-            className="absolute flex h-10 w-24 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-md border border-border bg-surface-subtle px-2 text-center text-[10px] leading-3 text-muted-foreground"
-            key={`topic-node-${node.edge.id}`}
-            style={{ left: `${node.x}%`, top: `${node.y}%` }}
-            title={node.label}
-          >
-            <span className="line-clamp-2">{node.label}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function TopicGraphEdgesList({
-  edges,
-  onOpenSource,
-}: {
-  edges: TopicGraphEdge[];
-  onOpenSource: (memoryId: string) => void;
-}) {
-  if (edges.length === 0) return null;
-  return (
-    <div className="mt-4 grid gap-2 border-t border-border pt-3">
-      <h4 className="text-[12px] font-semibold text-foreground">Graph links</h4>
-      <div className="grid gap-1.5">
-        {edges.slice(0, 8).map((edge) => {
-          const canOpenSource = edge.memoryId !== undefined;
-          return (
-            <button
-              className="flex w-full items-center justify-between gap-2 rounded-md border border-border bg-background px-3 py-2 text-left text-[12px] outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:hover:bg-background"
-              disabled={!canOpenSource}
-              key={edge.id}
-              onClick={() => {
-                if (edge.memoryId !== undefined) onOpenSource(edge.memoryId);
-              }}
-              type="button"
-            >
-              <span className="min-w-0 truncate text-foreground">{topicGraphEdgeLabel(edge)}</span>
-              <Badge className="shrink-0 border-border bg-surface-subtle text-muted-foreground">
-                {edge.kind}
-              </Badge>
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function graphNodeY(index: number, count: number) {
-  if (count <= 1) return 50;
-  const step = 60 / Math.max(1, count - 1);
-  return 20 + index * step;
-}
-
-function TopicPageForm({
-  form,
-  loading,
-  mode,
+function WikiCompileRunDetailPanel({
+  actionLoading,
+  events,
+  run,
+  wikiEnabled,
   onCancel,
-  onChange,
-  onSave,
+  onResume,
+  onRetry,
 }: {
-  form: TopicPageFormState;
-  loading: boolean;
-  mode: TopicFormMode;
-  onCancel: () => void;
-  onChange: (form: TopicPageFormState) => void;
-  onSave: () => void;
+  actionLoading: boolean;
+  events: WikiCompileEvent[];
+  run: WikiCompileRunDetail;
+  wikiEnabled: boolean;
+  onCancel: (id: string) => void;
+  onResume: (id: string) => void;
+  onRetry: (id: string) => void;
 }) {
-  const title = form.title.trim();
+  const progress = wikiCompileRunProgress(run);
   return (
-    <section className="rounded-lg border border-border bg-surface p-4">
-      <div className="mb-3 flex items-center justify-between gap-2">
+    <div className="min-w-0 border-l-2 border-primary bg-muted px-3 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
-          <h3 className="truncate text-sm font-semibold">
-            {mode === "create" ? "New topic page" : "Edit topic page"}
-          </h3>
-          <p className="mt-1 text-[11px] text-muted-foreground">
-            Derived notes stay linked to source memories.
+          <p className="text-xs font-semibold">{wikiCompileRunStatusLabel(run.status)}</p>
+          <p className="mt-0.5 break-all text-[10.5px] text-muted-foreground">
+            {run.provider} / {run.modelId}
           </p>
         </div>
-        <Button
-          disabled={loading || title.length === 0}
-          onClick={onSave}
-          size="sm"
-          variant="subtle"
-        >
-          {loading ? <Loader2 className="animate-spin" size={14} /> : <Save size={14} />}
-          Save
-        </Button>
+        <Badge className="border-border bg-surface text-muted-foreground">{progress}%</Badge>
       </div>
-      <div className="grid gap-3">
-        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-topic-title">
-          <span className="font-medium text-foreground">Title</span>
-          <Input
-            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-            id="clio-topic-title"
-            onChange={(event) => onChange({ ...form, title: event.target.value })}
-            placeholder="Customer onboarding"
-            value={form.title}
-          />
-        </label>
-        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-topic-summary">
-          <span className="font-medium text-foreground">Summary</span>
-          <Input
-            className="h-10 rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-primary"
-            id="clio-topic-summary"
-            onChange={(event) => onChange({ ...form, summary: event.target.value })}
-            placeholder="Short user-facing summary"
-            value={form.summary}
-          />
-        </label>
-        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-topic-content">
-          <span className="font-medium text-foreground">Content</span>
-          <textarea
-            className="min-h-[180px] resize-y rounded-lg border border-border bg-background px-3 py-2.5 text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-primary"
-            id="clio-topic-content"
-            onChange={(event) => onChange({ ...form, content: event.target.value })}
-            placeholder="Compile what matters from local memories."
-            value={form.content}
-          />
-        </label>
-        <label className="grid gap-1.5 text-[12px]" htmlFor="clio-topic-sources">
-          <span className="font-medium text-foreground">Source refs</span>
-          <textarea
-            className="min-h-[84px] resize-y rounded-lg border border-border bg-background px-3 py-2.5 font-mono text-[11.5px] leading-5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-primary"
-            id="clio-topic-sources"
-            onChange={(event) => onChange({ ...form, sourceRefsText: event.target.value })}
-            placeholder="mem_abc|chunk_xyz|optional quote"
-            value={form.sourceRefsText}
-          />
-        </label>
+      <div
+        className="mt-2 h-1.5 overflow-hidden rounded-full bg-background"
+        aria-label={`${progress}% complete`}
+      >
+        <div className="h-full bg-primary" style={{ width: `${progress}%` }} />
       </div>
-      <div className="mt-3 flex justify-end gap-2">
-        <Button
-          disabled={loading}
-          onClick={() => {
-            onChange(emptyTopicPageForm);
-            onCancel();
-          }}
-          size="sm"
-          variant="ghost"
-        >
-          Cancel
-        </Button>
+      <p className="mt-2 text-[11px] text-muted-foreground">
+        {run.completedStepCount}/{run.stepCount} steps / {run.coveredChunkCount}/
+        {run.totalChunkCount} chunks
+      </p>
+      {run.errorMessage === undefined ? null : (
+        <p className="mt-2 break-words text-xs leading-5 text-danger">{run.errorMessage}</p>
+      )}
+      <div className="mt-3 flex flex-wrap gap-2">
+        {wikiCompileRunCanCancel(run.status) ? (
+          <Button
+            disabled={actionLoading}
+            onClick={() => onCancel(run.id)}
+            size="sm"
+            variant="subtle"
+          >
+            <Square size={13} />
+            Cancel
+          </Button>
+        ) : null}
+        {wikiCompileRunCanRetry(run.status, wikiEnabled) ? (
+          <Button
+            disabled={actionLoading}
+            onClick={() => onRetry(run.id)}
+            size="sm"
+            variant="subtle"
+          >
+            <RefreshCw size={13} />
+            Retry
+          </Button>
+        ) : null}
+        {wikiCompileRunCanResume(run.status, wikiEnabled) ? (
+          <Button
+            disabled={actionLoading}
+            onClick={() => onResume(run.id)}
+            size="sm"
+            variant="subtle"
+          >
+            <RefreshCw size={13} />
+            Resume
+          </Button>
+        ) : null}
       </div>
+      <div className="mt-3 border-t border-border pt-2">
+        <p className="text-[11px] font-medium">Steps and events</p>
+        <ul className="mt-1.5 grid gap-1.5 text-[10.5px] text-muted-foreground">
+          {run.steps.slice(0, 12).map((step) => (
+            <li className="flex min-w-0 justify-between gap-2" key={step.id}>
+              <span className="truncate">Step {step.index + 1}</span>
+              <span className="shrink-0">{step.status}</span>
+            </li>
+          ))}
+          {events.slice(0, 12).map((event) => (
+            <li className="break-words" key={event.id}>
+              {formatDate(event.createdAt)} / {event.message}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function WikiArtifactMetadata({
+  title,
+  value,
+}: {
+  title: string;
+  value: WikiArtifactMachineVersion["coverage"];
+}) {
+  const entries = Object.entries(value).slice(0, 12);
+  return (
+    <section className="border-b border-border py-4">
+      <h5 className="text-xs font-semibold text-foreground">{title}</h5>
+      {entries.length === 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground">No metadata.</p>
+      ) : (
+        <dl className="mt-2 grid gap-2">
+          {entries.map(([key, item]) => (
+            <div
+              className="grid min-w-0 grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)] gap-3 text-[11px]"
+              key={key}
+            >
+              <dt className="break-words text-muted-foreground">{key}</dt>
+              <dd className="break-words text-right text-foreground">
+                {wikiArtifactJsonValueLabel(item)}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </section>
+  );
+}
+
+function WikiArtifactRelations({ detail }: { detail: WikiArtifactDetail }) {
+  const links = [...detail.outgoingLinks, ...detail.incomingLinks];
+  return (
+    <section className="py-4">
+      <h5 className="text-xs font-semibold text-foreground">Relations and edits</h5>
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        {links.length} links / {detail.userEdits.length} user edits
+      </p>
+      {links.length === 0 ? null : (
+        <ul className="mt-2 grid gap-1 text-[11px] text-muted-foreground">
+          {links.slice(0, 20).map((link) => (
+            <li className="break-all" key={link.id}>
+              {link.kind}: {link.fromArtifactId} to {link.toArtifactId}
+            </li>
+          ))}
+        </ul>
+      )}
+      {detail.userEdits.length === 0 ? null : (
+        <ul className="mt-3 grid gap-1 text-[11px] text-muted-foreground">
+          {detail.userEdits.slice(0, 20).map((edit) => (
+            <li className="break-words" key={edit.id}>
+              Edit v{edit.versionNo}: {edit.editKind} / {edit.mergeOutcome}
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
@@ -8064,16 +8069,42 @@ function MemoryDetailPanel({
   detail,
   loading,
   onBack,
+  onCancelWikiCompileRun,
   onDelete,
+  onEnqueueSourceWikiCompile,
+  onOpenWikiArtifact,
   onOpenSource,
+  onResumeWikiCompileRun,
+  onRetryWikiCompileRun,
   pdfPreview,
+  sourceWikiArtifacts,
+  sourceWikiArtifactsError,
+  sourceWikiArtifactsLoading,
+  sourceWikiCompileRun,
+  sourceWikiCompileRunLoading,
+  wikiActionLoading,
+  wikiEnabled,
+  wikiEvidenceTarget,
 }: {
   detail: MemoryDetail | null;
   loading: boolean;
   onBack: () => void;
+  onCancelWikiCompileRun: (id: string) => void;
   onDelete: (id: string) => void;
+  onEnqueueSourceWikiCompile: (sourceId: string) => void;
+  onOpenWikiArtifact: (id: string) => void;
   onOpenSource: (memory: MemoryDetail) => void;
+  onResumeWikiCompileRun: (id: string) => void;
+  onRetryWikiCompileRun: (id: string) => void;
   pdfPreview: PdfReaderPreviewState | null;
+  sourceWikiArtifacts: WikiArtifactMachineVersion[];
+  sourceWikiArtifactsError: string | null;
+  sourceWikiArtifactsLoading: boolean;
+  sourceWikiCompileRun: WikiCompileRunSummary | null;
+  sourceWikiCompileRunLoading: boolean;
+  wikiActionLoading: boolean;
+  wikiEnabled: boolean;
+  wikiEvidenceTarget: WikiArtifactEvidence | null;
 }) {
   if (detail === null) {
     return (
@@ -8126,6 +8157,25 @@ function MemoryDetailPanel({
           {detail.version.versionNo > 1 ? <Badge>v{detail.version.versionNo}</Badge> : null}
           {!detail.version.isCurrent ? <Badge>superseded</Badge> : null}
         </div>
+        <WikiEvidenceTarget detail={detail} evidence={wikiEvidenceTarget} pdfPreview={pdfPreview} />
+        <SourceWikiCompile
+          actionLoading={wikiActionLoading}
+          artifactCount={sourceWikiArtifacts.length}
+          loading={sourceWikiCompileRunLoading}
+          run={sourceWikiCompileRun}
+          sourceId={detail.id}
+          wikiEnabled={wikiEnabled}
+          onCancel={onCancelWikiCompileRun}
+          onCompile={onEnqueueSourceWikiCompile}
+          onResume={onResumeWikiCompileRun}
+          onRetry={onRetryWikiCompileRun}
+        />
+        <SourceWikiArtifacts
+          error={sourceWikiArtifactsError}
+          items={sourceWikiArtifacts}
+          loading={sourceWikiArtifactsLoading}
+          onOpen={onOpenWikiArtifact}
+        />
         <PdfDocumentIndex detail={detail} preview={pdfPreview} />
         {isMarkdownMemoryDetail(detail) ? (
           <MarkdownRenderer
@@ -8141,6 +8191,208 @@ function MemoryDetailPanel({
         )}
       </article>
     </div>
+  );
+}
+
+function SourceWikiCompile({
+  actionLoading,
+  artifactCount,
+  loading,
+  run,
+  sourceId,
+  wikiEnabled,
+  onCancel,
+  onCompile,
+  onResume,
+  onRetry,
+}: {
+  actionLoading: boolean;
+  artifactCount: number;
+  loading: boolean;
+  run: WikiCompileRunSummary | null;
+  sourceId: string;
+  wikiEnabled: boolean;
+  onCancel: (id: string) => void;
+  onCompile: (sourceId: string) => void;
+  onResume: (id: string) => void;
+  onRetry: (id: string) => void;
+}) {
+  const progress = run === null ? 0 : wikiCompileRunProgress(run);
+  return (
+    <section className="mb-4 border-y border-border py-3" data-clio-source-wiki-compile="true">
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h4 className="text-xs font-semibold">Wiki compilation</h4>
+          <p className="mt-0.5 break-words text-[11px] text-muted-foreground">
+            {loading
+              ? "Loading latest run"
+              : run === null
+                ? "No compile run for this Source"
+                : `${wikiCompileRunStatusLabel(run.status)} / ${progress}%`}
+          </p>
+        </div>
+        {loading ? <Loader2 className="animate-spin text-muted-foreground" size={14} /> : null}
+      </div>
+      {run?.errorMessage === undefined ? null : (
+        <p className="mt-2 break-words text-xs leading-5 text-danger">{run.errorMessage}</p>
+      )}
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button
+          disabled={!wikiEnabled || actionLoading}
+          onClick={() => onCompile(sourceId)}
+          size="sm"
+          title={wikiEnabled ? undefined : "Enable Wiki in Settings before compiling"}
+          variant="default"
+        >
+          {actionLoading ? <Loader2 className="animate-spin" size={13} /> : <BookOpen size={13} />}
+          {artifactCount > 0 ? "Recompile Wiki" : "Compile Wiki"}
+        </Button>
+        {run !== null && wikiCompileRunCanCancel(run.status) ? (
+          <Button
+            disabled={actionLoading}
+            onClick={() => onCancel(run.id)}
+            size="sm"
+            variant="subtle"
+          >
+            <Square size={13} />
+            Cancel
+          </Button>
+        ) : null}
+        {run !== null && wikiCompileRunCanRetry(run.status, wikiEnabled) ? (
+          <Button
+            disabled={actionLoading}
+            onClick={() => onRetry(run.id)}
+            size="sm"
+            variant="subtle"
+          >
+            <RefreshCw size={13} />
+            Retry
+          </Button>
+        ) : null}
+        {run !== null && wikiCompileRunCanResume(run.status, wikiEnabled) ? (
+          <Button
+            disabled={actionLoading}
+            onClick={() => onResume(run.id)}
+            size="sm"
+            variant="subtle"
+          >
+            <RefreshCw size={13} />
+            Resume
+          </Button>
+        ) : null}
+      </div>
+      {!wikiEnabled ? (
+        <p className="mt-2 text-[10.5px] leading-4 text-muted-foreground">
+          Existing Wiki and run history remain available while generation is disabled.
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+function WikiEvidenceTarget({
+  detail,
+  evidence,
+  pdfPreview,
+}: {
+  detail: MemoryDetail;
+  evidence: WikiArtifactEvidence | null;
+  pdfPreview: PdfReaderPreviewState | null;
+}) {
+  if (evidence === null || evidence.sourceId !== detail.id) return null;
+  const chunk = detail.chunks.find((item) => item.id === evidence.chunkId);
+  const pdfUrl =
+    evidence.pageNo !== undefined &&
+    pdfPreview?.status === "ready" &&
+    pdfPreview.objectUrl !== undefined
+      ? pdfPreviewUrl(pdfPreview.objectUrl, evidence.pageNo)
+      : undefined;
+  return (
+    <section
+      className="mb-4 border-l-2 border-primary bg-muted px-3 py-2.5"
+      data-clio-wiki-evidence-target="true"
+    >
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h4 className="text-xs font-semibold">Wiki evidence</h4>
+          <p className="mt-1 break-all text-[11px] text-muted-foreground">
+            Chunk {evidence.chunkId}
+            {evidence.pageNo === undefined ? "" : ` / PDF page ${evidence.pageNo}`}
+          </p>
+        </div>
+        {pdfUrl === undefined ? null : (
+          <a
+            aria-label={`Open Wiki evidence on PDF page ${evidence.pageNo}`}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-primary outline-none hover:bg-surface focus-visible:ring-2 focus-visible:ring-primary"
+            href={pdfUrl}
+            rel="noreferrer"
+            target="_blank"
+            title={`Open PDF page ${evidence.pageNo}`}
+          >
+            <ExternalLink size={14} />
+          </a>
+        )}
+      </div>
+      <p className="mt-2 line-clamp-5 whitespace-pre-wrap break-words text-xs leading-5 text-foreground">
+        {chunk?.text ?? "The referenced Chunk is no longer available in this Source version."}
+      </p>
+    </section>
+  );
+}
+
+function SourceWikiArtifacts({
+  error,
+  items,
+  loading,
+  onOpen,
+}: {
+  error: string | null;
+  items: WikiArtifactMachineVersion[];
+  loading: boolean;
+  onOpen: (id: string) => void;
+}) {
+  return (
+    <section className="mb-4 border-y border-border py-3" data-clio-source-wiki="true">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h4 className="text-xs font-semibold">Used by Wiki</h4>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            {loading ? "Loading references" : `${items.length} current artifacts`}
+          </p>
+        </div>
+        {loading ? <Loader2 className="animate-spin text-muted-foreground" size={14} /> : null}
+      </div>
+      {error === null ? null : (
+        <p className="mt-2 break-words text-xs leading-5 text-danger" role="alert">
+          {error}
+        </p>
+      )}
+      {items.length === 0 && !loading && error === null ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          No current Wiki artifact cites this Source.
+        </p>
+      ) : (
+        <ul className="mt-2 divide-y divide-border">
+          {items.map((artifact) => (
+            <li key={artifact.id}>
+              <button
+                className="flex min-h-11 w-full min-w-0 items-center justify-between gap-3 px-1 text-left outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary"
+                onClick={() => onOpen(artifact.id)}
+                type="button"
+              >
+                <span className="min-w-0">
+                  <span className="block truncate text-xs font-medium">{artifact.title}</span>
+                  <span className="block text-[10.5px] text-muted-foreground">
+                    {wikiArtifactKindLabel(artifact.artifactKind)} / v{artifact.versionNo}
+                  </span>
+                </span>
+                <ChevronRight className="shrink-0 text-muted-foreground" size={14} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 

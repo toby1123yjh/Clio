@@ -62,4 +62,29 @@ describe("Wiki compiler extension boundaries", () => {
     expect(requestRoute).not.toContain('request.kind = "createWikiCompileRun"');
     expect(requestRoute).toContain("requestEngine(request)");
   });
+
+  it("observes saved captures and enqueues through the same trusted Offscreen route", () => {
+    const engineRoute = sourceSection(
+      backgroundSource,
+      "async function routeEngineRequest(request: EngineTransportRequest)",
+      "async function enqueueWikiForNewCapture(sourceId: string)",
+    );
+    expect(engineRoute).toContain("const response = (await chrome.runtime.sendMessage");
+    expect(engineRoute).toContain("wikiAutoCompileSourceId(request, response)");
+    expect(engineRoute).toContain("void enqueueWikiForNewCapture(sourceId)");
+    expect(engineRoute).toContain("return response");
+
+    const enqueueRoute = sourceSection(
+      backgroundSource,
+      "async function enqueueWikiForNewCapture(sourceId: string)",
+      "async function routeKnowledgeBaseClusterLabelRefinementRequest",
+    );
+    expect(enqueueRoute).toContain("await readKnowledgeBaseAiSettings()");
+    expect(enqueueRoute).toContain("if (!settings.wiki.enabled) return");
+    expect(enqueueRoute).toContain("await ensureOffscreen()");
+    expect(enqueueRoute).toContain('kind: "enqueueWikiCompileRun", payload: { sourceId }');
+    expect(enqueueRoute).toContain('console.debug("clio:bg automatic Wiki enqueue failed"');
+    expect(enqueueRoute).not.toContain("listMemories");
+    expect(enqueueRoute).not.toContain("capturePage");
+  });
 });

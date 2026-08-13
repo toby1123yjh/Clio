@@ -303,73 +303,6 @@ describe("session engine RPC guards", () => {
     ).toBe(false);
   });
 
-  it("accepts typed topic page requests", () => {
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: { kind: "listTopicPages", query: "onboarding", limit: 20 },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: { kind: "getTopicPage", id: "topic-1" },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "createTopicPage",
-          payload: {
-            title: "Customer onboarding",
-            summary: "Derived operating notes",
-            content: "Use saved memories as evidence.",
-            sourceRefs: [{ memoryId: "mem-1", chunkId: "chunk-1", quote: "saved quote" }],
-          },
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "updateTopicPage",
-          id: "topic-1",
-          payload: {
-            title: "Updated onboarding",
-            sourceRefs: [{ memoryId: "mem-1" }],
-          },
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: { kind: "deleteTopicPage", id: "topic-1" },
-      }),
-    ).toBe(true);
-  });
-
-  it("rejects invalid topic page source refs", () => {
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "createTopicPage",
-          payload: {
-            title: "Customer onboarding",
-            sourceRefs: [{ memoryId: 42 }],
-          },
-        },
-      }),
-    ).toBe(false);
-  });
-
   it("accepts typed Wiki Artifact Core requests", () => {
     expect(
       isEngineRequestMessage({
@@ -437,6 +370,19 @@ describe("session engine RPC guards", () => {
             includeHistory: true,
             limit: 50,
           },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listWikiArtifactsForSource",
+          sourceId: "source-1",
+          chunkId: "chunk-1",
+          includeHistory: true,
+          limit: 50,
         },
       }),
     ).toBe(true);
@@ -599,6 +545,25 @@ describe("session engine RPC guards", () => {
     expect(
       isEngineRequestMessage({
         type: CLIO_ENGINE_REQUEST,
+        request: { kind: "listWikiArtifactsForSource", sourceId: "", limit: 501 },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: {
+          kind: "listWikiArtifactsForSource",
+          sourceId: "source-1",
+          chunkId: "chunk-1",
+          includeHistory: "yes",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
         request: {
           kind: "appendWikiUserEdit",
           payload: {
@@ -615,145 +580,6 @@ describe("session engine RPC guards", () => {
       isEngineRequestMessage({
         type: CLIO_ENGINE_REQUEST,
         request: { kind: "listWikiUserEdits", artifactId: "", limit: 20 },
-      }),
-    ).toBe(false);
-  });
-
-  it("accepts typed wiki compile job and graph requests", () => {
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "enqueueWikiCompile",
-          payload: {
-            topicId: "topic-1",
-            query: "Customer onboarding",
-            instructions: "Focus on durable operating notes.",
-            sourceMemoryIds: ["mem-1", "mem-2"],
-            maxAttempts: 3,
-          },
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: { kind: "listWikiCompileJobs", status: "queued", limit: 10 },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: { kind: "getWikiCompileJob", id: "wiki-job-1" },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "appendWikiCompileJobEvent",
-          payload: {
-            jobId: "wiki-job-1",
-            kind: "sources_selected",
-            level: "info",
-            message: "2 source memories selected.",
-            detail: { sourceMemoryCount: 2 },
-          },
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: { kind: "listWikiCompileJobEvents", jobId: "wiki-job-1", limit: 20 },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: { kind: "claimNextWikiCompileJob", now: "2026-06-21T00:00:00.000Z" },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "claimNextWikiCompileJob",
-          id: "wiki-job-1",
-          now: "2026-06-21T00:00:00.000Z",
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "completeWikiCompileJob",
-          id: "wiki-job-1",
-          result: {
-            topic: {
-              title: "Customer onboarding",
-              summary: "Compiled from saved memories.",
-              content: "## What matters\nUse the cited source memories.",
-            },
-            sourceRefs: [{ memoryId: "mem-1", chunkId: "chunk-1", quote: "saved quote" }],
-            edges: [
-              {
-                kind: "source",
-                memoryId: "mem-1",
-                chunkId: "chunk-1",
-                weight: 1,
-                label: "evidence",
-              },
-              {
-                kind: "related",
-                toTopicId: "topic-2",
-                weight: 0.6,
-              },
-            ],
-          },
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "failWikiCompileJob",
-          id: "wiki-job-1",
-          error: "Provider failed",
-          retryAfter: "2026-06-21T00:01:00.000Z",
-        },
-      }),
-    ).toBe(true);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: { kind: "listTopicGraphEdges", topicId: "topic-1", edgeKind: "source" },
-      }),
-    ).toBe(true);
-  });
-
-  it("rejects invalid wiki compile graph edges", () => {
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "completeWikiCompileJob",
-          id: "wiki-job-1",
-          result: {
-            edges: [{ kind: "invalid", memoryId: "mem-1" }],
-          },
-        },
       }),
     ).toBe(false);
   });
@@ -932,36 +758,6 @@ describe("session engine RPC guards", () => {
         request: {
           kind: "queryGraphTimeline",
           payload: { sourceIds: ["source-1"], order: "latest" },
-        },
-      }),
-    ).toBe(false);
-  });
-
-  it("rejects invalid wiki compile event payloads", () => {
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "appendWikiCompileJobEvent",
-          payload: {
-            jobId: "wiki-job-1",
-            kind: "provider_started",
-            level: "verbose",
-          },
-        },
-      }),
-    ).toBe(false);
-
-    expect(
-      isEngineRequestMessage({
-        type: CLIO_ENGINE_REQUEST,
-        request: {
-          kind: "appendWikiCompileJobEvent",
-          payload: {
-            jobId: "wiki-job-1",
-            kind: "provider_started",
-            detail: "not an object",
-          },
         },
       }),
     ).toBe(false);

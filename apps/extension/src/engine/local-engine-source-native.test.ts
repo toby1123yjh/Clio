@@ -45,8 +45,6 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("CREATE TABLE IF NOT EXISTS source_audit_log");
     expect(workerSource).toContain("function dropPreSourceNativeTables(db: SqliteDb)");
     expect(workerSource).toContain("currentVersion < sourceNativeSchemaVersion");
-    expect(workerSource).toContain("DROP TABLE IF EXISTS topic_pages");
-    expect(workerSource).toContain("DROP TABLE IF EXISTS wiki_compile_jobs");
     expect(workerSource).toContain("DROP TABLE IF EXISTS source_working_set");
     expect(workerSource).toContain("DROP TABLE IF EXISTS keyword_index_sources");
     expect(workerSource).toContain("DROP TABLE IF EXISTS keyword_index");
@@ -84,6 +82,7 @@ describe("local engine source-native storage foundation", () => {
     const handleSection = sourceSection("async handle", "private async health");
     expect(handleSection).toContain('case "publishWikiArtifacts"');
     expect(handleSection).toContain('case "listWikiArtifacts"');
+    expect(handleSection).toContain('case "listWikiArtifactsForSource"');
     expect(handleSection).toContain('case "getWikiArtifact"');
     expect(handleSection).toContain('case "appendWikiUserEdit"');
     expect(handleSection).toContain('case "listWikiUserEdits"');
@@ -314,9 +313,11 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain('db.exec("DELETE FROM keyword_index_sources")');
     expect(workerSource).toContain('db.exec("DELETE FROM keyword_index")');
 
-    const deleteSection = sourceSection("private async delete", "private async listTopicPages");
+    const deleteSection = sourceSection(
+      "private async delete",
+      "private async publishWikiArtifacts",
+    );
     expect(deleteSection).toContain("DELETE FROM anchors WHERE memory_id = ?");
-    expect(deleteSection).toContain("DELETE FROM topic_graph_edges WHERE memory_id = ?");
     expect(deleteSection).toContain("deleteGraphForSource(db, id)");
     expect(deleteSection).toContain("DELETE FROM source_embeddings WHERE source_id = ?");
     expect(deleteSection).toContain("DELETE FROM source_working_set WHERE source_id = ?");
@@ -334,7 +335,6 @@ describe("local engine source-native storage foundation", () => {
     expect(resetSection).toContain('db.exec("DELETE FROM jobs")');
     expect(resetSection).toContain('db.exec("DELETE FROM graph_edges")');
     expect(resetSection).toContain('db.exec("DELETE FROM graph_nodes")');
-    expect(resetSection).toContain('db.exec("DELETE FROM topic_graph_edges")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_embeddings")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_working_set")');
     expect(resetSection).toContain('db.exec("DELETE FROM source_metadata_fts")');
