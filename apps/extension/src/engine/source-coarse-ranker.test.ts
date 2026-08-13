@@ -3,6 +3,7 @@ import {
   ScoreGapRelevanceBandStrategy,
   type SourceCoarseRankCandidate,
   rankSourceCoarseCandidates,
+  runBoundedSourceFineRanker,
   runSourceFineRanker,
   selectSourceCoarseBandItems,
   selectSourceCoarseCandidates,
@@ -282,6 +283,61 @@ describe("source document coarse ranker", () => {
       },
     });
     expect(failed).toEqual({ items: input, status: "failed", reason: "fine_ranker_failed" });
+  });
+
+  it("does not invoke bounded Fine Rank for an empty candidate set", async () => {
+    let enabledCalls = 0;
+    let buildCalls = 0;
+    const result = await runBoundedSourceFineRanker({
+      query: "query",
+      strength: "balanced",
+      candidates: [],
+      provider: {
+        isEnabled: async () => {
+          enabledCalls += 1;
+          return true;
+        },
+        rank: async () => {
+          throw new Error("must not rank");
+        },
+      },
+      inputBuilder: {
+        build: async () => {
+          buildCalls += 1;
+          throw new Error("must not build");
+        },
+      },
+    });
+    expect(result).toMatchObject({
+      items: [],
+      status: "skipped",
+      reason: "no_candidates",
+      trace: { inputCount: 0, keptCount: 0, droppedCount: 0 },
+    });
+    expect(enabledCalls).toBe(0);
+    expect(buildCalls).toBe(0);
+  });
+
+  it("preserves a stable Wiki corruption reason", async () => {
+    const result = await runBoundedSourceFineRanker({
+      query: "query",
+      strength: "balanced",
+      candidates: [{ id: "source-a" }],
+      provider: {
+        isEnabled: async () => true,
+        rank: async () => {
+          throw new Error("unused");
+        },
+      },
+      inputBuilder: {
+        build: async () => {
+          const error = new Error("corrupt Wiki JSON") as Error & { code: string };
+          error.code = "WIKI_ARTIFACT_CORRUPT";
+          throw error;
+        },
+      },
+    });
+    expect(result).toMatchObject({ items: [{ id: "source-a" }], status: "failed", reason: "wiki_corrupt" });
   });
 
   it("uses a score cliff instead of a fixed top-N count for high relevance", () => {

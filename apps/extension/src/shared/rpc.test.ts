@@ -30,6 +30,8 @@ import {
   CLIO_WORKER_EMBEDDING_RESPONSE,
   CLIO_WORKER_GRAPH_EXTRACTION_REQUEST,
   CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE,
+  CLIO_WORKER_SOURCE_FINE_RANK_REQUEST,
+  CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE,
   CLIO_WORKER_VISION_ANALYSIS_REQUEST,
   CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
   type PdfRawFileResult,
@@ -70,6 +72,8 @@ import {
   isWorkerEmbeddingResponseMessage,
   isWorkerGraphExtractionRequestMessage,
   isWorkerGraphExtractionResponseMessage,
+  isWorkerSourceFineRankRequestMessage,
+  isWorkerSourceFineRankResponseMessage,
   isWorkerRequestMessage,
   isWorkerVisionAnalysisRequestMessage,
   isWorkerVisionAnalysisResponseMessage,
@@ -3238,6 +3242,67 @@ describe("session engine RPC guards", () => {
                 edgeType: "uses",
                 confidence: 0.9,
                 evidenceChunkIds: ["chunk:1"],
+              },
+            ],
+          },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts bounded Wiki Fine Rank bridge messages and rejects full-source fields", () => {
+    const request = {
+      type: CLIO_WORKER_SOURCE_FINE_RANK_REQUEST,
+      requestId: "fine-rank-request-1",
+      request: {
+        query: "bounded retrieval",
+        strength: "balanced",
+        promptVersion: "source-fine-rank-v1",
+        candidates: [
+          {
+            source: {
+              id: "source:1",
+              title: "Bounded Retrieval",
+              sourceType: "paper",
+              keywords: ["retrieval"],
+              sectionHeadings: ["Methods"],
+            },
+            evidence: [{ id: "evidence:1", chunkId: "chunk:1", excerpt: "Bounded evidence." }],
+            wiki: [
+              {
+                artifactId: "artifact:1",
+                artifactKind: "source_digest",
+                title: "Digest",
+                outline: "A bounded digest.",
+                evidenceRefs: ["chunk:1"],
+              },
+            ],
+          },
+        ],
+      },
+    };
+    expect(isWorkerSourceFineRankRequestMessage(request)).toBe(true);
+    expect(
+      isWorkerSourceFineRankRequestMessage({
+        ...request,
+        request: { ...request.request, normalizedText: "Full source text must not cross bridge." },
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerSourceFineRankResponseMessage({
+        type: CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE,
+        requestId: request.requestId,
+        response: {
+          ok: true,
+          value: {
+            judgments: [
+              {
+                sourceId: "source:1",
+                decision: "keep",
+                relevance: "high",
+                reason: "Matches bounded retrieval evidence.",
+                confidence: 0.9,
+                evidenceRefs: ["chunk:1"],
               },
             ],
           },

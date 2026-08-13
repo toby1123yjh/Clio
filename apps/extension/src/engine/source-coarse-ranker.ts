@@ -8,6 +8,15 @@ import type {
   RetrieveTrackName,
 } from "@/src/shared/rpc";
 import { expandChineseBigrams, normalizeText } from "@/src/shared/text";
+import {
+  type SourceFineRankProvider,
+  type SourceFineRankRequest,
+  type SourceFineRankReasonCode,
+  type SourceFineRankStrength,
+  allowedRelevanceForStrength,
+  relevanceRank,
+  validateSourceFineRankProviderResult,
+} from "@/src/shared/source-fine-rank";
 
 type RetrievalTrack = Exclude<RetrieveTrackName, "recent_sources">;
 
@@ -51,6 +60,31 @@ export interface SourceFineRankResult<T> {
   items: T[];
   status: "not_configured" | "applied" | "failed";
   reason?: string;
+}
+
+export interface BoundedSourceFineRankResult<T> {
+  items: T[];
+  status: "not_configured" | "applied" | "failed" | "skipped";
+  reason?: SourceFineRankReasonCode | string;
+  trace?: {
+    inputCount: number;
+    keptCount: number;
+    droppedCount: number;
+    model?: string;
+    promptVersion?: string;
+    inputRefs?: string[];
+    inputTokens?: number;
+    outputTokens?: number;
+    latencyMs?: number;
+  };
+}
+
+export interface BoundedSourceFineRankInputBuilder<T> {
+  build(input: {
+    query: string;
+    strength: SourceFineRankStrength;
+    candidates: readonly T[];
+  }): Promise<SourceFineRankRequest>;
 }
 
 export interface EvidenceSelectionStrategy {
@@ -467,6 +501,87 @@ export async function runSourceFineRanker<T>(
       reason: "fine_ranker_failed",
     };
   }
+}
+
+export async function runBoundedSourceFineRanker<T>(input: {
+  query: string;
+  strength: SourceFineRankStrength;
+  candidates: readonly T[];
+  provider?: SourceFineRankProvider;
+  inputBuilder: BoundedSourceFineRankInputBuilder<T>;
+}): Promise<BoundedSourceFineRankResult<T>> {
+  const original = [...input.candidates];
+  if (original.length === 0) {
+    return {
+      items: original,
+      status: "skipped",
+      reason: "no_candidates",
+      trace: { inputCount: 0, keptCount: 0, droppedCount: 0 },
+    };
+  }
+  if (input.provider === undefined) return { items: original, status: "not_configured" };
+  try {
+    if (!(await input.provider.isEnabled())) {
+      return { items: original, status: "skipped", reason: "wiki_disabled" };
+    }
+    const request = await input.inputBuilder.build({
+      query: input.query,
+      strength: input.strength,
+      candidates: original,
+    });
+    const providerResult = await input.provider.rank(request);
+    const validated = validateSourceFineRankProviderResult(request, providerResult);
+    const indexById = new Map(
+      original.map((candidate, index) => [String((candidate as { id?: string }).id), { candidate, index }]),
+    );
+    const allowed = new Set(allowedRelevanceForStrength(input.strength));
+    const items = validated.judgments
+      .filter((judgment) => judgment.decision === "keep" && allowed.has(judgment.relevance))
+      .sort((left, right) => {
+        const relevanceDelta = relevanceRank(right.relevance) - relevanceRank(left.relevance);
+        if (relevanceDelta !== 0) return relevanceDelta;
+        const confidenceDelta = right.confidence - left.confidence;
+        if (confidenceDelta !== 0) return confidenceDelta;
+        return (indexById.get(left.sourceId)?.index ?? 0) - (indexById.get(right.sourceId)?.index ?? 0);
+      })
+      .flatMap((judgment) => {
+        const entry = indexById.get(judgment.sourceId);
+        return entry === undefined ? [] : [entry.candidate];
+      });
+    return {
+      items,
+      status: "applied",
+      trace: {
+        inputCount: original.length,
+        keptCount: items.length,
+        droppedCount: original.length - items.length,
+        model: validated.model,
+        promptVersion: validated.promptVersion,
+        inputRefs: validated.inputRefs,
+        inputTokens: validated.inputTokens,
+        outputTokens: validated.outputTokens,
+        latencyMs: validated.latencyMs,
+      },
+    };
+  } catch (error) {
+    const reason = sourceFineRankReasonFromError(error);
+    return {
+      items: original,
+      status: "failed",
+      reason,
+      trace: { inputCount: original.length, keptCount: original.length, droppedCount: 0 },
+    };
+  }
+}
+
+function sourceFineRankReasonFromError(error: unknown): SourceFineRankReasonCode | string {
+  if (error instanceof Error && "code" in error && typeof error.code === "string") {
+    if (error.code === "WIKI_ARTIFACT_CORRUPT" || error.code === "WIKI_ARTIFACT_EVIDENCE_CORRUPT") {
+      return "wiki_corrupt";
+    }
+    return error.code;
+  }
+  return "provider_error";
 }
 
 interface QueryProfile {

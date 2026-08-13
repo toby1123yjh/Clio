@@ -34,7 +34,9 @@ import {
   CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST,
   CLIO_WORKER_EMBEDDING_REQUEST,
   CLIO_WORKER_GRAPH_EXTRACTION_REQUEST,
+  CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_REQUEST,
   CLIO_WORKER_RESPONSE,
+  CLIO_WORKER_SOURCE_FINE_RANK_REQUEST,
   CLIO_WORKER_VISION_ANALYSIS_REQUEST,
   type CaptureBasePayload,
   type CaptureMarkdownPayload,
@@ -213,8 +215,20 @@ import {
   isWorkerEmbeddingResponseMessage,
   isWorkerGraphExtractionResponseMessage,
   isWorkerRequestMessage,
+  isWorkerSourceFineRankEnabledResponseMessage,
+  isWorkerSourceFineRankResponseMessage,
   isWorkerVisionAnalysisResponseMessage,
 } from "@/src/shared/rpc";
+import {
+  type SourceFineRankProvider,
+  type SourceFineRankProviderResult,
+  type SourceFineRankRequest,
+  type SourceFineRankCandidateInput,
+  type SourceFineRankStrength,
+  SourceFineRankValidationError,
+  SOURCE_FINE_RANK_PROMPT_VERSION,
+  boundSourceFineRankRequest,
+} from "@/src/shared/source-fine-rank";
 import {
   type TextBlock,
   type TextBlockContentKind,
@@ -263,6 +277,7 @@ import {
   type SourceCoarseRankedCandidate,
   type SourceFineRanker,
   rankSourceCoarseCandidates,
+  runBoundedSourceFineRanker,
   runSourceFineRanker,
   selectSourceCoarseBandItems,
   selectSourceCoarseCandidates,
@@ -445,6 +460,7 @@ export interface LocalEngineOptions {
   pdfFigureVisionImageExtractor?: PdfFigureVisionImageExtractor;
   pdfRawFileStore?: PdfRawFileStore;
   sourceFineRanker?: SourceFineRanker<RetrieveSourceItem>;
+  sourceFineRankProvider?: SourceFineRankProvider;
   sourceRelevanceBandStrategy?: RelevanceBandStrategy;
   evidenceSelectionStrategy?: EvidenceSelectionStrategy;
 }
@@ -512,6 +528,7 @@ const figureVisionMaxPageContextChars = 1_200;
 const figureVisionMaxAnalysesPerJob = 8;
 const chunkMetaSummaryBridgeTimeoutMs = 60_000;
 const graphExtractionBridgeTimeoutMs = 60_000;
+const sourceFineRankBridgeTimeoutMs = 65_000;
 const defaultChunkMetaTier2MaxChunks = 8;
 const maxChunkMetaTier2MaxChunks = 32;
 const chunkMetaSummaryExcerptMaxChars = 1_800;
@@ -922,6 +939,7 @@ export class LocalEngine {
   private readonly pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor;
   private readonly pdfRawFileStore: PdfRawFileStore;
   private readonly sourceFineRanker?: SourceFineRanker<RetrieveSourceItem>;
+  private readonly sourceFineRankProvider?: SourceFineRankProvider;
   private readonly sourceRelevanceBandStrategy: RelevanceBandStrategy;
   private readonly evidenceSelectionStrategy: EvidenceSelectionStrategy;
 
@@ -946,6 +964,7 @@ export class LocalEngine {
       options.pdfFigureVisionImageExtractor ?? extractPdfFigureVisionImageInput;
     this.pdfRawFileStore = options.pdfRawFileStore ?? new OpfsPdfRawFileStore();
     this.sourceFineRanker = options.sourceFineRanker;
+    this.sourceFineRankProvider = options.sourceFineRankProvider;
     this.sourceRelevanceBandStrategy =
       options.sourceRelevanceBandStrategy ?? new ScoreGapRelevanceBandStrategy();
     this.evidenceSelectionStrategy =
@@ -1523,6 +1542,7 @@ export class LocalEngine {
   private async retrieveSources(
     payload: RetrieveSourcesPayload,
     mode: "hybrid" | KnowledgeBaseSearchMode = "hybrid",
+    runFineRank = true,
   ): Promise<RetrieveSourcesResult> {
     const db = await this.ensureReady();
     const query = normalizeText(payload.query);
@@ -1709,7 +1729,20 @@ export class LocalEngine {
         maxChunks: includeChunks,
       }),
     );
-    const fineRank = await runSourceFineRanker(query, selectedItems, this.sourceFineRanker);
+    const fineRank = runFineRank
+      ? this.sourceFineRankProvider === undefined
+        ? await runSourceFineRanker(query, selectedItems, this.sourceFineRanker)
+        : await runBoundedSourceFineRanker({
+            query,
+            strength,
+            candidates: selectedItems,
+            provider: this.sourceFineRankProvider,
+            inputBuilder: {
+              build: async ({ query: fineQuery, strength: fineStrength, candidates }) =>
+                buildSourceFineRankRequest(db, fineQuery, fineStrength, candidates),
+            },
+          })
+      : { items: selectedItems, status: "skipped" as const, reason: "deferred_to_kb_strength" };
     const items = fineRank.items;
     const sourceCount = new Set(
       retrievalHits.map((hit) => stringField(hit.source, "id")).filter(Boolean),
@@ -1802,18 +1835,19 @@ export class LocalEngine {
         fineRank: {
           status: fineRank.status,
           ...(fineRank.reason === undefined ? {} : { reason: fineRank.reason }),
+          ...('trace' in fineRank && fineRank.trace !== undefined ? fineRank.trace : {}),
         },
       },
     };
   }
 
-  private applyKnowledgeBaseStrength(
+  private async applyKnowledgeBaseStrength(
     result: RetrieveSourcesResult,
     query: string,
     sourceItems: RetrieveSourceItem[],
     strength: RetrieveStrength,
     limit: number,
-  ): RetrieveSourcesResult {
+  ): Promise<RetrieveSourcesResult> {
     if (query.length === 0) {
       const selectedItems = sourceItems.slice(0, limit);
       return {
@@ -1821,6 +1855,7 @@ export class LocalEngine {
         items: selectedItems,
         trace: {
           ...result.trace,
+          fineRank: { status: "skipped", reason: "empty_query" },
           relevance: result.trace.relevance
             ? { ...result.trace.relevance, strength, selectedCount: selectedItems.length }
             : undefined,
@@ -1876,12 +1911,18 @@ export class LocalEngine {
         selectedItems.length,
       ),
     ];
+    const fineRank = await this.runFineRankForSelectedItems(query, strength, selectedItems);
     return {
       ...result,
-      items: selectedItems,
+      items: fineRank.items,
       bands,
       trace: {
         ...result.trace,
+        fineRank: {
+          status: fineRank.status,
+          ...(fineRank.reason === undefined ? {} : { reason: fineRank.reason }),
+          ...('trace' in fineRank && fineRank.trace !== undefined ? fineRank.trace : {}),
+        },
         stages,
         relevance: relevanceTraceFromBands({
           strategy: relevanceResult.strategy,
@@ -1896,6 +1937,26 @@ export class LocalEngine {
         }),
       },
     };
+  }
+
+  private async runFineRankForSelectedItems(
+    query: string,
+    strength: RetrieveStrength,
+    candidates: readonly RetrieveSourceItem[],
+  ) {
+    const db = await this.ensureReady();
+    return this.sourceFineRankProvider === undefined
+      ? runSourceFineRanker(query, candidates, this.sourceFineRanker)
+      : runBoundedSourceFineRanker({
+          query,
+          strength: strength === "strict" || strength === "balanced" || strength === "broad" ? strength : "broad",
+          candidates,
+          provider: this.sourceFineRankProvider,
+          inputBuilder: {
+            build: async ({ query: fineQuery, strength: fineStrength, candidates: fineCandidates }) =>
+              buildSourceFineRankRequest(db, fineQuery, fineStrength, fineCandidates),
+          },
+        });
   }
 
   private async searchKnowledgeBase(
@@ -1915,10 +1976,11 @@ export class LocalEngine {
         filter: payload.filter,
       },
       payload.mode ?? "hybrid",
+      false,
     );
 
     if (query.length === 0) {
-      const selected = this.applyKnowledgeBaseStrength(
+      const selected = await this.applyKnowledgeBaseStrength(
         original,
         query,
         original.items,
@@ -1943,7 +2005,7 @@ export class LocalEngine {
 
     const filters = normalizeRetrieveSourcesFilter(payload.filter);
     if (filters.hasImpossibleFilter) {
-      const selected = this.applyKnowledgeBaseStrength(
+      const selected = await this.applyKnowledgeBaseStrength(
         original,
         query,
         original.items,
@@ -1967,7 +2029,7 @@ export class LocalEngine {
     }
 
     if (payload.mode !== undefined) {
-      const selected = this.applyKnowledgeBaseStrength(
+      const selected = await this.applyKnowledgeBaseStrength(
         original,
         query,
         original.items,
@@ -1992,7 +2054,7 @@ export class LocalEngine {
 
     const directItems = original.items.filter(hasDirectKnowledgeBaseLexicalMatch);
     if (directItems.length > 0) {
-      const selected = this.applyKnowledgeBaseStrength(
+      const selected = await this.applyKnowledgeBaseStrength(
         original,
         query,
         directItems,
@@ -2022,7 +2084,7 @@ export class LocalEngine {
     });
     const { terms } = expansionTerms;
     if (terms.length === 0) {
-      const selected = this.applyKnowledgeBaseStrength(
+      const selected = await this.applyKnowledgeBaseStrength(
         original,
         query,
         original.items,
@@ -2047,7 +2109,7 @@ export class LocalEngine {
 
     const expandedQuery = normalizeText([query, ...terms].join(" "));
     if (buildFtsQuery(expandedQuery).length === 0) {
-      const selected = this.applyKnowledgeBaseStrength(
+      const selected = await this.applyKnowledgeBaseStrength(
         original,
         query,
         original.items,
@@ -2077,13 +2139,13 @@ export class LocalEngine {
       limit: retrievalPoolLimit,
       includeChunks,
       filter: payload.filter,
-    });
+    }, "hybrid", false);
 
     const mergedItems = mergeKnowledgeBaseSearchItems(original.items, expanded.items, {
       limit: retrievalPoolLimit,
       includeChunks,
     });
-    const selected = this.applyKnowledgeBaseStrength(
+    const selected = await this.applyKnowledgeBaseStrength(
       original,
       query,
       mergedItems,
@@ -4525,6 +4587,128 @@ export class LocalEngine {
   }
 }
 
+async function buildSourceFineRankRequest(
+  db: SqliteDb,
+  query: string,
+  strength: SourceFineRankStrength,
+  candidates: readonly RetrieveSourceItem[],
+): Promise<SourceFineRankRequest> {
+  const inputs: SourceFineRankCandidateInput[] = [];
+  for (const candidate of candidates) {
+    const source = db.selectObject(
+      `SELECT
+         s.id,
+         s.source_title,
+         s.source_type,
+         s.source_url,
+         sm.title AS meta_title,
+         sm.abstract AS meta_abstract,
+         sm.metadata_json,
+         sm.section_outline_json
+       FROM sources s
+       LEFT JOIN source_metadata sm ON sm.source_id = s.id
+       WHERE s.id = ? AND s.lifecycle_status <> 'deleted'
+       LIMIT 1`,
+      [candidate.id],
+    );
+    if (source === undefined) {
+      throw new SourceFineRankValidationError("input_invalid", "Fine Rank source disappeared during lookup.");
+    }
+    const metadata = parseMetadata(stringField(source, "metadata_json"));
+    const wikiRows = db.selectObjects(
+      `SELECT DISTINCT
+         artifacts.id,
+         artifacts.artifact_kind,
+         artifacts.title,
+         substr(artifacts.content, 1, 1600) AS bounded_content,
+         artifacts.payload_json
+       FROM wiki_artifacts artifacts
+       JOIN wiki_artifact_evidence evidence ON evidence.artifact_id = artifacts.id
+       WHERE evidence.source_id = ? AND artifacts.freshness = 'fresh'
+       ORDER BY artifacts.published_at DESC, artifacts.version_no DESC, artifacts.id ASC
+       LIMIT 8`,
+      [candidate.id],
+    );
+    const staleCount = Number(
+      db.selectValue(
+        `SELECT COUNT(*) FROM wiki_artifacts artifacts
+         JOIN wiki_artifact_evidence evidence ON evidence.artifact_id = artifacts.id
+         WHERE evidence.source_id = ? AND artifacts.freshness = 'stale'`,
+        [candidate.id],
+      ) ?? 0,
+    );
+    if (wikiRows.length === 0) {
+      throw new SourceFineRankValidationError(
+        staleCount > 0 ? "wiki_stale" : "wiki_missing",
+        staleCount > 0 ? "Fine Rank source Wiki is stale." : "Fine Rank source Wiki is missing.",
+      );
+    }
+    const wiki = wikiRows.map((row) => {
+      const payload = wikiArtifactJsonObjectFromRow(row, "payload_json");
+      const outline = boundedWikiArtifactOutline(payload, stringField(row, "bounded_content"));
+      const artifactId = wikiArtifactRequiredRowString(row, "id");
+      const evidenceRows = db.selectObjects(
+        `SELECT id, chunk_id FROM wiki_artifact_evidence WHERE artifact_id = ? ORDER BY ordinal ASC LIMIT 16`,
+        [artifactId],
+      );
+      return {
+        artifactId,
+        artifactKind: wikiArtifactKindFromRow(row, "artifact_kind"),
+        title: wikiArtifactRequiredRowString(row, "title"),
+        outline,
+        evidenceRefs: evidenceRows.flatMap((evidence) => [
+          stringField(evidence, "id"),
+          stringField(evidence, "chunk_id"),
+        ]),
+      };
+    });
+    inputs.push({
+      source: {
+        id: candidate.id,
+        title: stringField(source, "meta_title") || stringField(source, "source_title"),
+        sourceType: stringField(source, "source_type"),
+        sourceUrl: stringField(source, "source_url") || undefined,
+        abstract: stringField(source, "meta_abstract") || undefined,
+        keywords: boundedUniqueStrings(
+          [
+            ...stringArrayMetadataField(metadata, "keywords"),
+            ...stringArrayMetadataField(metadata, "categories"),
+            ...stringArrayMetadataField(metadata, "subjects"),
+          ],
+          20,
+        ),
+        sectionHeadings: graphSectionHeadingLabels(stringField(source, "section_outline_json")).slice(0, 16),
+      },
+      evidence: candidate.hitChunks.slice(0, 4).map((hit) => ({
+        id: `${candidate.id}:${hit.chunkId}`,
+        chunkId: hit.chunkId,
+        excerpt: hit.snippet,
+        ...(hit.pageStart === undefined ? {} : { pageNo: hit.pageStart }),
+        ...(hit.sectionPath === undefined ? {} : { sectionPath: hit.sectionPath }),
+      })),
+      wiki,
+    });
+  }
+  return boundSourceFineRankRequest({
+    query,
+    strength,
+    promptVersion: SOURCE_FINE_RANK_PROMPT_VERSION,
+    candidates: inputs,
+  });
+}
+
+function boundedWikiArtifactOutline(payload: WikiArtifactJsonObject, fallback: string): string {
+  const structured = ["outline", "summary", "claims", "findings", "keyPoints"]
+    .flatMap((key) => {
+      const value = payload[key];
+      if (typeof value === "string") return [value];
+      if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+      return [];
+    })
+    .join("\n");
+  return (structured || fallback).slice(0, 1600);
+}
+
 async function openProductionDatabase(): Promise<LocalEngineDatabaseOpenResult> {
   const sqliteInit = sqlite3InitModule as unknown as SqliteInitModule;
   const sqlite3 = await sqliteInit({
@@ -4787,6 +4971,74 @@ function createWorkerGraphExtractor(workerSelf: LocalEngineWorkerGlobal): GraphE
   };
 }
 
+function createWorkerSourceFineRanker(workerSelf: LocalEngineWorkerGlobal): SourceFineRankProvider {
+  const pending = new Map<
+    string,
+    {
+      resolve: (result: SourceFineRankProviderResult) => void;
+      reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  const enabledPending = new Map<
+    string,
+    {
+      resolve: (enabled: boolean) => void;
+      reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+
+  workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (isWorkerSourceFineRankEnabledResponseMessage(event.data)) {
+      const entry = enabledPending.get(event.data.requestId);
+      if (entry === undefined) return;
+      clearTimeout(entry.timer);
+      enabledPending.delete(event.data.requestId);
+      if (event.data.response.ok) entry.resolve(event.data.response.value);
+      else entry.reject(new EngineRpcError(event.data.response.error.code, event.data.response.error.message));
+      return;
+    }
+    if (!isWorkerSourceFineRankResponseMessage(event.data)) return;
+    const entry = pending.get(event.data.requestId);
+    if (entry === undefined) return;
+    clearTimeout(entry.timer);
+    pending.delete(event.data.requestId);
+    if (event.data.response.ok) entry.resolve(event.data.response.value);
+    else entry.reject(new EngineRpcError(event.data.response.error.code, event.data.response.error.message));
+  });
+
+  return {
+    isEnabled() {
+      const requestId = createRequestId();
+      return new Promise<boolean>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          enabledPending.delete(requestId);
+          reject(new EngineRpcError("SOURCE_FINE_RANK_ENABLED_TIMEOUT", "Wiki Fine Rank settings request timed out."));
+        }, sourceFineRankBridgeTimeoutMs);
+        enabledPending.set(requestId, { resolve, reject, timer });
+        workerSelf.postMessage({ type: CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_REQUEST, requestId });
+      });
+    },
+    rank(input: SourceFineRankRequest) {
+      const bounded = boundSourceFineRankRequest(input);
+      const requestId = createRequestId();
+      return new Promise<SourceFineRankProviderResult>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(requestId);
+          reject(new EngineRpcError("SOURCE_FINE_RANK_BRIDGE_TIMEOUT", "Fine Rank provider request timed out."));
+        }, sourceFineRankBridgeTimeoutMs);
+        pending.set(requestId, { resolve, reject, timer });
+        workerSelf.postMessage({
+          type: CLIO_WORKER_SOURCE_FINE_RANK_REQUEST,
+          requestId,
+          request: bounded,
+        });
+      });
+    },
+  };
+}
+
 function installWorkerMessageHandler(workerSelf: LocalEngineWorkerGlobal, engine: LocalEngine) {
   workerSelf.addEventListener("message", (event: MessageEvent<unknown>) => {
     if (!isWorkerRequestMessage(event.data)) return;
@@ -4830,6 +5082,7 @@ if (workerSelf !== null) {
       chunkMetaSummarizer: createWorkerChunkMetaSummarizer(workerSelf),
       figureVisionAnalyzer: createWorkerFigureVisionAnalyzer(workerSelf),
       graphExtractor: createWorkerGraphExtractor(workerSelf),
+      sourceFineRankProvider: createWorkerSourceFineRanker(workerSelf),
     }),
   );
 }

@@ -20,6 +20,11 @@ import type {
   GraphExtractionResult,
 } from "@/src/agent-runtime/graph-extractor";
 import type {
+  SourceFineRankProviderResult,
+  SourceFineRankRequest,
+} from "./source-fine-rank";
+import { isSourceFineRankRequest } from "./source-fine-rank";
+import type {
   ImageGenerationSettings,
   SaveImageGenerationSettingsInput,
 } from "@/src/agent-runtime/image-generation-settings";
@@ -135,6 +140,12 @@ export const CLIO_WORKER_VISION_ANALYSIS_REQUEST = "clio:worker:vision-analysis:
 export const CLIO_WORKER_VISION_ANALYSIS_RESPONSE = "clio:worker:vision-analysis:response";
 export const CLIO_WORKER_GRAPH_EXTRACTION_REQUEST = "clio:worker:graph-extraction:request";
 export const CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE = "clio:worker:graph-extraction:response";
+export const CLIO_WORKER_SOURCE_FINE_RANK_REQUEST = "clio:worker:source-fine-rank:request";
+export const CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE = "clio:worker:source-fine-rank:response";
+export const CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_REQUEST =
+  "clio:worker:source-fine-rank:enabled:request";
+export const CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_RESPONSE =
+  "clio:worker:source-fine-rank:enabled:response";
 export const CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST = "clio:kb-cluster-label-refinement:request";
 export const CLIO_CONTENT_COMMAND = "clio:content:command";
 export const CLIO_PROVIDER_REQUEST = "clio:provider:request";
@@ -464,6 +475,15 @@ export interface RetrieveSourcesResult {
     fineRank?: {
       status: "not_configured" | "applied" | "failed" | "skipped";
       reason?: string;
+      inputCount?: number;
+      keptCount?: number;
+      droppedCount?: number;
+      model?: string;
+      promptVersion?: string;
+      inputRefs?: string[];
+      inputTokens?: number;
+      outputTokens?: number;
+      latencyMs?: number;
     };
   };
 }
@@ -2365,6 +2385,29 @@ export interface WorkerGraphExtractionResponseMessage {
   response: EngineResponse<GraphExtractionResult>;
 }
 
+export interface WorkerSourceFineRankRequestMessage {
+  type: typeof CLIO_WORKER_SOURCE_FINE_RANK_REQUEST;
+  requestId: string;
+  request: SourceFineRankRequest;
+}
+
+export interface WorkerSourceFineRankResponseMessage {
+  type: typeof CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE;
+  requestId: string;
+  response: EngineResponse<SourceFineRankProviderResult>;
+}
+
+export interface WorkerSourceFineRankEnabledRequestMessage {
+  type: typeof CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_REQUEST;
+  requestId: string;
+}
+
+export interface WorkerSourceFineRankEnabledResponseMessage {
+  type: typeof CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_RESPONSE;
+  requestId: string;
+  response: EngineResponse<boolean>;
+}
+
 export type KnowledgeBaseClusterLabelRefinementRequest = KnowledgeBaseClusterLabelRefinementInput;
 export type KnowledgeBaseClusterLabelRefinementResult =
   KnowledgeBaseClusterLabelRefinementRuntimeResult;
@@ -2758,6 +2801,49 @@ export function isWorkerGraphExtractionResponseMessage(
     value.type === CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE &&
     typeof value.requestId === "string" &&
     isGraphExtractionResponse(value.response)
+  );
+}
+
+export function isWorkerSourceFineRankRequestMessage(
+  value: unknown,
+): value is WorkerSourceFineRankRequestMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_SOURCE_FINE_RANK_REQUEST &&
+    typeof value.requestId === "string" &&
+    isSourceFineRankRequest(value.request)
+  );
+}
+
+export function isWorkerSourceFineRankResponseMessage(
+  value: unknown,
+): value is WorkerSourceFineRankResponseMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE &&
+    typeof value.requestId === "string" &&
+    isEngineResponse(value.response)
+  );
+}
+
+export function isWorkerSourceFineRankEnabledRequestMessage(
+  value: unknown,
+): value is WorkerSourceFineRankEnabledRequestMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_REQUEST &&
+    typeof value.requestId === "string"
+  );
+}
+
+export function isWorkerSourceFineRankEnabledResponseMessage(
+  value: unknown,
+): value is WorkerSourceFineRankEnabledResponseMessage {
+  return (
+    isRecord(value) &&
+    value.type === CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_RESPONSE &&
+    typeof value.requestId === "string" &&
+    isEngineResponse(value.response)
   );
 }
 

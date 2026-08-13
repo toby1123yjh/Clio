@@ -8,6 +8,7 @@ import { ProviderBackedKnowledgeBaseClusterLabelRefiner } from "@/src/agent-runt
 import { PiAgentCoreRunAdapter } from "@/src/agent-runtime/pi-agent-core-run-adapter";
 import { type ProviderId, defaultActiveProvider } from "@/src/agent-runtime/provider-settings";
 import { ProviderBackedSemanticCitationJudge } from "@/src/agent-runtime/semantic-citation-judge";
+import { ProviderBackedSourceFineRanker } from "@/src/agent-runtime/source-fine-ranker";
 import { ClioWebToolRuntime } from "@/src/agent-runtime/web-search-runtime";
 import { WikiCompileRunner } from "@/src/agent-runtime/wiki-compile-runner";
 import engineWorkerUrl from "@/src/engine/local-engine.worker.ts?worker&url";
@@ -23,6 +24,8 @@ import {
   CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
   CLIO_WORKER_EMBEDDING_RESPONSE,
   CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE,
+  CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_RESPONSE,
+  CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE,
   CLIO_WORKER_REQUEST,
   CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
   type ClioImageGenerationEvent,
@@ -46,10 +49,13 @@ import {
   isWorkerChunkMetaSummaryRequestMessage,
   isWorkerEmbeddingRequestMessage,
   isWorkerGraphExtractionRequestMessage,
+  isWorkerSourceFineRankEnabledRequestMessage,
+  isWorkerSourceFineRankRequestMessage,
   isWorkerResponseMessage,
   isWorkerVisionAnalysisRequestMessage,
   unwrapEngineResponse,
 } from "@/src/shared/rpc";
+import { type SourceFineRankRequest } from "@/src/shared/source-fine-rank";
 
 console.info("clio:offscreen local engine host loaded");
 
@@ -133,6 +139,12 @@ const figureVisionAnalyzer = new ProviderBackedFigureVisionAnalyzer({
   ensureProviderPermission: (provider, config) => hasVisionProviderHostPermission(provider, config),
 });
 const graphExtractor = new ProviderBackedGraphExtractor({
+  loadConfig: () => requestProviderConfig(),
+  loadProviderId: async () => (await requestProviderConfig())?.provider ?? defaultActiveProvider,
+  ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
+});
+const sourceFineRanker = new ProviderBackedSourceFineRanker({
+  loadSettings: () => requestProvider({ kind: "getKnowledgeBaseAiSettings" }),
   loadConfig: () => requestProviderConfig(),
   loadProviderId: async () => (await requestProviderConfig())?.provider ?? defaultActiveProvider,
   ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
@@ -513,6 +525,14 @@ function ensureWorker() {
       void handleWorkerGraphExtractionRequest(worker as Worker, event.data);
       return;
     }
+    if (isWorkerSourceFineRankEnabledRequestMessage(event.data)) {
+      void handleWorkerSourceFineRankEnabledRequest(worker as Worker, event.data);
+      return;
+    }
+    if (isWorkerSourceFineRankRequestMessage(event.data)) {
+      void handleWorkerSourceFineRankRequest(worker as Worker, event.data);
+      return;
+    }
     if (!isWorkerResponseMessage(event.data)) return;
     const entry = pending.get(event.data.requestId);
     if (entry === undefined) return;
@@ -622,6 +642,45 @@ async function handleWorkerGraphExtractionRequest(
         ok: false,
         error: engineErrorFromUnknown(error, "GRAPH_EXTRACTION_PROVIDER_ERROR"),
       },
+    });
+  }
+}
+
+async function handleWorkerSourceFineRankEnabledRequest(
+  engineWorker: Worker,
+  message: import("@/src/shared/rpc").WorkerSourceFineRankEnabledRequestMessage,
+) {
+  try {
+    engineWorker.postMessage({
+      type: CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_RESPONSE,
+      requestId: message.requestId,
+      response: { ok: true, value: await sourceFineRanker.isEnabled() },
+    });
+  } catch (error) {
+    engineWorker.postMessage({
+      type: CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_RESPONSE,
+      requestId: message.requestId,
+      response: { ok: false, error: engineErrorFromUnknown(error, "SOURCE_FINE_RANK_SETTINGS_ERROR") },
+    });
+  }
+}
+
+async function handleWorkerSourceFineRankRequest(
+  engineWorker: Worker,
+  message: import("@/src/shared/rpc").WorkerSourceFineRankRequestMessage,
+) {
+  try {
+    const value = await sourceFineRanker.rank(message.request as SourceFineRankRequest);
+    engineWorker.postMessage({
+      type: CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE,
+      requestId: message.requestId,
+      response: { ok: true, value },
+    });
+  } catch (error) {
+    engineWorker.postMessage({
+      type: CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE,
+      requestId: message.requestId,
+      response: { ok: false, error: engineErrorFromUnknown(error, "SOURCE_FINE_RANK_PROVIDER_ERROR") },
     });
   }
 }
