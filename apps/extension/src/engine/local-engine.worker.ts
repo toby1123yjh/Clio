@@ -34,8 +34,8 @@ import {
   CLIO_WORKER_CHUNK_META_SUMMARY_REQUEST,
   CLIO_WORKER_EMBEDDING_REQUEST,
   CLIO_WORKER_GRAPH_EXTRACTION_REQUEST,
-  CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_REQUEST,
   CLIO_WORKER_RESPONSE,
+  CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_REQUEST,
   CLIO_WORKER_SOURCE_FINE_RANK_REQUEST,
   CLIO_WORKER_VISION_ANALYSIS_REQUEST,
   type CaptureBasePayload,
@@ -72,6 +72,7 @@ import {
   type GetMemoryEvidenceWindowAnchor,
   type GetMemoryEvidenceWindowsPayload,
   type GetMemoryEvidenceWindowsResult,
+  type GetSourceIngestStatusesResult,
   type GraphEdge,
   type GraphEdgeCreatedBy,
   type GraphEdgeDimension,
@@ -116,10 +117,15 @@ import {
   type OrchestrationRunFilter,
   type OrchestrationRunStatus,
   type OrchestrationRunSummary,
+  POST_CAPTURE_STAGE_NAMES,
   type PauseWikiCompileRunPayload,
   type PdfRawFileResult,
+  type PostCaptureJobResultV1,
+  type PostCaptureStageName,
+  type PostCaptureStageResult,
   type PublishWikiArtifactsPayload,
   type PublishWikiArtifactsResult,
+  type RecoverPostCaptureJobsResult,
   type RecoverWikiCompileRunsPayload,
   type RecoverWikiCompileRunsResult,
   type ReindexResult,
@@ -137,6 +143,7 @@ import {
   type RetrieveSourcesTraceTrack,
   type RetrieveStrength,
   type RetrieveTrackName,
+  type RunNextPostCaptureJobResult,
   type SearchKnowledgeBasePayload,
   type SearchKnowledgeBaseResult,
   type SearchMemoryResult,
@@ -169,6 +176,7 @@ import {
   type SourceContextPackSourceDepthOverride,
   type SourceContextPackWindow,
   type SourceContextPackWindowPriority,
+  type SourceIngestStatus,
   type SourceKind,
   type UpdateChatMessagePayload,
   type UpsertChatMessagePayload,
@@ -209,8 +217,10 @@ import {
   type WorkingSetLoadDepth,
   type WorkingSetStatusResult,
   createRequestId,
+  decodePostCaptureJobResult,
   engineErrorFromUnknown,
   isBoundedWikiArtifactJsonObject,
+  isPostCaptureStageName,
   isWorkerChunkMetaSummaryResponseMessage,
   isWorkerEmbeddingResponseMessage,
   isWorkerGraphExtractionResponseMessage,
@@ -220,13 +230,13 @@ import {
   isWorkerVisionAnalysisResponseMessage,
 } from "@/src/shared/rpc";
 import {
+  SOURCE_FINE_RANK_PROMPT_VERSION,
+  type SourceFineRankCandidateInput,
   type SourceFineRankProvider,
   type SourceFineRankProviderResult,
   type SourceFineRankRequest,
-  type SourceFineRankCandidateInput,
   type SourceFineRankStrength,
   SourceFineRankValidationError,
-  SOURCE_FINE_RANK_PROMPT_VERSION,
   boundSourceFineRankRequest,
 } from "@/src/shared/source-fine-rank";
 import {
@@ -586,13 +596,6 @@ type SourceAuditAction =
   | "source.stage_queued";
 
 type SourceRetrievalTrack = "meta_sources" | "vector_meta" | "fts_chunks" | "vector_chunks";
-type PostCaptureStageName =
-  | "paper_metadata"
-  | "embedding"
-  | "chunk_meta"
-  | "graph"
-  | "figure_vision";
-
 interface SourceRetrievalHit {
   track: SourceRetrievalTrack;
   rank: number;
@@ -1138,6 +1141,14 @@ export class LocalEngine {
         return await this.repair(request.action);
       case "getActiveEmbeddingModel":
         return await this.getActiveEmbeddingModel();
+      case "getSourceIngestStatuses":
+        return await this.getSourceIngestStatuses(request.sourceIds);
+      case "retrySourceIngest":
+        return await this.retrySourceIngest(request.sourceId);
+      case "recoverPostCaptureJobs":
+        return await this.recoverPostCaptureJobs(request.now);
+      case "runNextPostCaptureJob":
+        return await this.runNextPostCaptureJob(request.now);
       case "getJobStatus":
         return await this.getJobStatus(request.status, request.limit);
       case "runJob":
@@ -1467,6 +1478,7 @@ export class LocalEngine {
       const jobId = enqueueJob(db, "post_capture_hardening", {
         sourceId,
         stages: postCaptureStages,
+        trigger: "automatic_capture",
       });
       insertSourceAuditLog(db, {
         action: "source.stage_queued",
@@ -1478,6 +1490,7 @@ export class LocalEngine {
         payload: {
           jobType: "post_capture_hardening",
           stages: postCaptureStages,
+          trigger: "automatic_capture",
         },
       });
     });
@@ -1835,7 +1848,7 @@ export class LocalEngine {
         fineRank: {
           status: fineRank.status,
           ...(fineRank.reason === undefined ? {} : { reason: fineRank.reason }),
-          ...('trace' in fineRank && fineRank.trace !== undefined ? fineRank.trace : {}),
+          ...("trace" in fineRank && fineRank.trace !== undefined ? fineRank.trace : {}),
         },
       },
     };
@@ -1921,7 +1934,7 @@ export class LocalEngine {
         fineRank: {
           status: fineRank.status,
           ...(fineRank.reason === undefined ? {} : { reason: fineRank.reason }),
-          ...('trace' in fineRank && fineRank.trace !== undefined ? fineRank.trace : {}),
+          ...("trace" in fineRank && fineRank.trace !== undefined ? fineRank.trace : {}),
         },
         stages,
         relevance: relevanceTraceFromBands({
@@ -1949,12 +1962,18 @@ export class LocalEngine {
       ? runSourceFineRanker(query, candidates, this.sourceFineRanker)
       : runBoundedSourceFineRanker({
           query,
-          strength: strength === "strict" || strength === "balanced" || strength === "broad" ? strength : "broad",
+          strength:
+            strength === "strict" || strength === "balanced" || strength === "broad"
+              ? strength
+              : "broad",
           candidates,
           provider: this.sourceFineRankProvider,
           inputBuilder: {
-            build: async ({ query: fineQuery, strength: fineStrength, candidates: fineCandidates }) =>
-              buildSourceFineRankRequest(db, fineQuery, fineStrength, fineCandidates),
+            build: async ({
+              query: fineQuery,
+              strength: fineStrength,
+              candidates: fineCandidates,
+            }) => buildSourceFineRankRequest(db, fineQuery, fineStrength, fineCandidates),
           },
         });
   }
@@ -2133,13 +2152,17 @@ export class LocalEngine {
       );
     }
 
-    const expanded = await this.retrieveSources({
-      query: expandedQuery,
-      strength: "broad",
-      limit: retrievalPoolLimit,
-      includeChunks,
-      filter: payload.filter,
-    }, "hybrid", false);
+    const expanded = await this.retrieveSources(
+      {
+        query: expandedQuery,
+        strength: "broad",
+        limit: retrievalPoolLimit,
+        includeChunks,
+        filter: payload.filter,
+      },
+      "hybrid",
+      false,
+    );
 
     const mergedItems = mergeKnowledgeBaseSearchItems(original.items, expanded.items, {
       limit: retrievalPoolLimit,
@@ -3481,6 +3504,42 @@ export class LocalEngine {
     return row === undefined ? null : activeEmbeddingModelSummaryFromRow(row);
   }
 
+  private async getSourceIngestStatuses(
+    sourceIds: string[],
+  ): Promise<GetSourceIngestStatusesResult> {
+    const db = await this.ensureReady();
+    return { items: projectSourceIngestStatuses(db, sourceIds) };
+  }
+
+  private async retrySourceIngest(sourceId: string): Promise<SourceIngestStatus> {
+    const db = await this.ensureReady();
+    return retryAutomaticSourceIngest(db, sourceId);
+  }
+
+  private async recoverPostCaptureJobs(now?: string): Promise<RecoverPostCaptureJobsResult> {
+    const db = await this.ensureReady();
+    return recoverAutomaticPostCaptureJobs(db, now);
+  }
+
+  private async runNextPostCaptureJob(now?: string): Promise<RunNextPostCaptureJobResult> {
+    const db = await this.ensureReady();
+    const claimed = claimNextAutomaticPostCaptureJob(db, now);
+    if (claimed === undefined) return { status: "idle" };
+    const job = await runJob(
+      db,
+      claimed.id,
+      this.embeddingProviderOverride,
+      this.embeddingProviderFactory,
+      this.chunkMetaSummarizerFactory,
+      this.figureVisionAnalyzerFactory,
+      this.graphExtractorFactory,
+      this.pdfRawFileStore,
+      this.pdfFigureVisionImageExtractor,
+      { alreadyClaimed: true },
+    );
+    return { status: "ran", job };
+  }
+
   private async getJobStatus(status?: JobStatus, limit = 30): Promise<GetJobStatusResult> {
     const db = await this.ensureReady();
     const clampedLimit = clampLimit(limit, 100);
@@ -4612,7 +4671,10 @@ async function buildSourceFineRankRequest(
       [candidate.id],
     );
     if (source === undefined) {
-      throw new SourceFineRankValidationError("input_invalid", "Fine Rank source disappeared during lookup.");
+      throw new SourceFineRankValidationError(
+        "input_invalid",
+        "Fine Rank source disappeared during lookup.",
+      );
     }
     const metadata = parseMetadata(stringField(source, "metadata_json"));
     const wikiRows = db.selectObjects(
@@ -4648,7 +4710,7 @@ async function buildSourceFineRankRequest(
       const outline = boundedWikiArtifactOutline(payload, stringField(row, "bounded_content"));
       const artifactId = wikiArtifactRequiredRowString(row, "id");
       const evidenceRows = db.selectObjects(
-        `SELECT id, chunk_id FROM wiki_artifact_evidence WHERE artifact_id = ? ORDER BY ordinal ASC LIMIT 16`,
+        "SELECT id, chunk_id FROM wiki_artifact_evidence WHERE artifact_id = ? ORDER BY ordinal ASC LIMIT 16",
         [artifactId],
       );
       return {
@@ -4677,7 +4739,9 @@ async function buildSourceFineRankRequest(
           ],
           20,
         ),
-        sectionHeadings: graphSectionHeadingLabels(stringField(source, "section_outline_json")).slice(0, 16),
+        sectionHeadings: graphSectionHeadingLabels(
+          stringField(source, "section_outline_json"),
+        ).slice(0, 16),
       },
       evidence: candidate.hitChunks.slice(0, 4).map((hit) => ({
         id: `${candidate.id}:${hit.chunkId}`,
@@ -4702,7 +4766,8 @@ function boundedWikiArtifactOutline(payload: WikiArtifactJsonObject, fallback: s
     .flatMap((key) => {
       const value = payload[key];
       if (typeof value === "string") return [value];
-      if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+      if (Array.isArray(value))
+        return value.filter((item): item is string => typeof item === "string");
       return [];
     })
     .join("\n");
@@ -4996,7 +5061,10 @@ function createWorkerSourceFineRanker(workerSelf: LocalEngineWorkerGlobal): Sour
       clearTimeout(entry.timer);
       enabledPending.delete(event.data.requestId);
       if (event.data.response.ok) entry.resolve(event.data.response.value);
-      else entry.reject(new EngineRpcError(event.data.response.error.code, event.data.response.error.message));
+      else
+        entry.reject(
+          new EngineRpcError(event.data.response.error.code, event.data.response.error.message),
+        );
       return;
     }
     if (!isWorkerSourceFineRankResponseMessage(event.data)) return;
@@ -5005,7 +5073,10 @@ function createWorkerSourceFineRanker(workerSelf: LocalEngineWorkerGlobal): Sour
     clearTimeout(entry.timer);
     pending.delete(event.data.requestId);
     if (event.data.response.ok) entry.resolve(event.data.response.value);
-    else entry.reject(new EngineRpcError(event.data.response.error.code, event.data.response.error.message));
+    else
+      entry.reject(
+        new EngineRpcError(event.data.response.error.code, event.data.response.error.message),
+      );
   });
 
   return {
@@ -5014,7 +5085,12 @@ function createWorkerSourceFineRanker(workerSelf: LocalEngineWorkerGlobal): Sour
       return new Promise<boolean>((resolve, reject) => {
         const timer = setTimeout(() => {
           enabledPending.delete(requestId);
-          reject(new EngineRpcError("SOURCE_FINE_RANK_ENABLED_TIMEOUT", "Wiki Fine Rank settings request timed out."));
+          reject(
+            new EngineRpcError(
+              "SOURCE_FINE_RANK_ENABLED_TIMEOUT",
+              "Wiki Fine Rank settings request timed out.",
+            ),
+          );
         }, sourceFineRankBridgeTimeoutMs);
         enabledPending.set(requestId, { resolve, reject, timer });
         workerSelf.postMessage({ type: CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_REQUEST, requestId });
@@ -5026,7 +5102,12 @@ function createWorkerSourceFineRanker(workerSelf: LocalEngineWorkerGlobal): Sour
       return new Promise<SourceFineRankProviderResult>((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(requestId);
-          reject(new EngineRpcError("SOURCE_FINE_RANK_BRIDGE_TIMEOUT", "Fine Rank provider request timed out."));
+          reject(
+            new EngineRpcError(
+              "SOURCE_FINE_RANK_BRIDGE_TIMEOUT",
+              "Fine Rank provider request timed out.",
+            ),
+          );
         }, sourceFineRankBridgeTimeoutMs);
         pending.set(requestId, { resolve, reject, timer });
         workerSelf.postMessage({
@@ -8764,7 +8845,8 @@ function recoverStaleJobs(db: SqliteDb) {
                 last_error = COALESCE(last_error, 'Job was running when the engine stopped.')
             WHERE status = 'running'
               AND attempts >= max_attempts
-              AND (heartbeat_at IS NULL OR heartbeat_at < ?)`,
+              AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+              AND NOT ${automaticPostCaptureJobPredicate}`,
       bind: [new Date().toISOString(), cutoff],
     });
     db.exec({
@@ -8775,10 +8857,325 @@ function recoverStaleJobs(db: SqliteDb) {
                 run_after = ?
             WHERE status = 'running'
               AND attempts < max_attempts
-              AND (heartbeat_at IS NULL OR heartbeat_at < ?)`,
+              AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+              AND NOT ${automaticPostCaptureJobPredicate}`,
       bind: [new Date().toISOString(), cutoff],
     });
   });
+}
+
+const automaticPostCaptureJobPredicate = `EXISTS (
+  SELECT 1
+  FROM source_audit_log automatic_audit
+  WHERE automatic_audit.action = 'source.stage_queued'
+    AND automatic_audit.target_kind = 'job'
+    AND automatic_audit.target_id = jobs.id
+    AND automatic_audit.reason = 'post_capture_hardening'
+)`;
+
+function recoverAutomaticPostCaptureJobs(
+  db: SqliteDb,
+  nowInput?: string,
+): RecoverPostCaptureJobsResult {
+  const now = normalizedPostCaptureNow(nowInput);
+  const cutoff = new Date(Date.parse(now) - staleJobMs).toISOString();
+  const rows = db.selectObjects(
+    `SELECT *
+     FROM jobs
+     WHERE type = 'post_capture_hardening'
+       AND status = 'running'
+       AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+       AND ${automaticPostCaptureJobPredicate}
+     ORDER BY created_at ASC, id ASC`,
+    [cutoff],
+  );
+  let requeued = 0;
+  let failed = 0;
+  transaction(db, () => {
+    for (const row of rows) {
+      const jobId = stringField(row, "id");
+      const exhausted = numberField(row, "attempts") >= numberField(row, "max_attempts");
+      const result = postCaptureResultFromJobRow(row);
+      const requestedStages = requestedPostCaptureStages(
+        parsePostCaptureHardeningPayload(stringField(row, "payload_json")),
+      );
+      const completed = requestedStages.every((stage) =>
+        isSuccessfulPostCaptureStage(result.stages[stage]),
+      );
+      if (!completed) {
+        for (const stage of requestedStages) {
+          if (result.stages[stage].status !== "running") continue;
+          result.stages[stage] = exhausted
+            ? stalePostCaptureStageFailure(result.stages[stage].startedAt, now)
+            : { status: "pending" };
+        }
+        if (
+          exhausted &&
+          !requestedStages.some((stage) => result.stages[stage].status === "failed")
+        ) {
+          const interruptedStage = requestedStages.find(
+            (stage) => !isSuccessfulPostCaptureStage(result.stages[stage]),
+          );
+          if (interruptedStage !== undefined) {
+            result.stages[interruptedStage] = stalePostCaptureStageFailure(undefined, now);
+          }
+        }
+      }
+      const nextStatus = completed ? "done" : exhausted ? "failed" : "queued";
+      const progressCurrent = requestedStages.filter((stage) =>
+        isSuccessfulPostCaptureStage(result.stages[stage]),
+      ).length;
+      db.exec({
+        sql: `UPDATE jobs
+              SET status = ?,
+                  run_after = ?,
+                  heartbeat_at = NULL,
+                  finished_at = ?,
+                  last_error = ?,
+                  progress_current = ?,
+                  progress_total = ?,
+                  result_json = ?
+              WHERE id = ?
+                AND status = 'running'
+                AND (heartbeat_at IS NULL OR heartbeat_at < ?)`,
+        bind: [
+          nextStatus,
+          nextStatus === "queued" ? now : null,
+          nextStatus === "queued" ? null : now,
+          nextStatus === "failed" ? "Processing stopped after the final retry." : null,
+          progressCurrent,
+          Math.max(1, requestedStages.length),
+          JSON.stringify(result),
+          jobId,
+          cutoff,
+        ],
+      });
+      if (Number(db.selectValue("SELECT changes()") ?? 0) !== 1) continue;
+      if (nextStatus === "failed") failed += 1;
+      else if (nextStatus === "queued") requeued += 1;
+    }
+  });
+  return { requeued, failed };
+}
+
+function stalePostCaptureStageFailure(
+  startedAt: string | undefined,
+  finishedAt: string,
+): PostCaptureStageResult {
+  return {
+    status: "failed",
+    errorCode: "POST_CAPTURE_JOB_STALE",
+    reason: "Processing stopped before this stage completed.",
+    ...(startedAt === undefined ? {} : { startedAt }),
+    finishedAt,
+  };
+}
+
+function claimNextAutomaticPostCaptureJob(
+  db: SqliteDb,
+  nowInput?: string,
+): { id: string } | undefined {
+  const now = normalizedPostCaptureNow(nowInput);
+  const row = db.selectObject(
+    `SELECT id
+     FROM jobs
+     WHERE type = 'post_capture_hardening'
+       AND status = 'queued'
+       AND (run_after IS NULL OR run_after <= ?)
+       AND ${automaticPostCaptureJobPredicate}
+     ORDER BY COALESCE(run_after, created_at) ASC, created_at ASC, id ASC
+     LIMIT 1`,
+    [now],
+  );
+  if (row === undefined) return undefined;
+  const id = stringField(row, "id");
+  db.exec({
+    sql: `UPDATE jobs
+          SET status = 'running',
+              attempts = attempts + 1,
+              started_at = COALESCE(started_at, ?),
+              heartbeat_at = ?,
+              finished_at = NULL,
+              last_error = NULL
+          WHERE id = ?
+            AND status = 'queued'
+            AND (run_after IS NULL OR run_after <= ?)
+            AND ${automaticPostCaptureJobPredicate}`,
+    bind: [now, now, id, now],
+  });
+  return Number(db.selectValue("SELECT changes()") ?? 0) === 1 ? { id } : undefined;
+}
+
+function projectSourceIngestStatuses(db: SqliteDb, sourceIdsInput: string[]) {
+  const sourceIds = normalizeSourceIngestIds(sourceIdsInput);
+  if (sourceIds.length === 0) return [];
+  const placeholders = sourceIds.map(() => "?").join(", ");
+  const rows = db.selectObjects(
+    `SELECT automatic_audit.source_id, jobs.*
+     FROM source_audit_log automatic_audit
+     JOIN jobs ON jobs.id = automatic_audit.target_id
+     WHERE automatic_audit.action = 'source.stage_queued'
+       AND automatic_audit.target_kind = 'job'
+       AND automatic_audit.reason = 'post_capture_hardening'
+       AND automatic_audit.source_id IN (${placeholders})
+     ORDER BY automatic_audit.source_id ASC,
+              automatic_audit.created_at DESC,
+              automatic_audit.id DESC`,
+    sourceIds,
+  );
+  const latestBySource = new Map<string, SqlRow>();
+  for (const row of rows) {
+    const sourceId = stringField(row, "source_id");
+    if (!latestBySource.has(sourceId)) latestBySource.set(sourceId, row);
+  }
+  return sourceIds.map((sourceId) =>
+    sourceIngestStatusFromJobRow(sourceId, latestBySource.get(sourceId)),
+  );
+}
+
+function retryAutomaticSourceIngest(db: SqliteDb, sourceIdInput: string): SourceIngestStatus {
+  const [sourceId] = normalizeSourceIngestIds([sourceIdInput]);
+  if (sourceId === undefined) {
+    throw new EngineRpcError("INVALID_SOURCE_ID", "A Source id is required.");
+  }
+  const source = db.selectObject(
+    "SELECT id FROM sources WHERE id = ? AND lifecycle_status <> 'deleted' LIMIT 1",
+    [sourceId],
+  );
+  if (source === undefined) {
+    throw new EngineRpcError("SOURCE_NOT_FOUND", `Source not found: ${sourceId}`);
+  }
+  const latest = latestAutomaticPostCaptureJobRow(db, sourceId);
+  if (latest === undefined || jobStatusField(latest, "status") !== "failed") {
+    throw new EngineRpcError(
+      "SOURCE_INGEST_RETRY_NOT_ALLOWED",
+      "Only the latest failed Source processing job can be retried.",
+    );
+  }
+  const now = new Date().toISOString();
+  const payload = {
+    ...parseMetadata(stringField(latest, "payload_json")),
+    sourceId,
+    trigger: "automatic_capture",
+    retryOfJobId: stringField(latest, "id"),
+  };
+  let jobId = "";
+  transaction(db, () => {
+    jobId = enqueueJob(
+      db,
+      "post_capture_hardening",
+      payload,
+      Math.max(1, numberField(latest, "max_attempts")),
+    );
+    const retryResult = postCaptureRetryResultFromJobRow(latest, sourceId);
+    const requestedStages = requestedPostCaptureStages(
+      parsePostCaptureHardeningPayload(JSON.stringify(payload)),
+    );
+    db.exec({
+      sql: `UPDATE jobs
+            SET progress_current = ?,
+                progress_total = ?,
+                result_json = ?
+            WHERE id = ?
+              AND status = 'queued'`,
+      bind: [
+        requestedStages.filter((stage) => isSuccessfulPostCaptureStage(retryResult.stages[stage]))
+          .length,
+        Math.max(1, requestedStages.length),
+        JSON.stringify(retryResult),
+        jobId,
+      ],
+    });
+    insertSourceAuditLog(db, {
+      action: "source.stage_queued",
+      sourceId,
+      targetKind: "job",
+      targetId: jobId,
+      reason: "post_capture_hardening",
+      payload: {
+        jobType: "post_capture_hardening",
+        trigger: "automatic_capture",
+        retryOfJobId: stringField(latest, "id"),
+      },
+      createdAt: now,
+    });
+  });
+  return (
+    projectSourceIngestStatuses(db, [sourceId])[0] ?? {
+      sourceId,
+      state: "processing",
+      jobId,
+      progressCurrent: 0,
+      progressTotal: 1,
+      updatedAt: now,
+    }
+  );
+}
+
+function latestAutomaticPostCaptureJobRow(db: SqliteDb, sourceId: string) {
+  return db.selectObject(
+    `SELECT jobs.*
+     FROM source_audit_log automatic_audit
+     JOIN jobs ON jobs.id = automatic_audit.target_id
+     WHERE automatic_audit.source_id = ?
+       AND automatic_audit.action = 'source.stage_queued'
+       AND automatic_audit.target_kind = 'job'
+       AND automatic_audit.reason = 'post_capture_hardening'
+     ORDER BY automatic_audit.created_at DESC, automatic_audit.id DESC
+     LIMIT 1`,
+    [sourceId],
+  );
+}
+
+function sourceIngestStatusFromJobRow(sourceId: string, row?: SqlRow): SourceIngestStatus {
+  if (row === undefined) {
+    return { sourceId, state: "available", progressCurrent: 0, progressTotal: 0 };
+  }
+  const status = jobStatusField(row, "status");
+  const result = postCaptureResultFromJobRow(row);
+  const failedStage = POST_CAPTURE_STAGE_NAMES.find(
+    (stage) => result.stages[stage].status === "failed",
+  );
+  const lastError = optionalString(row, "last_error");
+  const stageReason = failedStage === undefined ? undefined : result.stages[failedStage].reason;
+  const reason = boundedNormalizedText(stageReason ?? lastError ?? "", 300);
+  return {
+    sourceId,
+    state: status === "failed" ? "failed" : status === "done" ? "available" : "processing",
+    jobId: stringField(row, "id"),
+    progressCurrent: Math.max(0, numberField(row, "progress_current")),
+    progressTotal: Math.max(1, numberField(row, "progress_total")),
+    ...(failedStage === undefined ? {} : { failedStage }),
+    ...(reason.length === 0 ? {} : { reason }),
+    updatedAt:
+      optionalString(row, "finished_at") ??
+      optionalString(row, "heartbeat_at") ??
+      optionalString(row, "started_at") ??
+      stringField(row, "created_at"),
+  };
+}
+
+function normalizeSourceIngestIds(sourceIds: string[]) {
+  if (!Array.isArray(sourceIds) || sourceIds.length > 100) {
+    throw new EngineRpcError("INVALID_SOURCE_IDS", "At most 100 Source ids can be requested.");
+  }
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const sourceIdInput of sourceIds) {
+    const sourceId = normalizeText(sourceIdInput).slice(0, 256);
+    if (sourceId.length === 0) {
+      throw new EngineRpcError("INVALID_SOURCE_ID", "Source ids cannot be empty.");
+    }
+    if (seen.has(sourceId)) continue;
+    seen.add(sourceId);
+    unique.push(sourceId);
+  }
+  return unique;
+}
+
+function normalizedPostCaptureNow(nowInput?: string) {
+  const parsed = Date.parse(normalizeOptionalIso(nowInput) ?? "");
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date().toISOString();
 }
 
 function recoverStaleOrchestrationRuns(db: SqliteDb) {
@@ -8936,6 +9333,11 @@ function enqueueJob(
 ) {
   const now = new Date().toISOString();
   const jobId = createId("job");
+  const requestedStages =
+    type === "post_capture_hardening" && Array.isArray(payload.stages)
+      ? uniquePostCaptureStages(payload.stages.filter(isPostCaptureStageName))
+      : [];
+  const progressTotal = Math.max(1, requestedStages.length);
   db.exec({
     sql: `INSERT INTO jobs (
       id,
@@ -8943,11 +9345,13 @@ function enqueueJob(
       status,
       attempts,
       max_attempts,
+      progress_current,
+      progress_total,
       run_after,
       payload_json,
       created_at
-    ) VALUES (?, ?, 'queued', 0, ?, ?, ?, ?)`,
-    bind: [jobId, type, Math.max(1, maxAttempts), now, JSON.stringify(payload), now],
+    ) VALUES (?, ?, 'queued', 0, ?, 0, ?, ?, ?, ?)`,
+    bind: [jobId, type, Math.max(1, maxAttempts), progressTotal, now, JSON.stringify(payload), now],
   });
   return jobId;
 }
@@ -9786,25 +10190,38 @@ async function runJob(
   graphExtractorFactory?: GraphExtractorFactory,
   pdfRawFileStore?: PdfRawFileStore,
   pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor = extractPdfFigureVisionImageInput,
+  options: { alreadyClaimed?: boolean } = {},
 ): Promise<JobSummary> {
   const job = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [jobId]);
   if (job === undefined) {
     throw new EngineRpcError("JOB_NOT_FOUND", `Job not found: ${jobId}`);
   }
-  if (stringField(job, "status") !== "queued") return jobSummaryFromRow(job);
+  const expectedStatus = options.alreadyClaimed ? "running" : "queued";
+  if (stringField(job, "status") !== expectedStatus) return jobSummaryFromRow(job);
 
   const now = new Date().toISOString();
-  const attempts = numberField(job, "attempts") + 1;
-  db.exec({
-    sql: `UPDATE jobs
-          SET status = 'running',
-              attempts = ?,
-              started_at = COALESCE(started_at, ?),
-              heartbeat_at = ?,
-              last_error = NULL
-          WHERE id = ?`,
-    bind: [attempts, now, now, jobId],
-  });
+  const attempts = numberField(job, "attempts") + (options.alreadyClaimed ? 0 : 1);
+  if (!options.alreadyClaimed) {
+    db.exec({
+      sql: `UPDATE jobs
+            SET status = 'running',
+                attempts = ?,
+                started_at = COALESCE(started_at, ?),
+                heartbeat_at = ?,
+                finished_at = NULL,
+                last_error = NULL
+            WHERE id = ?
+              AND status = 'queued'`,
+      bind: [attempts, now, now, jobId],
+    });
+    if (Number(db.selectValue("SELECT changes()") ?? 0) !== 1) {
+      const current = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [jobId]);
+      if (current === undefined) {
+        throw new EngineRpcError("JOB_NOT_FOUND", `Job not found after claim: ${jobId}`);
+      }
+      return jobSummaryFromRow(current);
+    }
+  }
 
   try {
     const type = jobTypeField(job, "type");
@@ -9841,10 +10258,13 @@ async function runJob(
     db.exec({
       sql: `UPDATE jobs
             SET status = 'done',
+                progress_current = progress_total,
                 heartbeat_at = ?,
                 finished_at = ?,
-                result_json = ?
-            WHERE id = ?`,
+                result_json = ?,
+                last_error = NULL
+            WHERE id = ?
+              AND status = 'running'`,
       bind: [finishedAt, finishedAt, JSON.stringify(result), jobId],
     });
   } catch (error) {
@@ -9860,7 +10280,8 @@ async function runJob(
                 heartbeat_at = NULL,
                 finished_at = ?,
                 last_error = ?
-            WHERE id = ?`,
+            WHERE id = ?
+              AND status = 'running'`,
       bind: [
         failed ? "failed" : "queued",
         new Date(Date.now() + attempts * 1000).toISOString(),
@@ -10145,61 +10566,227 @@ async function runPostCaptureHardeningJob(
   if (payload.sourceId.length === 0) {
     throw new EngineRpcError("INVALID_JOB_PAYLOAD", "Post-capture job is missing sourceId.");
   }
-  const shouldRunPaperMetadata = payload.stages.includes("paper_metadata");
-  const shouldRunChunkMeta = payload.stages.includes("chunk_meta");
-  const shouldRunEmbedding = payload.stages.length === 0 || payload.stages.includes("embedding");
-  const shouldRunGraph = payload.stages.includes("graph");
-  const shouldRunFigureVision = payload.stages.includes("figure_vision");
+  const requestedStages = requestedPostCaptureStages(payload);
+  const requested = new Set<PostCaptureStageName>(requestedStages);
+  const jobRow = db.selectObject("SELECT * FROM jobs WHERE id = ? LIMIT 1", [jobId]);
+  if (jobRow === undefined) throw new EngineRpcError("JOB_NOT_FOUND", `Job not found: ${jobId}`);
+  const result = postCaptureResultFromJobRow(jobRow);
+  const initializedAt = new Date().toISOString();
+  for (const stage of POST_CAPTURE_STAGE_NAMES) {
+    if (requested.has(stage) || isTerminalPostCaptureStage(result.stages[stage])) continue;
+    result.stages[stage] = {
+      status: "skipped",
+      reason: "stage_not_requested",
+      finishedAt: initializedAt,
+    };
+  }
+  persistPostCaptureJobResult(db, jobId, result, requestedStages);
 
-  const paperMetadata = shouldRunPaperMetadata
-    ? runPaperMetadataStageForSource(db, payload.sourceId)
-    : { skipped: true, reason: "stage_not_requested" };
-  const chunkMeta = shouldRunChunkMeta
-    ? await runChunkMetaStageForSource(db, payload.sourceId, {
-        tier2: payload.chunkMetaTier2,
+  for (const stage of requestedStages) {
+    if (isSuccessfulPostCaptureStage(result.stages[stage])) continue;
+    const startedAt = new Date().toISOString();
+    result.stages[stage] = { status: "running", startedAt };
+    persistPostCaptureJobResult(db, jobId, result, requestedStages);
+    try {
+      const detail = await runPostCaptureStage(db, payload, stage, {
         jobId,
-        summarizerFactory: chunkMetaSummarizerFactory,
-      })
-    : { skipped: true, reason: "stage_not_requested" };
-  const embeddingResult = shouldRunEmbedding
-    ? await runEmbeddingStageForSource(
-        db,
-        payload.sourceId,
         embeddingProviderOverride,
         embeddingProviderFactory,
-      )
-    : { ok: true, embedding: { skipped: true, reason: "stage_not_requested" } };
+        chunkMetaSummarizerFactory,
+        figureVisionAnalyzerFactory,
+        graphExtractorFactory,
+        pdfRawFileStore,
+        pdfFigureVisionImageExtractor,
+      });
+      const finishedAt = new Date().toISOString();
+      const reason = typeof detail.reason === "string" ? detail.reason : undefined;
+      result.stages[stage] = postCaptureStageWasSkipped(stage, detail)
+        ? {
+            status: "skipped",
+            ...(reason === undefined ? {} : { reason }),
+            startedAt,
+            finishedAt,
+            detail: boundAuditPayload(detail),
+          }
+        : {
+            status: "done",
+            startedAt,
+            finishedAt,
+            detail: boundAuditPayload(detail),
+          };
+    } catch (error) {
+      const failure = engineErrorFromUnknown(error, "POST_CAPTURE_STAGE_FAILED");
+      result.stages[stage] = {
+        status: "failed",
+        errorCode: boundedNormalizedText(failure.code, 120),
+        reason: boundedNormalizedText(failure.message, 500),
+        startedAt,
+        finishedAt: new Date().toISOString(),
+      };
+    }
+    persistPostCaptureJobResult(db, jobId, result, requestedStages);
+  }
 
-  const figureVision = shouldRunFigureVision
-    ? await runPdfFigureVisionStageForSource(
+  const failedStage = requestedStages.find((stage) => result.stages[stage].status === "failed");
+  if (failedStage !== undefined) {
+    const failure = result.stages[failedStage];
+    throw new EngineRpcError(
+      failure.errorCode ?? "POST_CAPTURE_STAGE_FAILED",
+      failure.reason ?? `Post-capture stage failed: ${failedStage}`,
+    );
+  }
+  return result;
+}
+
+interface RunPostCaptureStageDependencies {
+  jobId: string;
+  embeddingProviderOverride?: EmbeddingProvider;
+  embeddingProviderFactory?: EmbeddingProviderFactory;
+  chunkMetaSummarizerFactory?: ChunkMetaSummarizerFactory;
+  figureVisionAnalyzerFactory?: FigureVisionAnalyzerFactory;
+  graphExtractorFactory?: GraphExtractorFactory;
+  pdfRawFileStore?: PdfRawFileStore;
+  pdfFigureVisionImageExtractor: PdfFigureVisionImageExtractor;
+}
+
+async function runPostCaptureStage(
+  db: SqliteDb,
+  payload: ReturnType<typeof parsePostCaptureHardeningPayload>,
+  stage: PostCaptureStageName,
+  dependencies: RunPostCaptureStageDependencies,
+): Promise<Record<string, unknown>> {
+  switch (stage) {
+    case "paper_metadata":
+      return runPaperMetadataStageForSource(db, payload.sourceId);
+    case "chunk_meta":
+      return await runChunkMetaStageForSource(db, payload.sourceId, {
+        tier2: payload.chunkMetaTier2,
+        jobId: dependencies.jobId,
+        summarizerFactory: dependencies.chunkMetaSummarizerFactory,
+      });
+    case "figure_vision":
+      return await runPdfFigureVisionStageForSource(
         db,
         payload.sourceId,
-        pdfRawFileStore,
-        figureVisionAnalyzerFactory,
-        pdfFigureVisionImageExtractor,
-      )
-    : { skipped: true, reason: "stage_not_requested" };
+        dependencies.pdfRawFileStore,
+        dependencies.figureVisionAnalyzerFactory,
+        dependencies.pdfFigureVisionImageExtractor,
+      );
+    case "embedding": {
+      const result = await runEmbeddingStageForSource(
+        db,
+        payload.sourceId,
+        dependencies.embeddingProviderOverride,
+        dependencies.embeddingProviderFactory,
+      );
+      return isRecord(result.embedding) ? result.embedding : result;
+    }
+    case "graph": {
+      if (payload.graphBuildMode === undefined) {
+        return { skipped: true, reason: "explicit_build_required" };
+      }
+      const graph = await runSourceGraphBuildForSource(
+        db,
+        payload.sourceId,
+        payload.graphBuildMode,
+        dependencies.graphExtractorFactory,
+      );
+      return { ...graph };
+    }
+    default:
+      return assertNever(stage);
+  }
+}
 
-  const graph =
-    shouldRunGraph && payload.graphBuildMode !== undefined
-      ? await runSourceGraphBuildForSource(
-          db,
-          payload.sourceId,
-          payload.graphBuildMode,
-          graphExtractorFactory,
-        )
-      : shouldRunGraph
-        ? { skipped: true, reason: "explicit_build_required" }
-        : { skipped: true, reason: "stage_not_requested" };
-
+function postCaptureResultFromJobRow(row: SqlRow): PostCaptureJobResultV1 {
+  const payload = parsePostCaptureHardeningPayload(stringField(row, "payload_json"));
+  const persisted = postCaptureResultFromJson(optionalString(row, "result_json"));
+  if (persisted !== undefined && persisted.sourceId === payload.sourceId) return persisted;
   return {
-    ok: true,
-    paperMetadata,
-    embedding: embeddingResult.embedding,
-    chunkMeta,
-    figureVision,
-    graph,
+    version: "post-capture-result-v1",
+    sourceId: payload.sourceId,
+    stages: Object.fromEntries(
+      POST_CAPTURE_STAGE_NAMES.map((stage) => [stage, { status: "pending" }]),
+    ) as Record<PostCaptureStageName, PostCaptureStageResult>,
   };
+}
+
+function postCaptureRetryResultFromJobRow(row: SqlRow, sourceId: string): PostCaptureJobResultV1 {
+  const previous = postCaptureResultFromJobRow(row);
+  return {
+    version: "post-capture-result-v1",
+    sourceId,
+    stages: Object.fromEntries(
+      POST_CAPTURE_STAGE_NAMES.map((stage) => [
+        stage,
+        isSuccessfulPostCaptureStage(previous.stages[stage])
+          ? previous.stages[stage]
+          : { status: "pending" },
+      ]),
+    ) as Record<PostCaptureStageName, PostCaptureStageResult>,
+  };
+}
+
+function postCaptureResultFromJson(input: string | undefined) {
+  if (input === undefined) return undefined;
+  try {
+    return decodePostCaptureJobResult(JSON.parse(input) as unknown);
+  } catch {
+    return undefined;
+  }
+}
+
+function persistPostCaptureJobResult(
+  db: SqliteDb,
+  jobId: string,
+  result: PostCaptureJobResultV1,
+  requestedStages: PostCaptureStageName[],
+) {
+  const progressCurrent = requestedStages.filter((stage) =>
+    isSuccessfulPostCaptureStage(result.stages[stage]),
+  ).length;
+  db.exec({
+    sql: `UPDATE jobs
+          SET progress_current = ?,
+              progress_total = ?,
+              heartbeat_at = ?,
+              result_json = ?
+          WHERE id = ?
+            AND status = 'running'`,
+    bind: [
+      progressCurrent,
+      Math.max(1, requestedStages.length),
+      new Date().toISOString(),
+      JSON.stringify(result),
+      jobId,
+    ],
+  });
+}
+
+function uniquePostCaptureStages(stages: PostCaptureStageName[]) {
+  return POST_CAPTURE_STAGE_NAMES.filter((stage) => stages.includes(stage));
+}
+
+function requestedPostCaptureStages(payload: ReturnType<typeof parsePostCaptureHardeningPayload>) {
+  return uniquePostCaptureStages(payload.stages.length === 0 ? ["embedding"] : payload.stages);
+}
+
+function isSuccessfulPostCaptureStage(result: PostCaptureStageResult) {
+  return result.status === "done" || result.status === "skipped";
+}
+
+function isTerminalPostCaptureStage(result: PostCaptureStageResult) {
+  return isSuccessfulPostCaptureStage(result) || result.status === "failed";
+}
+
+function postCaptureStageWasSkipped(stage: PostCaptureStageName, detail: Record<string, unknown>) {
+  if (detail.skipped === true) return true;
+  if (stage !== "figure_vision") return false;
+  return (
+    detail.reason === "figure_vision_analyzer_unavailable" ||
+    detail.reason === "pdf_raw_file_unavailable" ||
+    detail.reason === "pdf_raw_file_read_failed"
+  );
 }
 
 function parsePostCaptureHardeningPayload(payloadJson: string) {
@@ -10223,16 +10810,6 @@ function parsePostCaptureHardeningPayload(payloadJson: string) {
 function clampChunkMetaTier2MaxChunks(value: unknown) {
   if (typeof value !== "number" || !Number.isFinite(value)) return defaultChunkMetaTier2MaxChunks;
   return Math.max(0, Math.min(maxChunkMetaTier2MaxChunks, Math.floor(value)));
-}
-
-function isPostCaptureStageName(value: unknown): value is PostCaptureStageName {
-  return (
-    value === "paper_metadata" ||
-    value === "embedding" ||
-    value === "chunk_meta" ||
-    value === "graph" ||
-    value === "figure_vision"
-  );
 }
 
 function runPaperMetadataStageForSource(db: SqliteDb, sourceId: string): Record<string, unknown> {

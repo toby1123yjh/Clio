@@ -180,7 +180,8 @@ describe("local engine source-native storage foundation", () => {
 
   it("queues bounded post-capture work and does not add public ingest job types", () => {
     expect(workerSource).toContain('enqueueJob(db, "post_capture_hardening"');
-    expect(workerSource).toContain("type PostCaptureStageName =");
+    expect(rpcSource).toContain("export type PostCaptureStageName =");
+    expect(workerSource).toContain("type PostCaptureStageName,");
     expect(workerSource).toContain('"paper_metadata"');
     expect(workerSource).toContain('"figure_vision"');
     expect(workerSource).toContain("function boundAuditPayload(payload: Record<string, unknown>)");
@@ -201,8 +202,8 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).toContain("private async runQueuedJob");
     expect(workerSource).toContain('case "runJob"');
     expect(workerSource).toContain("function parsePostCaptureHardeningPayload");
-    expect(workerSource).toContain('value === "paper_metadata"');
-    expect(workerSource).toContain('value === "figure_vision"');
+    expect(rpcSource).toContain("export function isPostCaptureStageName");
+    expect(workerSource).toContain("isPostCaptureStageName(stage)");
     expect(workerSource).toContain('payload.graphBuildMode === "deterministic"');
     expect(workerSource).toContain('payload.graphBuildMode === "llm"');
     expect(workerSource).toContain("function upsertSourceChunkEmbeddings");
@@ -214,6 +215,19 @@ describe("local engine source-native storage foundation", () => {
     expect(workerSource).not.toContain('"ingest_embedding"');
     expect(workerSource).not.toContain('"ingest_chunk_meta"');
     expect(workerSource).not.toContain('"ingest_graph"');
+  });
+
+  it("keeps automatic post-capture jobs out of generic stale recovery", () => {
+    const recoverSection = sourceSection(
+      "function recoverStaleJobs",
+      "const automaticPostCaptureJobPredicate",
+    );
+    const recoveryStatements = recoverSection.match(/sql: `UPDATE jobs[\s\S]*?`,/g) ?? [];
+
+    expect(recoveryStatements).toHaveLength(2);
+    for (const statement of recoveryStatements) {
+      expect(statement).toContain("AND NOT ${automaticPostCaptureJobPredicate}");
+    }
   });
 
   it("defines a Source Adapter registry for source-native capture", () => {

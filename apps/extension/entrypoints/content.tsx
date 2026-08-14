@@ -182,6 +182,7 @@ import {
   type SourceContextMapEvent,
   type SourceContextMapRunSummary,
   type SourceContextPackResult,
+  type SourceIngestStatus,
   type WebSearchHistoryRecord,
   type WikiArtifactDetail,
   type WikiArtifactEvidence,
@@ -221,6 +222,7 @@ import { createRoot } from "react-dom/client";
 
 const commandEventName = "clio:content-command";
 const relatedSearchLimit = 12;
+const sourceIngestStatusPollMs = 1_200;
 const defaultSourceContextPlannerBudget = {
   maxTotalTokens: sourceContextPackResearchBudgetDefaults.maxTotalTokens,
   maxGroups: sourceContextPackResearchBudgetDefaults.maxGroups,
@@ -1064,6 +1066,11 @@ function ClioContentApp() {
   );
   const [selection, setSelection] = React.useState<SelectionState | null>(null);
   const [items, setItems] = React.useState<SearchMemoryItem[]>([]);
+  const [sourceIngestStatuses, setSourceIngestStatuses] = React.useState<
+    Record<string, SourceIngestStatus>
+  >({});
+  const [sourceIngestPollRevision, setSourceIngestPollRevision] = React.useState(0);
+  const sourceIngestPollRevisionRef = React.useRef(0);
   const [knowledgeBaseSearchLoading, setKnowledgeBaseSearchLoading] = React.useState(false);
   const [knowledgeBaseRefreshLoading, setKnowledgeBaseRefreshLoading] = React.useState(false);
   const [knowledgeBaseSearchMode, setKnowledgeBaseSearchMode] =
@@ -1257,6 +1264,21 @@ function ClioContentApp() {
     setToast(next);
     window.setTimeout(() => setToast(null), 3200);
   }, []);
+
+  const retrySourceIngest = React.useCallback(
+    async (sourceId: string) => {
+      try {
+        const status = await requestEngine({ kind: "retrySourceIngest", sourceId });
+        setSourceIngestStatuses((current) => ({ ...current, [sourceId]: status }));
+        sourceIngestPollRevisionRef.current += 1;
+        setSourceIngestPollRevision(sourceIngestPollRevisionRef.current);
+        showToast({ tone: "success", message: "Source processing queued again." });
+      } catch (error) {
+        showToast(errorToast(error));
+      }
+    },
+    [showToast],
+  );
 
   const loadHealth = React.useCallback(async () => {
     const next = await requestEngine({ kind: "health" });
@@ -3857,6 +3879,37 @@ function ClioContentApp() {
   }, [loadKnowledgeBaseResults, railState.mode, railState.query]);
 
   React.useEffect(() => {
+    if (railState.mode !== "knowledge-base" && railState.mode !== "research-planner") return;
+    const sourceIds = Array.from(new Set(items.map((item) => item.id))).slice(0, 100);
+    if (sourceIds.length === 0) {
+      setSourceIngestStatuses({});
+      return;
+    }
+
+    let cancelled = false;
+    let timer: number | undefined;
+    const pollRevision = sourceIngestPollRevision;
+    const poll = async () => {
+      try {
+        const result = await requestEngine({ kind: "getSourceIngestStatuses", sourceIds });
+        if (cancelled || sourceIngestPollRevisionRef.current !== pollRevision) return;
+        setSourceIngestStatuses(
+          Object.fromEntries(result.items.map((status) => [status.sourceId, status])),
+        );
+        if (!result.items.some((status) => status.state === "processing")) return;
+      } catch {
+        if (cancelled || sourceIngestPollRevisionRef.current !== pollRevision) return;
+      }
+      timer = window.setTimeout(() => void poll(), sourceIngestStatusPollMs);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [items, railState.mode, sourceIngestPollRevision]);
+
+  React.useEffect(() => {
     if (activeEmbeddingModel !== null || knowledgeBaseSearchMode !== "semantic") return;
     setKnowledgeBaseSearchMode("exact");
   }, [activeEmbeddingModel, knowledgeBaseSearchMode]);
@@ -4737,6 +4790,7 @@ function ClioContentApp() {
         imageGenerationSettings={imageGenerationSettings}
         imageGenerationState={imageGenerationState}
         items={items}
+        sourceIngestStatuses={sourceIngestStatuses}
         knowledgeBaseAiSettings={knowledgeBaseAiSettings}
         knowledgeBaseAiSettingsLoading={knowledgeBaseAiSettingsLoading}
         knowledgeBaseAiSettingsMessage={knowledgeBaseAiSettingsMessage}
@@ -4873,6 +4927,7 @@ function ClioContentApp() {
           void runChunkMetaTier2Job(sourceId, maxChunks)
         }
         onRunSourceGraphJob={(sourceId) => void runSourceGraphJob(sourceId)}
+        onRetrySourceIngest={(sourceId) => void retrySourceIngest(sourceId)}
         onCancelOrchestrationRun={(runId) => void cancelOrchestrationRun(runId)}
         onRetryOrchestrationRun={(runId) => void retryOrchestrationRun(runId)}
         onRefreshOrchestrationRuns={() => void loadOrchestrationRuns()}

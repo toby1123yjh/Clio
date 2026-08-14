@@ -136,6 +136,7 @@ import type {
   SourceContextMapRunSummary,
   SourceContextPackResult,
   SourceContextPackSourceDepthOverride,
+  SourceIngestStatus,
   WebSearchHistoryRecord,
   WikiArtifactDetail,
   WikiArtifactEvidence,
@@ -228,6 +229,7 @@ export interface RailShellProps {
   state: RailState;
   health: EngineHealth | null;
   items: SearchMemoryItem[];
+  sourceIngestStatuses: Readonly<Record<string, SourceIngestStatus>>;
   knowledgeBaseFilter: KnowledgeBaseFilterState;
   knowledgeBaseRelevance: {
     bands: RetrieveSourceRelevanceBand[];
@@ -353,6 +355,7 @@ export interface RailShellProps {
   onReloadWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
   onRunSourceGraphJob: (sourceId: string) => void;
+  onRetrySourceIngest: (sourceId: string) => void;
   onCancelOrchestrationRun: (runId: string) => void;
   onRetryOrchestrationRun: (runId: string) => void;
   onRefreshOrchestrationRuns: () => void;
@@ -5666,6 +5669,7 @@ function KnowledgeBasePanel(props: RailShellProps) {
               items={props.items}
               loading={props.state.loading || props.knowledgeBaseSearchLoading}
               selectedPlannerSourceIds={selectedPlannerSourceIds}
+              sourceIngestStatuses={props.sourceIngestStatuses}
               stages={props.knowledgeBaseRelevance.stages}
               relevanceTrace={props.knowledgeBaseRelevance.trace}
               workingSetSourceIds={workingSetSourceIds}
@@ -5673,6 +5677,7 @@ function KnowledgeBasePanel(props: RailShellProps) {
               onPinWorkingSetSource={props.onPinWorkingSetSource}
               onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
               onRunSourceGraphJob={props.onRunSourceGraphJob}
+              onRetrySourceIngest={props.onRetrySourceIngest}
               onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
             />
           </div>
@@ -5830,11 +5835,13 @@ function ResearchPlannerPanel(props: RailShellProps) {
               items={props.items}
               loading={props.state.loading || props.knowledgeBaseSearchLoading}
               selectedPlannerSourceIds={selectedPlannerSourceIds}
+              sourceIngestStatuses={props.sourceIngestStatuses}
               workingSetSourceIds={workingSetSourceIds}
               onOpenDetail={props.onOpenDetail}
               onPinWorkingSetSource={props.onPinWorkingSetSource}
               onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
               onRunSourceGraphJob={props.onRunSourceGraphJob}
+              onRetrySourceIngest={props.onRetrySourceIngest}
               onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
             />
           </section>
@@ -5935,11 +5942,13 @@ function KnowledgeBaseResultGroups(props: {
   relevanceTrace?: RetrieveSourcesRelevanceTrace;
   stages: RetrieveSourcesStageTrace[];
   selectedPlannerSourceIds: ReadonlySet<string>;
+  sourceIngestStatuses: Readonly<Record<string, SourceIngestStatus>>;
   workingSetSourceIds: ReadonlySet<string>;
   onOpenDetail: (id: string) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
   onRunSourceGraphJob: (sourceId: string) => void;
+  onRetrySourceIngest: (sourceId: string) => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
 }) {
   const selectedIds = React.useMemo(
@@ -6003,11 +6012,13 @@ function KnowledgeBaseResultGroups(props: {
                     items={visibleItems}
                     loading={props.loading}
                     selectedPlannerSourceIds={props.selectedPlannerSourceIds}
+                    sourceIngestStatuses={props.sourceIngestStatuses}
                     workingSetSourceIds={props.workingSetSourceIds}
                     onOpenDetail={props.onOpenDetail}
                     onPinWorkingSetSource={props.onPinWorkingSetSource}
                     onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
                     onRunSourceGraphJob={props.onRunSourceGraphJob}
+                    onRetrySourceIngest={props.onRetrySourceIngest}
                     onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
                   />
                 ) : (
@@ -6026,11 +6037,13 @@ function KnowledgeBaseResultGroups(props: {
           items={props.items}
           loading={props.loading}
           selectedPlannerSourceIds={props.selectedPlannerSourceIds}
+          sourceIngestStatuses={props.sourceIngestStatuses}
           workingSetSourceIds={props.workingSetSourceIds}
           onOpenDetail={props.onOpenDetail}
           onPinWorkingSetSource={props.onPinWorkingSetSource}
           onRunChunkMetaTier2Job={props.onRunChunkMetaTier2Job}
           onRunSourceGraphJob={props.onRunSourceGraphJob}
+          onRetrySourceIngest={props.onRetrySourceIngest}
           onSelectSourceContextPlannerSource={props.onSelectSourceContextPlannerSource}
         />
       ) : null}
@@ -7787,17 +7800,75 @@ function WikiArtifactRelations({ detail }: { detail: WikiArtifactDetail }) {
   );
 }
 
+function SourceIngestStatusBadge({ status }: { status?: SourceIngestStatus }) {
+  if (status === undefined) {
+    return (
+      <Badge
+        aria-label="Source processing status: checking"
+        className="gap-1 border-border bg-surface-subtle px-1.5 py-0.5 text-[10px] text-muted-foreground"
+        title="Checking Source processing status"
+      >
+        <Loader2 className="animate-spin" size={11} />
+        Checking
+      </Badge>
+    );
+  }
+  if (status.state === "processing") {
+    const progress =
+      status.progressTotal > 0
+        ? ` ${Math.min(status.progressCurrent, status.progressTotal)}/${status.progressTotal}`
+        : "";
+    return (
+      <Badge
+        aria-label={`Source processing status: processing${progress}`}
+        className="gap-1 border-warning-border bg-warning-background px-1.5 py-0.5 text-[10px] text-warning-foreground"
+        title={`Processing Source${progress}`}
+      >
+        <Loader2 className="animate-spin" size={11} />
+        Processing{progress}
+      </Badge>
+    );
+  }
+  if (status.state === "failed") {
+    const stage = status.failedStage === undefined ? "" : ` at ${status.failedStage}`;
+    const reason = status.reason === undefined ? "" : `: ${status.reason}`;
+    const message = `Source processing failed${stage}${reason}`;
+    return (
+      <Badge
+        aria-label={message}
+        className="gap-1 border-destructive/40 bg-destructive/10 px-1.5 py-0.5 text-[10px] text-destructive"
+        title={message}
+      >
+        <ShieldAlert size={11} />
+        Failed
+      </Badge>
+    );
+  }
+  return (
+    <Badge
+      aria-label="Source processing status: available"
+      className="gap-1 border-success-border bg-success-background px-1.5 py-0.5 text-[10px] text-success-foreground"
+      title="Source processing complete"
+    >
+      <CheckCircle2 size={11} />
+      Available
+    </Badge>
+  );
+}
+
 function MemoryList({
   hasActiveCriteria,
   highlightedId,
   items,
   loading,
   selectedPlannerSourceIds,
+  sourceIngestStatuses,
   workingSetSourceIds,
   onOpenDetail,
   onPinWorkingSetSource,
   onRunChunkMetaTier2Job,
   onRunSourceGraphJob,
+  onRetrySourceIngest,
   onSelectSourceContextPlannerSource,
 }: {
   hasActiveCriteria: boolean;
@@ -7805,11 +7876,13 @@ function MemoryList({
   items: SearchMemoryItem[];
   loading: boolean;
   selectedPlannerSourceIds: ReadonlySet<string>;
+  sourceIngestStatuses: Readonly<Record<string, SourceIngestStatus>>;
   workingSetSourceIds: ReadonlySet<string>;
   onOpenDetail: (id: string) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
   onRunSourceGraphJob: (sourceId: string) => void;
+  onRetrySourceIngest: (sourceId: string) => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
 }) {
   if (loading && items.length === 0) {
@@ -7839,11 +7912,13 @@ function MemoryList({
           key={item.id}
           loading={loading}
           selectedPlannerSourceIds={selectedPlannerSourceIds}
+          sourceIngestStatus={sourceIngestStatuses[item.id]}
           workingSetSourceIds={workingSetSourceIds}
           onOpenDetail={onOpenDetail}
           onPinWorkingSetSource={onPinWorkingSetSource}
           onRunChunkMetaTier2Job={onRunChunkMetaTier2Job}
           onRunSourceGraphJob={onRunSourceGraphJob}
+          onRetrySourceIngest={onRetrySourceIngest}
           onSelectSourceContextPlannerSource={onSelectSourceContextPlannerSource}
         />
       ))}
@@ -7856,22 +7931,26 @@ function MemoryListItem({
   item,
   loading,
   selectedPlannerSourceIds,
+  sourceIngestStatus,
   workingSetSourceIds,
   onOpenDetail,
   onPinWorkingSetSource,
   onRunChunkMetaTier2Job,
   onRunSourceGraphJob,
+  onRetrySourceIngest,
   onSelectSourceContextPlannerSource,
 }: {
   highlightedId?: string;
   item: SearchMemoryItem;
   loading: boolean;
   selectedPlannerSourceIds: ReadonlySet<string>;
+  sourceIngestStatus?: SourceIngestStatus;
   workingSetSourceIds: ReadonlySet<string>;
   onOpenDetail: (id: string) => void;
   onPinWorkingSetSource: (sourceId: string, loadDepth?: WorkingSetLoadDepth) => void;
   onRunChunkMetaTier2Job: (sourceId: string, maxChunks?: number) => void;
   onRunSourceGraphJob: (sourceId: string) => void;
+  onRetrySourceIngest: (sourceId: string) => void;
   onSelectSourceContextPlannerSource: (sourceId: string) => void;
 }) {
   const isInWorkingSet = workingSetSourceIds.has(item.id);
@@ -7953,6 +8032,7 @@ function MemoryListItem({
             <Badge className="border-border bg-surface-subtle px-1.5 py-0.5 text-[10px] text-muted-foreground">
               {item.sourceKind}
             </Badge>
+            <SourceIngestStatusBadge status={sourceIngestStatus} />
             <span>{formatDate(item.capturedAt)}</span>
           </div>
           <p
@@ -8059,6 +8139,21 @@ function MemoryListItem({
             <Sparkles size={14} />
             Run Tier2 summaries
           </button>
+          {sourceIngestStatus?.state === "failed" ? (
+            <button
+              className="flex min-h-8 items-center gap-2 rounded-md px-2 text-left text-[12px] text-destructive outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:opacity-50"
+              disabled={loading}
+              onClick={() => {
+                closeMenuAndFocusTrigger();
+                onRetrySourceIngest(item.id);
+              }}
+              role="menuitem"
+              type="button"
+            >
+              <RefreshCw size={14} />
+              Retry processing
+            </button>
+          ) : null}
         </div>
       ) : null}
     </li>

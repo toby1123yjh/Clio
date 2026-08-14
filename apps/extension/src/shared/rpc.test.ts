@@ -16,6 +16,7 @@ import {
   CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
   CLIO_LOCAL_EMBEDDING_REQUEST,
   CLIO_OFFSCREEN_REQUEST,
+  CLIO_POST_CAPTURE_WAKE,
   CLIO_PROVIDER_CONFIG_REQUEST,
   CLIO_PROVIDER_REQUEST,
   CLIO_UI_REQUEST,
@@ -40,6 +41,7 @@ import {
   type RetrieveSourceItem,
   decodeEngineRequestFromChrome,
   decodeEngineResponseFromChrome,
+  decodePostCaptureJobResult,
   encodeEngineRequestForChrome,
   encodeEngineResponseForChrome,
   isAgentRunEventMessage,
@@ -58,6 +60,7 @@ import {
   isKnowledgeBaseClusterLabelRefinementResponseMessage,
   isLocalEmbeddingModelRequestMessage,
   isOffscreenRequestMessage,
+  isPostCaptureWakeMessage,
   isProviderConfigRequestMessage,
   isProviderRequestMessage,
   isUiRequestMessage,
@@ -72,9 +75,9 @@ import {
   isWorkerEmbeddingResponseMessage,
   isWorkerGraphExtractionRequestMessage,
   isWorkerGraphExtractionResponseMessage,
+  isWorkerRequestMessage,
   isWorkerSourceFineRankRequestMessage,
   isWorkerSourceFineRankResponseMessage,
-  isWorkerRequestMessage,
   isWorkerVisionAnalysisRequestMessage,
   isWorkerVisionAnalysisResponseMessage,
   unwrapEngineResponse,
@@ -85,6 +88,77 @@ describe("session engine RPC guards", () => {
     expect(isWikiCompileWakeMessage({ type: CLIO_WIKI_COMPILE_WAKE })).toBe(true);
     expect(isWikiCompileWakeMessage({ type: "clio:wiki-compile:other" })).toBe(false);
     expect(isWikiCompileWakeMessage({ type: CLIO_WIKI_COMPILE_WAKE, value: false })).toBe(true);
+  });
+
+  it("recognizes the fixed post-capture wake message", () => {
+    expect(isPostCaptureWakeMessage({ type: CLIO_POST_CAPTURE_WAKE })).toBe(true);
+    expect(isPostCaptureWakeMessage({ type: "clio:post-capture:other" })).toBe(false);
+    expect(isPostCaptureWakeMessage({ type: CLIO_POST_CAPTURE_WAKE, value: false })).toBe(true);
+  });
+
+  it("keeps Source ingest status public while scheduler controls stay Worker-only", () => {
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "getSourceIngestStatuses", sourceIds: ["source-1", "source-2"] },
+      }),
+    ).toBe(true);
+    expect(
+      isEngineRequestMessage({
+        type: CLIO_ENGINE_REQUEST,
+        request: { kind: "retrySourceIngest", sourceId: "source-1" },
+      }),
+    ).toBe(true);
+
+    const internalRequest = { kind: "runNextPostCaptureJob" } as const;
+    expect(isEngineRequestMessage({ type: CLIO_ENGINE_REQUEST, request: internalRequest })).toBe(
+      false,
+    );
+    expect(
+      isOffscreenRequestMessage({ type: CLIO_OFFSCREEN_REQUEST, request: internalRequest }),
+    ).toBe(false);
+    expect(
+      isWorkerRequestMessage({
+        type: "clio:worker:request",
+        requestId: "post-capture-request-1",
+        request: internalRequest,
+      }),
+    ).toBe(true);
+    expect(() => encodeEngineRequestForChrome(internalRequest)).toThrowError(
+      "Worker-only scheduler requests cannot cross the extension transport.",
+    );
+  });
+
+  it("decodes only complete versioned post-capture stage results", () => {
+    const stages = Object.fromEntries(
+      ["paper_metadata", "chunk_meta", "figure_vision", "embedding", "graph"].map((stage) => [
+        stage,
+        { status: stage === "embedding" ? "skipped" : "done", reason: "test" },
+      ]),
+    );
+    expect(
+      decodePostCaptureJobResult({
+        version: "post-capture-result-v1",
+        sourceId: "source-1",
+        stages,
+      }),
+    ).toMatchObject({ sourceId: "source-1", stages: { embedding: { status: "skipped" } } });
+    expect(
+      decodePostCaptureJobResult({
+        version: "post-capture-result-v1",
+        sourceId: "source-1",
+        stages: { ...stages, graph: { status: "unknown" } },
+      }),
+    ).toBeUndefined();
+    const incompleteStages = { ...stages };
+    Reflect.deleteProperty(incompleteStages, "graph");
+    expect(
+      decodePostCaptureJobResult({
+        version: "post-capture-result-v1",
+        sourceId: "source-1",
+        stages: incompleteStages,
+      }),
+    ).toBeUndefined();
   });
 
   it("separates public Wiki compile requests from Worker-only scheduler requests", () => {

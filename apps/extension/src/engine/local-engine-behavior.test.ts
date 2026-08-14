@@ -11,6 +11,7 @@ import type {
   EngineRequest,
   EngineResultFor,
   JobSummary,
+  PostCaptureStageResult,
   PublishWikiArtifactsPayload,
   RetrieveSourcesResult,
   SourceContextMapRunDetail,
@@ -65,11 +66,14 @@ describe("local engine behavior harness", () => {
     const storedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       queued.jobs[0]?.id ?? "",
     ]);
-    expect(JSON.parse(String(storedJob?.result_json ?? "{}"))).toMatchObject({
-      embedding: {
-        skipped: true,
-        reason: "embedding_model_unavailable",
-      },
+    const embeddingStage = postCaptureStage<{ reason?: string; skipped?: boolean }>(
+      JSON.parse(String(storedJob?.result_json ?? "{}")),
+      "embedding",
+    );
+    expect(embeddingStage).toMatchObject({
+      status: "skipped",
+      reason: "embedding_model_unavailable",
+      detail: { skipped: true, reason: "embedding_model_unavailable" },
     });
 
     const retrieved = await harness.request({
@@ -80,6 +84,286 @@ describe("local engine behavior harness", () => {
     expect(trackStatus(retrieved, "fts_chunks")).toBe("used");
     expect(trackStatus(retrieved, "vector_meta")).toBe("unavailable");
     expect(trackReason(retrieved, "vector_meta")).toBe("embedding_model_unavailable");
+  });
+
+  it("claims automatic post-capture jobs once and excludes manual jobs", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({ normalizedText: ragText("automatic ingest status", 12) }),
+    });
+    const sourceId = capture.memory.id;
+
+    const queued = await harness.request({
+      kind: "getSourceIngestStatuses",
+      sourceIds: [sourceId],
+    });
+    expect(queued.items).toMatchObject([
+      { sourceId, state: "processing", progressCurrent: 0, progressTotal: 5 },
+    ]);
+
+    const results = await Promise.all([
+      harness.request({ kind: "runNextPostCaptureJob" }),
+      harness.request({ kind: "runNextPostCaptureJob" }),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual(["idle", "ran"]);
+    const completed = await harness.request({
+      kind: "getSourceIngestStatuses",
+      sourceIds: [sourceId],
+    });
+    expect(completed.items[0]).toMatchObject({
+      sourceId,
+      state: "available",
+      progressCurrent: 5,
+      progressTotal: 5,
+    });
+
+    const finishedRow = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
+      completed.items[0]?.jobId ?? "",
+    ]);
+    const finishedResult = JSON.parse(String(finishedRow?.result_json ?? "{}"));
+    expect(postCaptureStage(finishedResult, "chunk_meta")?.status).toBe("done");
+    expect(postCaptureStage(finishedResult, "embedding")?.status).toBe("skipped");
+    expect(postCaptureStage(finishedResult, "graph")?.reason).toBe("explicit_build_required");
+
+    const manual = await harness.request({
+      kind: "enqueueSourceGraphJob",
+      payload: { sourceId, mode: "deterministic" },
+    });
+    expect(await harness.request({ kind: "runNextPostCaptureJob" })).toEqual({ status: "idle" });
+    expect(harness.count("jobs", "id = ? AND status = 'queued'", [manual.id])).toBe(1);
+  });
+
+  it("derives queued post-capture progress from unique valid stages", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({ normalizedText: ragText("queued stage progress", 12) }),
+    });
+    const sourceId = capture.memory.id;
+    const initial = await harness.request({
+      kind: "getSourceIngestStatuses",
+      sourceIds: [sourceId],
+    });
+    const initialJobId = initial.items[0]?.jobId ?? "";
+
+    harness.exec("UPDATE jobs SET status = 'failed', payload_json = ? WHERE id = ?", [
+      JSON.stringify({
+        sourceId,
+        stages: ["embedding", "invalid_stage", "embedding", "graph"],
+        trigger: "automatic_capture",
+      }),
+      initialJobId,
+    ]);
+    const deduplicated = await harness.request({ kind: "retrySourceIngest", sourceId });
+    expect(deduplicated).toMatchObject({ progressCurrent: 0, progressTotal: 2 });
+
+    harness.exec("UPDATE jobs SET status = 'failed', payload_json = ? WHERE id = ?", [
+      JSON.stringify({
+        sourceId,
+        stages: ["invalid_stage", null],
+        trigger: "automatic_capture",
+      }),
+      deduplicated.jobId ?? "",
+    ]);
+    const minimum = await harness.request({ kind: "retrySourceIngest", sourceId });
+    expect(minimum).toMatchObject({ progressCurrent: 0, progressTotal: 1 });
+  });
+
+  it("persists incremental stage state while automatic embedding is running", async () => {
+    let blockEmbedding = false;
+    let releaseEmbedding: (() => void) | undefined;
+    let embeddingStarted: (() => void) | undefined;
+    const embeddingGate = new Promise<void>((resolve) => {
+      releaseEmbedding = resolve;
+    });
+    const embeddingStartedSignal = new Promise<void>((resolve) => {
+      embeddingStarted = resolve;
+    });
+    const harness = createHarness({
+      embeddingProviderFactory: (model) =>
+        model.modelId === testEmbeddingModel.id
+          ? {
+              modelId: model.modelId,
+              provider: model.provider,
+              dimension: model.dimension,
+              async embedTexts(inputs) {
+                if (blockEmbedding) {
+                  embeddingStarted?.();
+                  await embeddingGate;
+                }
+                return inputs.map(testEmbeddingVector);
+              },
+            }
+          : null,
+    });
+    await activateTestEmbeddingModel(harness);
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({ normalizedText: ragText("incremental stage checkpoint", 24) }),
+    });
+    const queuedStatus = await harness.request({
+      kind: "getSourceIngestStatuses",
+      sourceIds: [capture.memory.id],
+    });
+    const jobId = queuedStatus.items[0]?.jobId ?? "";
+    blockEmbedding = true;
+
+    const runningJob = harness.request({ kind: "runNextPostCaptureJob" });
+    await embeddingStartedSignal;
+    const runningRow = harness.selectObject(
+      "SELECT progress_current, result_json FROM jobs WHERE id = ? LIMIT 1",
+      [jobId],
+    );
+    const runningResult = JSON.parse(String(runningRow?.result_json ?? "{}"));
+    expect(postCaptureStage(runningResult, "chunk_meta")?.status).toBe("done");
+    expect(postCaptureStage(runningResult, "embedding")?.status).toBe("running");
+    expect(postCaptureStage(runningResult, "graph")?.status).toBe("pending");
+    expect(Number(runningRow?.progress_current ?? 0)).toBeGreaterThan(0);
+
+    releaseEmbedding?.();
+    expect((await runningJob).status).toBe("ran");
+    const completed = await harness.request({
+      kind: "getSourceIngestStatuses",
+      sourceIds: [capture.memory.id],
+    });
+    expect(completed.items[0]?.state).toBe("available");
+  });
+
+  it("recovers stale automatic stages and retries the latest failed job", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({ normalizedText: ragText("stale ingest recovery", 12) }),
+    });
+    const sourceId = capture.memory.id;
+    const initial = await harness.request({
+      kind: "getSourceIngestStatuses",
+      sourceIds: [sourceId],
+    });
+    const originalJobId = initial.items[0]?.jobId ?? "";
+    const staleHeartbeat = "2026-08-14T00:00:00.000Z";
+    const recoveryNow = "2026-08-14T01:00:00.000Z";
+
+    harness.exec(
+      "UPDATE jobs SET status = 'running', attempts = 1, max_attempts = 3, heartbeat_at = ?, result_json = ? WHERE id = ?",
+      [
+        staleHeartbeat,
+        JSON.stringify(postCaptureResultFixture(sourceId, "embedding")),
+        originalJobId,
+      ],
+    );
+    expect(await harness.request({ kind: "recoverPostCaptureJobs", now: recoveryNow })).toEqual({
+      requeued: 1,
+      failed: 0,
+    });
+    const recoveredRow = harness.selectObject("SELECT status, result_json FROM jobs WHERE id = ?", [
+      originalJobId,
+    ]);
+    expect(recoveredRow?.status).toBe("queued");
+    expect(
+      postCaptureStage(JSON.parse(String(recoveredRow?.result_json ?? "{}")), "embedding")?.status,
+    ).toBe("pending");
+
+    const exhaustedResult = postCaptureResultFixture(sourceId, "embedding");
+    exhaustedResult.stages.paper_metadata = {
+      status: "done",
+      startedAt: "2026-08-14T00:00:00.000Z",
+      finishedAt: "2026-08-14T00:00:01.000Z",
+      detail: { sourceType: "paper" },
+    };
+    exhaustedResult.stages.figure_vision = {
+      status: "skipped",
+      reason: "figure_vision_analyzer_unavailable",
+      finishedAt: "2026-08-14T00:00:01.000Z",
+    };
+    harness.exec(
+      "UPDATE jobs SET status = 'running', attempts = max_attempts, heartbeat_at = ?, result_json = ? WHERE id = ?",
+      [staleHeartbeat, JSON.stringify(exhaustedResult), originalJobId],
+    );
+    expect(await harness.request({ kind: "recoverPostCaptureJobs", now: recoveryNow })).toEqual({
+      requeued: 0,
+      failed: 1,
+    });
+    const failed = await harness.request({
+      kind: "getSourceIngestStatuses",
+      sourceIds: [sourceId],
+    });
+    expect(failed.items[0]).toMatchObject({
+      state: "failed",
+      failedStage: "embedding",
+      reason: "Processing stopped before this stage completed.",
+    });
+
+    const retried = await harness.request({ kind: "retrySourceIngest", sourceId });
+    expect(retried).toMatchObject({
+      sourceId,
+      state: "processing",
+      progressCurrent: 2,
+      progressTotal: 5,
+    });
+    expect(retried.jobId).not.toBe(originalJobId);
+    const retryRow = harness.selectObject(
+      "SELECT progress_current, result_json FROM jobs WHERE id = ? LIMIT 1",
+      [retried.jobId ?? ""],
+    );
+    const retryResult = JSON.parse(String(retryRow?.result_json ?? "{}"));
+    expect(Number(retryRow?.progress_current ?? 0)).toBe(2);
+    expect(postCaptureStage(retryResult, "paper_metadata")).toEqual(
+      exhaustedResult.stages.paper_metadata,
+    );
+    expect(postCaptureStage(retryResult, "figure_vision")).toEqual(
+      exhaustedResult.stages.figure_vision,
+    );
+    expect(postCaptureStage(retryResult, "embedding")?.status).toBe("pending");
+    expect((await harness.request({ kind: "runNextPostCaptureJob" })).status).toBe("ran");
+    expect(
+      (await harness.request({ kind: "getSourceIngestStatuses", sourceIds: [sourceId] })).items[0]
+        ?.state,
+    ).toBe("available");
+  });
+
+  it("finalizes a stale automatic job when every requested stage was checkpointed", async () => {
+    const harness = createHarness();
+    const capture = await harness.request({
+      kind: "capturePage",
+      payload: pagePayload({ normalizedText: ragText("completed stale ingest", 12) }),
+    });
+    const sourceId = capture.memory.id;
+    const status = await harness.request({
+      kind: "getSourceIngestStatuses",
+      sourceIds: [sourceId],
+    });
+    const jobId = status.items[0]?.jobId ?? "";
+    const completedAt = "2026-08-14T00:00:01.000Z";
+    const completedResult = postCaptureResultFixture(sourceId, "embedding");
+    for (const stage of Object.keys(completedResult.stages)) {
+      completedResult.stages[stage] =
+        stage === "graph"
+          ? { status: "skipped", reason: "explicit_build_required", finishedAt: completedAt }
+          : { status: "done", finishedAt: completedAt };
+    }
+    harness.exec(
+      "UPDATE jobs SET status = 'running', attempts = max_attempts, heartbeat_at = ?, result_json = ? WHERE id = ?",
+      ["2026-08-14T00:00:00.000Z", JSON.stringify(completedResult), jobId],
+    );
+
+    expect(
+      await harness.request({
+        kind: "recoverPostCaptureJobs",
+        now: "2026-08-14T01:00:00.000Z",
+      }),
+    ).toEqual({ requeued: 0, failed: 0 });
+    expect(
+      (await harness.request({ kind: "getSourceIngestStatuses", sourceIds: [sourceId] })).items[0],
+    ).toMatchObject({
+      state: "available",
+      progressCurrent: 5,
+      progressTotal: 5,
+    });
+    expect(harness.selectObject("SELECT status FROM jobs WHERE id = ?", [jobId])?.status).toBe(
+      "done",
+    );
   });
 
   it("keeps title-only matches in metadata instead of multiplying them across chunks", async () => {
@@ -244,24 +528,22 @@ describe("local engine behavior harness", () => {
     const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       queued.jobs[0]?.id ?? "",
     ]);
-    const defaultJobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
-      chunkMeta?: {
-        chunkCount?: number;
-        selectedTier?: string;
-        tier?: string;
-        tier1Count?: number;
-        tier2DisabledCount?: number;
-        tier2Reason?: string;
-      };
-      graph?: { skipped?: boolean; reason?: string };
-    };
-    expect(defaultJobResult.chunkMeta?.tier).toBe("tier1");
-    expect(defaultJobResult.chunkMeta?.selectedTier).toBe("tier1");
-    expect(defaultJobResult.chunkMeta?.chunkCount ?? 0).toBeGreaterThan(0);
-    expect(defaultJobResult.chunkMeta?.tier1Count ?? 0).toBeGreaterThan(0);
-    expect(defaultJobResult.chunkMeta?.tier2DisabledCount ?? 0).toBeGreaterThan(0);
-    expect(defaultJobResult.chunkMeta?.tier2Reason).toBe("explicit_llm_chunk_meta_not_configured");
-    expect(defaultJobResult.graph).toMatchObject({
+    const defaultJobResult = JSON.parse(String(finishedJob?.result_json ?? "{}"));
+    const chunkMeta = postCaptureStageDetail<{
+      chunkCount?: number;
+      selectedTier?: string;
+      tier?: string;
+      tier1Count?: number;
+      tier2DisabledCount?: number;
+      tier2Reason?: string;
+    }>(defaultJobResult, "chunk_meta");
+    expect(chunkMeta?.tier).toBe("tier1");
+    expect(chunkMeta?.selectedTier).toBe("tier1");
+    expect(chunkMeta?.chunkCount ?? 0).toBeGreaterThan(0);
+    expect(chunkMeta?.tier1Count ?? 0).toBeGreaterThan(0);
+    expect(chunkMeta?.tier2DisabledCount ?? 0).toBeGreaterThan(0);
+    expect(chunkMeta?.tier2Reason).toBe("explicit_llm_chunk_meta_not_configured");
+    expect(postCaptureStageDetail(defaultJobResult, "graph")).toMatchObject({
       skipped: true,
       reason: "explicit_build_required",
     });
@@ -299,12 +581,14 @@ describe("local engine behavior harness", () => {
       "SELECT result_json FROM jobs WHERE id = ? LIMIT 1",
       [explicitGraphJobId],
     );
-    const explicitGraphJobResult = JSON.parse(String(finishedGraphJob?.result_json ?? "{}")) as {
-      graph?: { nodeCount?: number; edgeCount?: number; evidenceChunkCount?: number };
-    };
-    expect(explicitGraphJobResult.graph?.nodeCount ?? 0).toBeGreaterThan(1);
-    expect(explicitGraphJobResult.graph?.edgeCount ?? 0).toBeGreaterThan(0);
-    expect(explicitGraphJobResult.graph?.evidenceChunkCount ?? 0).toBeGreaterThan(0);
+    const explicitGraphJobResult = postCaptureStageDetail<{
+      nodeCount?: number;
+      edgeCount?: number;
+      evidenceChunkCount?: number;
+    }>(JSON.parse(String(finishedGraphJob?.result_json ?? "{}")), "graph");
+    expect(explicitGraphJobResult?.nodeCount ?? 0).toBeGreaterThan(1);
+    expect(explicitGraphJobResult?.edgeCount ?? 0).toBeGreaterThan(0);
+    expect(explicitGraphJobResult?.evidenceChunkCount ?? 0).toBeGreaterThan(0);
     expect(harness.count("graph_nodes")).toBeGreaterThan(1);
     expect(harness.count("graph_edges")).toBeGreaterThan(0);
 
@@ -529,15 +813,13 @@ describe("local engine behavior harness", () => {
     const jobRow = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       queued.id,
     ]);
-    const result = JSON.parse(String(jobRow?.result_json ?? "{}")) as {
-      graph?: {
-        requestedMode?: string;
-        appliedMode?: string;
-        llmEdgeCount?: number;
-        fallbackReason?: string;
-      };
-    };
-    expect(result.graph).toMatchObject({
+    const result = postCaptureStageDetail<{
+      requestedMode?: string;
+      appliedMode?: string;
+      llmEdgeCount?: number;
+      fallbackReason?: string;
+    }>(JSON.parse(String(jobRow?.result_json ?? "{}")), "graph");
+    expect(result).toMatchObject({
       requestedMode: "llm",
       appliedMode: "llm",
       llmEdgeCount: 1,
@@ -839,18 +1121,16 @@ describe("local engine behavior harness", () => {
     const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       queued.id,
     ]);
-    const jobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
-      chunkMeta?: {
-        selectedTier?: string;
-        tier2Enabled?: boolean;
-        tier2UnavailableCount?: number;
-        tier2Reason?: string;
-      };
-    };
-    expect(jobResult.chunkMeta?.selectedTier).toBe("tier1");
-    expect(jobResult.chunkMeta?.tier2Enabled).toBe(true);
-    expect(jobResult.chunkMeta?.tier2UnavailableCount ?? 0).toBeGreaterThan(0);
-    expect(jobResult.chunkMeta?.tier2Reason).toBe("chunk_meta_summarizer_unavailable");
+    const jobResult = postCaptureStageDetail<{
+      selectedTier?: string;
+      tier2Enabled?: boolean;
+      tier2UnavailableCount?: number;
+      tier2Reason?: string;
+    }>(JSON.parse(String(finishedJob?.result_json ?? "{}")), "chunk_meta");
+    expect(jobResult?.selectedTier).toBe("tier1");
+    expect(jobResult?.tier2Enabled).toBe(true);
+    expect(jobResult?.tier2UnavailableCount ?? 0).toBeGreaterThan(0);
+    expect(jobResult?.tier2Reason).toBe("chunk_meta_summarizer_unavailable");
 
     const chunk = harness.selectObject(
       "SELECT meta_head_json FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
@@ -943,16 +1223,14 @@ describe("local engine behavior harness", () => {
     const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       queued.jobs[0]?.id ?? "",
     ]);
-    const jobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
-      chunkMeta?: {
-        selectedTier?: string;
-        tier2SummarizedCount?: number;
-        tier2ErrorCount?: number;
-      };
-    };
-    expect(jobResult.chunkMeta?.selectedTier).toBe("tier2");
-    expect(jobResult.chunkMeta?.tier2SummarizedCount ?? 0).toBeGreaterThan(0);
-    expect(jobResult.chunkMeta?.tier2ErrorCount ?? -1).toBe(0);
+    const jobResult = postCaptureStageDetail<{
+      selectedTier?: string;
+      tier2SummarizedCount?: number;
+      tier2ErrorCount?: number;
+    }>(JSON.parse(String(finishedJob?.result_json ?? "{}")), "chunk_meta");
+    expect(jobResult?.selectedTier).toBe("tier2");
+    expect(jobResult?.tier2SummarizedCount ?? 0).toBeGreaterThan(0);
+    expect(jobResult?.tier2ErrorCount ?? -1).toBe(0);
 
     const chunk = harness.selectObject(
       "SELECT id, text, hash, meta_head_json FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
@@ -1054,16 +1332,14 @@ describe("local engine behavior harness", () => {
     const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       queued.jobs[0]?.id ?? "",
     ]);
-    const jobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
-      chunkMeta?: {
-        selectedTier?: string;
-        tier2ErrorCount?: number;
-        tier2Reason?: string;
-      };
-    };
-    expect(jobResult.chunkMeta?.selectedTier).toBe("tier1");
-    expect(jobResult.chunkMeta?.tier2ErrorCount ?? 0).toBeGreaterThan(0);
-    expect(jobResult.chunkMeta?.tier2Reason).toBe("chunk_meta_summary_error");
+    const jobResult = postCaptureStageDetail<{
+      selectedTier?: string;
+      tier2ErrorCount?: number;
+      tier2Reason?: string;
+    }>(JSON.parse(String(finishedJob?.result_json ?? "{}")), "chunk_meta");
+    expect(jobResult?.selectedTier).toBe("tier1");
+    expect(jobResult?.tier2ErrorCount ?? 0).toBeGreaterThan(0);
+    expect(jobResult?.tier2Reason).toBe("chunk_meta_summary_error");
 
     const chunk = harness.selectObject(
       "SELECT meta_head_json FROM source_chunks WHERE source_id = ? ORDER BY ord ASC LIMIT 1",
@@ -2626,18 +2902,16 @@ describe("local engine behavior harness", () => {
     const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       queued.jobs[0]?.id ?? "",
     ]);
-    const jobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
-      chunkMeta?: {
-        selectedTier?: string;
-        tier?: string;
-        chunkCount?: number;
-        tier2Reason?: string;
-      };
-    };
-    expect(jobResult.chunkMeta?.tier).toBe("tier1");
-    expect(jobResult.chunkMeta?.selectedTier).toBe("tier1");
-    expect(jobResult.chunkMeta?.tier2Reason).toBe("explicit_llm_chunk_meta_not_configured");
-    expect(jobResult.chunkMeta?.chunkCount ?? 0).toBeGreaterThan(0);
+    const jobResult = postCaptureStageDetail<{
+      selectedTier?: string;
+      tier?: string;
+      chunkCount?: number;
+      tier2Reason?: string;
+    }>(JSON.parse(String(finishedJob?.result_json ?? "{}")), "chunk_meta");
+    expect(jobResult?.tier).toBe("tier1");
+    expect(jobResult?.selectedTier).toBe("tier1");
+    expect(jobResult?.tier2Reason).toBe("explicit_llm_chunk_meta_not_configured");
+    expect(jobResult?.chunkCount ?? 0).toBeGreaterThan(0);
 
     const repairedChunk = harness.selectObject(
       "SELECT text, hash, meta_head_json FROM source_chunks WHERE id = ? LIMIT 1",
@@ -4115,10 +4389,12 @@ describe("local engine behavior harness", () => {
     const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       queued.jobs[0]?.id ?? "",
     ]);
-    const jobResult = JSON.parse(String(finishedJob?.result_json ?? "{}")) as {
-      paperMetadata?: { version?: number; remoteStatus?: string; referenceCount?: number };
-    };
-    expect(jobResult.paperMetadata).toMatchObject({
+    const jobResult = postCaptureStageDetail<{
+      version?: number;
+      remoteStatus?: string;
+      referenceCount?: number;
+    }>(JSON.parse(String(finishedJob?.result_json ?? "{}")), "paper_metadata");
+    expect(jobResult).toMatchObject({
       version: 1,
       remoteStatus: "disabled",
       referenceCount: 1,
@@ -4905,14 +5181,14 @@ describe("local engine behavior harness", () => {
     const finishedJob = harness.selectObject("SELECT result_json FROM jobs WHERE id = ? LIMIT 1", [
       job.id,
     ]);
-    expect(JSON.parse(String(finishedJob?.result_json ?? "{}"))).toMatchObject({
-      figureVision: {
-        version: "clio-pdf-figure-vision-stage-v1",
-        analyzed: 1,
-        unavailable: 0,
-        error: 0,
-        resultCount: 1,
-      },
+    expect(
+      postCaptureStageDetail(JSON.parse(String(finishedJob?.result_json ?? "{}")), "figure_vision"),
+    ).toMatchObject({
+      version: "clio-pdf-figure-vision-stage-v1",
+      analyzed: 1,
+      unavailable: 0,
+      error: 0,
+      resultCount: 1,
     });
   });
 
@@ -5930,6 +6206,49 @@ async function waitForJob(
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error(`Timed out waiting for job ${jobId}.`);
+}
+
+function postCaptureStage<T>(
+  value: unknown,
+  stage: string,
+): { status?: string; reason?: string; detail?: T } | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const stages = (value as { stages?: unknown }).stages;
+  if (typeof stages !== "object" || stages === null) return undefined;
+  const result = (stages as Record<string, unknown>)[stage];
+  return typeof result === "object" && result !== null
+    ? (result as { status?: string; reason?: string; detail?: T })
+    : undefined;
+}
+
+function postCaptureStageDetail<T = Record<string, unknown>>(
+  value: unknown,
+  stage: string,
+): T | undefined {
+  return postCaptureStage<T>(value, stage)?.detail;
+}
+
+function postCaptureResultFixture(
+  sourceId: string,
+  runningStage: string,
+): {
+  version: "post-capture-result-v1";
+  sourceId: string;
+  stages: Record<string, PostCaptureStageResult>;
+} {
+  const stageNames = ["paper_metadata", "chunk_meta", "figure_vision", "embedding", "graph"];
+  return {
+    version: "post-capture-result-v1",
+    sourceId,
+    stages: Object.fromEntries(
+      stageNames.map((stage) => [
+        stage,
+        stage === runningStage
+          ? { status: "running", startedAt: "2026-08-14T00:00:00.000Z" }
+          : { status: "pending" },
+      ]),
+    ),
+  };
 }
 
 function unitVector64(index: number) {

@@ -1015,4 +1015,61 @@ describe("content local RAG flow", () => {
     expect(slashSection).toContain("research: handleResearchCommand");
     expect(startRunSection).not.toContain('kind: "buildSourceContextPack"');
   });
+
+  it("polls only lightweight Source ingest status while visible work is processing", () => {
+    const pollSection = contentSource.slice(
+      contentSource.indexOf(
+        "const sourceIds = Array.from(new Set(items.map((item) => item.id))).slice(0, 100);",
+      ),
+      contentSource.indexOf(
+        'if (activeEmbeddingModel !== null || knowledgeBaseSearchMode !== "semantic")',
+      ),
+    );
+    const railPropsSection = contentSource.slice(
+      contentSource.indexOf("<RailShell"),
+      contentSource.indexOf("</RailShell>"),
+    );
+
+    expect(pollSection).toContain('kind: "getSourceIngestStatuses"');
+    expect(pollSection).toContain('status.state === "processing"');
+    expect(pollSection).toContain("sourceIngestStatusPollMs");
+    expect(pollSection).toContain("window.clearTimeout(timer)");
+    expect(pollSection).toContain("sourceIngestPollRevision");
+    expect(pollSection).not.toContain("loadLibrary");
+    expect(pollSection).not.toContain('kind: "searchKnowledgeBase"');
+    expect(pollSection).not.toContain('kind: "retrieveSources"');
+    expect(pollSection).not.toContain('kind: "getMemoryEvidenceWindows"');
+    expect(railPropsSection).toContain("sourceIngestStatuses={sourceIngestStatuses}");
+    expect(railPropsSection).toContain("onRetrySourceIngest=");
+
+    const retrySection = contentSource.slice(
+      contentSource.indexOf("const retrySourceIngest = React.useCallback"),
+      contentSource.indexOf("const loadHealth = React.useCallback"),
+    );
+    expect(retrySection).toContain("sourceIngestPollRevisionRef.current += 1");
+    expect(retrySection).toContain(
+      "setSourceIngestPollRevision(sourceIngestPollRevisionRef.current)",
+    );
+  });
+
+  it("shows bounded Source states and retries failures from the existing action menu", () => {
+    const badgeSection = railShellSource.slice(
+      railShellSource.indexOf("function SourceIngestStatusBadge"),
+      railShellSource.indexOf("function MemoryList("),
+    );
+    const memoryItemSection = railShellSource.slice(
+      railShellSource.indexOf("function MemoryListItem"),
+      railShellSource.indexOf("function MemoryDetailPanel"),
+    );
+
+    expect(badgeSection).toContain("Processing{progress}");
+    expect(badgeSection).toContain("Available");
+    expect(badgeSection).toContain("Failed");
+    expect(badgeSection).toContain("status.reason");
+    expect(badgeSection).toContain("aria-label={message}");
+    expect(memoryItemSection).toContain('sourceIngestStatus?.state === "failed"');
+    expect(memoryItemSection).toContain("onRetrySourceIngest(item.id)");
+    expect(memoryItemSection).toContain("Retry processing");
+    expect(memoryItemSection).not.toContain('kind: "retrySourceIngest"');
+  });
 });

@@ -64,6 +64,7 @@ import {
   CLIO_KB_CLUSTER_LABEL_REFINEMENT_REQUEST,
   CLIO_LOCAL_EMBEDDING_REQUEST,
   CLIO_OFFSCREEN_REQUEST,
+  CLIO_POST_CAPTURE_WAKE,
   CLIO_WEB_SEARCH_RUN_REQUEST,
   CLIO_WEB_SEARCH_STREAM_EVENT,
   CLIO_WEB_SEARCH_STREAM_PORT,
@@ -104,6 +105,8 @@ const menuIds = {
 
 const WIKI_COMPILE_ALARM = "clio-wiki-compile-wake";
 const WIKI_COMPILE_ALARM_PERIOD_MINUTES = 1;
+const POST_CAPTURE_ALARM = "clio-post-capture-wake";
+const POST_CAPTURE_ALARM_PERIOD_MINUTES = 1;
 
 type RuntimeWithContexts = typeof chrome.runtime & {
   ContextType?: {
@@ -133,9 +136,11 @@ export default defineBackground(() => {
   console.info("clio:bg service worker loaded");
   setupSessionStorageAccess();
   setupWikiCompileAlarm();
+  setupPostCaptureAlarm();
   chrome.runtime.onInstalled.addListener(() => {
     setupContextMenus();
     setupWikiCompileAlarm();
+    setupPostCaptureAlarm();
   });
   setupContextMenus();
 
@@ -263,8 +268,11 @@ export default defineBackground(() => {
   });
 
   chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name !== WIKI_COMPILE_ALARM) return;
-    void wakeWikiCompileRunner();
+    if (alarm.name === WIKI_COMPILE_ALARM) {
+      void wakeWikiCompileRunner();
+      return;
+    }
+    if (alarm.name === POST_CAPTURE_ALARM) void wakePostCaptureRunner();
   });
 });
 
@@ -615,7 +623,10 @@ async function routeEngineRequest(request: EngineTransportRequest) {
     request,
   })) as EngineResponse;
   const sourceId = wikiAutoCompileSourceId(request, response);
-  if (sourceId !== undefined) void enqueueWikiForNewCapture(sourceId);
+  if (sourceId !== undefined) {
+    void wakePostCaptureRunner();
+    void enqueueWikiForNewCapture(sourceId);
+  }
   return response;
 }
 
@@ -971,6 +982,26 @@ function setupWikiCompileAlarm() {
         engineErrorFromUnknown(error).message,
       );
     });
+}
+
+function setupPostCaptureAlarm() {
+  void chrome.alarms
+    .create(POST_CAPTURE_ALARM, { periodInMinutes: POST_CAPTURE_ALARM_PERIOD_MINUTES })
+    .catch((error) => {
+      console.debug(
+        "clio:bg post-capture alarm setup failed",
+        engineErrorFromUnknown(error).message,
+      );
+    });
+}
+
+async function wakePostCaptureRunner() {
+  try {
+    await ensureOffscreen();
+    await chrome.runtime.sendMessage({ type: CLIO_POST_CAPTURE_WAKE });
+  } catch (error) {
+    console.debug("clio:bg post-capture wake failed", engineErrorFromUnknown(error).message);
+  }
 }
 
 async function wakeWikiCompileRunner() {

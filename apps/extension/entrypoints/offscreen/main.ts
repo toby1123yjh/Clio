@@ -6,6 +6,7 @@ import { ProviderBackedGraphExtractor } from "@/src/agent-runtime/graph-extracto
 import { ClioImageGenerationRuntime } from "@/src/agent-runtime/image-generation-runtime";
 import { ProviderBackedKnowledgeBaseClusterLabelRefiner } from "@/src/agent-runtime/knowledge-base-cluster-label-refiner";
 import { PiAgentCoreRunAdapter } from "@/src/agent-runtime/pi-agent-core-run-adapter";
+import { PostCaptureRunner } from "@/src/agent-runtime/post-capture-runner";
 import { type ProviderId, defaultActiveProvider } from "@/src/agent-runtime/provider-settings";
 import { ProviderBackedSemanticCitationJudge } from "@/src/agent-runtime/semantic-citation-judge";
 import { ProviderBackedSourceFineRanker } from "@/src/agent-runtime/source-fine-ranker";
@@ -24,9 +25,9 @@ import {
   CLIO_WORKER_CHUNK_META_SUMMARY_RESPONSE,
   CLIO_WORKER_EMBEDDING_RESPONSE,
   CLIO_WORKER_GRAPH_EXTRACTION_RESPONSE,
+  CLIO_WORKER_REQUEST,
   CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_RESPONSE,
   CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE,
-  CLIO_WORKER_REQUEST,
   CLIO_WORKER_VISION_ANALYSIS_RESPONSE,
   type ClioImageGenerationEvent,
   type ClioWebSearchEvent,
@@ -44,18 +45,19 @@ import {
   isKnowledgeBaseClusterLabelRefinementRequestMessage,
   isLocalEmbeddingModelRequestMessage,
   isOffscreenRequestMessage,
+  isPostCaptureWakeMessage,
   isWebSearchRunRequestMessage,
   isWikiCompileWakeMessage,
   isWorkerChunkMetaSummaryRequestMessage,
   isWorkerEmbeddingRequestMessage,
   isWorkerGraphExtractionRequestMessage,
+  isWorkerResponseMessage,
   isWorkerSourceFineRankEnabledRequestMessage,
   isWorkerSourceFineRankRequestMessage,
-  isWorkerResponseMessage,
   isWorkerVisionAnalysisRequestMessage,
   unwrapEngineResponse,
 } from "@/src/shared/rpc";
-import { type SourceFineRankRequest } from "@/src/shared/source-fine-rank";
+import type { SourceFineRankRequest } from "@/src/shared/source-fine-rank";
 
 console.info("clio:offscreen local engine host loaded");
 
@@ -154,6 +156,15 @@ const wikiCompileRunner = new WikiCompileRunner({
   loadSettings: () => requestProvider({ kind: "getKnowledgeBaseAiSettings" }),
   loadProviderConfig: () => requestProviderConfig(),
   ensureProviderPermission: (provider, config) => hasProviderHostPermission(provider, config),
+});
+const postCaptureRunner = new PostCaptureRunner({
+  requestEngine: requestEngineValue,
+});
+void postCaptureRunner.wake().catch((error) => {
+  console.debug(
+    "clio:offscreen post-capture recovery failed",
+    engineErrorFromUnknown(error).message,
+  );
 });
 void wikiCompileRunner.wake().catch((error) => {
   console.debug(
@@ -305,6 +316,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  if (isPostCaptureWakeMessage(message)) {
+    void postCaptureRunner.wake().catch((error) => {
+      console.debug(
+        "clio:offscreen post-capture wake failed",
+        engineErrorFromUnknown(error).message,
+      );
+    });
+    sendResponse({ ok: true, value: { accepted: true } });
+    return false;
+  }
+
   if (!isOffscreenRequestMessage(message)) return false;
 
   let request: EngineRequest;
@@ -349,6 +371,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({
           ok: false,
           error: engineErrorFromUnknown(error, "WIKI_COMPILE_RESUME_ERROR"),
+        }),
+      );
+    return true;
+  }
+  if (request.kind === "retrySourceIngest") {
+    requestEngine(request)
+      .then((response) => {
+        sendResponse(encodeEngineResponseForChrome(request, response));
+        if (response.ok) void postCaptureRunner.wake().catch(() => undefined);
+      })
+      .catch((error) =>
+        sendResponse({
+          ok: false,
+          error: engineErrorFromUnknown(error, "SOURCE_INGEST_RETRY_ERROR"),
         }),
       );
     return true;
@@ -660,7 +696,10 @@ async function handleWorkerSourceFineRankEnabledRequest(
     engineWorker.postMessage({
       type: CLIO_WORKER_SOURCE_FINE_RANK_ENABLED_RESPONSE,
       requestId: message.requestId,
-      response: { ok: false, error: engineErrorFromUnknown(error, "SOURCE_FINE_RANK_SETTINGS_ERROR") },
+      response: {
+        ok: false,
+        error: engineErrorFromUnknown(error, "SOURCE_FINE_RANK_SETTINGS_ERROR"),
+      },
     });
   }
 }
@@ -680,7 +719,10 @@ async function handleWorkerSourceFineRankRequest(
     engineWorker.postMessage({
       type: CLIO_WORKER_SOURCE_FINE_RANK_RESPONSE,
       requestId: message.requestId,
-      response: { ok: false, error: engineErrorFromUnknown(error, "SOURCE_FINE_RANK_PROVIDER_ERROR") },
+      response: {
+        ok: false,
+        error: engineErrorFromUnknown(error, "SOURCE_FINE_RANK_PROVIDER_ERROR"),
+      },
     });
   }
 }
