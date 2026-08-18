@@ -23,7 +23,7 @@ apps/extension/
     suggestions/         reply suggestion engine
     ui/                  shared UI components
     shared/              cross-entry types & utilities
-  poc/                   proof-of-concept harnesses
+  ../../poc/               root-level smoke and acceptance harnesses
 ```
 
 ## Conventions

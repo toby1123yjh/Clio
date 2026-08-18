@@ -64,15 +64,21 @@ describe("source fine rank contract", () => {
   });
 
   it("bounds request fields and rejects an oversized candidate batch", () => {
-    const baseCandidate = request().candidates[0]!;
-    expect(() => boundSourceFineRankRequest({
-      ...request(),
-      query: ` ${"q".repeat(SOURCE_FINE_RANK_LIMITS.queryChars + 10)} `,
-      candidates: Array.from({ length: SOURCE_FINE_RANK_LIMITS.maxCandidates + 4 }, (_, index) => ({
-        ...baseCandidate,
-        source: { ...baseCandidate.source, id: `source-${index}` },
-      })),
-    })).toThrowError(SourceFineRankValidationError);
+    const baseCandidate = request().candidates[0];
+    if (baseCandidate === undefined) throw new Error("test fixture must include a candidate");
+    expect(() =>
+      boundSourceFineRankRequest({
+        ...request(),
+        query: ` ${"q".repeat(SOURCE_FINE_RANK_LIMITS.queryChars + 10)} `,
+        candidates: Array.from(
+          { length: SOURCE_FINE_RANK_LIMITS.maxCandidates + 4 },
+          (_, index) => ({
+            ...baseCandidate,
+            source: { ...baseCandidate.source, id: `source-${index}` },
+          }),
+        ),
+      }),
+    ).toThrowError(SourceFineRankValidationError);
     const bounded = boundSourceFineRankRequest({
       ...request(),
       query: ` ${"q".repeat(SOURCE_FINE_RANK_LIMITS.queryChars + 10)} `,

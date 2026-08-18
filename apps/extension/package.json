@@ -10,15 +10,7 @@
     "zip": "wxt zip",
     "typecheck": "wxt prepare && tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "poc": "echo 'POC scripts live under poc/ — run by id, e.g. pnpm poc:01-sqlite-wasm'",
-    "poc:01-sqlite-wasm": "echo 'TODO: wire POC-01 runner'",
-    "poc:02-opfs": "echo 'TODO: wire POC-02 runner'",
-    "poc:03-fts5": "echo 'TODO: wire POC-03 runner'",
-    "poc:04-offscreen-lifecycle": "echo 'TODO: wire POC-04 runner'",
-    "poc:05-worker-cpu": "echo 'TODO: wire POC-05 runner'",
-    "poc:06-csp": "echo 'TODO: wire POC-06 runner'",
-    "poc:10-idb-fallback": "echo 'TODO: wire POC-10 runner'"
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.75.4",

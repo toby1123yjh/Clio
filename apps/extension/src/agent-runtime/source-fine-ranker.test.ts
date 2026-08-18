@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { type AssistantMessage, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
+import { type AssistantMessage, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { describe, expect, it } from "vitest";
 import { ProviderBackedSourceFineRanker, buildSourceFineRankPrompt } from "./source-fine-ranker";
 
 const config = {
@@ -116,6 +116,8 @@ describe("ProviderBackedSourceFineRanker", () => {
     expect(result.model).toBe("main-model");
     expect(prompt).toContain("source-a");
     expect(prompt).not.toContain("secret");
-    expect(buildSourceFineRankPrompt(input())).toContain("Judge every source candidate exactly once");
+    expect(buildSourceFineRankPrompt(input())).toContain(
+      "Judge every source candidate exactly once",
+    );
   });
 });

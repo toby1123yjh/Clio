@@ -1,5 +1,17 @@
+import {
+  SOURCE_FINE_RANK_LIMITS,
+  SOURCE_FINE_RANK_PROMPT_VERSION,
+  type SourceFineRankProvider,
+  type SourceFineRankProviderResult,
+  type SourceFineRankRequest,
+  SourceFineRankValidationError,
+  assertSourceFineRankPromptBudget,
+  boundSourceFineRankRequest,
+  validateSourceFineRankProviderResult,
+} from "@/src/shared/source-fine-rank";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { KnowledgeBaseAiSettings } from "./knowledge-base-ai-settings";
 import { defaultClioProviderStreamFn } from "./pi-agent-core-run-adapter";
 import { modelForProvider, providerLabel } from "./provider-runtime";
 import {
@@ -7,18 +19,6 @@ import {
   type StoredProviderConfig,
   defaultActiveProvider,
 } from "./provider-settings";
-import type { KnowledgeBaseAiSettings } from "./knowledge-base-ai-settings";
-import {
-  SOURCE_FINE_RANK_LIMITS,
-  SOURCE_FINE_RANK_PROMPT_VERSION,
-  SourceFineRankValidationError,
-  assertSourceFineRankPromptBudget,
-  boundSourceFineRankRequest,
-  type SourceFineRankProvider,
-  type SourceFineRankProviderResult,
-  type SourceFineRankRequest,
-  validateSourceFineRankProviderResult,
-} from "@/src/shared/source-fine-rank";
 
 export interface ProviderBackedSourceFineRankerOptions {
   loadSettings: () => Promise<KnowledgeBaseAiSettings>;
@@ -53,7 +53,9 @@ export class ProviderBackedSourceFineRanker implements SourceFineRankProvider {
   }
 
   async isEnabled() {
-    return (await this.loadSettings().catch(() => ({ wiki: { enabled: false } }))).wiki.enabled === true;
+    return (
+      (await this.loadSettings().catch(() => ({ wiki: { enabled: false } }))).wiki.enabled === true
+    );
   }
 
   async rank(
@@ -71,13 +73,20 @@ export class ProviderBackedSourceFineRanker implements SourceFineRankProvider {
       throw new SourceFineRankValidationError("timeout", "Fine Rank was aborted.");
     }
     const config = await this.loadConfig().catch(() => undefined);
-    const provider = config?.provider ?? (await this.loadProviderId().catch(() => defaultActiveProvider));
+    const provider =
+      config?.provider ?? (await this.loadProviderId().catch(() => defaultActiveProvider));
     const label = providerLabel(provider);
     if (config === undefined) {
-      throw new SourceFineRankValidationError("model_not_configured", `${label} provider is not configured.`);
+      throw new SourceFineRankValidationError(
+        "model_not_configured",
+        `${label} provider is not configured.`,
+      );
     }
     if (!(await this.ensureProviderPermission(provider, config).catch(() => false))) {
-      throw new SourceFineRankValidationError("permission_denied", `${label} provider permission is unavailable.`);
+      throw new SourceFineRankValidationError(
+        "permission_denied",
+        `${label} provider permission is unavailable.`,
+      );
     }
 
     const prompt = buildSourceFineRankPrompt(bounded);
@@ -104,7 +113,10 @@ export class ProviderBackedSourceFineRanker implements SourceFineRankProvider {
         if (event.type === "text_delta") {
           streamed += event.delta;
           if (streamed.length > SOURCE_FINE_RANK_LIMITS.maxOutputTokens * 8) {
-            throw new SourceFineRankValidationError("malformed_output", "Fine Rank output exceeded its bound.");
+            throw new SourceFineRankValidationError(
+              "malformed_output",
+              "Fine Rank output exceeded its bound.",
+            );
           }
         }
         if (event.type === "done") finalText = assistantText(event.message) || streamed;
@@ -149,7 +161,7 @@ export function buildSourceFineRankPrompt(input: SourceFineRankRequest) {
     "Judge every source candidate exactly once.",
     `Strength: ${bounded.strength}. Allowed relevance: high, medium, low, irrelevant.`,
     "Keep/drop must reflect the query and supplied evidence. Copy evidenceRefs exactly.",
-    "Return JSON only with {\"judgments\":[{\"sourceId\":\"id\",\"decision\":\"keep|drop\",\"relevance\":\"high|medium|low|irrelevant\",\"reason\":\"bounded\",\"confidence\":0.0,\"evidenceRefs\":[\"id\"]}]}.",
+    'Return JSON only with {"judgments":[{"sourceId":"id","decision":"keep|drop","relevance":"high|medium|low|irrelevant","reason":"bounded","confidence":0.0,"evidenceRefs":["id"]}]}.',
     JSON.stringify(bounded),
   ].join("\n");
   return assertSourceFineRankPromptBudget(bounded, prompt);
@@ -158,12 +170,18 @@ export function buildSourceFineRankPrompt(input: SourceFineRankRequest) {
 function parseJsonObject(text: string): unknown {
   const candidate = extractJsonObject(text.trim());
   if (candidate.length === 0) {
-    throw new SourceFineRankValidationError("malformed_output", "Fine Rank provider returned no JSON.");
+    throw new SourceFineRankValidationError(
+      "malformed_output",
+      "Fine Rank provider returned no JSON.",
+    );
   }
   try {
     return JSON.parse(candidate);
   } catch {
-    throw new SourceFineRankValidationError("malformed_output", "Fine Rank provider returned malformed JSON.");
+    throw new SourceFineRankValidationError(
+      "malformed_output",
+      "Fine Rank provider returned malformed JSON.",
+    );
   }
 }
 

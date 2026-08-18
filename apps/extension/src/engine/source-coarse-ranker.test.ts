@@ -337,7 +337,11 @@ describe("source document coarse ranker", () => {
         },
       },
     });
-    expect(result).toMatchObject({ items: [{ id: "source-a" }], status: "failed", reason: "wiki_corrupt" });
+    expect(result).toMatchObject({
+      items: [{ id: "source-a" }],
+      status: "failed",
+      reason: "wiki_corrupt",
+    });
   });
 
   it("uses a score cliff instead of a fixed top-N count for high relevance", () => {

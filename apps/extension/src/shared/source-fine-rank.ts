@@ -107,7 +107,10 @@ export interface SourceFineRankProviderResult {
 
 export interface SourceFineRankProvider {
   isEnabled(): Promise<boolean>;
-  rank(input: SourceFineRankRequest, options?: { signal?: AbortSignal }): Promise<SourceFineRankProviderResult>;
+  rank(
+    input: SourceFineRankRequest,
+    options?: { signal?: AbortSignal },
+  ): Promise<SourceFineRankProviderResult>;
 }
 
 export interface SourceFineRankTrace {
@@ -154,10 +157,17 @@ export function boundSourceFineRankRequest(input: SourceFineRankRequest): Source
       sourceType: boundString(candidate.source.sourceType, SOURCE_FINE_RANK_LIMITS.sourceTypeChars),
       ...(candidate.source.sourceUrl === undefined
         ? {}
-        : { sourceUrl: boundString(candidate.source.sourceUrl, SOURCE_FINE_RANK_LIMITS.sourceUrlChars) }),
+        : {
+            sourceUrl: boundString(
+              candidate.source.sourceUrl,
+              SOURCE_FINE_RANK_LIMITS.sourceUrlChars,
+            ),
+          }),
       ...(candidate.source.abstract === undefined
         ? {}
-        : { abstract: boundString(candidate.source.abstract, SOURCE_FINE_RANK_LIMITS.abstractChars) }),
+        : {
+            abstract: boundString(candidate.source.abstract, SOURCE_FINE_RANK_LIMITS.abstractChars),
+          }),
       keywords: uniqueBoundedStrings(
         candidate.source.keywords,
         SOURCE_FINE_RANK_LIMITS.maxKeywords,
@@ -203,18 +213,27 @@ export function validateSourceFineRankProviderResult(
   result: unknown,
 ): SourceFineRankProviderResult {
   if (!isRecord(result) || !Array.isArray(result.judgments)) {
-    throw new SourceFineRankValidationError("malformed_output", "Fine Rank output must contain judgments.");
+    throw new SourceFineRankValidationError(
+      "malformed_output",
+      "Fine Rank output must contain judgments.",
+    );
   }
   const expected = new Map(request.candidates.map((candidate) => [candidate.source.id, candidate]));
   const seen = new Set<string>();
   const judgments: SourceFineRankJudgment[] = [];
   for (const value of result.judgments) {
     if (!isRecord(value) || typeof value.sourceId !== "string") {
-      throw new SourceFineRankValidationError("malformed_output", "Fine Rank judgment is malformed.");
+      throw new SourceFineRankValidationError(
+        "malformed_output",
+        "Fine Rank judgment is malformed.",
+      );
     }
     const sourceId = value.sourceId;
     if (!expected.has(sourceId) || seen.has(sourceId)) {
-      throw new SourceFineRankValidationError("candidate_mismatch", "Fine Rank candidate coverage is invalid.");
+      throw new SourceFineRankValidationError(
+        "candidate_mismatch",
+        "Fine Rank candidate coverage is invalid.",
+      );
     }
     if (value.decision !== "keep" && value.decision !== "drop") {
       throw new SourceFineRankValidationError("malformed_output", "Fine Rank decision is invalid.");
@@ -225,19 +244,39 @@ export function validateSourceFineRankProviderResult(
       value.relevance !== "low" &&
       value.relevance !== "irrelevant"
     ) {
-      throw new SourceFineRankValidationError("malformed_output", "Fine Rank relevance is invalid.");
+      throw new SourceFineRankValidationError(
+        "malformed_output",
+        "Fine Rank relevance is invalid.",
+      );
     }
     if (typeof value.reason !== "string" || value.reason.length === 0) {
       throw new SourceFineRankValidationError("malformed_output", "Fine Rank reason is required.");
     }
-    if (typeof value.confidence !== "number" || !Number.isFinite(value.confidence) || value.confidence < 0 || value.confidence > 1) {
-      throw new SourceFineRankValidationError("malformed_output", "Fine Rank confidence must be between 0 and 1.");
+    if (
+      typeof value.confidence !== "number" ||
+      !Number.isFinite(value.confidence) ||
+      value.confidence < 0 ||
+      value.confidence > 1
+    ) {
+      throw new SourceFineRankValidationError(
+        "malformed_output",
+        "Fine Rank confidence must be between 0 and 1.",
+      );
     }
-    if (!Array.isArray(value.evidenceRefs) || value.evidenceRefs.some((ref) => typeof ref !== "string")) {
-      throw new SourceFineRankValidationError("malformed_output", "Fine Rank evidence refs are invalid.");
+    if (
+      !Array.isArray(value.evidenceRefs) ||
+      value.evidenceRefs.some((ref) => typeof ref !== "string")
+    ) {
+      throw new SourceFineRankValidationError(
+        "malformed_output",
+        "Fine Rank evidence refs are invalid.",
+      );
     }
     if (value.evidenceRefs.length > SOURCE_FINE_RANK_LIMITS.maxEvidenceRefs) {
-      throw new SourceFineRankValidationError("malformed_output", "Fine Rank evidence refs exceeded their bound.");
+      throw new SourceFineRankValidationError(
+        "malformed_output",
+        "Fine Rank evidence refs exceeded their bound.",
+      );
     }
     const candidate = expected.get(sourceId);
     const allowedRefs = new Set([
@@ -247,7 +286,10 @@ export function validateSourceFineRankProviderResult(
       ...(candidate?.wiki.map((artifact) => artifact.artifactId) ?? []),
     ]);
     if (value.evidenceRefs.some((ref) => !allowedRefs.has(ref))) {
-      throw new SourceFineRankValidationError("invalid_evidence_refs", "Fine Rank referenced evidence outside its candidate.");
+      throw new SourceFineRankValidationError(
+        "invalid_evidence_refs",
+        "Fine Rank referenced evidence outside its candidate.",
+      );
     }
     seen.add(sourceId);
     judgments.push({
@@ -256,16 +298,25 @@ export function validateSourceFineRankProviderResult(
       relevance: value.relevance,
       reason: boundString(value.reason, SOURCE_FINE_RANK_LIMITS.maxReasonChars),
       confidence: value.confidence,
-      evidenceRefs: [...new Set(value.evidenceRefs)].slice(0, SOURCE_FINE_RANK_LIMITS.maxEvidenceRefs),
+      evidenceRefs: [...new Set(value.evidenceRefs)].slice(
+        0,
+        SOURCE_FINE_RANK_LIMITS.maxEvidenceRefs,
+      ),
     });
   }
   if (seen.size !== expected.size) {
-    throw new SourceFineRankValidationError("candidate_mismatch", "Fine Rank must judge every candidate exactly once.");
+    throw new SourceFineRankValidationError(
+      "candidate_mismatch",
+      "Fine Rank must judge every candidate exactly once.",
+    );
   }
   const inputRefs = result.inputRefs;
   if (inputRefs !== undefined) {
     if (!Array.isArray(inputRefs) || !inputRefs.every((ref) => typeof ref === "string")) {
-      throw new SourceFineRankValidationError("invalid_evidence_refs", "Fine Rank input refs are invalid.");
+      throw new SourceFineRankValidationError(
+        "invalid_evidence_refs",
+        "Fine Rank input refs are invalid.",
+      );
     }
     const allowedInputRefs = new Set<string>();
     for (const candidate of request.candidates) {
@@ -276,7 +327,9 @@ export function validateSourceFineRankProviderResult(
       }
       for (const artifact of candidate.wiki) {
         allowedInputRefs.add(artifact.artifactId);
-        artifact.evidenceRefs.forEach((ref) => allowedInputRefs.add(ref));
+        for (const ref of artifact.evidenceRefs) {
+          allowedInputRefs.add(ref);
+        }
       }
     }
     if (inputRefs.some((ref) => !allowedInputRefs.has(ref))) {
@@ -289,7 +342,9 @@ export function validateSourceFineRankProviderResult(
   return {
     judgments,
     ...(typeof result.model === "string" ? { model: boundString(result.model, 240) } : {}),
-    ...(typeof result.promptVersion === "string" ? { promptVersion: boundString(result.promptVersion, 120) } : {}),
+    ...(typeof result.promptVersion === "string"
+      ? { promptVersion: boundString(result.promptVersion, 120) }
+      : {}),
     ...(Array.isArray(inputRefs)
       ? { inputRefs: [...new Set(inputRefs)].slice(0, SOURCE_FINE_RANK_LIMITS.maxCandidates * 4) }
       : {}),
@@ -300,7 +355,11 @@ export function validateSourceFineRankProviderResult(
 }
 
 export function isSourceFineRankRequest(value: unknown): value is SourceFineRankRequest {
-  if (!isRecord(value) || typeof value.query !== "string" || typeof value.promptVersion !== "string") {
+  if (
+    !isRecord(value) ||
+    typeof value.query !== "string" ||
+    typeof value.promptVersion !== "string"
+  ) {
     return false;
   }
   if (containsFineRankBoundaryLeak(value)) return false;
@@ -308,7 +367,10 @@ export function isSourceFineRankRequest(value: unknown): value is SourceFineRank
     return false;
   }
   if (!Array.isArray(value.candidates)) return false;
-  if (value.candidates.length === 0 || value.candidates.length > SOURCE_FINE_RANK_LIMITS.maxCandidates) {
+  if (
+    value.candidates.length === 0 ||
+    value.candidates.length > SOURCE_FINE_RANK_LIMITS.maxCandidates
+  ) {
     return false;
   }
   return value.candidates.every((candidate) => {
@@ -366,19 +428,25 @@ function containsFineRankBoundaryLeak(value: unknown): boolean {
 
 export function assertSourceFineRankPromptBudget(_request: SourceFineRankRequest, prompt: string) {
   if (estimateE5Tokens(prompt) > SOURCE_FINE_RANK_LIMITS.maxInputTokens) {
-    throw new SourceFineRankValidationError("budget_exceeded", "Fine Rank prompt exceeded its input budget.");
+    throw new SourceFineRankValidationError(
+      "budget_exceeded",
+      "Fine Rank prompt exceeded its input budget.",
+    );
   }
   return prompt;
 }
 
 export class SourceFineRankValidationError extends Error {
-  constructor(readonly code: SourceFineRankReasonCode, message: string) {
+  constructor(
+    readonly code: SourceFineRankReasonCode,
+    message: string,
+  ) {
     super(message);
     this.name = "SourceFineRankValidationError";
   }
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
@@ -387,7 +455,11 @@ function boundString(value: string, maxChars: number) {
 }
 
 function uniqueBoundedStrings(values: string[], maxItems: number, maxChars: number) {
-  return [...new Set(values.map((value) => boundString(value, maxChars)).filter((value) => value.length > 0))].slice(0, maxItems);
+  return [
+    ...new Set(
+      values.map((value) => boundString(value, maxChars)).filter((value) => value.length > 0),
+    ),
+  ].slice(0, maxItems);
 }
 
 function positiveInteger(value: number) {

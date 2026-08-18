@@ -7,16 +7,16 @@ import type {
   RetrieveStrength,
   RetrieveTrackName,
 } from "@/src/shared/rpc";
-import { expandChineseBigrams, normalizeText } from "@/src/shared/text";
 import {
   type SourceFineRankProvider,
-  type SourceFineRankRequest,
   type SourceFineRankReasonCode,
+  type SourceFineRankRequest,
   type SourceFineRankStrength,
   allowedRelevanceForStrength,
   relevanceRank,
   validateSourceFineRankProviderResult,
 } from "@/src/shared/source-fine-rank";
+import { expandChineseBigrams, normalizeText } from "@/src/shared/text";
 
 type RetrievalTrack = Exclude<RetrieveTrackName, "recent_sources">;
 
@@ -532,7 +532,10 @@ export async function runBoundedSourceFineRanker<T>(input: {
     const providerResult = await input.provider.rank(request);
     const validated = validateSourceFineRankProviderResult(request, providerResult);
     const indexById = new Map(
-      original.map((candidate, index) => [String((candidate as { id?: string }).id), { candidate, index }]),
+      original.map((candidate, index) => [
+        String((candidate as { id?: string }).id),
+        { candidate, index },
+      ]),
     );
     const allowed = new Set(allowedRelevanceForStrength(input.strength));
     const items = validated.judgments
@@ -542,7 +545,9 @@ export async function runBoundedSourceFineRanker<T>(input: {
         if (relevanceDelta !== 0) return relevanceDelta;
         const confidenceDelta = right.confidence - left.confidence;
         if (confidenceDelta !== 0) return confidenceDelta;
-        return (indexById.get(left.sourceId)?.index ?? 0) - (indexById.get(right.sourceId)?.index ?? 0);
+        return (
+          (indexById.get(left.sourceId)?.index ?? 0) - (indexById.get(right.sourceId)?.index ?? 0)
+        );
       })
       .flatMap((judgment) => {
         const entry = indexById.get(judgment.sourceId);
