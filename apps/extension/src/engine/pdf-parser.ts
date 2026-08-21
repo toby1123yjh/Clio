@@ -476,7 +476,7 @@ interface PdfRenderCanvas2dContext {
 }
 
 const pdfPageSeparator = "\n\n";
-const maxPdfSections = 80;
+const maxPdfSections = 160;
 const maxPdfReferences = 120;
 const maxPdfCaptions = 80;
 const maxPdfWarnings = 20;
@@ -816,13 +816,12 @@ async function readPdfMetadata(document: PdfJsDocument) {
 }
 
 function extractPdfSections(text: string, pages: ParsedPdfPage[]): ParsedPdfSection[] {
-  const headings = textLineRanges(text)
-    .flatMap((line) => {
-      const heading = parseSectionHeading(line.text);
-      if (heading === null) return [];
-      return [{ ...heading, charStart: line.charStart }];
-    })
-    .slice(0, maxPdfSections);
+  const headingCandidates = textLineRanges(text).flatMap((line) => {
+    const heading = parseSectionHeading(line.text);
+    if (heading === null) return [];
+    return [{ ...heading, charStart: line.charStart }];
+  });
+  const headings = retainTerminalPdfSections(headingCandidates);
 
   return headings.map((heading, index) => {
     const nextHeading = headings[index + 1];
@@ -840,9 +839,36 @@ function extractPdfSections(text: string, pages: ParsedPdfPage[]): ParsedPdfSect
   });
 }
 
+function retainTerminalPdfSections(
+  headings: Array<{
+    level: number;
+    text: string;
+    kind: ParsedPdfSectionKind;
+    charStart: number;
+  }>,
+) {
+  if (headings.length <= maxPdfSections) return headings;
+  const retained = headings.slice(0, maxPdfSections);
+  for (const terminal of headings.slice(maxPdfSections)) {
+    if (terminal.kind !== "references" && terminal.kind !== "appendix") continue;
+    if (retained.some((heading) => heading.charStart === terminal.charStart)) continue;
+    let replacementIndex = -1;
+    for (let index = retained.length - 1; index >= 0; index -= 1) {
+      if (retained[index]?.kind === "unknown") {
+        replacementIndex = index;
+        break;
+      }
+    }
+    if (replacementIndex < 0) break;
+    retained[replacementIndex] = terminal;
+  }
+  return retained.sort((left, right) => left.charStart - right.charStart);
+}
+
 function parseSectionHeading(lineText: string) {
   const cleaned = normalizeText(lineText).replace(/\s+/g, " ");
   if (cleaned.length === 0 || cleaned.length > 180) return null;
+  if (looksLikePdfReferenceLine(cleaned)) return null;
 
   const numberedPrefix = /^(?:section\s+)?(\d+(?:\.\d+)*)\.?\s+/i.exec(cleaned);
   const level = numberedPrefix === null ? 1 : (numberedPrefix[1]?.split(".").length ?? 1);
@@ -938,10 +964,17 @@ function extractPdfReferences(
   sections: ParsedPdfSection[],
 ): ParsedPdfReference[] {
   const referenceSection = sections.find((section) => section.kind === "references");
-  const candidateRange =
-    referenceSection === undefined
-      ? { charStart: 0, charEnd: text.length }
-      : { charStart: referenceSection.charStart, charEnd: referenceSection.charEnd };
+  // Without an explicit references/bibliography heading, numbered prose is
+  // too ambiguous to treat as a reference list. In particular, PDF text
+  // extraction often turns numbered section headings and page headers into
+  // lines that look like "1. ... 2025". Returning no references here keeps
+  // those paragraphs eligible as body evidence instead of poisoning the
+  // whole document's content-kind classification.
+  if (referenceSection === undefined) return [];
+  const candidateRange = {
+    charStart: referenceSection.charStart,
+    charEnd: referenceSection.charEnd,
+  };
   const lines = textLineRanges(text).filter(
     (line) => line.charEnd > candidateRange.charStart && line.charStart < candidateRange.charEnd,
   );
@@ -1206,13 +1239,37 @@ function pdfLineContentKind(line: PdfLineLayout): ParsedPdfParagraphContentKind 
   const caption = parseCaptionMarker(text);
   if (caption?.kind === "figure") return "figure_caption";
   if (caption?.kind === "table") return "table_caption";
-  if (/^(?:\[\d+\]|\d+\.)\s+.+(?:19|20)\d{2}\b/u.test(text)) return "reference";
+  if (looksLikePdfReferenceLine(text)) return "reference";
   if (looksLikePdfCodeLine(text)) return "code";
   if (looksLikePdfTableLine(line)) return "table";
   return "body";
 }
 
+function looksLikePdfReferenceLine(input: string) {
+  const match = /^(?:\[\d+\]|\d+[.)])\s+(.+)$/u.exec(input);
+  const body = match?.[1];
+  if (body === undefined) return false;
+
+  // A numbered section can contain a year in its first paragraph. It is not
+  // a bibliography entry, even when the extracted line starts with "1.".
+  if (
+    /^(?:abstract|introduction|related work|background|method|methods|approach|materials and methods|experiments|experimental setup|evaluation|results|discussion|limitations|conclusion|appendix)\b/i.test(
+      body,
+    )
+  ) {
+    return false;
+  }
+
+  const hasYear = /\b(?:19|20)\d{2}\b/u.test(body);
+  const hasCitationSignal =
+    /(?:\bdoi\s*:|\bhttps?:\/\/|\bet al\.?\b|\b(?:in|journal|proceedings|press|university)\b|,\s*[A-Z][a-z])/iu.test(
+      body,
+    );
+  return hasYear && hasCitationSignal;
+}
+
 function looksLikePdfHeadingLine(input: string) {
+  if (looksLikePdfReferenceLine(input)) return false;
   if (parseSectionHeading(input) !== null) return true;
   if (/^(?:\d+(?:\.\d+){0,3}|[IVXLCDM]+)\.?\s+[\p{L}][^.!?]{1,100}$/u.test(input)) {
     return input.split(/\s+/).length <= 14;
@@ -1315,6 +1372,10 @@ function finalizedPdfParagraphContentKind(
   if (input.tables.some((marker) => rangesOverlap(paragraph, marker))) return "table_caption";
   if (section?.kind === "references") return "reference";
   if (input.references.some((reference) => rangesOverlap(paragraph, reference))) return "reference";
+  // The line-level detector is only used to keep bibliography entries
+  // separated while reconstructing paragraphs. If no explicit section or
+  // validated reference range confirms the paragraph, classify it as body.
+  if (paragraph.contentKind === "reference") return "body";
   return paragraph.contentKind;
 }
 

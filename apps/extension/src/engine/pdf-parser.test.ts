@@ -386,6 +386,90 @@ describe("pdf parser", () => {
     });
   });
 
+  it("keeps numbered section prose as body evidence until a reference section confirms it", async () => {
+    const parsed = await parsePdfDocument(
+      new Uint8Array([1, 2, 3]),
+      fakePdfJs({
+        pages: [
+          [
+            [
+              "1. Introduction This paper evaluates retrieval quality in 2025.",
+              "2. Method We compare bounded evidence windows and report the results in 2025.",
+            ].join("\n"),
+          ],
+          [
+            ["References", "1. Ada Lovelace, Notes on local memory. 2024. doi:10.1234/clio.1"].join(
+              "\n",
+            ),
+          ],
+        ],
+      }),
+    );
+
+    expect(parsed.references).toHaveLength(1);
+    expect(parsed.paragraphs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          text: "1. Introduction This paper evaluates retrieval quality in 2025.",
+          contentKind: "body",
+        }),
+        expect.objectContaining({
+          text: "2. Method We compare bounded evidence windows and report the results in 2025.",
+          contentKind: "body",
+        }),
+        expect.objectContaining({
+          text: "1. Ada Lovelace, Notes on local memory. 2024. doi:10.1234/clio.1",
+          contentKind: "reference",
+        }),
+      ]),
+    );
+  });
+
+  it("does not scan the whole document for references when no reference heading is present", async () => {
+    const parsed = await parsePdfDocument(
+      new Uint8Array([1, 2, 3]),
+      fakePdfJs({
+        pages: [
+          [
+            [
+              "1. Introduction This numbered paragraph mentions a prior study from 2025.",
+              "2. Results The measured improvement was reported in 2024.",
+            ].join("\n"),
+          ],
+        ],
+      }),
+    );
+
+    expect(parsed.references).toEqual([]);
+    expect(parsed.paragraphs.every((paragraph) => paragraph.contentKind !== "reference")).toBe(
+      true,
+    );
+  });
+
+  it("retains an explicit references section beyond the generic section cap", async () => {
+    const genericHeadings = Array.from(
+      { length: 165 },
+      (_, index) => `${index + 1}. Section ${index + 1}`,
+    );
+    const parsed = await parsePdfDocument(
+      new Uint8Array([1, 2, 3]),
+      fakePdfJs({
+        pages: [
+          [
+            [
+              ...genericHeadings,
+              "References",
+              "1. Ada Lovelace, Notes on local memory. 2024. doi:10.1234/clio.1",
+            ].join("\n"),
+          ],
+        ],
+      }),
+    );
+
+    expect(parsed.sections.some((section) => section.kind === "references")).toBe(true);
+    expect(parsed.references).toHaveLength(1);
+  });
+
   it("converts parsed output into a PDF capture payload without bypassing source adapters", async () => {
     const parsed = await parsePdfDocument(
       new ArrayBuffer(1),
